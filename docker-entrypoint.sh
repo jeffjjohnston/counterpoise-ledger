@@ -1,6 +1,10 @@
 #!/bin/sh
 set -e
 
+# Before migrations, because a run that gets this far has already connected
+# with the credential in question.
+./check-db-credential.sh
+
 echo "Running database migrations..."
 node /app/migrate.js
 

@@ -52,6 +52,11 @@ paths = [
 regexes = [
   # gitleaks' built-in plaid-secret-key rule matches our table/identifier name.
   '''plaidTransactionReconciliation''',
+  # The documented placeholder in .env.example's production DATABASE_URL. Kept
+  # this narrow on purpose: .env.example is deliberately absent from the path
+  # allowlist above, because it is the file a real secret is most likely to be
+  # pasted into, and a real password pasted over this token does not match.
+  '''PASTE_APP_DB_PASSWORD''',
   # Placeholders in docs, READMEs, and test fixtures.
   '''(?i)^(test|fake|dummy|example|sample|placeholder)[-_]''',
   '''(?i)your-[a-z-]*(secret|key|token)''',

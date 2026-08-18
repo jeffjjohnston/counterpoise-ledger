@@ -20,9 +20,17 @@ services:
       POSTGRES_USER: counterpoise
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-counterpoise}
       POSTGRES_DB: counterpoise
+      # Read by scripts/postgres-init/01-app-role.sh on first initialization.
+      # Optional, not `${APP_DB_PASSWORD:?}`: Compose interpolates this whole
+      # file before it selects services, so a required variable here would also
+      # block `docker compose up -d postgres`, `ps`, `logs` and `down`. The app
+      # container enforces it instead — see scripts/check-db-credential.sh.
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-}
       TZ: ${TZ:-America/New_York}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Runs on first initialization only. An existing pgdata volume skips it.
+      - ./scripts/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U counterpoise"]
       interval: 5s

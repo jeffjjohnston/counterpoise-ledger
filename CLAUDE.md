@@ -721,10 +721,43 @@ Do not use `ALTER TABLE`, `CREATE INDEX`, or other DDL statements directly again
 ### Database Location
 - Local PostgreSQL default: `postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev`
 - The `counterpoise_dev` database is created by `npm run db:create-test-dbs` — Docker Compose only creates the `counterpoise` database
-- Docker deployment database: `postgresql://counterpoise:counterpoise@postgres:5432/counterpoise`
+- Docker deployment database: `counterpoise`, reached as the **`counterpoise_app`** role, not the bootstrap one
 - Override with `DATABASE_URL` environment variable
 - Run `docker compose up -d` to start the local PostgreSQL instance
 - Inspect with `npx drizzle-kit studio` (see Essential Commands)
+
+### Two Roles, One Instance
+
+`counterpoise` (bootstrap superuser) and `counterpoise_app` (owner of the
+production database, **not** a superuser) share one PostgreSQL instance.
+
+The split exists because the bootstrap credential is *published* —
+`.env.example`, the README, and four hardcoded fallbacks (`db/index.ts:10`,
+`scripts/create-test-dbs.ts`, `scripts/docker-migrate.mjs`,
+`playwright.config.ts`) all carry `counterpoise:counterpoise`. That is
+deliberate: those open `counterpoise_dev`, `counterpoise_e2e` and
+`counterpoise_test_0..8`, which are disposable, and `tests/setup.ts` builds a
+*different* connection string per worker — so exporting one `DATABASE_URL` to
+re-point them would collapse all eight workers onto one database and destroy
+test isolation. The dev credential cannot move. Production moved instead.
+
+- `scripts/postgres-init/01-app-role.sh` creates the role from `APP_DB_PASSWORD`
+  on **first initialization only**. The postgres image skips
+  `/docker-entrypoint-initdb.d` once the volume holds a database, so setting
+  that variable later does nothing. Same trap as `POSTGRES_PASSWORD`, which
+  `initdb` reads and nothing else — editing it on a populated volume is
+  silently ignored, and the role's password changes only via `ALTER ROLE`.
+- `scripts/check-db-credential.sh` runs from `docker-entrypoint.sh` before
+  migrations and aborts startup when `DATABASE_URL` carries the published
+  default. It is **not** a `${APP_DB_PASSWORD:?}` guard in `docker-compose.yml`:
+  Compose interpolates the whole file before selecting services, so a required
+  variable there also blocks `docker compose up -d postgres`, `ps`, `logs` and
+  `down` (measured). Checking the connection string also catches the operator
+  who sets `APP_DB_PASSWORD` and forgets to update `DATABASE_URL`.
+- Migrating an existing instance is manual, and **never** with
+  `REASSIGN OWNED BY`: databases are shared objects, so it retitles every
+  database the role owns instance-wide, dev and test included. The README's
+  "Separating the application database role" has the per-database loop.
 
 ## Recurring Transactions
 
@@ -1003,6 +1036,8 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 | `/lib/lots-db.ts` | `rebuildLots()` — the only inserter of lots and allocations at runtime (rows also disappear via FK cascade on deletes) |
 | `/lib/realized-gains.ts` | Realized gain/loss query shared by the report route and MCP |
 | `/scripts/rebuild-lots.ts` | Guarded backfill, run by the container entrypoint |
+| `/scripts/check-db-credential.sh` | Aborts container startup when `DATABASE_URL` uses the published default credential |
+| `/scripts/postgres-init/01-app-role.sh` | Creates the `counterpoise_app` role on first postgres initialization |
 | `/lib/reports.ts` | Financial report logic |
 | `/lib/api-auth.ts` | API authentication and book access |
 | `/lib/api-keys.ts` | API key generation, hashing, and verification |

@@ -84,6 +84,7 @@ RUN npm install --no-save --ignore-scripts $(cat runtime-deps.txt) \
 
 # Copy entrypoint
 COPY --chown=node:node docker-entrypoint.sh ./
+COPY --chown=node:node scripts/check-db-credential.sh ./
 
 EXPOSE 3000
 

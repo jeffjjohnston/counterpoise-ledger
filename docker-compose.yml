@@ -1,0 +1,96 @@
+# Pins the Compose project name, which is otherwise taken from the directory
+# this file sits in. Container names derive from it, so without this a clone
+# named anything else — counterpoise-ledger, per the README's own clone
+# command — produces counterpoise-ledger-app-1, and every documented
+# `docker exec counterpoise-app-1 ...` in the README, CLAUDE.md and
+# mcp/README.md is wrong for the person following them.
+#
+# Still overridable by `-p` or COMPOSE_PROJECT_NAME for anyone running more
+# than one instance from separate checkouts.
+name: counterpoise
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      # Loopback only. Publishing on 0.0.0.0 puts the financial database on the
+      # LAN behind a default password.
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: counterpoise
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-counterpoise}
+      POSTGRES_DB: counterpoise
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U counterpoise"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
+        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
+        ENABLE_HSTS: ${ENABLE_HSTS:-}
+    ports:
+      # Loopback by default so a reverse proxy (Tailscale Serve, Caddy, nginx)
+      # is the only ingress. Publishing on 0.0.0.0 lets any LAN device reach the
+      # app directly and bypass whatever authenticates that proxy.
+      # Set APP_BIND=0.0.0.0 to expose it on the LAN deliberately.
+      - "${APP_BIND:-127.0.0.1}:3000:3000"
+    environment:
+      TZ: ${TZ:-America/New_York}
+    env_file:
+      - path: .env.production.local
+        required: false
+    volumes:
+      # Read-only: the app reports job health, it never writes to backups.
+      - ./backups:/backups:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    image: postgres:16-alpine
+    environment:
+      TZ: ${TZ:-America/New_York}
+    env_file:
+      - path: .env.production.local
+        required: false
+    volumes:
+      - ./backups:/backups
+      - ./scripts/scheduler:/scheduler:ro
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        cat <<'CRONTAB' | crontab -
+        # Process recurring transactions every hour
+        0 * * * * { echo "[recurring] $$(date +\%F\ \%T)"; if wget -qO- --header="Authorization: Bearer $$CRON_SECRET" http://app:3000/api/cron/recurring 2>&1; then /scheduler/record-status.sh recurring ok "HTTP 200"; else /scheduler/record-status.sh recurring fail "wget failed"; fi; } >> /proc/1/fd/1 2>&1
+        # Sync Plaid transactions every 6 hours (12am, 6am, 12pm, 6pm)
+        0 0,6,12,18 * * * { echo "[plaid-sync] $$(date +\%F\ \%T)"; if wget -qO- --header="Authorization: Bearer $$CRON_SECRET" http://app:3000/api/cron/plaid-sync 2>&1; then /scheduler/record-status.sh plaid-sync ok "HTTP 200"; else /scheduler/record-status.sh plaid-sync fail "wget failed"; fi; } >> /proc/1/fd/1 2>&1
+        # Fetch security prices early morning after each market day (Tue-Sat 6am ET)
+        0 6 * * 2-6 { echo "[price-sync] $$(date +\%F\ \%T)"; if wget -qO- --header="Authorization: Bearer $$CRON_SECRET" http://app:3000/api/cron/price-sync 2>&1; then /scheduler/record-status.sh price-sync ok "HTTP 200"; else /scheduler/record-status.sh price-sync fail "wget failed"; fi; } >> /proc/1/fd/1 2>&1
+        # Hourly database backup, 6am–9pm (with lock to prevent overlap)
+        0 6-21 * * * { echo "[backup] $$(date +\%F\ \%T)"; if mkdir /backups/.backup.lock 2>/dev/null; then trap 'rmdir /backups/.backup.lock' EXIT; F=/backups/counterpoise-$$(date +\%Y\%m\%d-\%H\%M\%S).dump; if pg_dump "$$DATABASE_URL" --format=custom --file="$$F" 2>&1; then if pg_restore --list "$$F" >/dev/null 2>&1; then /scheduler/record-status.sh backup ok "" "$$(wc -c < "$$F")" true; else /scheduler/record-status.sh backup ok "dump unreadable by pg_restore" "$$(wc -c < "$$F")" false; fi; else /scheduler/record-status.sh backup fail "pg_dump failed"; fi; else echo "[backup] skipped: lock held"; fi; } >> /proc/1/fd/1 2>&1
+        # Prune backups older than 30 days, daily at 4am (shares lock with backup)
+        0 4 * * * { echo "[backup-prune] $$(date +\%F\ \%T)"; if mkdir /backups/.backup.lock 2>/dev/null; then trap 'rmdir /backups/.backup.lock' EXIT; if find /backups -name "counterpoise-*.dump" -mtime +30 -delete 2>&1; then /scheduler/record-status.sh prune ok; else /scheduler/record-status.sh prune fail "find failed"; fi; else echo "[backup-prune] skipped: lock held"; fi; } >> /proc/1/fd/1 2>&1
+        # Monthly REINDEX on the 1st at 3am
+        0 3 1 * * { echo "[reindex] $$(date +\%F\ \%T)"; if reindexdb "$$DATABASE_URL" 2>&1; then /scheduler/record-status.sh reindex ok; else /scheduler/record-status.sh reindex fail "reindexdb failed"; fi; } >> /proc/1/fd/1 2>&1
+        CRONTAB
+        crond -f -l 2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    name: counterpoise_pgdata
+    external: true

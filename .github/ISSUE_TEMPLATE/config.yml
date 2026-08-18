@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Fork this project
+    url: https://github.com/jeffjjohnston/counterpoise-ledger/fork
+    about: >
+      Counterpoise does not accept issues, feature requests, or pull requests.
+      Fork it and build what you need — CLAUDE.md is written so your own AI
+      agents can work in the codebase immediately.

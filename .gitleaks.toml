@@ -1,0 +1,61 @@
+title = "Counterpoise secret scanning"
+
+# Start from gitleaks' built-in ruleset (Plaid, PostHog, AWS, GitHub, Stripe, ...)
+# and layer on the credential formats that are specific to this app.
+[extend]
+useDefault = true
+
+# Counterpoise API keys grant MCP-level read/write access to a user's entire book.
+# Format is defined by generateApiKey() in lib/api-keys.ts.
+[[rules]]
+id = "counterpoise-api-key"
+description = "Counterpoise API key (cpk_ + 48 hex chars)"
+regex = '''cpk_[0-9a-f]{48}'''
+keywords = ["cpk_"]
+
+# Bearer token guarding /api/cron/* (recurring, plaid-sync, price-sync).
+# Matches a literal assignment. The leading character class skips indirection
+# (${VAR}) and documentation placeholders (<generate with: ...>, [your-value]).
+[[rules]]
+id = "counterpoise-cron-secret"
+description = "Hardcoded CRON_SECRET value"
+regex = '''(?i)\bcron_secret\b['"]?\s*[:=]\s*['"]?([^'"\s${<\[][^'"\s]{7,})'''
+keywords = ["cron_secret"]
+
+# Tiingo end-of-day price API key (no vendor-specific rule ships with gitleaks).
+[[rules]]
+id = "tiingo-api-key"
+description = "Hardcoded TIINGO_API_KEY value"
+regex = '''(?i)\btiingo_api_key\b['"]?\s*[:=]\s*['"]?([^'"\s${<\[][^'"\s]{15,})'''
+keywords = ["tiingo_api_key"]
+
+# PostgreSQL connection strings carrying a real password.
+[[rules]]
+id = "counterpoise-database-url"
+description = "PostgreSQL connection string with embedded password"
+regex = '''postgres(?:ql)?://[a-zA-Z0-9_.-]+:[^@\s'"/]+@[^\s'"/]+'''
+keywords = ["postgres://", "postgresql://"]
+
+  [[rules.allowlists]]
+  description = "Published local-dev and CI defaults (documented in CLAUDE.md, not a secret)"
+  regexes = ['''counterpoise:counterpoise@''']
+
+[allowlist]
+description = "Global allowlist"
+# Path allowlists disable EVERY rule for a file, so they are reserved for files
+# that can never hold a real credential. .env.example is deliberately NOT here:
+# it is the template a real secret is most likely to be pasted into, and its
+# placeholder values are already covered by the regex allowlists below.
+paths = [
+  '''package-lock\.json$''',
+]
+regexes = [
+  # gitleaks' built-in plaid-secret-key rule matches our table/identifier name.
+  '''plaidTransactionReconciliation''',
+  # Placeholders in docs, READMEs, and test fixtures.
+  '''(?i)^(test|fake|dummy|example|sample|placeholder)[-_]''',
+  '''(?i)your-[a-z-]*(secret|key|token)''',
+  '''originalCronSecret''',
+  # Deliberately-invalid API keys used in tests (46 hex chars, not the real 48).
+  '''cpk_(abcdef|efgh)[0-9a-f]*$''',
+]

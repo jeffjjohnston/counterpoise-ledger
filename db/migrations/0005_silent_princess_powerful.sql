@@ -1,0 +1,1 @@
+ALTER TABLE "books" ADD COLUMN "upcoming_days" integer DEFAULT 30 NOT NULL;

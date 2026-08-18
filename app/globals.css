@@ -1,0 +1,252 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── General Sans ── */
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/GeneralSans-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/GeneralSans-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/GeneralSans-Semibold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/GeneralSans-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Light mode (default) ── */
+:root {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f4f4f5;
+  --bg-tertiary: #e8e8ec;
+  --bg-elevated: #ffffff;
+  --bg-inset: #ebebef;
+  --bg-accent: #2563eb;
+  --bg-accent-hover: #1d4ed8;
+  --bg-accent-subtle: #eff6ff;
+  --bg-danger: #dc2626;
+  --bg-danger-hover: #b91c1c;
+  --bg-danger-subtle: #fef2f2;
+  --bg-success-subtle: #f0fdf4;
+  --bg-warning-subtle: #fffbeb;
+  --bg-future: #eef4ff;
+  --bg-future-hover: #dcebfe;
+  --border-future: #6dacf0;
+
+  --fg-primary: #09090b;
+  --fg-secondary: #52525b;
+  /* zinc-500: ~4.6:1 on white, clears WCAG AA for body text (was #a1a1aa @ ~2.3:1).
+     Reserve #a1a1aa for purely decorative icons/strokes, not informational text. */
+  --fg-tertiary: #71717a;
+  --fg-accent: #2563eb;
+  --fg-on-accent: #ffffff;
+  --fg-danger: #dc2626;
+  --fg-danger-muted: #c07070;
+  --fg-success: #16a34a;
+  --fg-success-muted: #5a9a70;
+  --fg-warning: #d97706;
+
+  --border-primary: #e4e4e7;
+  --border-secondary: #f0f0f3;
+  --border-focus: #2563eb;
+  --border-danger: #fca5a5;
+  --border-warning: #fcd34d;
+
+  --shadow-color: rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 2px 8px -2px rgba(0, 0, 0, 0.08), 0 1px 2px -1px rgba(0, 0, 0, 0.04);
+}
+
+/* ── Dark mode ── */
+.dark {
+  --bg-primary: #0a0a0b;
+  --bg-secondary: #131316;
+  --bg-tertiary: #1c1c21;
+  --bg-elevated: #18181b;
+  --bg-inset: #0f0f12;
+  --bg-accent: #3b82f6;
+  --bg-accent-hover: #2563eb;
+  --bg-accent-subtle: #172554;
+  --bg-danger: #ef4444;
+  --bg-danger-hover: #dc2626;
+  --bg-danger-subtle: #450a0a;
+  --bg-success-subtle: #052e16;
+  --bg-warning-subtle: #451a03;
+  --bg-future: #0d1729;
+  --bg-future-hover: #132240;
+  --border-future: #2d6cc4;
+
+  --fg-primary: #fafafa;
+  --fg-secondary: #a1a1aa;
+  /* ~5.1:1 on the dark surface, clears WCAG AA for body text (was #52525b @ ~3.4:1). */
+  --fg-tertiary: #8b8b94;
+  --fg-accent: #60a5fa;
+  --fg-on-accent: #ffffff;
+  --fg-danger: #f87171;
+  --fg-danger-muted: #b07070;
+  --fg-success: #4ade80;
+  --fg-success-muted: #5a9a70;
+  --fg-warning: #fbbf24;
+
+  --border-primary: #27272a;
+  --border-secondary: #1e1e22;
+  --border-focus: #3b82f6;
+  --border-danger: #991b1b;
+  --border-warning: #92400e;
+
+  --shadow-color: rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 2px 8px -2px rgba(0, 0, 0, 0.3), 0 1px 2px -1px rgba(0, 0, 0, 0.2);
+}
+
+body {
+  color: var(--fg-primary);
+  background: var(--bg-secondary);
+  font-family: "General Sans", system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* iPhone safe area for landscape and home indicator */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Prevent iOS Safari zoom on input focus (inputs smaller than 16px trigger zoom) */
+@media screen and (max-width: 767px) {
+  input[type="text"],
+  input[type="number"],
+  input[type="email"],
+  input[type="password"],
+  input[type="date"],
+  input[type="search"],
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}
+
+/* Shared keyboard focus ring — lifts the Button primitive's focus-visible recipe
+   (ring-2 + ring-offset-2, surface offset, accent ring) onto every bare interactive
+   element so nav links, account links and menu items show a consistent ring. The
+   Button's own Tailwind utilities live in a higher layer and still take precedence.
+   Finding #13. */
+@layer base {
+  a:focus-visible,
+  button:focus-visible {
+    outline: none;
+    box-shadow:
+      0 0 0 2px var(--bg-primary),
+      0 0 0 4px var(--border-focus);
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator:hover {
+  opacity: 1;
+}
+
+@keyframes row-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes row-highlight {
+  from {
+    background-color: var(--bg-success-subtle);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+@keyframes row-highlight-persistent {
+  0%,
+  80% {
+    background-color: var(--bg-success-subtle);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.animate-new-row {
+  animation:
+    row-slide-in 300ms ease-out both,
+    row-highlight 800ms ease-out 300ms both;
+}
+
+.animate-highlight-row {
+  animation: row-highlight-persistent 5000ms ease-out both;
+}
+
+@keyframes modal-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.animate-modal-enter {
+  animation: modal-enter 200ms ease-out both;
+}
+
+@keyframes mobile-menu-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.animate-mobile-menu-in {
+  animation: mobile-menu-in 200ms ease-out both;
+}
+
+@keyframes mobile-menu-in-left {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.animate-mobile-menu-in-left {
+  animation: mobile-menu-in-left 200ms ease-out both;
+}

@@ -325,6 +325,120 @@ describe("RecurringPage calendar", () => {
     expect(within(dayGrid).getByRole("button", { name: "Last" })).toBeInTheDocument();
   });
 
+  it("shows a business-days-only rule's next occurrence on the shifted date", async () => {
+    // 2026-02-14 is a Saturday; the occurrence is observed on Monday the 16th.
+    const weekendRule = {
+      ...recurringPayload[1],
+      id: 4,
+      name: "Weekend Rule",
+      frequency: "monthly",
+      daysOfWeek: null,
+      weekOfMonth: null,
+      daysOfMonth: "[14]",
+      nextDate: "2026-02-14",
+      businessDaysOnly: true,
+    };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/b/1/recurring") {
+        return { ok: true, json: async () => [weekendRule] } as Response;
+      }
+
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountPayload } as Response;
+      }
+
+      if (url.startsWith("/api/b/1/recurring/transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<RecurringPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Recurring Transactions")).toBeInTheDocument();
+    });
+
+    const card = screen.getByTestId("recurring-rule-card-4");
+    expect(card.textContent).toContain("(business days only)");
+    expect(card.textContent).toContain("Feb 16, 2026");
+    expect(card.textContent).not.toContain("Feb 14, 2026");
+
+    // The calendar pill lands on the Monday too, not the scheduled Saturday.
+    expect(
+      within(screen.getByTestId("calendar-day-cell-2026-02-16")).getByText(
+        "Weekend Rule"
+      )
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("calendar-day-cell-2026-02-14")).queryByText(
+        "Weekend Rule"
+      )
+    ).not.toBeInTheDocument();
+  });
+
+  it("sends businessDaysOnly when the option is ticked on a new rule", async () => {
+    let postedBody: Record<string, unknown> | null = null;
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/b/1/recurring" && init?.method === "POST") {
+        postedBody = JSON.parse(String(init.body));
+        return { ok: true, json: async () => ({}) } as Response;
+      }
+
+      if (url === "/api/b/1/recurring") {
+        return { ok: true, json: async () => [] } as Response;
+      }
+
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountPayload } as Response;
+      }
+
+      if (url.startsWith("/api/b/1/recurring/transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+
+      if (url.startsWith("/api/b/1/payees")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<RecurringPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Recurring Transactions")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "New Rule" }));
+
+    const modal = screen.getByTestId("modal");
+    const checkbox = within(modal).getByLabelText("Business days only");
+    expect(checkbox).not.toBeChecked();
+    fireEvent.click(checkbox);
+
+    fireEvent.change(within(modal).getByLabelText("Rule Name"), {
+      target: { value: "Weekend Rule" },
+    });
+    fireEvent.submit(modal.querySelector("form")!);
+
+    await waitFor(() => {
+      expect(postedBody).not.toBeNull();
+    });
+    expect(postedBody!.businessDaysOnly).toBe(true);
+  });
+
   it("animates a rule card out before removing it when deleting a reminder", async () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     let isDeleted = false;

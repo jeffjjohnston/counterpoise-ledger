@@ -102,6 +102,79 @@ describe("SearchPage", () => {
     );
   });
 
+  // 2026-08-15 is a Saturday. A businessDaysOnly rule is observed on Monday
+  // 2026-08-17, and search must agree with the recurring page about that.
+  it("shows the observed next date for a business-day-only rule", async () => {
+    vi.mocked(global.fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          transactions: [],
+          accounts: [],
+          payees: [],
+          recurringRules: [
+            {
+              id: 7,
+              name: "Vacation Fund Transfer",
+              frequency: "monthly",
+              nextDate: "2026-08-15",
+              businessDaysOnly: true,
+              isActive: true,
+            },
+          ],
+        })
+      )
+    );
+
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
+      target: { value: "vacation" },
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("Vacation Fund Transfer")).toBeInTheDocument();
+      },
+      { timeout: 2000 }
+    );
+    expect(screen.getByText("Aug 17, 2026")).toBeInTheDocument();
+    expect(screen.queryByText("Aug 15, 2026")).not.toBeInTheDocument();
+  });
+
+  it("shows the scheduled next date when the rule is not business-day only", async () => {
+    vi.mocked(global.fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          transactions: [],
+          accounts: [],
+          payees: [],
+          recurringRules: [
+            {
+              id: 8,
+              name: "Vacation Fund Transfer",
+              frequency: "monthly",
+              nextDate: "2026-08-15",
+              businessDaysOnly: false,
+              isActive: true,
+            },
+          ],
+        })
+      )
+    );
+
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
+      target: { value: "vacation" },
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("Vacation Fund Transfer")).toBeInTheDocument();
+      },
+      { timeout: 2000 }
+    );
+    expect(screen.getByText("Aug 15, 2026")).toBeInTheDocument();
+  });
+
   it("does not call fetch when query is empty", async () => {
     vi.useFakeTimers();
     try {

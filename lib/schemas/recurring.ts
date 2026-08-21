@@ -81,6 +81,16 @@ const autoCreateDaysBeforeSchema = z
   .max(30, AUTO_CREATE_DAYS_MESSAGE)
   .optional();
 
+// New field, so there is no prior guard to port. `business_days_only` is a real
+// Postgres boolean with a NOT NULL default, so a non-boolean would fail at the
+// database — validating it here turns that 500 into a 400, the same reasoning
+// updateRuleSchema.isActive gives below. Optional on both routes: absent means
+// "leave it alone" on PUT and "take the column default (false)" on POST.
+const BUSINESS_DAYS_ONLY_MESSAGE = "businessDaysOnly must be a boolean";
+const businessDaysOnlySchema = z
+  .boolean({ error: BUSINESS_DAYS_ONLY_MESSAGE })
+  .optional();
+
 // POST's endDate guard was `if (endDate && !isValidDateString(endDate))` —
 // note the bare truthy check, not `!== undefined && !== null` like the other
 // three date guards below. `""` and `null` are both falsy, so both silently
@@ -138,6 +148,7 @@ export const createRuleSchema = z.object(
     endDate: createEndDateSchema,
     templateSplits: templateSplitsSchema(TEMPLATE_SPLITS_MESSAGE),
     autoCreateDaysBefore: autoCreateDaysBeforeSchema,
+    businessDaysOnly: businessDaysOnlySchema,
     interval: z.any().optional(),
     daysOfWeek: z.any().optional(),
     weekOfMonth: z.any().optional(),
@@ -178,6 +189,7 @@ export const updateRuleSchema = z.object({
   nextDate: nullishDateSchema(NEXT_DATE_FORMAT_MESSAGE),
   templateSplits: templateSplitsSchema(TEMPLATE_SPLITS_MESSAGE).optional(),
   autoCreateDaysBefore: autoCreateDaysBeforeSchema,
+  businessDaysOnly: businessDaysOnlySchema,
   name: z.string().optional(),
   frequency: frequencySchema.optional(),
   isActive: z.boolean().optional(),

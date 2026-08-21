@@ -8,7 +8,7 @@ import {
   validateSplits,
 } from "@/lib/accounting";
 import { toDateString } from "@/lib/formatters";
-import { addDaysToDateString } from "@/lib/recurring";
+import { addDaysToDateString, getOccurrenceDate } from "@/lib/recurring";
 
 // AppDb (from "@/db") is already the shared base both the top-level db and a
 // `tx` handle satisfy — see the comment on its definition — so this used to
@@ -25,6 +25,7 @@ type RuleWithTemplateSplits = {
   daysOfMonth: string | null;
   nextDate: string;
   endDate: string | null;
+  businessDaysOnly: boolean;
   templateDescription: string | null;
   payeeId: number | null;
   autoCreateDaysBefore: number;
@@ -158,6 +159,9 @@ export async function processRecurringRuleById(
   }
 
   const dueDate = rule.nextDate;
+  // The rule advances on its own cadence; only the transaction's date observes
+  // the business-day shift. See getOccurrenceDate in lib/recurring.ts.
+  const occurrenceDate = getOccurrenceDate(dueDate, rule.businessDaysOnly);
   const nextDate = getNextDate(dueDate, buildConfig(rule));
 
   const transactionIds: number[] = [];
@@ -186,7 +190,7 @@ export async function processRecurringRuleById(
       tx,
       bookId,
       toRuleInput(rule),
-      dueDate
+      occurrenceDate
     );
     if (transactionId) {
       transactionIds.push(transactionId);
@@ -217,7 +221,11 @@ export async function processAllRecurringRules(
 
   for (const rule of activeRules) {
     const horizonDate = addDaysToDateString(today, rule.autoCreateDaysBefore ?? 0);
-    if (rule.nextDate > horizonDate) {
+    // The horizon is compared against the *observed* date throughout: a
+    // businessDaysOnly rule due on a Saturday is not created until the Monday
+    // it will be dated, not on the Saturday itself.
+    const observe = (date: string) => getOccurrenceDate(date, rule.businessDaysOnly);
+    if (observe(rule.nextDate) > horizonDate) {
       continue;
     }
 
@@ -231,17 +239,20 @@ export async function processAllRecurringRules(
 
     // Work out which dates are due up front so the guarded nextDate update can
     // be the first statement in the transaction — see processRecurringRuleById.
-    const dueDates: string[] = [];
+    const occurrenceDates: string[] = [];
     let currentDate = rule.nextDate;
     let deactivateRule = false;
 
-    while (currentDate <= horizonDate) {
+    // endDate bounds the schedule, not the observed date — an occurrence
+    // scheduled on or before endDate still counts even when its business-day
+    // shift lands past it.
+    while (observe(currentDate) <= horizonDate) {
       if (rule.endDate && currentDate > rule.endDate) {
         deactivateRule = true;
         break;
       }
 
-      dueDates.push(currentDate);
+      occurrenceDates.push(observe(currentDate));
       currentDate = getNextDate(currentDate, buildConfig(rule));
     }
 
@@ -266,12 +277,12 @@ export async function processAllRecurringRules(
       }
 
       const ruleTransactionIds: number[] = [];
-      for (const dueDate of dueDates) {
+      for (const occurrenceDate of occurrenceDates) {
         const transactionId = await createTransactionFromRule(
           tx,
           bookId,
           toRuleInput(rule),
-          dueDate
+          occurrenceDate
         );
         if (transactionId) {
           ruleTransactionIds.push(transactionId);

@@ -354,6 +354,16 @@ export const recurringRules = pgTable("recurring_rules", {
   startDate: text("start_date").notNull(),
   endDate: text("end_date"),
   nextDate: text("next_date").notNull(),
+  // When true, an occurrence that lands on a weekend is observed on the
+  // following Monday instead. Only the *occurrence* moves: next_date keeps the
+  // unshifted schedule, so a Saturday occurrence never drags the following
+  // month's due date forward with it. Weekends are the whole definition of
+  // "non-business day" here — bank holidays are not modeled, same limitation
+  // getNextBusinessDay() in lib/accounting.ts documents. Two scheduled
+  // occurrences can collapse onto one observed date (a daily rule's Saturday
+  // and Sunday both land on Monday); that is two occurrences observed the same
+  // day, and both transactions are created.
+  businessDaysOnly: boolean("business_days_only").notNull().default(false),
   autoCreateDaysBefore: integer("auto_create_days_before").notNull().default(0),
   templateDescription: text("template_description"),
   payeeId: integer("payee_id").references(() => payees.id, { onDelete: "set null" }),

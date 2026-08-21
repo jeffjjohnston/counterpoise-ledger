@@ -55,6 +55,229 @@ describe("Recurring rule API", () => {
     expect(payload.autoCreateDaysBefore).toBe(0);
   });
 
+  it("defaults businessDaysOnly to false when omitted on create", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const rent = await createAccount({ name: "Rent", type: "expense" });
+
+    const response = await POSTRecurring(
+      new Request("http://localhost/api/recurring", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Monthly Rent",
+          frequency: "monthly",
+          startDate: "2026-02-01",
+          templateSplits: [
+            { accountId: rent.id, amount: 150000 },
+            { accountId: checking.id, amount: -150000 },
+          ],
+        }),
+      }),
+      { params: Promise.resolve({ bookId: "1" }) }
+    );
+
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    expect(payload.businessDaysOnly).toBe(false);
+  });
+
+  it("persists businessDaysOnly on create and toggles it on update", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const rent = await createAccount({ name: "Rent", type: "expense" });
+
+    const created = await POSTRecurring(
+      new Request("http://localhost/api/recurring", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Monthly Rent",
+          frequency: "monthly",
+          startDate: "2026-02-01",
+          businessDaysOnly: true,
+          templateSplits: [
+            { accountId: rent.id, amount: 150000 },
+            { accountId: checking.id, amount: -150000 },
+          ],
+        }),
+      }),
+      { params: Promise.resolve({ bookId: "1" }) }
+    );
+
+    expect(created.status).toBe(200);
+    const rule = await created.json();
+    expect(rule.businessDaysOnly).toBe(true);
+
+    const updated = await PUTRecurring(
+      new Request(`http://localhost/api/recurring/${rule.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ businessDaysOnly: false }),
+      }),
+      { params: Promise.resolve({ bookId: "1", id: String(rule.id) }) }
+    );
+
+    expect(updated.status).toBe(200);
+    expect((await updated.json()).businessDaysOnly).toBe(false);
+  });
+
+  it("leaves businessDaysOnly alone when an update omits it", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const rent = await createAccount({ name: "Rent", type: "expense" });
+    const rule = await createRecurringRule({
+      name: "Monthly Rent",
+      frequency: "monthly",
+      startDate: "2026-02-01",
+      nextDate: "2026-02-01",
+      businessDaysOnly: true,
+      templateSplits: [
+        { accountId: rent.id, amount: 150000 },
+        { accountId: checking.id, amount: -150000 },
+      ],
+    });
+
+    const response = await PUTRecurring(
+      new Request(`http://localhost/api/recurring/${rule.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "Renamed" }),
+      }),
+      { params: Promise.resolve({ bookId: "1", id: String(rule.id) }) }
+    );
+
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    expect(payload.name).toBe("Renamed");
+    expect(payload.businessDaysOnly).toBe(true);
+  });
+
+  // 2026-08-15 is a Saturday. A businessDaysOnly rule observes it on Monday
+  // 2026-08-17, so creating the rule on that Sunday or Monday must keep the
+  // occurrence — the raw Saturday date is still what gets stored.
+  it("keeps a weekend occurrence a business-day rule has yet to observe", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-17T12:00:00"));
+    try {
+      const checking = await createAccount({ name: "Checking", type: "asset" });
+      const rent = await createAccount({ name: "Rent", type: "expense" });
+
+      const response = await POSTRecurring(
+        new Request("http://localhost/api/recurring", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: "Monthly Rent",
+            frequency: "monthly",
+            startDate: "2026-08-15",
+            businessDaysOnly: true,
+            templateSplits: [
+              { accountId: rent.id, amount: 150000 },
+              { accountId: checking.id, amount: -150000 },
+            ],
+          }),
+        }),
+        { params: Promise.resolve({ bookId: "1" }) }
+      );
+
+      expect(response.status).toBe(200);
+      expect((await response.json()).nextDate).toBe("2026-08-15");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips the same weekend occurrence when the rule is not business-day only", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-17T12:00:00"));
+    try {
+      const checking = await createAccount({ name: "Checking", type: "asset" });
+      const rent = await createAccount({ name: "Rent", type: "expense" });
+
+      const response = await POSTRecurring(
+        new Request("http://localhost/api/recurring", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: "Monthly Rent",
+            frequency: "monthly",
+            startDate: "2026-08-15",
+            templateSplits: [
+              { accountId: rent.id, amount: 150000 },
+              { accountId: checking.id, amount: -150000 },
+            ],
+          }),
+        }),
+        { params: Promise.resolve({ bookId: "1" }) }
+      );
+
+      expect(response.status).toBe(200);
+      expect((await response.json()).nextDate).toBe("2026-09-15");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a weekend occurrence when a schedule change recomputes nextDate", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-17T12:00:00"));
+    try {
+      const checking = await createAccount({ name: "Checking", type: "asset" });
+      const rent = await createAccount({ name: "Rent", type: "expense" });
+      const rule = await createRecurringRule({
+        name: "Monthly Rent",
+        frequency: "monthly",
+        startDate: "2026-08-10",
+        nextDate: "2026-08-10",
+        businessDaysOnly: true,
+        templateSplits: [
+          { accountId: rent.id, amount: 150000 },
+          { accountId: checking.id, amount: -150000 },
+        ],
+      });
+
+      const response = await PUTRecurring(
+        new Request(`http://localhost/api/recurring/${rule.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ startDate: "2026-08-15" }),
+        }),
+        { params: Promise.resolve({ bookId: "1", id: String(rule.id) }) }
+      );
+
+      expect(response.status).toBe(200);
+      expect((await response.json()).nextDate).toBe("2026-08-15");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects a non-boolean businessDaysOnly on create", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const rent = await createAccount({ name: "Rent", type: "expense" });
+
+    const response = await POSTRecurring(
+      new Request("http://localhost/api/recurring", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Monthly Rent",
+          frequency: "monthly",
+          startDate: "2026-02-01",
+          businessDaysOnly: "yes",
+          templateSplits: [
+            { accountId: rent.id, amount: 150000 },
+            { accountId: checking.id, amount: -150000 },
+          ],
+        }),
+      }),
+      { params: Promise.resolve({ bookId: "1" }) }
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe(
+      "businessDaysOnly must be a boolean"
+    );
+  });
+
   it("rejects invalid autoCreateDaysBefore on create", async () => {
     const checking = await createAccount({ name: "Checking", type: "asset" });
     const rent = await createAccount({ name: "Rent", type: "expense" });

@@ -276,6 +276,36 @@ describe("createRuleSchema", () => {
     expect(r.data!.autoCreateDaysBefore).toBeUndefined();
   });
 
+  it("accepts a boolean businessDaysOnly and rejects anything else", () => {
+    const base = {
+      name: "Rent",
+      frequency: "monthly",
+      startDate: "2026-02-01",
+      templateSplits: validTemplateSplits,
+    };
+
+    expect(
+      createRuleSchema.safeParse({ ...base, businessDaysOnly: true }).success
+    ).toBe(true);
+
+    for (const invalid of ["yes", 1, null]) {
+      const r = createRuleSchema.safeParse({ ...base, businessDaysOnly: invalid });
+      expect(r.success).toBe(false);
+      expect(r.error!.issues[0].message).toBe("businessDaysOnly must be a boolean");
+    }
+  });
+
+  it("accepts an omitted businessDaysOnly (route defaults it to false)", () => {
+    const r = createRuleSchema.safeParse({
+      name: "Rent",
+      frequency: "monthly",
+      startDate: "2026-02-01",
+      templateSplits: validTemplateSplits,
+    });
+    expect(r.success).toBe(true);
+    expect(r.data!.businessDaysOnly).toBeUndefined();
+  });
+
   it.each([
     ["null", null],
     ["an array", []],
@@ -298,6 +328,13 @@ describe("createRuleSchema", () => {
 });
 
 describe("updateRuleSchema", () => {
+  it("validates businessDaysOnly the same way on update", () => {
+    expect(updateRuleSchema.safeParse({ businessDaysOnly: false }).success).toBe(true);
+    const r = updateRuleSchema.safeParse({ businessDaysOnly: "no" });
+    expect(r.success).toBe(false);
+    expect(r.error!.issues[0].message).toBe("businessDaysOnly must be a boolean");
+  });
+
   it("accepts an empty update (no fields changed)", () => {
     const r = updateRuleSchema.safeParse({});
     expect(r.success).toBe(true);

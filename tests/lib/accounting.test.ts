@@ -5,6 +5,7 @@ import {
   getDisplayBalance,
   getNextDate,
   getInitialNextDate,
+  advanceNextDateToFuture,
   describeRecurrence,
   groupAccountsByType,
   ACCOUNT_TYPE_LABELS,
@@ -23,6 +24,8 @@ import {
   buildAccountHierarchyName,
   isDescendantOf,
   getNextBusinessDay,
+  isBusinessDay,
+  advanceToBusinessDay,
   resolveAccountIcon,
   resolveAccountIconSource,
   buildCategoryLabelMap,
@@ -570,6 +573,51 @@ describe("getNextBusinessDay", () => {
   });
 });
 
+describe("isBusinessDay", () => {
+  it("is true Monday through Friday", () => {
+    // 2026-07-06 is a Monday, 2026-07-10 a Friday
+    expect(isBusinessDay("2026-07-06")).toBe(true);
+    expect(isBusinessDay("2026-07-08")).toBe(true);
+    expect(isBusinessDay("2026-07-10")).toBe(true);
+  });
+
+  it("is false on Saturday and Sunday", () => {
+    expect(isBusinessDay("2026-07-11")).toBe(false);
+    expect(isBusinessDay("2026-07-12")).toBe(false);
+  });
+
+  it("treats a bank holiday as a business day (holidays are not modeled)", () => {
+    // 2026-07-03 (observed Independence Day) is a Friday
+    expect(isBusinessDay("2026-07-03")).toBe(true);
+  });
+
+  it("throws on a malformed or non-calendar date", () => {
+    expect(() => isBusinessDay("not-a-date")).toThrow("Invalid date");
+    expect(() => isBusinessDay("2026-02-30")).toThrow("Invalid date");
+  });
+});
+
+describe("advanceToBusinessDay", () => {
+  it("leaves a weekday untouched, unlike getNextBusinessDay", () => {
+    expect(advanceToBusinessDay("2026-07-08")).toBe("2026-07-08");
+    expect(getNextBusinessDay("2026-07-08")).toBe("2026-07-09");
+  });
+
+  it("moves Saturday and Sunday to the following Monday", () => {
+    expect(advanceToBusinessDay("2026-07-11")).toBe("2026-07-13");
+    expect(advanceToBusinessDay("2026-07-12")).toBe("2026-07-13");
+  });
+
+  it("crosses a month boundary", () => {
+    // 2026-08-01 is a Saturday
+    expect(advanceToBusinessDay("2026-08-01")).toBe("2026-08-03");
+  });
+
+  it("throws on a malformed date", () => {
+    expect(() => advanceToBusinessDay("2026-13-01")).toThrow("Invalid date");
+  });
+});
+
 describe("getInitialNextDate", () => {
   it("returns start date for daily recurrence", () => {
     expect(
@@ -613,6 +661,64 @@ describe("getInitialNextDate", () => {
         interval: 1,
       })
     ).toBe("2026-08-05");
+  });
+});
+
+describe("advanceNextDateToFuture", () => {
+  const monthlyOn15th = {
+    frequency: "monthly" as const,
+    interval: 1,
+    daysOfMonth: [15],
+  };
+
+  it("keeps an occurrence that is already today", () => {
+    expect(
+      advanceNextDateToFuture("2026-08-14", monthlyOn15th, "2026-08-14")
+    ).toBe("2026-08-14");
+  });
+
+  it("skips an occurrence that is already past", () => {
+    expect(
+      advanceNextDateToFuture("2026-08-15", monthlyOn15th, "2026-08-17")
+    ).toBe("2026-09-15");
+  });
+
+  // 2026-08-15 is a Saturday, observed on Monday 2026-08-17 by a
+  // businessDaysOnly rule. The Saturday date is still stored — only the
+  // comparison against today uses the observed date.
+  const observeBusinessDay = (date: string) => advanceToBusinessDay(date);
+
+  it("keeps a weekend occurrence whose observed date is today", () => {
+    expect(
+      advanceNextDateToFuture(
+        "2026-08-15",
+        monthlyOn15th,
+        "2026-08-17",
+        observeBusinessDay
+      )
+    ).toBe("2026-08-15");
+  });
+
+  it("keeps a weekend occurrence whose observed date is still ahead", () => {
+    expect(
+      advanceNextDateToFuture(
+        "2026-08-15",
+        monthlyOn15th,
+        "2026-08-16",
+        observeBusinessDay
+      )
+    ).toBe("2026-08-15");
+  });
+
+  it("skips a weekend occurrence once its observed date has passed", () => {
+    expect(
+      advanceNextDateToFuture(
+        "2026-08-15",
+        monthlyOn15th,
+        "2026-08-18",
+        observeBusinessDay
+      )
+    ).toBe("2026-09-15");
   });
 });
 

@@ -71,9 +71,6 @@ Squash-merge PR on GitHub      ← all commits become one commit on main
 - **CI**: GitHub Actions (`.github/workflows/ci.yml`) runs on every PR to main — lint, type-check, tests against a PostgreSQL service container, and a `production-build` job that builds with **no database service**, since a page querying the database at build time passes E2E (which has one) and fails `docker build` (which does not)
 - **After release.sh, before merging**: Additional commits can be pushed to dev to address PR feedback. These get included in the squash merge. The version tag is corrected at deploy time.
 - **The session-hash migration is not reversible by redeploying the previous image.** Once the `sessions.token` column is renamed to `token_hash`, the old code queries a column that no longer exists and 500s on every authenticated request. Rolling back requires a forward migration (or a new fix-forward deploy), not an image rollback.
-- **The post-deploy check needs a write.** The existing check (`/api/health` returns 200, the job-health indicator reads `/backups`) exercises no write path, and the cross-origin check in `proxy.ts` is only first exercised by a real browser write through the reverse proxy. Add "create or edit a transaction in the browser" to the post-deploy checklist.
-- **The post-deploy check also needs to cover lot tracking.** Add "open a security's Lots tab" and "run the realized gains report for a year with known sells" to the post-deploy checklist — the deploy-time lot backfill (see Lot Tracking) runs unattended and aborts startup on failure, but a *wrong* rebuild (e.g. from a bug in `replayLots`) would start up fine and just serve incorrect cost basis and gains with no error anywhere.
-- **"Add demo book" is the only long request the app makes.** `POST /api/books/demo` runs the full seed inline and holds the connection for seconds, so it is the one request a reverse-proxy read timeout can cut. Nothing in the test suite covers that: the tests call the route handler directly and never cross a proxy. Click the button once on the deployed instance after a proxy or infrastructure change. A timeout shows as a failed request while the seed keeps running server-side, which leaves a complete demo book that the page never displayed.
 
 ### After Making Code Changes
 After modifying TypeScript files, always run `npx tsc --noEmit` to check for type errors and fix any that arise before considering the task complete.
@@ -519,7 +516,11 @@ with per-pair commits, a crash partway through plus Docker's
 progress as "already populated" on the next boot and silently skip the
 remaining pairs — serving zero cost basis for them while reporting success. A
 failure aborts container startup on purpose, because the alternative is
-serving that zero cost basis with no visible error.
+serving that zero cost basis with no visible error. Note that this only
+catches a rebuild that *fails*. A rebuild that succeeds and is wrong — say
+from a bug in `replayLots` — starts up cleanly and serves incorrect cost
+basis and realized gains with no error anywhere, which no automated signal
+here can distinguish from a correct one.
 
 Short positions (sell-to-open) are **not** modeled — the `action` enum has no
 open/close discriminator, `lib/investments.ts` skips positions with
@@ -766,15 +767,56 @@ test isolation. The dev credential cannot move. Production moved instead.
 - Template splits stored in `recurring_template_splits`
 - `nextDate` field tracks next due date
 - `autoCreateDaysBefore` (default 0) lets a rule's transaction be auto-created up to N days before it's due
+- `businessDaysOnly` (default false) shifts an occurrence that lands on a weekend to the following Monday — see Business-Day Occurrences below
 - Process via POST to `/api/b/[bookId]/recurring/process`
 - Cron endpoint at `/api/cron/recurring` runs hourly (via Docker `scheduler` sidecar; same sidecar runs Plaid sync — see below)
 
 ### Processing Due Rules
-1. Check if `nextDate <= today`
-2. Create new transaction from template
-3. Calculate next date using `getNextDate()` function
+1. Check if the *observed* date (`getOccurrenceDate(nextDate, businessDaysOnly)`) is `<= today` (plus `autoCreateDaysBefore`)
+2. Create new transaction from template, dated the observed date
+3. Calculate next date using `getNextDate()` function — from the **scheduled** `nextDate`, never the observed one
 4. Update rule's `nextDate`
 5. If past `endDate`, deactivate rule
+
+### Business-Day Occurrences
+`getOccurrenceDate(scheduledDate, businessDaysOnly)` in `/lib/recurring.ts` is
+the single place the shift is applied, and it is applied at *read* time — when a
+scheduled date becomes a transaction date — never written back into the rule.
+Storing the shifted date in `nextDate` would make `getNextDate()` compute the
+following occurrence from the Monday, so a rule due on the 15th would creep to
+the 17th and stay there.
+
+Everything that turns a rule into dates goes through it: `processRecurringRuleById`
+and `processAllRecurringRules` (`/lib/recurring-processing.ts`), the projection
+route (`/app/api/b/[bookId]/recurring/projected/route.ts`), the recurring page's
+due badge, "Next:" line and calendar, and the global search page's "Next Date"
+column (`lib/search.ts` carries `businessDaysOnly` through so the two pages
+cannot disagree). `isRecurringRuleDue()` takes `businessDaysOnly` as an optional
+4th argument and compares the observed date, so a rule whose occurrence falls on
+a Saturday is not due — and is not created — until the Monday it will be dated.
+
+`advanceNextDateToFuture()` (`/lib/accounting.ts`) needs the observed date too,
+for the opposite reason: it decides which scheduled occurrence to *store* when a
+rule is created or its schedule is edited. Comparing raw dates against today
+threw away a Saturday occurrence for a rule created on that Sunday or Monday,
+even though the rule would still have created the transaction on the Monday. It
+takes an optional `observe` transform rather than a `businessDaysOnly` flag:
+`lib/recurring.ts` already imports `lib/accounting.ts`, so a flag would need
+either a circular import or a second copy of the shift inside `accounting.ts`.
+Callers pass `(date) => getOccurrenceDate(date, businessDaysOnly)`; the default
+leaves dates alone.
+
+Two consequences worth knowing:
+- **Weekends are the whole definition of "non-business day."** Bank holidays are
+  not modeled, the same limitation `getNextBusinessDay()` in `/lib/accounting.ts`
+  documents. `advanceToBusinessDay()` next to it is the "when is this observed?"
+  variant — it leaves a weekday alone, where `getNextBusinessDay()` always moves.
+- **Two occurrences can collapse onto one observed date.** A daily rule's Saturday
+  and Sunday both land on Monday, and both transactions are created. That is two
+  occurrences observed the same day, not a duplicate.
+
+`endDate` still bounds the **scheduled** date, not the observed one: an occurrence
+scheduled on or before `endDate` counts even when its shift lands past it.
 
 ## Plaid Bank Sync
 

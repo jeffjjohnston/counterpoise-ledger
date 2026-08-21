@@ -197,6 +197,7 @@ export const createRecurringRule = async (data: {
   startDate: string;
   endDate?: string | null;
   nextDate: string;
+  businessDaysOnly?: boolean;
   autoCreateDaysBefore?: number;
   templateDescription?: string | null;
   payeeId?: number | null;
@@ -224,6 +225,7 @@ export const createRecurringRule = async (data: {
       startDate: data.startDate,
       endDate: data.endDate ?? null,
       nextDate: data.nextDate,
+      businessDaysOnly: data.businessDaysOnly ?? false,
       autoCreateDaysBefore: data.autoCreateDaysBefore ?? 0,
       templateDescription: data.templateDescription ?? null,
       payeeId: data.payeeId ?? null,

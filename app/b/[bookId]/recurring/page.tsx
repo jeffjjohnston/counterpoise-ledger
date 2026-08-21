@@ -16,6 +16,7 @@ import {
   type RecurrenceConfig,
 } from "@/lib/accounting";
 import {
+  getOccurrenceDate,
   isRecurringRuleDue,
   MAX_AUTO_CREATE_DAYS_BEFORE,
   MAX_DAILY_INTERVAL_DAYS,
@@ -116,7 +117,12 @@ function getRuleOccurrencesInRange(
   let iterations = 0;
   let currentDate = rule.nextDate;
 
-  while (currentDate < rangeStartDate && iterations < MAX_OCCURRENCE_ITERATIONS) {
+  // The walk follows the scheduled dates; every date that leaves this function
+  // is the observed one, so a businessDaysOnly rule lands on the calendar
+  // square the transaction will actually carry.
+  const observe = (date: string) => getOccurrenceDate(date, rule.businessDaysOnly);
+
+  while (observe(currentDate) < rangeStartDate && iterations < MAX_OCCURRENCE_ITERATIONS) {
     const nextDate = getNextDate(currentDate, config);
     if (nextDate <= currentDate) break;
     currentDate = nextDate;
@@ -124,8 +130,9 @@ function getRuleOccurrencesInRange(
   }
 
   while (currentDate <= rangeEndDate && iterations < MAX_OCCURRENCE_ITERATIONS) {
-    if (currentDate > today) {
-      occurrences.push(currentDate);
+    const occurrenceDate = observe(currentDate);
+    if (occurrenceDate > today && occurrenceDate <= rangeEndDate) {
+      occurrences.push(occurrenceDate);
     }
 
     const nextDate = getNextDate(currentDate, config);
@@ -403,7 +410,12 @@ function RecurringPageInner() {
   const dueRules = rules.filter(
     (r) =>
       r.isActive &&
-      isRecurringRuleDue(r.nextDate, today, r.autoCreateDaysBefore ?? 0)
+      isRecurringRuleDue(
+        r.nextDate,
+        today,
+        r.autoCreateDaysBefore ?? 0,
+        r.businessDaysOnly
+      )
   );
   const todayDate = parseDateString(today);
   const calendarStartDate = new Date(todayDate);
@@ -568,7 +580,8 @@ function RecurringPageInner() {
             isRecurringRuleDue(
               rule.nextDate,
               today,
-              rule.autoCreateDaysBefore ?? 0
+              rule.autoCreateDaysBefore ?? 0,
+              rule.businessDaysOnly
             );
           const amount = rule.templateSplits.reduce(
             (max, s) => Math.max(max, Math.abs(s.amount)),
@@ -623,8 +636,11 @@ function RecurringPageInner() {
                       {rule.payee && (
                         <span className="text-fg-secondary">{rule.payee.name} &middot; </span>
                       )}
-                      {ruleDesc} | Next:{" "}
-                      {formatDate(rule.nextDate)}
+                      {ruleDesc}
+                      {rule.businessDaysOnly && " (business days only)"} | Next:{" "}
+                      {formatDate(
+                        getOccurrenceDate(rule.nextDate, rule.businessDaysOnly)
+                      )}
                     </p>
                   </div>
                 </div>
@@ -757,6 +773,7 @@ type RecurringFormData = {
   startDate: string;
   endDate: string | null;
   autoCreateDaysBefore: number;
+  businessDaysOnly: boolean;
   templateDescription: string;
   templateSplits: SplitInput[];
   payeeId: number | null;
@@ -841,6 +858,9 @@ function RecurringForm({
   const [endDate, setEndDate] = useState(rule?.endDate || "");
   const [autoCreateDaysBefore, setAutoCreateDaysBefore] = useState(
     rule?.autoCreateDaysBefore ?? 0
+  );
+  const [businessDaysOnly, setBusinessDaysOnly] = useState(
+    rule?.businessDaysOnly ?? false
   );
   const [description, setDescription] = useState(rule?.templateDescription || prefill?.templateDescription || "");
   const [splits, setSplits] = useState<SplitInput[]>(
@@ -933,6 +953,7 @@ function RecurringForm({
       startDate,
       endDate: endDate || null,
       autoCreateDaysBefore,
+      businessDaysOnly,
       templateDescription: description,
       templateSplits: splits,
       payeeId: normalizedPayeeName ? payeeId : null,
@@ -1115,6 +1136,23 @@ function RecurringForm({
           );
         }}
       />
+
+      <div className="space-y-1">
+        <label className="flex items-center gap-2 text-sm text-fg">
+          <input
+            type="checkbox"
+            id="businessDaysOnly"
+            checked={businessDaysOnly}
+            onChange={(e) => setBusinessDaysOnly(e.target.checked)}
+            className="h-4 w-4 text-fg-accent focus:ring-fg-accent border-border rounded"
+          />
+          <span>Business days only</span>
+        </label>
+        <p className="pl-6 text-xs text-fg-tertiary">
+          An occurrence that falls on a weekend is created on the next business
+          day instead. The schedule itself does not move.
+        </p>
+      </div>
 
       <Input
         label="Description"

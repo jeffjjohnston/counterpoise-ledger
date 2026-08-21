@@ -49,7 +49,9 @@ export type SearchResults = {
     id: number;
     name: string;
     frequency: string;
+    /** Scheduled date — shift it with getOccurrenceDate() before display. */
     nextDate: string;
+    businessDaysOnly: boolean;
     isActive: boolean;
   }>;
 };
@@ -228,6 +230,7 @@ export async function searchBook(
       name: recurringRules.name,
       frequency: recurringRules.frequency,
       nextDate: recurringRules.nextDate,
+      businessDaysOnly: recurringRules.businessDaysOnly,
       isActive: recurringRules.isActive,
     })
     .from(recurringRules)

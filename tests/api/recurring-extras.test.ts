@@ -212,6 +212,69 @@ describe("GET /api/b/[bookId]/recurring/projected", () => {
     )).toBe(true);
   });
 
+  it("projects a businessDaysOnly occurrence on the next business day", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const expense = await createAccount({ name: "Rent", type: "expense" });
+
+    await createRecurringRule({
+      name: "Monthly Rent",
+      frequency: "monthly",
+      daysOfMonth: [15],
+      startDate: "2026-08-15",
+      // 2026-08-15 is a Saturday
+      nextDate: "2026-08-15",
+      businessDaysOnly: true,
+      templateSplits: [
+        { accountId: checking.id, amount: -150000 },
+        { accountId: expense.id, amount: 150000 },
+      ],
+    });
+
+    const res = await getProjected(
+      new Request(
+        "http://localhost/api/recurring/projected?startDate=2026-08-01&endDate=2026-09-30"
+      ),
+      rp()
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // September 15 2026 is a Tuesday, so only the August occurrence shifts
+    expect(body.map((t: { date: string }) => t.date)).toEqual([
+      "2026-08-17",
+      "2026-09-15",
+    ]);
+  });
+
+  it("includes an occurrence whose shift moves it into the requested window", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const expense = await createAccount({ name: "Rent", type: "expense" });
+
+    await createRecurringRule({
+      name: "Monthly Rent",
+      frequency: "monthly",
+      daysOfMonth: [15],
+      startDate: "2026-08-15",
+      nextDate: "2026-08-15",
+      businessDaysOnly: true,
+      templateSplits: [
+        { accountId: checking.id, amount: -150000 },
+        { accountId: expense.id, amount: 150000 },
+      ],
+    });
+
+    // The window opens after the scheduled Saturday but on the observed Monday
+    const res = await getProjected(
+      new Request(
+        "http://localhost/api/recurring/projected?startDate=2026-08-17&endDate=2026-08-31"
+      ),
+      rp()
+    );
+
+    const body = await res.json();
+    expect(body.map((t: { date: string }) => t.date)).toEqual(["2026-08-17"]);
+  });
+
   it("does not include inactive rules", async () => {
     const checking = await createAccount({ name: "Checking", type: "asset" });
     const expense = await createAccount({ name: "Expense", type: "expense" });

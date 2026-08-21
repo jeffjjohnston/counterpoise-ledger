@@ -320,3 +320,145 @@ describe("processAllRecurringRules", () => {
     expect(updatedRule.isActive).toBe(false);
   });
 });
+
+describe("businessDaysOnly rules", () => {
+  async function createWeekendRule(overrides: {
+    businessDaysOnly: boolean;
+    nextDate?: string;
+    frequency?: "daily" | "weekly" | "monthly" | "yearly";
+    daysOfMonth?: number[] | null;
+    autoCreateDaysBefore?: number;
+  }) {
+    const { checking, rent } = await createRuleFixture();
+    const rule = await createRecurringRule({
+      name: "Monthly Rent",
+      frequency: overrides.frequency ?? "monthly",
+      daysOfMonth: overrides.daysOfMonth ?? [15],
+      startDate: "2026-08-15",
+      // 2026-08-15 is a Saturday
+      nextDate: overrides.nextDate ?? "2026-08-15",
+      businessDaysOnly: overrides.businessDaysOnly,
+      autoCreateDaysBefore: overrides.autoCreateDaysBefore ?? 0,
+      templateDescription: "Rent payment",
+      templateSplits: [
+        { accountId: rent.id, amount: 150000 },
+        { accountId: checking.id, amount: -150000 },
+      ],
+    });
+    return { rule, checking, rent };
+  }
+
+  it("dates a weekend occurrence on the following Monday", async () => {
+    const { rule } = await createWeekendRule({ businessDaysOnly: true });
+
+    const result = await processRecurringRuleById(db, 1, rule.id);
+
+    expect(result?.transactionsCreated).toBe(1);
+    const [created] = await db
+      .select()
+      .from(transactions)
+      .where(eq(transactions.recurringRuleId, rule.id));
+    expect(created.date).toBe("2026-08-17");
+  });
+
+  it("leaves the date on the weekend when the option is off", async () => {
+    const { rule } = await createWeekendRule({ businessDaysOnly: false });
+
+    await processRecurringRuleById(db, 1, rule.id);
+
+    const [created] = await db
+      .select()
+      .from(transactions)
+      .where(eq(transactions.recurringRuleId, rule.id));
+    expect(created.date).toBe("2026-08-15");
+  });
+
+  it("keeps nextDate on the unshifted schedule so the cadence does not creep", async () => {
+    const { rule } = await createWeekendRule({ businessDaysOnly: true });
+
+    await processRecurringRuleById(db, 1, rule.id);
+
+    const [updated] = await db
+      .select()
+      .from(recurringRules)
+      .where(eq(recurringRules.id, rule.id));
+    // Advanced from the scheduled Saturday, not from the Monday it was dated
+    expect(updated.nextDate).toBe("2026-09-15");
+  });
+
+  it("does not create the occurrence while today is still the weekend", async () => {
+    const { rule } = await createWeekendRule({ businessDaysOnly: true });
+
+    const result = await processAllRecurringRules(db, 1, "2026-08-15");
+
+    expect(result.transactionsCreated).toBe(0);
+    const [unchanged] = await db
+      .select()
+      .from(recurringRules)
+      .where(eq(recurringRules.id, rule.id));
+    expect(unchanged.nextDate).toBe("2026-08-15");
+  });
+
+  it("creates it on the Monday the occurrence lands on", async () => {
+    const { rule } = await createWeekendRule({ businessDaysOnly: true });
+
+    const result = await processAllRecurringRules(db, 1, "2026-08-17");
+
+    expect(result.transactionsCreated).toBe(1);
+    const [created] = await db
+      .select()
+      .from(transactions)
+      .where(eq(transactions.recurringRuleId, rule.id));
+    expect(created.date).toBe("2026-08-17");
+    const [updated] = await db
+      .select()
+      .from(recurringRules)
+      .where(eq(recurringRules.id, rule.id));
+    expect(updated.nextDate).toBe("2026-09-15");
+  });
+
+  it("measures autoCreateDaysBefore against the shifted date", async () => {
+    // Thursday 2026-08-13 with a 2-day lead reaches the scheduled Saturday but
+    // not the Monday the occurrence is observed on.
+    const { rule } = await createWeekendRule({
+      businessDaysOnly: true,
+      autoCreateDaysBefore: 2,
+    });
+
+    expect(
+      (await processAllRecurringRules(db, 1, "2026-08-13")).transactionsCreated
+    ).toBe(0);
+
+    const later = await processAllRecurringRules(db, 1, "2026-08-15");
+    expect(later.transactionsCreated).toBe(1);
+    const [created] = await db
+      .select()
+      .from(transactions)
+      .where(eq(transactions.recurringRuleId, rule.id));
+    expect(created.date).toBe("2026-08-17");
+  });
+
+  it("observes a run of weekend occurrences on the same Monday", async () => {
+    // A daily rule spanning Sat 2026-08-15 and Sun 2026-08-16: two occurrences,
+    // both observed on Monday 2026-08-17.
+    const { rule } = await createWeekendRule({
+      businessDaysOnly: true,
+      frequency: "daily",
+      daysOfMonth: null,
+      nextDate: "2026-08-15",
+    });
+
+    const result = await processAllRecurringRules(db, 1, "2026-08-17");
+
+    expect(result.transactionsCreated).toBe(3);
+    const created = await db
+      .select()
+      .from(transactions)
+      .where(eq(transactions.recurringRuleId, rule.id));
+    expect(created.map((t) => t.date).sort()).toEqual([
+      "2026-08-17",
+      "2026-08-17",
+      "2026-08-17",
+    ]);
+  });
+});

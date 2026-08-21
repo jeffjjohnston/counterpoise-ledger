@@ -361,6 +361,29 @@ export function getNextBusinessDay(date: string): string {
   return formatDateStr(next);
 }
 
+/**
+ * True when the date falls Mon–Fri. Bank holidays are not modeled, so a
+ * holiday reads as a business day — same limitation getNextBusinessDay
+ * documents. Throws on a malformed or non-calendar date, for the same reason.
+ */
+export function isBusinessDay(date: string): boolean {
+  if (!isValidDateString(date)) {
+    throw new Error(`Invalid date: ${date}`);
+  }
+  const day = parseDateStr(date).getDay();
+  return day !== 0 && day !== 6;
+}
+
+/**
+ * Returns the given date when it is already a business day, otherwise the next
+ * one. This is deliberately not getNextBusinessDay: that answers "what comes
+ * after this date?" and always moves, while this answers "when is this date
+ * observed?" and leaves a weekday alone.
+ */
+export function advanceToBusinessDay(date: string): string {
+  return isBusinessDay(date) ? date : getNextBusinessDay(date);
+}
+
 export function validateInvestmentSplitPayload(
   input: InvestmentActionInput & { securityId: number }
 ): boolean {
@@ -623,14 +646,26 @@ export function getInitialNextDate(
   return getNextDate(startDate, normalizedConfig);
 }
 
+/**
+ * Walks a scheduled date forward until it is no longer in the past.
+ *
+ * `observe` maps a scheduled date to the date the occurrence is actually seen
+ * on, and only the comparison against `today` uses it — the returned date stays
+ * a scheduled one. A businessDaysOnly rule needs this: its Saturday occurrence
+ * is observed on the Monday, so a rule created on that Sunday or Monday must
+ * keep the Saturday date rather than discard an occurrence that is still to
+ * come. Callers supply getOccurrenceDate() from lib/recurring.ts, which stays
+ * the one place the weekend shift is applied; the default leaves dates alone.
+ */
 export function advanceNextDateToFuture(
   nextDate: string,
   config: RecurrenceConfig,
-  today: string = toTodayString()
+  today: string = toTodayString(),
+  observe: (date: string) => string = (date) => date
 ): string {
   const MAX_ITERATIONS = 10_000;
   let date = nextDate;
-  for (let i = 0; i < MAX_ITERATIONS && date < today; i++) {
+  for (let i = 0; i < MAX_ITERATIONS && observe(date) < today; i++) {
     const next = getNextDate(date, config);
     if (next <= date) {
       return date;

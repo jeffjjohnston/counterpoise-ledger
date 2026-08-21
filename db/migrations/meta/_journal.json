@@ -127,6 +127,13 @@
       "when": 1787048253420,
       "tag": "0017_sour_millenium_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1787101770498,
+      "tag": "0018_handy_spitfire",
+      "breakpoints": true
     }
   ]
 }

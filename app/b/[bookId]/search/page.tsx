@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useBookId } from "@/hooks/useBookId";
 import { DateRangeFilter } from "@/components/ui/DateRangeFilter";
 import { formatCurrency, formatDate } from "@/lib/formatters";
+import { getOccurrenceDate } from "@/lib/recurring";
 import { cn } from "@/lib/utils";
 import { apiGet } from "@/lib/api-client";
 
@@ -45,6 +46,7 @@ type SearchRecurringRule = {
   name: string;
   frequency: string;
   nextDate: string;
+  businessDaysOnly: boolean;
   isActive: boolean;
 };
 
@@ -420,7 +422,12 @@ function SearchPageInner() {
                           {rule.frequency}
                         </td>
                         <td className="px-4 py-2.5 text-sm text-fg-tertiary">
-                          {formatDate(rule.nextDate)}
+                          {formatDate(
+                            getOccurrenceDate(
+                              rule.nextDate,
+                              rule.businessDaysOnly
+                            )
+                          )}
                         </td>
                         <td className="px-4 py-2.5 text-sm">
                           <span

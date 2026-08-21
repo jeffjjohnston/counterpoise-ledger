@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
-import { toDateString } from "../../lib/formatters";
+import { formatDate, toDateString } from "../../lib/formatters";
+import { getOccurrenceDate } from "../../lib/recurring";
 
 // Rules must be dated in the same timezone the app reckons "today" in. Using
 // toISOString() here dates them in UTC, which after ~8pm ET creates a rule due
@@ -163,6 +164,48 @@ test.describe("recurring transactions", () => {
     // Modal should close and rule should appear in the list
     await expect(page.getByText("New Recurring Transaction")).not.toBeVisible();
     await expect(page.getByRole("heading", { name: ruleName })).toBeVisible();
+  });
+
+  test("shows a business-days-only rule on the next business day", async ({ page }) => {
+    const ruleName = uniqueName("Saturday Rule");
+    const { checkingId, rentId } = await getAccountIds(page);
+
+    // Weekly on Saturday, so the next occurrence always lands on a weekend
+    // whatever day this test runs.
+    const response = await page.request.post("/api/b/1/recurring", {
+      data: {
+        name: ruleName,
+        frequency: "weekly",
+        interval: 1,
+        daysOfWeek: [6],
+        startDate: today(),
+        businessDaysOnly: true,
+        templateDescription: `${ruleName} description`,
+        templateSplits: [
+          { accountId: rentId, amount: 150000 },
+          { accountId: checkingId, amount: -150000 },
+        ],
+      },
+    });
+    expect(response.ok()).toBeTruthy();
+    const rule = await response.json();
+    expect(rule.businessDaysOnly).toBe(true);
+
+    await page.goto("/b/1/recurring");
+    const ruleCard = page.getByTestId(`recurring-rule-card-${rule.id}`);
+    await expect(ruleCard).toBeVisible();
+
+    // nextDate keeps the scheduled Saturday; the card shows the Monday it will
+    // actually be dated.
+    await expect(ruleCard).toContainText("(business days only)");
+    await expect(ruleCard).toContainText(
+      formatDate(getOccurrenceDate(rule.nextDate, true))
+    );
+    await expect(ruleCard).not.toContainText(formatDate(rule.nextDate));
+
+    // The saved value round-trips into the edit form.
+    await ruleCard.getByRole("button", { name: "Edit" }).click();
+    await expect(page.getByLabel("Business days only")).toBeChecked();
   });
 
   test("deletes a recurring rule", async ({ page }) => {

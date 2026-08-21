@@ -4,6 +4,7 @@ import { recurringRules } from "@/db/schema";
 import { and, eq } from "drizzle-orm";
 import { getNextDate } from "@/lib/accounting";
 import { toDateString } from "@/lib/formatters";
+import { getOccurrenceDate } from "@/lib/recurring";
 import type { TransactionWithSplits } from "@/types";
 import { projectedQuery } from "@/lib/schemas/recurring";
 
@@ -83,18 +84,25 @@ export async function GET(
           : undefined,
       };
 
-      // Iterate through occurrences starting from nextDate
+      // Iterate through occurrences starting from nextDate. The loop walks the
+      // *scheduled* dates — that is what getNextDate advances — while the range
+      // filter and the projected transaction both use the observed date, which
+      // is what will actually be created. Bounding the loop on the scheduled
+      // date is still safe: the shift only ever moves a date forward, so once
+      // the schedule passes endDate every later observed date has too.
       let currentDate = rule.nextDate;
       let occurrenceIndex = 0;
 
       while (currentDate <= endDate) {
-        if (currentDate >= startDate) {
+        const occurrenceDate = getOccurrenceDate(currentDate, rule.businessDaysOnly);
+
+        if (occurrenceDate >= startDate && occurrenceDate <= endDate) {
           const txId = -(rule.id * 10000 + occurrenceIndex);
 
           projected.push({
             id: txId,
             bookId: numericBookId,
-            date: currentDate,
+            date: occurrenceDate,
             description: rule.templateDescription,
             checkNumber: null,
             notes: null,

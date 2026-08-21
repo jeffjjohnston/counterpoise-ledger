@@ -4,7 +4,7 @@ import { accounts, payees, recurringRules, recurringTemplateSplits, transactions
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { advanceNextDateToFuture, getInitialNextDate, validateSplits } from "@/lib/accounting";
 import { normalizePayeeName } from "@/lib/payees";
-import { addDaysToDateString } from "@/lib/recurring";
+import { addDaysToDateString, getOccurrenceDate } from "@/lib/recurring";
 import { type AppDb } from "@/db";
 import { updateRuleSchema, type TemplateSplitInput } from "@/lib/schemas/recurring";
 
@@ -149,6 +149,7 @@ export async function PUT(
       templateSplits,
       isActive,
       autoCreateDaysBefore,
+      businessDaysOnly,
       payeeId,
       payeeName,
     } = parsed.data;
@@ -216,6 +217,8 @@ export async function PUT(
       const effWeekOfMonth = weekOfMonth !== undefined ? weekOfMonth : (existing.weekOfMonth ?? undefined);
       const effDaysOfMonth = daysOfMonth !== undefined ? daysOfMonth : (existing.daysOfMonth ? JSON.parse(existing.daysOfMonth) : undefined);
 
+      const effBusinessDaysOnly = businessDaysOnly ?? existing.businessDaysOnly;
+
       const recurrenceConfig = {
         frequency: effFrequency,
         interval: effInterval,
@@ -223,9 +226,15 @@ export async function PUT(
         weekOfMonth: effWeekOfMonth,
         daysOfMonth: effDaysOfMonth,
       };
+      // Compare the date each occurrence is observed on, not the scheduled one,
+      // so a business-day rule keeps a weekend occurrence it has yet to reach.
+      const observe = (date: string) =>
+        getOccurrenceDate(date, effBusinessDaysOnly);
       computedNextDate = advanceNextDateToFuture(
         getInitialNextDate(effStartDate, recurrenceConfig),
-        recurrenceConfig
+        recurrenceConfig,
+        undefined,
+        observe
       );
 
       // Don't let the recompute regress before occurrences already auto-created
@@ -242,10 +251,13 @@ export async function PUT(
         );
       const lastCreatedDate = lastCreated?.maxDate ?? null;
       if (lastCreatedDate) {
+        // Transactions carry the observed date, so the "already created" cutoff
+        // has to be compared against observed dates too.
         computedNextDate = advanceNextDateToFuture(
           computedNextDate,
           recurrenceConfig,
-          addDaysToDateString(lastCreatedDate, 1)
+          addDaysToDateString(lastCreatedDate, 1),
+          observe
         );
       }
     }
@@ -278,6 +290,7 @@ export async function PUT(
           ...(autoCreateDaysBefore !== undefined && {
             autoCreateDaysBefore,
           }),
+          ...(businessDaysOnly !== undefined && { businessDaysOnly }),
         })
         .where(and(eq(recurringRules.id, ruleId), eq(recurringRules.bookId, numericBookId)));
 

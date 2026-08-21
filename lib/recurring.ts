@@ -1,3 +1,4 @@
+import { advanceToBusinessDay } from "@/lib/accounting";
 import { toDateString } from "@/lib/formatters";
 
 export const MAX_AUTO_CREATE_DAYS_BEFORE = 30;
@@ -36,10 +37,35 @@ export function addDaysToDateString(dateString: string, days: number): string {
   return toDateString(date);
 }
 
+/**
+ * The date an occurrence is actually observed on.
+ *
+ * A businessDaysOnly rule shifts a weekend occurrence to the following Monday,
+ * and the shift is applied *here* — at the point a scheduled date becomes a
+ * transaction date — rather than being written back into the rule. Storing the
+ * shifted date in nextDate would make getNextDate() compute the following
+ * occurrence from the Monday, so a rule due on the 15th would creep to the 17th
+ * and stay there. Everything that turns a rule into dates (processing,
+ * projections, the due badge, the calendar) goes through this function so the
+ * shift is applied once and identically.
+ */
+export function getOccurrenceDate(
+  scheduledDate: string,
+  businessDaysOnly: boolean
+): string {
+  return businessDaysOnly ? advanceToBusinessDay(scheduledDate) : scheduledDate;
+}
+
 export function isRecurringRuleDue(
   nextDate: string,
   today: string,
-  autoCreateDaysBefore: number
+  autoCreateDaysBefore: number,
+  businessDaysOnly = false
 ): boolean {
-  return nextDate <= addDaysToDateString(today, autoCreateDaysBefore);
+  // Compares the *observed* date: a rule whose occurrence falls on Saturday is
+  // not due until the Monday it will actually be dated.
+  return (
+    getOccurrenceDate(nextDate, businessDaysOnly) <=
+    addDaysToDateString(today, autoCreateDaysBefore)
+  );
 }

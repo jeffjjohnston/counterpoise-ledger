@@ -78,6 +78,29 @@ describe("searchBook", () => {
     expect(results.recurringRules.map((r) => r.name)).toEqual(["Vacation Fund Transfer"]);
   });
 
+  // The search page shifts a weekend nextDate to the Monday it is observed on,
+  // exactly as the recurring page does, so the flag has to reach it.
+  it("carries businessDaysOnly through recurring rule results", async () => {
+    const savings = await createAccount({ name: "Vacation Savings", type: "asset", subtype: "bank" });
+    const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank" });
+    await createRecurringRule({
+      name: "Vacation Fund Transfer",
+      frequency: "monthly",
+      startDate: "2026-08-15",
+      nextDate: "2026-08-15",
+      businessDaysOnly: true,
+      templateSplits: [
+        { accountId: savings.id, amount: 20_000 },
+        { accountId: checking.id, amount: -20_000 },
+      ],
+    });
+
+    const results = await searchBook(db, 1, "vacation");
+    expect(results.recurringRules).toHaveLength(1);
+    expect(results.recurringRules[0].nextDate).toBe("2026-08-15");
+    expect(results.recurringRules[0].businessDaysOnly).toBe(true);
+  });
+
   it("restricts transactions to a date range using the effective date", async () => {
     const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank" });
     const food = await createAccount({ name: "Food", type: "expense" });

@@ -4,6 +4,7 @@ import { accounts, payees, recurringRules, recurringTemplateSplits } from "@/db/
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { advanceNextDateToFuture, getInitialNextDate, validateSplits } from "@/lib/accounting";
 import { normalizePayeeName } from "@/lib/payees";
+import { getOccurrenceDate } from "@/lib/recurring";
 import { captureEvent } from "@/lib/posthog-server";
 import { type AppDb } from "@/db";
 import { createRuleSchema, type TemplateSplitInput } from "@/lib/schemas/recurring";
@@ -130,6 +131,7 @@ export async function POST(
     const {
       name, frequency, interval, daysOfWeek, weekOfMonth, daysOfMonth,
       startDate, endDate, templateDescription, templateSplits, autoCreateDaysBefore,
+      businessDaysOnly,
       payeeId,
       payeeName,
     } = parsed.data;
@@ -176,9 +178,15 @@ export async function POST(
       weekOfMonth,
       daysOfMonth,
     };
+    const effBusinessDaysOnly = businessDaysOnly ?? false;
+    // Compare the date each occurrence is observed on, not the scheduled one:
+    // a business-day rule's Saturday occurrence is still to come when the rule
+    // is created on that Sunday or Monday.
     const initialNextDate = advanceNextDateToFuture(
       getInitialNextDate(startDate, recurrenceConfig),
-      recurrenceConfig
+      recurrenceConfig,
+      undefined,
+      (date) => getOccurrenceDate(date, effBusinessDaysOnly)
     );
 
     const newRule = await db.transaction(async (tx) => {
@@ -194,6 +202,7 @@ export async function POST(
           startDate,
           endDate: endDate || null,
           nextDate: initialNextDate,
+          businessDaysOnly: effBusinessDaysOnly,
           autoCreateDaysBefore: parsedAutoCreateDaysBefore,
           templateDescription: templateDescription || null,
           payeeId: resolvedPayeeId,

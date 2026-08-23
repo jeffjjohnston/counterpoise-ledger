@@ -1746,6 +1746,49 @@ describe("TransactionList", () => {
     expect(screen.queryByText("No transactions found")).not.toBeInTheDocument();
   });
 
+  // The register is `table-fixed`: the browser satisfies every fixed-width column
+  // first and gives only what is left to the percentage columns. When the fixed
+  // columns alone exceed the container, the percentage column collapses to 0px and
+  // its text paints on top of the next column. The narrowest desktop container is
+  // ~736px (the 1024px lg breakpoint, less the 256px sidebar and padding), so the
+  // fixed columns must leave at least ~160px for the flexible column.
+  const MAX_FIXED_COLUMN_REM = 36;
+
+  const sumFixedColumnRem = (container: HTMLElement): number =>
+    [...container.querySelectorAll("colgroup col")].reduce((total, col) => {
+      const match = /w-\[([\d.]+)rem\]/.exec(col.className);
+      return total + (match ? parseFloat(match[1]) : 0);
+    }, 0);
+
+  it("leaves room for the flexible column in the standard register", () => {
+    const { container } = render(
+      <TransactionList
+        transactions={[]}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        isLoading
+      />
+    );
+
+    expect(sumFixedColumnRem(container)).toBeLessThanOrEqual(MAX_FIXED_COLUMN_REM);
+  });
+
+  it("leaves room for the activity column in the investment register", () => {
+    const { container } = render(
+      <TransactionList
+        transactions={[]}
+        accounts={mockAccounts}
+        selectedAccountId={2}
+        balanceAccountId={2}
+        onEdit={vi.fn()}
+        isLoading
+      />
+    );
+
+    expect(sumFixedColumnRem(container)).toBeLessThanOrEqual(MAX_FIXED_COLUMN_REM);
+  });
+
   it("reserves more width for payee names than accounts in the table layout", () => {
     const { container } = render(
       <TransactionList

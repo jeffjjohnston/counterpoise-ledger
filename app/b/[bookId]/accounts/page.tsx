@@ -208,8 +208,8 @@ export default function AccountsPage() {
   return (
     <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       <div className="flex items-center justify-between mb-6 gap-3">
-        <h1 className="text-xl md:text-2xl font-bold text-fg">Chart of Accounts</h1>
-        <div className="flex items-center gap-2 md:gap-4">
+        <h1 className="text-xl lg:text-2xl font-bold text-fg">Chart of Accounts</h1>
+        <div className="flex items-center gap-2 lg:gap-4">
           <label className="hidden sm:flex items-center gap-2 text-sm text-fg-secondary">
             <input
               type="checkbox"
@@ -237,7 +237,7 @@ export default function AccountsPage() {
               className="bg-surface rounded-lg border border-border shadow-soft overflow-hidden"
             >
               <div
-                className={cn("px-4 md:px-6 py-3 md:py-4 border-b border-border border-l-4", {
+                className={cn("px-4 lg:px-6 py-3 lg:py-4 border-b border-border border-l-4", {
                   "bg-success-subtle border-l-fg-success": type === "asset" || type === "income",
                   "bg-danger-subtle border-l-fg-danger": type === "liability",
                   "bg-accent-subtle border-l-fg-accent": type === "equity",
@@ -279,7 +279,7 @@ export default function AccountsPage() {
                         key={account.id}
                         data-testid="account-row"
                         className={cn(
-                          "group py-3 md:py-4 flex items-center hover:bg-surface-tertiary transition-colors",
+                          "group py-3 lg:py-4 flex items-center hover:bg-surface-tertiary transition-colors",
                           !account.isActive && "opacity-50"
                         )}
                       >
@@ -294,7 +294,7 @@ export default function AccountsPage() {
                                 "hover:underline truncate block",
                                 depth === 0 && account.children && account.children.some(c => !c.isInvestmentCash)
                                   ? "text-fg-secondary font-normal text-sm"
-                                  : "text-fg font-medium text-sm md:text-base"
+                                  : "text-fg font-medium text-sm lg:text-base"
                               )}
                             >
                               <CategoryIcon icon={categoryLabels.get(account.id)?.icon ?? null} />
@@ -302,9 +302,9 @@ export default function AccountsPage() {
                             </Link>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2 md:gap-4 shrink-0 pr-3 md:pr-6">
+                        <div className="flex items-center gap-2 lg:gap-4 shrink-0 pr-3 lg:pr-6">
                           <label
-                            className="hidden md:flex items-center gap-2 cursor-pointer shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                            className="hidden lg:flex items-center gap-2 cursor-pointer shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
                             title={account.isActive ? "Mark as inactive" : "Mark as active"}
                           >
                             <input
@@ -332,7 +332,7 @@ export default function AccountsPage() {
                               </span>
                             )}
                           </div>
-                          <div className="hidden md:flex items-center gap-2 w-36">
+                          <div className="hidden lg:flex items-center gap-2 w-36">
                             <Button
                               variant="ghost"
                               size="sm"
@@ -355,7 +355,7 @@ export default function AccountsPage() {
                           {/* Mobile edit button */}
                           <button
                             onClick={() => setEditingAccount(account)}
-                            className="md:hidden p-1.5 text-fg-tertiary hover:text-fg-secondary rounded-md"
+                            className="lg:hidden p-1.5 text-fg-tertiary hover:text-fg-secondary rounded-md"
                             aria-label="Edit account"
                           >
                             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -394,7 +394,7 @@ export default function AccountsPage() {
                       <div key={subtype} className="border-b border-border-secondary last:border-b-0">
                         <button
                           onClick={() => toggleSubtype(subtype)}
-                          className="w-full px-4 md:px-6 py-3 flex items-center justify-between text-sm font-medium text-fg-secondary hover:bg-surface-tertiary transition-colors"
+                          className="w-full px-4 lg:px-6 py-3 flex items-center justify-between text-sm font-medium text-fg-secondary hover:bg-surface-tertiary transition-colors"
                         >
                           <div className="flex items-center gap-2">
                             <svg

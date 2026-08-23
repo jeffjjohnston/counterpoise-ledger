@@ -41,8 +41,8 @@ import type {
 import { useTransactionsPageData } from "./useTransactionsPageData";
 
 const TransactionsPageSkeleton = () => (
-  <div className="h-[calc(100vh-3.5rem)] md:h-[calc(100vh-4rem)] flex">
-    <div className="hidden md:block w-64 border-r border-border bg-surface p-4">
+  <div className="h-[calc(100vh-3.5rem)] lg:h-[calc(100vh-4rem)] flex">
+    <div className="hidden lg:block w-64 border-r border-border bg-surface p-4">
       <div className="animate-pulse space-y-4">
         {[1, 2, 3, 4, 5].map((i) => (
           <div key={i} className="h-8 bg-surface-tertiary rounded" />
@@ -814,7 +814,7 @@ function TransactionsPageInner() {
 
   if (error) {
     return (
-      <div className="h-[calc(100vh-3.5rem)] md:h-[calc(100vh-4rem)] flex items-center justify-center">
+      <div className="h-[calc(100vh-3.5rem)] lg:h-[calc(100vh-4rem)] flex items-center justify-center">
         <p className="text-danger">{error}</p>
       </div>
     );
@@ -870,10 +870,10 @@ function TransactionsPageInner() {
   );
 
   return (
-    <div className="h-[calc(100vh-3.5rem)] md:h-[calc(100vh-4rem)] flex">
+    <div className="h-[calc(100vh-3.5rem)] lg:h-[calc(100vh-4rem)] flex">
       {/* Desktop sidebar */}
       <div
-        className="hidden md:flex border-r border-border bg-surface relative flex-col"
+        className="hidden lg:flex border-r border-border bg-surface relative flex-col"
         style={{ width: `${sidebarWidth}px`, minWidth: "200px", maxWidth: "600px" }}
       >
         <div className="overflow-y-auto flex-1 pr-2.5">
@@ -890,7 +890,7 @@ function TransactionsPageInner() {
 
       {/* Mobile sidebar drawer */}
       {mobileSidebarOpen && (
-        <div className="fixed inset-0 z-40 md:hidden" aria-modal="true">
+        <div className="fixed inset-0 z-40 lg:hidden" aria-modal="true">
           <div
             className="fixed inset-0 bg-black/40"
             onClick={() => setMobileSidebarOpen(false)}
@@ -906,21 +906,21 @@ function TransactionsPageInner() {
           ref={scrollContainerRef}
           className="flex-1 overflow-y-auto bg-surface"
         >
-          <div className="px-3 py-3 md:px-6 md:py-4 border-b border-border">
+          <div className="px-3 py-3 lg:px-6 lg:py-4 border-b border-border">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center min-w-0">
                 {/* Mobile account picker button */}
                 <button
                   type="button"
                   onClick={() => setMobileSidebarOpen(true)}
-                  className="md:hidden mr-2 p-1.5 text-fg-secondary hover:text-fg rounded-md hover:bg-surface-tertiary transition-colors flex-shrink-0"
+                  className="lg:hidden mr-2 p-1.5 text-fg-secondary hover:text-fg rounded-md hover:bg-surface-tertiary transition-colors flex-shrink-0"
                   aria-label="Open accounts"
                 >
                   <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" />
                   </svg>
                 </button>
-                <h1 className="text-lg md:text-2xl font-bold text-fg truncate">
+                <h1 className="text-lg lg:text-2xl font-bold text-fg truncate">
                   {selectedAccountId
                     ? selectedAccount?.name || "Transactions"
                     : "All Transactions"}
@@ -935,7 +935,7 @@ function TransactionsPageInner() {
                         ? "Remove from favorites"
                         : "Add to favorites"
                     }
-                    className="ml-1 md:ml-2 inline-flex h-8 w-8 items-center justify-center rounded-md text-yellow-500 transition-colors hover:bg-yellow-50 disabled:cursor-not-allowed disabled:opacity-50 flex-shrink-0"
+                    className="ml-1 lg:ml-2 inline-flex h-8 w-8 items-center justify-center rounded-md text-yellow-500 transition-colors hover:bg-yellow-50 disabled:cursor-not-allowed disabled:opacity-50 flex-shrink-0"
                   >
                     <svg
                       className="h-5 w-5"
@@ -954,7 +954,7 @@ function TransactionsPageInner() {
                   </button>
                 )}
               </div>
-              <div className="hidden md:flex items-center gap-4">
+              <div className="hidden lg:flex items-center gap-4">
                 <label className="flex items-center gap-1.5 text-xs text-fg-tertiary">
                   <input
                     type="checkbox"
@@ -976,6 +976,7 @@ function TransactionsPageInner() {
                   value={selectedPayeeId}
                   onChange={setSelectedPayeeId}
                   placeholder="Filter by payee..."
+                  className="min-w-[9rem]"
                 />
                 <DateRangeFilter
                   startDate={startDate}
@@ -990,7 +991,7 @@ function TransactionsPageInner() {
                 is desktop-only, so this is the only way to see/clear a date
                 range applied via a link, e.g. from the income statement). */}
             {dateFilterLabel && (
-              <div className="md:hidden mt-2">
+              <div className="lg:hidden mt-2">
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-surface-tertiary px-2.5 py-1 text-xs text-fg-secondary">
                   <span className="tabular-nums">{dateFilterLabel}</span>
                   <button
@@ -1017,7 +1018,7 @@ function TransactionsPageInner() {
               </div>
             )}
           </div>
-          <div className="hidden md:block border-b border-border bg-surface px-4 py-3">
+          <div className="hidden lg:block border-b border-border bg-surface px-4 py-3">
             <TransactionForm
               ref={transactionFormRef}
               accounts={accounts}
@@ -1103,7 +1104,7 @@ function TransactionsPageInner() {
       <button
         type="button"
         onClick={() => setMobileCreateOpen(true)}
-        className="md:hidden fixed bottom-6 right-4 z-30 w-14 h-14 bg-accent hover:bg-accent-hover text-fg-on-accent rounded-full shadow-lg flex items-center justify-center transition-colors active:scale-95"
+        className="lg:hidden fixed bottom-6 right-4 z-30 w-14 h-14 bg-accent hover:bg-accent-hover text-fg-on-accent rounded-full shadow-lg flex items-center justify-center transition-colors active:scale-95"
         style={{ bottom: "calc(1.5rem + env(safe-area-inset-bottom, 0px))" }}
         aria-label="New transaction"
       >

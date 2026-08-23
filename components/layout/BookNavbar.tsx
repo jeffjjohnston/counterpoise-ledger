@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useBookId } from "@/hooks/useBookId";
+import { useIsMobile } from "@/hooks/useIsMobile";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "@/components/ThemeProvider";
@@ -162,6 +163,22 @@ export function BookNavbar() {
     setMobileMenuOpen(false);
   }, [pathname]);
 
+  // Close the mobile menu when the viewport leaves the mobile range.
+  //
+  // The menu and everything that dismisses it are `lg:hidden`: crossing to
+  // desktop width (an iPad rotating to landscape) removes the overlay, its
+  // backdrop, and the hamburger itself. The scroll lock below keys off menu
+  // state alone, so a menu left open would strand `overflow: hidden` on a
+  // desktop-width page with nothing on screen to clear it — recoverable only
+  // by rotating back and closing the menu. useIsMobile shares MOBILE_BREAKPOINT
+  // with the `lg:` classes, so this cannot drift from the CSS that hides them.
+  const isMobile = useIsMobile();
+  useEffect(() => {
+    if (!isMobile) {
+      setMobileMenuOpen(false);
+    }
+  }, [isMobile]);
+
   // Prevent body scroll when mobile menu is open
   useEffect(() => {
     if (mobileMenuOpen) {
@@ -181,12 +198,12 @@ export function BookNavbar() {
     <>
       <nav className="bg-surface border-b border-border">
         <div className="px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-14 md:h-16">
+          <div className="flex items-center justify-between h-14 lg:h-16">
             <div className="flex items-center">
-              <Link href="/" className="flex items-center gap-2">
+              <Link href="/" className="flex items-center gap-2 flex-shrink-0">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={logoSrc} alt="" className="w-7 h-7 md:w-8 md:h-8" />
-                <span className="text-lg md:text-xl font-bold text-fg hidden sm:inline" title={`Counterpoise v${process.env.NEXT_PUBLIC_APP_VERSION}`}>Counterpoise</span>
+                <img src={logoSrc} alt="" className="w-7 h-7 lg:w-8 lg:h-8" />
+                <span className="text-lg lg:text-xl font-bold text-fg hidden sm:inline" title={`Counterpoise v${process.env.NEXT_PUBLIC_APP_VERSION}`}>Counterpoise</span>
               </Link>
 
               {/* Book switcher */}
@@ -200,7 +217,7 @@ export function BookNavbar() {
                   aria-label="Open book menu"
                   aria-haspopup="true"
                   aria-expanded={showBookMenu}
-                  className="flex items-center gap-1 px-2 sm:px-3 py-1.5 text-sm font-medium text-fg-secondary bg-surface-tertiary rounded-md hover:bg-surface-tertiary/80 transition-colors max-w-[8rem] sm:max-w-none"
+                  className="flex items-center gap-1 px-2 sm:px-3 py-1.5 text-sm font-medium text-fg-secondary bg-surface-tertiary rounded-md hover:bg-surface-tertiary/80 transition-colors max-w-[8rem] sm:max-w-[10rem]"
                 >
                   <span className="truncate">{currentBook?.name || "Loading..."}</span>
                   <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
@@ -248,19 +265,19 @@ export function BookNavbar() {
             </div>
 
             {/* Right cluster: price pill + breakpoint-specific controls */}
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 self-stretch">
               <PriceEntryPill bookId={bookId} />
               <JobHealthIndicator />
 
               {/* Desktop nav links — hidden on mobile */}
-              <div className="hidden md:flex items-center">
+              <div className="hidden lg:flex items-stretch self-stretch">
               <div className="flex items-stretch">
                 {primaryNavItems.map((item) => (
                   <Link
                     key={item.href}
                     href={item.href}
                     className={cn(
-                      "self-stretch flex items-center px-4 text-sm font-medium transition-colors border-b-2",
+                      "self-stretch flex items-center px-3 text-sm font-medium transition-colors border-b-2",
                       isActive(item)
                         ? "border-fg-accent text-fg-accent"
                         : "border-transparent text-fg-secondary hover:text-fg hover:border-border"
@@ -286,7 +303,7 @@ export function BookNavbar() {
                     aria-expanded={showMoreMenu}
                     aria-haspopup="true"
                     className={cn(
-                      "self-stretch flex items-center gap-1 px-4 text-sm font-medium transition-colors border-b-2",
+                      "self-stretch flex items-center gap-1 px-3 text-sm font-medium transition-colors border-b-2",
                       [...moreNavItems, ...reportsNavItems].some((item) => isActive(item))
                         ? "border-fg-accent text-fg-accent"
                         : "border-transparent text-fg-secondary hover:text-fg hover:border-border"
@@ -407,7 +424,7 @@ export function BookNavbar() {
             </div>
 
             {/* Mobile controls — visible on mobile only */}
-            <div className="flex md:hidden items-center gap-1">
+            <div className="flex lg:hidden items-center gap-1">
               <button
                 onClick={() => setShowReportModal(true)}
                 aria-label="Report an issue"
@@ -441,7 +458,7 @@ export function BookNavbar() {
 
       {/* Mobile slide-out menu */}
       {mobileMenuOpen && (
-        <div className="fixed inset-0 z-40 md:hidden" aria-modal="true">
+        <div className="fixed inset-0 z-40 lg:hidden" aria-modal="true">
           <div
             className="fixed inset-0 bg-black/40"
             onClick={() => setMobileMenuOpen(false)}

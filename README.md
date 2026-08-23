@@ -209,10 +209,10 @@ CRON_SECRET=your-cron-secret-here
 # first account exists, then closes itself.
 REGISTRATION_ENABLED=true|false
 
-# Optional — Plaid bank sync
+# Optional — Plaid bank sync (see "Connecting a Bank (Plaid)" below)
 PLAID_CLIENT_ID=...
 PLAID_SECRET=...
-PLAID_ENV=sandbox|development|production
+PLAID_ENV=sandbox|production
 
 # Optional — Tiingo security prices
 TIINGO_API_KEY=...
@@ -226,9 +226,14 @@ POSTHOG_PERSONAL_API_KEY=...  # runtime; used for querying the PostHog API
 
 Set `DATABASE_URL` in `.env.production.local`, pointing at the internal
 `postgres` hostname and at the application role — for example
-`postgresql://counterpoise_app:<app password>@postgres:5432/counterpoise`. The
-app container refuses to start on the published default credential; see
-[Separating the application database role](#separating-the-application-database-role).
+`postgresql://counterpoise_app:<app password>@postgres:5432/counterpoise`. That
+role is created from `APP_DB_PASSWORD` by
+`scripts/postgres-init/01-app-role.sh`, which runs on **first initialization
+only**: the postgres image skips `/docker-entrypoint-initdb.d` once the volume
+holds a database. Set `APP_DB_PASSWORD` before the first `docker compose up` —
+setting it later does nothing. The app container refuses to start while
+`DATABASE_URL` still carries the published `counterpoise:counterpoise` default,
+which is in this repository and known to every reader of it.
 
 ### Starting
 
@@ -382,8 +387,7 @@ exposing it to anything wider, understand these defaults:
   the password from `POSTGRES_PASSWORD`. Change it before altering that binding.
 - **The application connects as its own non-superuser role.** A fresh install
   creates `counterpoise_app` from `APP_DB_PASSWORD`, and the app container
-  refuses to start if `DATABASE_URL` still carries the published default. See
-  below for what to do on an instance that predates this.
+  refuses to start if `DATABASE_URL` still carries the published default.
 - **Cron endpoints fail closed.** `/api/cron/*` returns 401 unless `CRON_SECRET`
   is set and presented as a bearer token.
 - **A reverse proxy in front of Counterpoise must preserve the original `Host`
@@ -400,89 +404,6 @@ exposing it to anything wider, understand these defaults:
   seconds — it is the longest the app makes, and the only one a short read
   timeout will cut. The seed keeps running server-side when it does, so the
   symptom is a failed request plus a complete demo book the page never showed.
-
-### Separating the application database role
-
-The password in `postgresql://counterpoise:counterpoise@...` is published. It is
-in this README, in `.env.example`, and hardcoded in four development and test
-entry points, because the databases it opens are disposable and the test suite
-builds one connection string per worker. A deployment that keeps it has a
-password every reader of this repository already knows.
-
-A fresh install handles this for you. Set `APP_DB_PASSWORD` before the first
-`docker compose up`, and `scripts/postgres-init/01-app-role.sh` creates a
-`counterpoise_app` role that owns the application database. It is not a
-superuser: Counterpoise runs plain DDL and DML only, so ownership is all it
-needs to run its own migrations.
-
-That script runs on **first initialization only** — the postgres image skips
-`/docker-entrypoint-initdb.d` once the volume holds a database, logging
-`Skipping initialization`. An instance that already has data is migrated by
-hand.
-
-**Migrating an existing instance.** Take a backup first, and note that the
-password only changes when you change it *inside* PostgreSQL. `POSTGRES_PASSWORD`
-is read by `initdb` and nothing else, so editing it on a populated volume is
-silently ignored.
-
-```bash
-# 1. Back up, and confirm the dump is readable before going further.
-docker exec counterpoise-postgres-1 pg_dump -U counterpoise -d counterpoise \
-  --format=custom --file=/tmp/pre-role.dump
-docker exec counterpoise-postgres-1 pg_restore --list /tmp/pre-role.dump > /dev/null
-
-# 2. Create the role and hand it the database.
-APP_PW=$(openssl rand -hex 32)
-# -i matters: without it docker exec attaches no stdin, psql reads nothing,
-# and the whole block exits 0 having done absolutely nothing.
-docker exec -i counterpoise-postgres-1 \
-  psql -v ON_ERROR_STOP=1 -U counterpoise -d counterpoise \
-  -v pw="$APP_PW" <<'SQL'
-BEGIN;
-CREATE ROLE counterpoise_app LOGIN PASSWORD :'pw';
-ALTER DATABASE counterpoise OWNER TO counterpoise_app;
-DO $$
-DECLARE r record;
-BEGIN
-  FOR r IN SELECT nspname FROM pg_namespace WHERE nspname IN ('public','drizzle')
-  LOOP EXECUTE format('ALTER SCHEMA %I OWNER TO counterpoise_app', r.nspname); END LOOP;
-
-  -- Tables only. ALTER TABLE carries the table's indexes and any sequence
-  -- linked to one of its columns, and PostgreSQL refuses to re-own such a
-  -- sequence directly: "Sequence ... is linked to table ...".
-  FOR r IN SELECT n.nspname, c.relname
-           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-           WHERE n.nspname IN ('public','drizzle') AND c.relkind IN ('r','p','v','m')
-  LOOP EXECUTE format('ALTER TABLE %I.%I OWNER TO counterpoise_app', r.nspname, r.relname); END LOOP;
-
-  -- Then any sequence no table claims.
-  FOR r IN SELECT n.nspname, c.relname
-           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-           WHERE n.nspname IN ('public','drizzle') AND c.relkind = 'S'
-             AND NOT EXISTS (SELECT 1 FROM pg_depend d
-                             WHERE d.objid = c.oid AND d.classid = 'pg_class'::regclass
-                               AND d.deptype IN ('a','i'))
-  LOOP EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO counterpoise_app', r.nspname, r.relname); END LOOP;
-END $$;
-COMMIT;
-SQL
-
-# 3. Put the password into APP_DB_PASSWORD and DATABASE_URL, then recreate.
-echo "$APP_PW"
-docker compose --env-file .env.production.local up -d --force-recreate app scheduler
-```
-
-Do **not** use `REASSIGN OWNED BY counterpoise TO counterpoise_app` for step 2.
-Databases are *shared* objects in PostgreSQL, so that statement retitles every
-database the old role owns across the whole instance — including
-`counterpoise_dev` and every `counterpoise_test_*` — not just the one you are
-connected to. The loop above touches only the current database.
-
-Indexes and identity sequences need no statement of their own — they follow the
-owner of their table, and PostgreSQL rejects an attempt to re-own a linked
-sequence directly. `BEGIN`/`COMMIT` matters too: without it the `CREATE ROLE`
-and `ALTER DATABASE` commit while a failure inside the `DO` block rolls back
-only the block, leaving the database owned by a role that owns nothing in it.
 
 ## Backups
 
@@ -572,6 +493,77 @@ Manual trigger:
 ```bash
 curl -H "authorization: Bearer ${CRON_SECRET}" http://localhost:3000/api/cron/recurring
 ```
+
+## Connecting a Bank (Plaid)
+
+Bank sync is optional, and off until `PLAID_CLIENT_ID` and `PLAID_SECRET` are
+set — `isPlaidConfigured()` is false without them, so sync fails closed rather
+than reaching a live institution.
+
+### 1. Get API credentials
+
+Sign up at [dashboard.plaid.com](https://dashboard.plaid.com). Your `client_id`
+and per-environment secrets are under **Developers → Keys**.
+
+Plaid has two environments: **Sandbox**, which serves fake institutions and
+fake transactions, and **Production**, which connects real banks. There is no
+longer a Development environment — Plaid retired it, so `PLAID_ENV` takes only
+`sandbox` or `production`.
+
+Production is not gated behind a sales call for a personal deployment. Developers
+signing up in the US or Canada get the **Trial plan**: free, real production
+data, auto-approved for most applicants, capped at 10 connected Items. That is
+usually enough for one household's banks. (The older Limited Production tier
+closed to new signups on 15 April 2026.)
+
+Use the **Sandbox** secret in `.env.local` and the **Production** secret in
+`.env.production.local`. `.env.example` explains why that separation is not
+optional: a production secret in `.env.local` means `npm run dev` reaches real
+banks and bills real API requests, and the separate `counterpoise_dev`
+database does nothing to prevent it — it bounds writes, not outbound calls.
+
+### 2. Mint an access token
+
+Counterpoise syncs against a stored access token per institution, but it does
+not run Plaid Link itself. `scripts/plaid-link.ts` produces the token:
+
+```bash
+npm run plaid:link      # sandbox, via .env.local
+
+# Or, to connect a real bank with the deployment's credentials:
+npx tsx --env-file=.env.production.local scripts/plaid-link.ts
+```
+
+It prints a Plaid-hosted URL. Open it in any browser, log in to the bank, and
+the script prints an **Item ID** and an **Access Token** when the session
+completes. In Sandbox, log in to any institution with `user_good` /
+`pass_good`.
+
+It stops waiting after ten minutes and prints the command to resume. Use that
+rather than re-running plain: a fresh link token stops watching the session you
+opened, so an Item you had already created at the bank would sit on your Plaid
+plan with no token to exchange for it.
+
+The script uses [Hosted Link](https://plaid.com/docs/link/hosted-link/), where
+Plaid serves the Link UI on its own domain, so there is nothing to run locally
+and no redirect URI to register. That matters for OAuth institutions — Chase,
+Wells Fargo, US Bank — which require a redirect URI that is HTTPS and
+registered in the Plaid dashboard, and so cannot be completed against a
+`http://localhost` page at all.
+
+### 3. Add the token to a book
+
+Go to **Sync → Manage Sync Tokens**, then **Add Token**. Enter the institution
+name, and paste the Item ID and Access Token. Counterpoise fetches the
+institution's accounts, and **Assign Accounts** maps each one to a Counterpoise
+account.
+
+From then on the `scheduler` sidecar syncs every six hours, staging
+transactions for reconciliation rather than writing them to the ledger
+directly. Review them on the **Sync** page.
+
+An access token does not expire. Treat it as a credential: it reads the
+connected account's transactions until revoked from the Plaid dashboard.
 
 ## Moneydance Import
 
@@ -670,6 +662,7 @@ npm run db:create-test-dbs  # Create dev + per-worker test databases (one-time s
 npm run db:list-books  # List books and their IDs
 npm run db:seed -- --book-id 2  # Full reset + seed sample data for a specific book
 npm run mcp:dev      # Start the MCP server (stdio)
+npm run plaid:link   # Mint a Plaid access token for one bank (sandbox)
 npx drizzle-kit studio  # Open Drizzle Studio (database GUI)
 ```
 

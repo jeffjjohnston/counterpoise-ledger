@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 
-const MOBILE_BREAKPOINT = 768; // matches Tailwind md:
+const MOBILE_BREAKPOINT = 1024; // matches Tailwind lg:
 
 export function useIsMobile(): boolean {
   const [isMobile, setIsMobile] = useState(false);

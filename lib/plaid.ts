@@ -1,8 +1,10 @@
-type PlaidEnv = "sandbox" | "development" | "production";
+// Plaid retired the Development environment; Sandbox and Production are the
+// only ones that still resolve. Keeping "development" in this union would let
+// PLAID_ENV=development pass validation and then fail at the socket.
+type PlaidEnv = "sandbox" | "production";
 
 const PLAID_BASE_URLS: Record<PlaidEnv, string> = {
   sandbox: "https://sandbox.plaid.com",
-  development: "https://development.plaid.com",
   production: "https://production.plaid.com",
 };
 
@@ -65,10 +67,12 @@ export type PlaidTransactionsSyncPage = {
   nextCursor: string | null;
 };
 
-type PlaidConfig = {
+export type PlaidConfig = {
   clientId: string;
   secret: string;
   baseUrl: string;
+  /** Which Plaid environment `baseUrl` points at, for callers that report it. */
+  env: PlaidEnv;
 };
 
 type FetchPlaidTransactionsSyncParams = {
@@ -80,13 +84,21 @@ type FetchPlaidTransactionsSyncParams = {
 
 function parsePlaidEnv(value: string | undefined): PlaidEnv | null {
   if (!value) return null;
-  if (value === "sandbox" || value === "development" || value === "production") {
+  if (value === "sandbox" || value === "production") {
     return value;
   }
   return null;
 }
 
-function getPlaidConfig(): PlaidConfig {
+/**
+ * Reads and validates the Plaid credentials from the environment.
+ *
+ * Exported so `scripts/plaid-link.ts` resolves PLAID_ENV through exactly the
+ * same code the app does. A token minted against one base URL is useless
+ * against another, so the script and the app must never disagree about what
+ * `production` means.
+ */
+export function getPlaidConfig(): PlaidConfig {
   const clientId = process.env.PLAID_CLIENT_ID;
   const secret = process.env.PLAID_SECRET;
   const plaidEnv = parsePlaidEnv(process.env.PLAID_ENV);
@@ -101,7 +113,7 @@ function getPlaidConfig(): PlaidConfig {
 
   if (!plaidEnv) {
     throw new Error(
-      "PLAID_ENV environment variable must be one of sandbox, development, or production"
+      "PLAID_ENV environment variable must be one of sandbox or production"
     );
   }
 
@@ -109,6 +121,7 @@ function getPlaidConfig(): PlaidConfig {
     clientId,
     secret,
     baseUrl: PLAID_BASE_URLS[plaidEnv],
+    env: plaidEnv,
   };
 }
 

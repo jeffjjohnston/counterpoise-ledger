@@ -669,6 +669,28 @@ Organized by domain:
 - API data fetching happens in Server Components or via client fetch
 - Use `useBookId()` from `/hooks/useBookId.ts` for current book ID; `useIsMobile()` from `/hooks/useIsMobile.ts` for responsive logic; `useRegisterShortcuts()` from `/hooks/useRegisterShortcuts.ts` for keyboard shortcut registration
 
+### The Mobile/Desktop Breakpoint Is In Two Places
+
+The layout switch is **`lg` (1024px)**, and it is declared twice: as Tailwind
+`lg:` classes in `BookNavbar.tsx`, `transactions/page.tsx` and
+`accounts/page.tsx`, and as `MOBILE_BREAKPOINT` in `/hooks/useIsMobile.ts`.
+**The two must move together.** The CSS controls the navbar, sidebar, drawer and
+FAB; the hook is what `TransactionList.tsx` reads to render the card list
+instead of the register table. Change one alone and you get a half-switched
+layout — the sidebar hides while the crushed table stays.
+
+It is `lg`, not `md`, because the desktop navbar needs ~1019px. At `md` (768px)
+every portrait iPad rendered a navbar it could not fit, which pushed More,
+Search, Report an issue and the user menu off-screen entirely, and scrolled the
+whole document sideways. The book-name button is capped (`sm:max-w-[10rem]`) so
+that width stays bounded no matter how long a book is named.
+
+Two register tables are `table-fixed` with a `<colgroup>` mixing `rem` and `%`
+widths. Fixed widths are satisfied first, so when they exceed the container the
+percentage column collapses to **0px** and its text paints over its neighbour —
+this is how the Activity column disappeared. Keep the fixed columns under 36rem;
+`TransactionList.test.tsx` asserts that budget.
+
 ## Common Patterns & Gotchas
 
 ### Transaction Balance Validation
@@ -755,10 +777,13 @@ test isolation. The dev credential cannot move. Production moved instead.
   variable there also blocks `docker compose up -d postgres`, `ps`, `logs` and
   `down` (measured). Checking the connection string also catches the operator
   who sets `APP_DB_PASSWORD` and forgets to update `DATABASE_URL`.
-- Migrating an existing instance is manual, and **never** with
-  `REASSIGN OWNED BY`: databases are shared objects, so it retitles every
-  database the role owns instance-wide, dev and test included. The README's
-  "Separating the application database role" has the per-database loop.
+- Migrating a pre-existing instance was a one-off, already done for the only
+  such deployment. The README no longer carries the procedure; recover it from
+  git history if it is ever needed again (`git log -S "REASSIGN OWNED BY" --
+  README.md`). The trap it documents still holds: **never** `REASSIGN OWNED BY`
+  — databases are shared objects, so it retitles every database the role owns
+  instance-wide, dev and test included. A per-database ownership loop is what
+  that migration needs.
 
 ## Recurring Transactions
 

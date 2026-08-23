@@ -23,13 +23,18 @@ const TRANSACTION_TABLE_COLUMN_WIDTHS = {
 // account's: which security, how many shares, at what price. Payee is near-always
 // empty on a trade, so its width is given back to Activity and to two numeric
 // columns that can be scanned vertically.
+// Activity is the only flexible column here, and `table-fixed` satisfies every
+// fixed width before it gets anything. Keep the fixed columns lean enough that
+// Activity still has room in the narrowest desktop register (~736px: the 1024px
+// lg breakpoint, less the sidebar and padding). Left wider, Activity collapses to
+// zero and its text paints over Shares.
 const INVESTMENT_TABLE_COLUMN_WIDTHS = {
   date: "w-[7rem]",
   activity: "w-[30%]",
   shares: "w-[7rem]",
-  price: "w-[7rem]",
-  amount: "w-[8rem]",
-  balance: "w-[8rem]",
+  price: "w-[6rem]",
+  amount: "w-[7.5rem]",
+  balance: "w-[7rem]",
 } as const;
 
 // Widest tag is CAPGAIN; every tag reserves the same box so the symbols beside

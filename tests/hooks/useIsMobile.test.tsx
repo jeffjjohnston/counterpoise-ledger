@@ -51,8 +51,8 @@ describe("useIsMobile", () => {
     expect(result.current).toBe(true);
   });
 
-  it("queries max-width: 767px (Tailwind md breakpoint - 1)", () => {
+  it("queries max-width: 1023px (Tailwind lg breakpoint - 1)", () => {
     renderHook(() => useIsMobile());
-    expect(window.matchMedia).toHaveBeenCalledWith("(max-width: 767px)");
+    expect(window.matchMedia).toHaveBeenCalledWith("(max-width: 1023px)");
   });
 });

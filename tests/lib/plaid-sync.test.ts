@@ -66,7 +66,7 @@ describe("plaid-sync", () => {
     });
 
     it("detects PLAID_ENV errors", () => {
-      expect(isPlaidConfigurationError("PLAID_ENV must be one of sandbox, development, or production")).toBe(true);
+      expect(isPlaidConfigurationError("PLAID_ENV must be one of sandbox or production")).toBe(true);
     });
 
     it("returns false for non-config errors", () => {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { BookNavbar } from "@/components/layout/BookNavbar";
 
@@ -102,6 +102,121 @@ describe("BookNavbar", () => {
     const dashboardLink = screen.getByRole("link", { name: "Dashboard" });
     expect(dashboardLink).not.toHaveClass("border-fg-accent");
     expect(dashboardLink).toHaveClass("border-transparent");
+  });
+
+  it("keeps the brand from shrinking when the navbar is tight", async () => {
+    // The brand shares a flex row with the book switcher and every nav link. At the
+    // default flex-shrink it is the first thing to give up width, and the wordmark
+    // renders clipped as "Counterpois".
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ id: 1, name: "Primary Book" }],
+    } as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<BookNavbar />);
+    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
+
+    const brand = screen.getByRole("link", { name: "Counterpoise" });
+    expect(brand).toHaveClass("flex-shrink-0");
+  });
+
+  it("switches between mobile and desktop chrome at the lg breakpoint", async () => {
+    // The desktop nav needs ~1000px, so it must not appear at md (768px) — every
+    // portrait iPad sits between the two and would render a nav it cannot fit,
+    // pushing More, Search and the user menu off-screen. This has to agree with
+    // MOBILE_BREAKPOINT in useIsMobile, which swaps the register table for cards.
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ id: 1, name: "Primary Book" }],
+    } as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { container } = render(<BookNavbar />);
+    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
+
+    const desktopNav = screen.getByRole("link", { name: "Transactions" }).closest("div.hidden");
+    expect(desktopNav).toHaveClass("lg:flex");
+
+    const hamburger = screen.getByLabelText("Open menu");
+    expect(hamburger.parentElement).toHaveClass("lg:hidden");
+
+    expect(container.innerHTML).not.toMatch(/\bmd:(flex|hidden|block)\b/);
+  });
+
+  it("releases the body scroll lock when the viewport leaves the mobile range", async () => {
+    // An iPad rotated from portrait to landscape crosses `lg` with the menu
+    // still open. `lg:hidden` then removes the overlay AND the hamburger that
+    // would close it, but the scroll lock keys off menu state alone — so the
+    // body stays `overflow: hidden` on a desktop-width page with no visible
+    // control to clear it. Rotating back and closing the menu is the only
+    // recovery, and nothing on screen says so.
+    const listeners = new Set<(event: MediaQueryListEvent) => void>();
+    let matches = true; // start below lg, as a portrait iPad does
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn(() => ({
+        get matches() {
+          return matches;
+        },
+        addEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+          void listeners.add(fn),
+        removeEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+          void listeners.delete(fn),
+      }))
+    );
+    const crossToDesktop = () => {
+      matches = false;
+      listeners.forEach((fn) => fn({ matches } as MediaQueryListEvent));
+    };
+
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ id: 1, name: "Primary Book" }],
+    } as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<BookNavbar />);
+    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText("Open menu"));
+    expect(document.body.style.overflow).toBe("hidden");
+
+    await act(async () => crossToDesktop());
+
+    expect(document.body.style.overflow).toBe("");
+    expect(screen.queryByLabelText("Close menu")).not.toBeInTheDocument();
+  });
+
+  it("propagates the navbar height down to the nav links", async () => {
+    // The active-tab underline is a `border-b-2` on the link, so it only lands at
+    // the base of the bar if the link is as tall as the bar. Any wrapper in
+    // between that sizes to its content collapses the row to text height, which
+    // floats the underline mid-bar and halves the touch target. Height propagates
+    // only when each wrapper either stretches itself or is stretched by its parent.
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ id: 1, name: "Primary Book" }],
+    } as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<BookNavbar />);
+    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
+
+    const link = screen.getByRole("link", { name: "Transactions" });
+    const collapsingWrappers: string[] = [];
+
+    let el = link.parentElement;
+    while (el && !/\bh-14\b/.test(el.className)) {
+      const parent = el.parentElement;
+      if (!parent) break;
+      const stretches =
+        /\bself-stretch\b/.test(el.className) || /\bitems-stretch\b/.test(parent.className);
+      if (!stretches) collapsingWrappers.push(el.className.trim());
+      el = parent;
+    }
+
+    expect(collapsingWrappers).toEqual([]);
   });
 
   it("shows primary nav items and hides secondary items behind More", async () => {

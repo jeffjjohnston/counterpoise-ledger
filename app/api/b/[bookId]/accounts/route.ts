@@ -1,56 +1,13 @@
 import { NextResponse } from "next/server";
 import { authenticateBookRequest, isError } from "@/lib/api-auth";
-import { accounts } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
 import {
   getAccountsWithBalances,
+  createAccount,
+  AccountValidationError,
   type AccountBalanceRow,
 } from "@/lib/accounts";
 import { captureEvent } from "@/lib/posthog-server";
-import { type AppDb } from "@/db";
 import { createAccountSchema, listAccountsQuery } from "@/lib/schemas/accounts";
-
-const isInvestmentAccount = (account: { type: string; subtype?: string | null }) =>
-  account.type === "asset" && account.subtype === "investment";
-
-const buildInvestmentCashName = (name: string) => `${name} Cash`;
-
-type DbOrTransaction = AppDb | Parameters<Parameters<AppDb["transaction"]>[0]>[0];
-
-async function ensureInvestmentCashAccount(
-  accountId: number,
-  accountName: string,
-  tx: DbOrTransaction,
-  bookId: number
-) {
-  const [existingCash] = await tx
-    .select()
-    .from(accounts)
-    .where(and(eq(accounts.bookId, bookId), eq(accounts.parentId, accountId), eq(accounts.isInvestmentCash, true)));
-
-  if (!existingCash) {
-    await tx
-      .insert(accounts)
-      .values({
-        name: buildInvestmentCashName(accountName),
-        type: "asset",
-        subtype: "cash",
-        parentId: accountId,
-        isActive: true,
-        isInvestmentCash: true,
-        bookId,
-      });
-    return;
-  }
-
-  const desiredName = buildInvestmentCashName(accountName);
-  if (existingCash.name !== desiredName) {
-    await tx
-      .update(accounts)
-      .set({ name: desiredName, updatedAt: new Date() })
-      .where(and(eq(accounts.id, existingCash.id), eq(accounts.bookId, bookId)));
-  }
-}
 
 export async function GET(
   request: Request,
@@ -133,49 +90,15 @@ export async function POST(
     if (!parsed.success) {
       return NextResponse.json({ error: parsed.error.issues[0].message }, { status: 400 });
     }
-    const { name, type, subtype, parentId, icon } = parsed.data;
 
-    if (parentId) {
-      const [parent] = await db
-        .select({ id: accounts.id })
-        .from(accounts)
-        .where(and(eq(accounts.id, parentId), eq(accounts.bookId, numericBookId)));
-
-      if (!parent) {
-        return NextResponse.json({ error: "Invalid parentId" }, { status: 400 });
+    let createdAccount;
+    try {
+      createdAccount = await createAccount(db, numericBookId, parsed.data);
+    } catch (error) {
+      if (error instanceof AccountValidationError) {
+        return NextResponse.json({ error: error.message }, { status: 400 });
       }
-    }
-
-    const createdAccount = await db.transaction(async (tx) => {
-      const [insertedAccount] = await tx
-        .insert(accounts)
-        .values({
-          name,
-          type,
-          subtype: subtype || null,
-          parentId: parentId || null,
-          icon: icon ?? null,
-          isActive: true,
-          bookId: numericBookId,
-        })
-        .returning();
-
-      if (!insertedAccount) {
-        return null;
-      }
-
-      if (isInvestmentAccount(insertedAccount)) {
-        await ensureInvestmentCashAccount(insertedAccount.id, insertedAccount.name, tx, numericBookId);
-      }
-
-      return insertedAccount;
-    });
-
-    if (!createdAccount) {
-      return NextResponse.json(
-        { error: "Failed to create account" },
-        { status: 500 }
-      );
+      throw error;
     }
 
     captureEvent(auth.userId, "account_created", {

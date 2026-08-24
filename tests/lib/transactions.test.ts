@@ -4,13 +4,26 @@ import {
   resetTestDatabase,
   createAccount,
   createBook,
+  createPlaidAccount,
+  createPlaidReconciliation,
+  createPlaidToken,
   createSecurity,
+  createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
 import { getDb } from "@/db";
-import { books, investmentSplits as investmentSplitsTable, payees } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import {
+  books,
+  investmentLots,
+  investmentSplits as investmentSplitsTable,
+  payees,
+  plaidTransactionReconciliation,
+  transactions,
+  transactionSplits,
+} from "@/db/schema";
+import { and, eq } from "drizzle-orm";
 import {
   createTransaction,
+  deleteTransaction,
   updateTransaction,
   TransactionNotFoundError,
 } from "@/lib/transactions";
@@ -575,6 +588,233 @@ describe("transactions shared logic", () => {
           description: "Should not work",
         })
       ).rejects.toThrow(TransactionNotFoundError);
+    });
+  });
+
+  describe("deleteTransaction", () => {
+    it("deletes the transaction and its splits", async () => {
+      const db = getDb();
+      const checking = await createAccount({
+        name: "Checking",
+        type: "asset",
+        subtype: "bank",
+        bookId,
+      });
+      const groceries = await createAccount({
+        name: "Groceries",
+        type: "expense",
+        subtype: "other",
+        bookId,
+      });
+      const txn = await createTransactionWithSplits({
+        bookId,
+        date: "2026-01-15",
+        description: "Groceries",
+        splits: [
+          { accountId: groceries.id, amount: 5000 },
+          { accountId: checking.id, amount: -5000 },
+        ],
+      });
+
+      await deleteTransaction(db, bookId, txn.id);
+
+      const rows = await db
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, txn.id));
+      expect(rows).toHaveLength(0);
+
+      const splits = await db
+        .select()
+        .from(transactionSplits)
+        .where(eq(transactionSplits.transactionId, txn.id));
+      expect(splits).toHaveLength(0);
+    });
+
+    it("throws TransactionNotFoundError for a transaction in another book", async () => {
+      const db = getDb();
+      const otherBook = await createBook({ name: "Other Book" });
+      const theirChecking = await createAccount({
+        name: "Their Checking",
+        type: "asset",
+        subtype: "bank",
+        bookId: otherBook.id,
+      });
+      const theirGroceries = await createAccount({
+        name: "Their Groceries",
+        type: "expense",
+        subtype: "other",
+        bookId: otherBook.id,
+      });
+      const txn = await createTransactionWithSplits({
+        bookId: otherBook.id,
+        date: "2026-01-15",
+        description: "Not yours",
+        splits: [
+          { accountId: theirGroceries.id, amount: 100 },
+          { accountId: theirChecking.id, amount: -100 },
+        ],
+      });
+
+      await expect(deleteTransaction(db, bookId, txn.id)).rejects.toThrow(
+        TransactionNotFoundError
+      );
+
+      // The row survives. A cross-book delete must not reach it.
+      const rows = await db
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, txn.id));
+      expect(rows).toHaveLength(1);
+    });
+
+    it("returns a matched Plaid reconciliation row to pending", async () => {
+      const db = getDb();
+      const checking = await createAccount({
+        name: "Checking",
+        type: "asset",
+        subtype: "bank",
+        bookId,
+      });
+      const coffee = await createAccount({
+        name: "Coffee",
+        type: "expense",
+        subtype: "other",
+        bookId,
+      });
+      const txn = await createTransactionWithSplits({
+        bookId,
+        date: "2026-01-15",
+        description: "Coffee",
+        splits: [
+          { accountId: coffee.id, amount: 500 },
+          { accountId: checking.id, amount: -500 },
+        ],
+      });
+      const token = await createPlaidToken({
+        bookId,
+        financialInstitution: "Test Bank",
+        itemId: "item-delete-1",
+        accessToken: "access-delete-1",
+      });
+      const link = await createPlaidAccount({
+        bookId,
+        tokenId: token.id,
+        plaidAccountId: "plaid-acct-delete-1",
+        name: "Checking",
+        type: "depository",
+        counterpoiseAccountId: checking.id,
+      });
+      const recon = await createPlaidReconciliation({
+        bookId,
+        plaidAccountLinkId: link.id,
+        plaidTransactionId: "plaid-txn-delete-1",
+        date: "2026-01-15",
+        amountCents: 500,
+        name: "Coffee",
+        resolutionStatus: "matched",
+        matchedTransactionId: txn.id,
+      });
+
+      await deleteTransaction(db, bookId, txn.id);
+
+      const [row] = await db
+        .select()
+        .from(plaidTransactionReconciliation)
+        .where(eq(plaidTransactionReconciliation.id, recon.id));
+      // Left at "matched" with a null id, this row hides from the
+      // reconciliation queue forever. That is the bug this reset prevents.
+      expect(row.resolutionStatus).toBe("pending");
+      expect(row.matchedTransactionId).toBeNull();
+    });
+
+    it("rebuilds lots after deleting a sell", async () => {
+      const db = getDb();
+      const investmentAccount = await createAccount({
+        name: "Brokerage",
+        type: "asset",
+        subtype: "investment",
+        bookId,
+      });
+      const cashAccount = await createAccount({
+        name: "Brokerage Cash",
+        type: "asset",
+        subtype: "cash",
+        parentId: investmentAccount.id,
+        isInvestmentCash: true,
+        bookId,
+      });
+      const security = await createSecurity({
+        name: "Vanguard Total Stock",
+        symbol: "VTI",
+        securityType: "etf",
+        bookId,
+      });
+
+      // Built with createTransaction, not the raw helpers, so the lots exist
+      // before the delete.
+      await createTransaction(db, bookId, {
+        date: "2026-01-05",
+        description: "Buy VTI",
+        splits: [
+          { accountId: investmentAccount.id, amount: 100_000 },
+          { accountId: cashAccount.id, amount: -100_000 },
+        ],
+        investmentSplits: [
+          {
+            securityId: security.id,
+            action: "buy",
+            sharesMicros: 100_000_000,
+            priceMicros: 10_000_000,
+          },
+        ],
+      });
+      const sell = await createTransaction(db, bookId, {
+        date: "2026-02-05",
+        description: "Sell VTI",
+        splits: [
+          { accountId: investmentAccount.id, amount: -60_000 },
+          { accountId: cashAccount.id, amount: 60_000 },
+        ],
+        investmentSplits: [
+          {
+            securityId: security.id,
+            action: "sell",
+            sharesMicros: 40_000_000,
+            priceMicros: 15_000_000,
+          },
+        ],
+      });
+
+      // The sell really did consume part of the lot, so the assertion after
+      // the delete is not passing on an untouched lot.
+      const consumed = await db
+        .select()
+        .from(investmentLots)
+        .where(
+          and(
+            eq(investmentLots.securityId, security.id),
+            eq(investmentLots.accountId, investmentAccount.id)
+          )
+        );
+      expect(consumed).toHaveLength(1);
+      expect(consumed[0].remainingSharesMicros).toBe(60_000_000);
+
+      await deleteTransaction(db, bookId, sell.id);
+
+      // After deleting the sell, the buy's lot must be whole again:
+      const lots = await db
+        .select()
+        .from(investmentLots)
+        .where(
+          and(
+            eq(investmentLots.securityId, security.id),
+            eq(investmentLots.accountId, investmentAccount.id)
+          )
+        );
+      expect(lots).toHaveLength(1);
+      expect(lots[0].remainingSharesMicros).toBe(lots[0].originalSharesMicros);
+      expect(lots[0].remainingBasisCents).toBe(lots[0].originalBasisCents);
     });
   });
 

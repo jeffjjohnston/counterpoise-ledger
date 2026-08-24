@@ -133,6 +133,18 @@ export const createAccount = async (data: {
   return account;
 };
 
+export const createUser = async (data: { username: string; passwordHash?: string }) => {
+  const [user] = await db
+    .insert(users)
+    .values({
+      username: data.username,
+      passwordHash: data.passwordHash ?? "test-hash-not-a-real-credential",
+    })
+    .returning();
+
+  return user;
+};
+
 export const createBook = async (data: {
   name: string;
   userId?: number;
@@ -156,6 +168,7 @@ export const createTransactionWithSplits = async (data: {
   payeeId?: number | null;
   isFloating?: boolean;
   isReconciled?: boolean;
+  recurringRuleId?: number | null;
   bookId?: number;
   splits: Array<{ accountId: number; amount: number }>;
 }) => {
@@ -171,6 +184,7 @@ export const createTransactionWithSplits = async (data: {
       payeeId: data.payeeId ?? null,
       isFloating: data.isFloating ?? false,
       isReconciled: data.isReconciled ?? false,
+      recurringRuleId: data.recurringRuleId ?? null,
     })
     .returning();
 

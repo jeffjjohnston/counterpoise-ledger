@@ -4,6 +4,7 @@ import { getDb } from "@/db";
 import { getPositions, getMarketValuesByAccount } from "@/lib/investments";
 import { getRealizedGains } from "@/lib/realized-gains";
 import { requireBookAuth } from "@/mcp/auth";
+import { READ } from "@/mcp/tools/_annotations";
 
 const MICROS = 1_000_000;
 
@@ -28,6 +29,7 @@ export function registerInvestmentTools(server: McpServer) {
           .default(false)
           .describe("Also include total market value per account"),
       },
+      annotations: READ,
     },
     async ({ bookId, accountId, includeAccountValues }) => {
       const auth = await requireBookAuth(bookId);
@@ -117,6 +119,7 @@ export function registerInvestmentTools(server: McpServer) {
           .optional()
           .describe("Filter to a specific investment account"),
       },
+      annotations: READ,
     },
     async ({ bookId, startDate, endDate, accountId }) => {
       const auth = await requireBookAuth(bookId);

@@ -4,6 +4,7 @@ import { books } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { getSession } from "@/lib/session";
 import { createBookSchema } from "@/lib/schemas/books";
+import { createBook } from "@/lib/books";
 
 export async function GET() {
   try {
@@ -45,13 +46,9 @@ export async function POST(request: Request) {
     if (!parsed.success) {
       return NextResponse.json({ error: parsed.error.issues[0].message }, { status: 400 });
     }
-    const { name } = parsed.data;
 
     const metaDb = getDb();
-    const [book] = await metaDb
-      .insert(books)
-      .values({ userId: session.userId, name })
-      .returning();
+    const book = await createBook(metaDb, session.userId, parsed.data);
 
     return NextResponse.json(book);
   } catch (error) {

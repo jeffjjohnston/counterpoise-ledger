@@ -6,7 +6,11 @@ import {
   setupTestDatabase,
   resetTestDatabase,
   createAccount,
+  createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
+import { getDb } from "@/db";
+import { transactions } from "@/db/schema";
+import { eq } from "drizzle-orm";
 
 // Mock MCP auth to return authenticated user
 vi.mock("@/mcp/auth", () => ({
@@ -30,7 +34,24 @@ async function callTool(name: string, args: Record<string, unknown> = {}) {
   const textContent = (result.content as Array<{ type: string; text: string }>)?.find(
     (c) => c.type === "text"
   );
-  const data = textContent ? JSON.parse(textContent.text) : undefined;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let data: any;
+  if (isError) {
+    // A schema-level rejection is caught at the MCP SDK boundary before the
+    // handler runs, so the body is the SDK's plain-text message rather than
+    // our JSON envelope. Only error results can legitimately be non-JSON —
+    // fall back to wrapping the raw text the same way fail() would.
+    try {
+      data = textContent ? JSON.parse(textContent.text) : undefined;
+    } catch {
+      data = { error: textContent?.text };
+    }
+  } else {
+    // A success result is always our own ok(), so it is always JSON. Leave
+    // this path exactly as strict as it always was: a non-JSON body here is
+    // a real bug and should throw loudly, not degrade silently.
+    data = textContent ? JSON.parse(textContent.text) : undefined;
+  }
   return { data, isError };
 }
 
@@ -118,6 +139,31 @@ describe("MCP Write Transaction Tools", () => {
 
       expect(isError).toBe(true);
       expect(data.error).toContain("sum to zero");
+    });
+
+    it("creates a transaction already marked reconciled", async () => {
+      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
+      const groceries = await createAccount({ name: "Groceries", type: "expense", subtype: "other", bookId });
+
+      const { data, isError } = await callTool("create_transaction", {
+        bookId,
+        date: "2025-01-15",
+        description: "Grocery store",
+        isReconciled: true,
+        splits: [
+          { accountId: groceries.id, amount: 5000 },
+          { accountId: checking.id, amount: -5000 },
+        ],
+      });
+
+      expect(isError).toBe(false);
+      expect(data.isReconciled).toBe(true);
+
+      const [row] = await getDb()
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, data.id));
+      expect(row.isReconciled).toBe(true);
     });
 
     it("creates transaction with payee", async () => {
@@ -235,6 +281,36 @@ describe("MCP Write Transaction Tools", () => {
       expect(amounts).toEqual([-7500, 7500]);
     });
 
+    it("marks a transaction reconciled", async () => {
+      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
+      const groceries = await createAccount({ name: "Groceries", type: "expense", subtype: "other", bookId });
+
+      const { data: created } = await callTool("create_transaction", {
+        bookId,
+        date: "2025-01-15",
+        description: "Original",
+        splits: [
+          { accountId: groceries.id, amount: 5000 },
+          { accountId: checking.id, amount: -5000 },
+        ],
+      });
+
+      const { data: updated, isError } = await callTool("update_transaction", {
+        bookId,
+        transactionId: created.id,
+        isReconciled: true,
+      });
+
+      expect(isError).toBe(false);
+      expect(updated.isReconciled).toBe(true);
+
+      const [row] = await getDb()
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, created.id));
+      expect(row.isReconciled).toBe(true);
+    });
+
     it("returns auth error when not authenticated", async () => {
       const { requireBookAuth } = await import("@/mcp/auth");
       vi.mocked(requireBookAuth).mockResolvedValueOnce({
@@ -250,6 +326,56 @@ describe("MCP Write Transaction Tools", () => {
 
       expect(isError).toBe(true);
       expect(data.error).toContain("COUNTERPOISE_API_KEY");
+    });
+  });
+
+  describe("delete_transaction", () => {
+    it("deletes a transaction", async () => {
+      const checking = await createAccount({
+        name: "Checking",
+        type: "asset",
+        subtype: "bank",
+        bookId,
+      });
+      const supplies = await createAccount({
+        name: "Supplies",
+        type: "expense",
+        subtype: "other",
+        bookId,
+      });
+      const txn = await createTransactionWithSplits({
+        bookId,
+        date: "2026-02-01",
+        description: "To be deleted",
+        splits: [
+          { accountId: supplies.id, amount: 2500 },
+          { accountId: checking.id, amount: -2500 },
+        ],
+      });
+
+      const { data, isError } = await callTool("delete_transaction", {
+        bookId,
+        transactionId: txn.id,
+      });
+
+      expect(isError).toBe(false);
+      expect(data.success).toBe(true);
+
+      const rows = await getDb()
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, txn.id));
+      expect(rows).toHaveLength(0);
+    });
+
+    it("returns an error for an unknown transaction", async () => {
+      const { data, isError } = await callTool("delete_transaction", {
+        bookId,
+        transactionId: 999999,
+      });
+
+      expect(isError).toBe(true);
+      expect(data.error).toMatch(/not found/i);
     });
   });
 
@@ -303,6 +429,34 @@ describe("MCP Write Transaction Tools", () => {
 
       expect(dup.isError).toBe(true);
       expect(dup.data.error).toMatch(/already exists/i);
+    });
+
+    it("creates a fixed-price security", async () => {
+      const { data, isError } = await callTool("create_security", {
+        bookId,
+        name: "Vanguard Federal Money Market",
+        symbol: "VMFXX",
+        securityType: "mutual_fund",
+        fixedPriceMicros: 1_000_000,
+      });
+
+      expect(isError).toBe(false);
+      expect(data.fixedPriceMicros).toBe(1_000_000);
+      // createSecurity() forces fetching off so the two cannot contradict.
+      expect(data.fetchPrices).toBe(false);
+    });
+
+    it("rejects a fixed price that is not a positive whole number of micros", async () => {
+      const { data, isError } = await callTool("create_security", {
+        bookId,
+        name: "Bad Fixed Price",
+        symbol: "BADFX",
+        securityType: "mutual_fund",
+        fixedPriceMicros: 0,
+      });
+
+      expect(isError).toBe(true);
+      expect(data.error).toMatch(/positive whole number of micros/);
     });
   });
 });

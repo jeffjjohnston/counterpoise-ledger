@@ -13,11 +13,15 @@ import {
 import { effectiveDateSql } from "@/lib/accounting";
 import { getPositions } from "@/lib/investments";
 import { requireBookAuth } from "@/mcp/auth";
+import { CREATE, READ } from "@/mcp/tools/_annotations";
+import { fail, ok } from "@/mcp/tools/_result";
+import { toolShape } from "@/mcp/tools/_tool-shape";
 import {
   createSecurity,
   SecurityDuplicateError,
   SecurityValidationError,
 } from "@/lib/securities";
+import { createSecuritySchema } from "@/lib/schemas/securities";
 
 const MICROS = 1_000_000;
 
@@ -30,55 +34,34 @@ export function registerSecurityTools(server: McpServer) {
     {
       title: "Create Security",
       description:
-        "Create a new security (ETF, mutual fund, or stock) in a book. Fails with an error if a security with the same symbol (case-insensitive) already exists in the book.",
+        "Create a new security (ETF, mutual fund, or stock) in a book. Fails with an error if a security with the same symbol (case-insensitive) already exists in the book. " +
+        "Set fixedPriceMicros for a security whose price never moves, such as a money market fund at a $1.00 NAV. Doing so forces price fetching off.",
+      // Spread rather than restate. The four fields listed here by hand went
+      // stale when fixedPriceMicros was added to the shared schema and to
+      // createSecurity(), leaving MCP unable to create a fixed-NAV security.
+      // write-transactions.ts has always spread its schema and never drifted.
       inputSchema: {
-        bookId: z.number().int().positive().describe("The book ID to create the security in"),
-        name: z.string().min(1).describe("Display name of the security"),
-        symbol: z.string().min(1).describe("Ticker symbol (e.g. VTI, AAPL)"),
-        securityType: z
-          .enum(["etf", "mutual_fund", "stock"])
-          .describe("Type of security"),
-        fetchPrices: z
-          .boolean()
-          .optional()
-          .describe("Whether to fetch prices automatically (defaults to true)"),
+        bookId: z
+          .number()
+          .int()
+          .positive()
+          .describe("The book ID to create the security in"),
+        ...toolShape(createSecuritySchema),
       },
+      annotations: CREATE,
     },
-    async ({ bookId, name, symbol, securityType, fetchPrices }) => {
+    async ({ bookId, ...input }) => {
       const auth = await requireBookAuth(bookId);
       if ("isError" in auth) return auth;
 
-      const db = getDb();
-
       try {
-        const created = await createSecurity(db, bookId, {
-          name,
-          symbol,
-          securityType,
-          fetchPrices,
-        });
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(created, null, 2),
-            },
-          ],
-        };
+        return ok(await createSecurity(getDb(), bookId, input));
       } catch (err) {
         if (
           err instanceof SecurityValidationError ||
           err instanceof SecurityDuplicateError
         ) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify({ error: err.message }, null, 2),
-              },
-            ],
-            isError: true,
-          };
+          return fail(err.message);
         }
         throw err;
       }
@@ -110,6 +93,7 @@ export function registerSecurityTools(server: McpServer) {
           .default(50)
           .describe("Number of recent prices to return (default 50, max 200)"),
       },
+      annotations: READ,
     },
     async ({ bookId, securityId, priceLimit }) => {
       const auth = await requireBookAuth(bookId);
@@ -124,19 +108,7 @@ export function registerSecurityTools(server: McpServer) {
         .where(and(eq(securities.bookId, bookId), eq(securities.id, securityId)));
 
       if (!security) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                { error: `Security with id ${securityId} not found` },
-                null,
-                2
-              ),
-            },
-          ],
-          isError: true,
-        };
+        return fail(`Security with id ${securityId} not found`);
       }
 
       // 2. Price history
@@ -209,14 +181,7 @@ export function registerSecurityTools(server: McpServer) {
         transactions: txns,
       };
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
+      return ok(result);
     }
   );
 }

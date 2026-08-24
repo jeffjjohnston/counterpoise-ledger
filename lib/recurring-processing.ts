@@ -41,7 +41,7 @@ export type RecurringProcessingResult = {
   skipped: Array<{ ruleId: number; reason: string }>;
 };
 
-function buildConfig(rule: {
+export function buildConfig(rule: {
   frequency: string;
   interval: number;
   daysOfWeek: string | null;

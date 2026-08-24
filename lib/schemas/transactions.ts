@@ -131,7 +131,14 @@ export const createTransactionBodySchema = z.object(
     isReconciled: z
       .boolean()
       .optional()
-      .describe("If true, the transaction is recorded as already reconciled."),
+      .describe(
+        "If true, the transaction is recorded as already reconciled. " +
+        "If the transaction is floating (isFloating is true), also set " +
+        "isFloating to false and give the cleared date in the same call. " +
+        "If you set only isReconciled, the transaction stays floating, and " +
+        "its effective date keeps moving to today even though it is marked " +
+        "reconciled."
+      ),
     // The schema-level `error` covers "missing" and "not an array"; `.min(2)`
     // covers "too few" — all three were the same guard, so all three keep the
     // same message.
@@ -179,7 +186,13 @@ export const updateTransactionBodySchema = z.object({
   isReconciled: z
     .boolean()
     .optional()
-    .describe("Set to true to mark the transaction reconciled."),
+    .describe(
+      "Set to true to mark the transaction reconciled. If the transaction " +
+      "is floating (isFloating is true), also set isFloating to false and " +
+      "set date to the cleared date in the same call. If you set only " +
+      "isReconciled, the transaction stays floating, and its effective " +
+      "date keeps moving to today even though it is marked reconciled."
+    ),
   splits: z
     .array(splitSchema, { error: UPDATE_SPLITS_MESSAGE })
     .min(2, UPDATE_SPLITS_MESSAGE)

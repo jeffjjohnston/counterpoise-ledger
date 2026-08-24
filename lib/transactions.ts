@@ -3,11 +3,12 @@ import {
   accounts,
   investmentSplits,
   payees,
+  plaidTransactionReconciliation,
   securities,
   transactions,
   transactionSplits,
 } from "@/db/schema";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import {
   isValidDateString,
@@ -743,4 +744,98 @@ export async function updateTransaction(
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// deleteTransaction
+// ---------------------------------------------------------------------------
+
+/**
+ * Delete a transaction, its splits, and its investment splits.
+ *
+ * Not a plain row delete. Four things must happen inside one transaction:
+ *
+ *   1. Collect affected (account, security) pairs BEFORE the delete.
+ *      Investment splits cascade away with the transaction. This is the
+ *      last point their pairs can be queried.
+ *   2. Reset Plaid reconciliation rows that point at this transaction to
+ *      "pending". The FK is onDelete: "set null". It clears the id but
+ *      leaves resolutionStatus at "matched" — and that combination hides
+ *      the row from the reconciliation queue forever.
+ *   3. Sweep for a row stranded by a race with a concurrent auto-match. If
+ *      auto-match claims the row after step 2 runs but before this delete
+ *      commits, the delete blocks on the FK until auto-match commits. ON
+ *      DELETE SET NULL then clears the id but leaves resolutionStatus at
+ *      "matched". No test covers this step: reproducing the race needs two
+ *      concurrent sessions, and a single-process test cannot create that
+ *      interleaving. Mutation testing during Task 4 confirmed the gap:
+ *      removing step 2 or step 3 alone still leaves the row "pending" in
+ *      every single-threaded test, because each step masks the other's
+ *      absence. A maintainer who deletes this step would see a fully green
+ *      suite.
+ *   4. Rebuild lots for the collected pairs. rebuildLots takes
+ *      pg_advisory_xact_lock as its first statement, and that lock releases
+ *      at commit. It MUST run on `tx`, not on the pooled db.
+ */
+export async function deleteTransaction(
+  db: AppDb,
+  bookId: number,
+  transactionId: number
+): Promise<void> {
+  const deleted = await db.transaction(async (tx) => {
+    const affectedPairs = await collectAffectedPairs(tx, bookId, transactionId);
+
+    await tx
+      .update(plaidTransactionReconciliation)
+      .set({
+        resolutionStatus: "pending",
+        matchedTransactionId: null,
+        resolvedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(plaidTransactionReconciliation.matchedTransactionId, transactionId),
+          eq(plaidTransactionReconciliation.bookId, bookId)
+        )
+      );
+
+    const rows = await tx
+      .delete(transactions)
+      .where(
+        and(eq(transactions.id, transactionId), eq(transactions.bookId, bookId))
+      )
+      .returning();
+
+    // Sweep for a row stranded by a race with a concurrent auto-match: if
+    // auto-match claimed this row in an uncommitted transaction, the reset
+    // above ran before the claim was visible and missed it. The delete then
+    // blocked on the FK until auto-match committed, at which point
+    // ON DELETE SET NULL cleared the id but left resolutionStatus at
+    // "matched". Idempotent: normally matches nothing.
+    await tx
+      .update(plaidTransactionReconciliation)
+      .set({
+        resolutionStatus: "pending",
+        resolvedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(plaidTransactionReconciliation.bookId, bookId),
+          eq(plaidTransactionReconciliation.resolutionStatus, "matched"),
+          isNull(plaidTransactionReconciliation.matchedTransactionId)
+        )
+      );
+
+    await rebuildLotsForPairs(tx, bookId, affectedPairs);
+
+    return rows;
+  });
+
+  if (deleted.length === 0) {
+    throw new TransactionNotFoundError(
+      `Transaction ${transactionId} not found in book ${bookId}`
+    );
+  }
 }

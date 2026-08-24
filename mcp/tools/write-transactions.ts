@@ -2,37 +2,31 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v4";
 import { getDb } from "@/db";
 import { requireBookAuth } from "@/mcp/auth";
+import { CREATE, DESTRUCTIVE } from "@/mcp/tools/_annotations";
+import { fail, ok } from "@/mcp/tools/_result";
+import { toolShape } from "@/mcp/tools/_tool-shape";
 import {
   createTransaction,
+  deleteTransaction,
   updateTransaction,
   TransactionValidationError,
   TransactionNotFoundError,
 } from "@/lib/transactions";
 // The payload shape lives in lib/schemas/transactions.ts so the HTTP routes
 // and these tools validate the same thing. `bookId` is the one field the two
-// surfaces genuinely differ on — it comes from the URL over HTTP, so the
-// shared schema omits it and the tools add it back here.
+// surfaces differ on — it comes from the URL over HTTP, so the shared schema
+// omits it and the tools add it back here.
 //
-// `isReconciled` is omitted in the other direction. The shared schema has to
-// carry it for HTTP (the reconcile checkbox PUTs it and nothing else), but
-// these tools have never exposed it and deliberately still don't: marking a
-// transaction reconciled is a user's attestation that it matched a bank
-// statement, and on a floating transaction it also clears `isFloating` and
-// overwrites the stored date. Whether an assistant may do that is a product
-// decision, not something a schema-sharing refactor should settle — so this
-// preserves the tools' pre-existing field set exactly rather than restricting
-// anything that previously worked.
+// isReconciled was withheld from these tools until 2026-08-23. See
+// docs/superpowers/specs/2026-08-23-mcp-ui-parity-design.md, decisions 3
+// and 4. Decision 4 exposes isReconciled. Decision 3 explains the
+// destructiveHint on update_transaction and delete_transaction: it tells a
+// client to confirm before an update or delete lands. create_transaction
+// carries CREATE, not DESTRUCTIVE, so that hint does not apply to it.
 import {
   createTransactionBodySchema,
   updateTransactionBodySchema,
 } from "@/lib/schemas/transactions";
-
-const createTransactionToolSchema = createTransactionBodySchema.omit({
-  isReconciled: true,
-});
-const updateTransactionToolSchema = updateTransactionBodySchema.omit({
-  isReconciled: true,
-});
 
 export function registerWriteTransactionTools(server: McpServer) {
   server.registerTool(
@@ -46,8 +40,9 @@ export function registerWriteTransactionTools(server: McpServer) {
         "Use list_accounts to find account IDs first.",
       inputSchema: {
         bookId: z.number().int().positive().describe("The book ID"),
-        ...createTransactionToolSchema.shape,
+        ...toolShape(createTransactionBodySchema),
       },
+      annotations: CREATE,
     },
     async (args) => {
       const { bookId, ...input } = args;
@@ -56,26 +51,10 @@ export function registerWriteTransactionTools(server: McpServer) {
 
       try {
         const db = getDb();
-        const result = await createTransaction(db, bookId, input);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return ok(await createTransaction(db, bookId, input));
       } catch (error) {
         if (error instanceof TransactionValidationError) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify({ error: error.message }),
-              },
-            ],
-            isError: true,
-          };
+          return fail(error.message);
         }
         throw error;
       }
@@ -98,8 +77,13 @@ export function registerWriteTransactionTools(server: McpServer) {
           .int()
           .positive()
           .describe("The transaction ID to update"),
-        ...updateTransactionToolSchema.shape,
+        ...toolShape(updateTransactionBodySchema),
       },
+      // DESTRUCTIVE, not UPDATE: when this tool receives `splits`, it replaces
+      // every existing split rather than merging. A caller that sends one split
+      // to correct an amount silently discards the others. The hint is what
+      // tells a client to confirm before that happens.
+      annotations: DESTRUCTIVE,
     },
     async (args) => {
       const { bookId, transactionId, ...input } = args;
@@ -108,34 +92,48 @@ export function registerWriteTransactionTools(server: McpServer) {
 
       try {
         const db = getDb();
-        const result = await updateTransaction(
-          db,
-          bookId,
-          transactionId,
-          input
-        );
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return ok(await updateTransaction(db, bookId, transactionId, input));
       } catch (error) {
         if (
           error instanceof TransactionValidationError ||
           error instanceof TransactionNotFoundError
         ) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify({ error: error.message }),
-              },
-            ],
-            isError: true,
-          };
+          return fail(error.message);
+        }
+        throw error;
+      }
+    }
+  );
+
+  server.registerTool(
+    "delete_transaction",
+    {
+      title: "Delete Transaction",
+      description:
+        "Delete a transaction and all of its splits. This cannot be undone. " +
+        "Any Plaid reconciliation row matched to this transaction returns to pending, " +
+        "and investment lots are rebuilt for every affected security. " +
+        "Use list_transactions or search to find the transaction ID first.",
+      inputSchema: {
+        bookId: z.number().int().positive().describe("The book ID"),
+        transactionId: z
+          .number()
+          .int()
+          .positive()
+          .describe("The transaction ID to delete"),
+      },
+      annotations: DESTRUCTIVE,
+    },
+    async ({ bookId, transactionId }) => {
+      const auth = await requireBookAuth(bookId);
+      if ("isError" in auth) return auth;
+
+      try {
+        await deleteTransaction(getDb(), bookId, transactionId);
+        return ok({ success: true, transactionId });
+      } catch (error) {
+        if (error instanceof TransactionNotFoundError) {
+          return fail(error.message);
         }
         throw error;
       }

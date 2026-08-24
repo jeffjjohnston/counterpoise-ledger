@@ -1,6 +1,22 @@
+/**
+ * Sample dataset builders.
+ *
+ * **This module must stay free of top-level side effects — declarations only.**
+ * It is imported by application code (lib/books.ts's createDemoBook, and
+ * through it the demo-book API route and the create_demo_book MCP tool), so
+ * anything that runs at import time runs on those paths too.
+ *
+ * It used to end in a main-module guard that ran the destructive seed. In
+ * source that guard is false for every importer, because import.meta.url is
+ * this file. Bundled it is not: scripts/bundle-node-entrypoints.mjs inlines
+ * this module into dist/mcp-server.mjs, where import.meta.url becomes the
+ * BUNDLE's URL — and the documented production invocation, `docker exec ...
+ * node /app/mcp-server.mjs`, makes that equal to process.argv[1]. The guard
+ * fired on every MCP server start and dropped the production schemas. The CLI
+ * now lives in db/seed-cli.ts, which nothing imports, and
+ * tests/mcp/bundle-safety.test.ts fails if either half returns here.
+ */
 import * as schema from "./schema";
-import path from "path";
-import { fileURLToPath } from "url";
 import { getDb, runMigrations, getSqlClient_raw } from "./index";
 import { hashPassword } from "../lib/auth";
 import { sql, eq } from "drizzle-orm";
@@ -1922,7 +1938,7 @@ export async function seedBook(db: AppDb, bookId: number) {
 
 /**
  * Full destructive seed: drops all data, recreates schema, creates admin user + book,
- * then seeds data. Used by `npm run db:seed` (no args).
+ * then seeds data. Used by `npm run db:seed` (no args), via db/seed-cli.ts.
  */
 export async function seed() {
   // Reset the database — drop both public (tables) and drizzle (migration metadata)
@@ -1945,61 +1961,6 @@ export async function seed() {
   await seedBook(db, book.id);
 }
 
-export function runSeedCli(): Promise<number> {
-  return seed()
-    .then(() => 0)
-    .catch((error) => {
-      console.error("Seed failed:", error);
-      return 1;
-    });
-}
-
-async function main() {
-  const args = process.argv.slice(2);
-  const bookIdIndex = args.indexOf("--book-id");
-
-  if (bookIdIndex !== -1) {
-    const bookIdStr = args[bookIdIndex + 1];
-    if (!bookIdStr) {
-      console.error("Error: --book-id requires a numeric argument");
-      process.exit(1);
-    }
-    const bookId = parseInt(bookIdStr, 10);
-    if (isNaN(bookId)) {
-      console.error(`Error: invalid book ID "${bookIdStr}"`);
-      process.exit(1);
-    }
-
-    const db = getDb();
-
-    // Verify book exists
-    const [book] = await db
-      .select({ id: schema.books.id, name: schema.books.name })
-      .from(schema.books)
-      .where(eq(schema.books.id, bookId));
-
-    if (!book) {
-      console.error(`Error: book ${bookId} not found. Use 'npm run db:list-books' to see available books.`);
-      process.exit(1);
-    }
-
-    logSeed(`  Found book '${book.name}' (id: ${book.id})`);
-    await seedBook(db, bookId);
-  } else {
-    const exitCode = await runSeedCli();
-    process.exit(exitCode);
-  }
-
-  process.exit(0);
-}
-
-const isMainModule =
-  process.argv[1] !== undefined &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-
-if (isMainModule) {
-  main().catch((error) => {
-    console.error("Seed failed:", error);
-    process.exit(1);
-  });
-}
+// The CLI half of this file — argument parsing, the main() entry, and the
+// main-module guard that ran it — lives in db/seed-cli.ts. See the header
+// comment above for why it cannot come back here.

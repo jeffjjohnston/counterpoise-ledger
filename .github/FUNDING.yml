@@ -1,0 +1,8 @@
+# Shows the Sponsor button on the repository page.
+#
+# The button appears only after you enable GitHub Sponsors on the account.
+# Until you do that, this file is correct but has no effect.
+#
+# GitHub reads this file from the default branch only. On the public mirror
+# that branch is main, which is the branch the publish script pushes to.
+github: jeffjjohnston

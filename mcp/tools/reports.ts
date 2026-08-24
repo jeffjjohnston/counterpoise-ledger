@@ -6,6 +6,7 @@ import { accounts, transactions, transactionSplits } from "@/db/schema";
 import { getDisplayBalance, effectiveDateSql } from "@/lib/accounting";
 import { getIncomeStatement, getReportSplits } from "@/lib/reports-queries";
 import { requireBookAuth } from "@/mcp/auth";
+import { READ } from "@/mcp/tools/_annotations";
 
 export function registerReportTools(server: McpServer) {
   // ── Tool 1: get_income_statement ─────────────────────────────────────
@@ -31,6 +32,7 @@ export function registerReportTools(server: McpServer) {
           .default(false)
           .describe("Include inactive accounts (default false)"),
       },
+      annotations: READ,
     },
     async ({ bookId, startDate, endDate, includeInactive }) => {
       const auth = await requireBookAuth(bookId);
@@ -120,6 +122,7 @@ export function registerReportTools(server: McpServer) {
           .default(2000)
           .describe("Max rows to return (default 2000, max 5000)"),
       },
+      annotations: READ,
     },
     async ({ bookId, startDate, endDate, accountTypes, accountIds, limit }) => {
       const auth = await requireBookAuth(bookId);
@@ -194,6 +197,7 @@ export function registerReportTools(server: McpServer) {
           .default(200)
           .describe("Max entries to return (default 200, max 1000)"),
       },
+      annotations: READ,
     },
     async ({ bookId, accountId, startDate, endDate, limit }) => {
       const auth = await requireBookAuth(bookId);

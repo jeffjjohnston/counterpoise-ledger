@@ -21,7 +21,8 @@ const UPCOMING_DAYS_MESSAGE = "upcomingDays must be an integer between 1 and 365
 const bookNameSchema = z
   .string({ error: BOOK_NAME_REQUIRED_MESSAGE })
   .trim()
-  .min(1, BOOK_NAME_REQUIRED_MESSAGE);
+  .min(1, BOOK_NAME_REQUIRED_MESSAGE)
+  .describe("The book's name, shown in the book switcher and page titles.");
 
 // Both routes' top-level `z.object(...)` also take `{ error:
 // BOOK_NAME_REQUIRED_MESSAGE }`. The original routes destructure `name`
@@ -64,7 +65,11 @@ export const updateBookSchema = z.object(
       .int(UPCOMING_DAYS_MESSAGE)
       .min(1, UPCOMING_DAYS_MESSAGE)
       .max(365, UPCOMING_DAYS_MESSAGE)
-      .optional(),
+      .optional()
+      .describe(
+        "How many days ahead recurring transactions are projected on the dashboard " +
+          "(integer, 1-365). Omit to leave it unchanged."
+      ),
   },
   { error: BOOK_NAME_REQUIRED_MESSAGE }
 );

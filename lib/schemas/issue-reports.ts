@@ -64,9 +64,15 @@ export const createIssueReportSchema = z.object(
     description: z
       .string({ error: DESCRIPTION_REQUIRED_MESSAGE })
       .trim()
-      .min(1, DESCRIPTION_REQUIRED_MESSAGE),
-    page: z.string({ error: PAGE_REQUIRED_MESSAGE }).min(1, PAGE_REQUIRED_MESSAGE),
-    type: issueReportTypeSchema.default("bug"),
+      .min(1, DESCRIPTION_REQUIRED_MESSAGE)
+      .describe("What went wrong or what should improve, in the reporter's own words."),
+    page: z
+      .string({ error: PAGE_REQUIRED_MESSAGE })
+      .min(1, PAGE_REQUIRED_MESSAGE)
+      .describe("The app path the report is about, e.g. /b/1/transactions."),
+    type: issueReportTypeSchema
+      .default("bug")
+      .describe("The kind of report: bug, improvement, or other. Defaults to bug."),
   },
   { error: DESCRIPTION_REQUIRED_MESSAGE }
 );
@@ -96,7 +102,10 @@ export type CreateIssueReportInput = z.infer<typeof createIssueReportSchema>;
 // the original, where each field's own guard already returned before the
 // trailing `Object.keys(updates).length === 0` check was ever reached.
 const DESCRIPTION_EMPTY_MESSAGE = "Description cannot be empty"; // issue-reports/[id]/route.ts:35
-const NO_FIELDS_MESSAGE = "No valid fields to update"; // issue-reports/[id]/route.ts:64
+// Exported: lib/issue-reports.ts's updateIssueReport() re-checks this same
+// rule and must report it with the identical text — see the comment there
+// for why the check is duplicated instead of relied on once.
+export const NO_FIELDS_MESSAGE = "No valid fields to update"; // issue-reports/[id]/route.ts:64
 
 // The top-level `z.object(...)` also takes `{ error: NO_FIELDS_MESSAGE }`.
 // The original route reads `body.description`/`body.status`/`body.type`
@@ -114,9 +123,14 @@ export const updateIssueReportSchema = z
         .string({ error: DESCRIPTION_EMPTY_MESSAGE })
         .trim()
         .min(1, DESCRIPTION_EMPTY_MESSAGE)
-        .optional(),
-      status: issueReportStatusSchema.optional(),
-      type: issueReportTypeSchema.optional(),
+        .optional()
+        .describe("New description. Omit to leave it unchanged."),
+      status: issueReportStatusSchema
+        .optional()
+        .describe("New status: new, resolved, or wontfix. Omit to leave it unchanged."),
+      type: issueReportTypeSchema
+        .optional()
+        .describe("New type: bug, improvement, or other. Omit to leave it unchanged."),
     },
     { error: NO_FIELDS_MESSAGE }
   )

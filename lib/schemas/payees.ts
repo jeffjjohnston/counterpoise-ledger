@@ -52,7 +52,15 @@ const NAME_REQUIRED_MESSAGE = "Name is required"; // payees/route.ts:71,76
 // lib/schemas/auth.ts's loginSchema.
 export const createPayeeSchema = z.object(
   {
-    name: z.string({ error: NAME_REQUIRED_MESSAGE }).trim().min(1, NAME_REQUIRED_MESSAGE),
+    name: z
+      .string({ error: NAME_REQUIRED_MESSAGE })
+      .trim()
+      .min(1, NAME_REQUIRED_MESSAGE)
+      .describe(
+        "The payee's name. Normalized on save: whitespace runs collapse to one space and " +
+          "curly quotes straighten to '. Case is NOT changed — \"IKEA\" and \"Ikea\" stay two " +
+          "different payees."
+      ),
   },
   { error: NAME_REQUIRED_MESSAGE }
 );

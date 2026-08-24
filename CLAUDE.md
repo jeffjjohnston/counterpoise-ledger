@@ -351,11 +351,37 @@ User authentication:
 Shared transaction logic (used by both API routes and MCP tools):
 - `createTransaction(db, bookId, input)` - Creates a transaction with splits and optional investment splits
 - `updateTransaction(db, bookId, transactionId, input)` - Updates fields and/or replaces splits
+- `deleteTransaction(db, bookId, transactionId)` - Deletes a transaction, its splits, and its investment splits
 - `TransactionValidationError` - Invalid input (splits don't balance, etc.)
 - `TransactionNotFoundError` - Transaction ID doesn't exist in the book
 
+### `/lib/accounts.ts`
+Shared account logic (used by both API routes and MCP tools):
+- `getAccountsWithBalances(db, bookId, opts?)` - Accounts with computed balances
+- `createAccount(db, bookId, input)` - Creates an account; an `investment` subtype also gets its paired cash sub-account
+- `updateAccount(db, bookId, accountId, input)` - Updates an account's fields
+- `deleteAccount(db, bookId, accountId)` - Deletes an account; refuses when it still has transactions or children
+- `ensureInvestmentCashAccount()`, `isInvestmentAccount()` - Investment cash pairing helpers
+- `AccountValidationError`, `AccountNotFoundError` - Error classes both surfaces map to their own status codes
+
+### `/lib/books.ts`
+Shared book logic (used by both API routes and MCP tools):
+- `createBook(db, userId, input)`, `updateBook(db, userId, bookId, input)` — note `name` is required on update; resend the current name to change only `upcomingDays`
+- `deleteBook(db, userId, bookId, confirmBookName)` - Deletes a book and, by FK cascade, its whole ledger. `confirmBookName` must match the stored name **exactly** — this guard is the only thing standing between MCP and an entire book, and the design doc's decision 3 records why it exists. Do not relax the comparison
+- `createDemoBook(db, userId)` - Creates a book and fills it with the `db/seed.ts` sample dataset. The only caller allowed to reach `seedBook`, and it always passes the id of the book it just created — `seedBook` deletes the target book's rows first, so a caller-supplied id would be a data-loss bug
+- `BookValidationError`, `BookNotFoundError` - Error classes
+
+### `/lib/issue-reports.ts`
+Shared issue-report logic (used by both API routes and MCP tools). These are scoped to `userId`, not `bookId`:
+- `createIssueReport()`, `listIssueReports()`, `updateIssueReport()`, `deleteIssueReport()`
+- `IssueReportValidationError`, `IssueReportNotFoundError` - Error classes
+
 ### Other lib files
-- `/lib/payees.ts` - `normalizePayeeName()` for deduplication
+- `/lib/payees.ts` - Payee reads and writes shared by API routes and MCP tools:
+  - `normalizePayeeName()` for deduplication (trims, collapses whitespace runs, straightens curly quotes; does **not** lowercase)
+  - `listPayees(db, bookId, {search, limit})`, `getPayee()`, `getPayeeLastAccountId()`, `getPayeeDetail()` — the reads behind `GET /payees`, `GET /payees/[id]`, `GET /payees/[id]/last-account` and the `list_payees`/`get_payee` tools. `getPayeeDetail()` is `getPayee` + `getPayeeLastAccountId`, which is why MCP folds the last-account route into `get_payee`
+  - `createPayee()`, `deletePayee()` — writes; `deletePayee` refuses a payee that still has transactions
+  - `PayeeValidationError`, `PayeeNotFoundError` - Error classes
 - `/lib/pricing.ts` - Security price data handling
 - `/lib/securities.ts` - Security validation (`SecurityValidationError`, `SecurityDuplicateError`) shared by API and MCP
 - `/lib/expression.ts` - `evaluateExpression()` parser for amount inputs (supports `+`, `-`, `*`, `/`, parens — e.g., user can type `12.50 + 3` in an amount field)
@@ -364,7 +390,7 @@ Shared transaction logic (used by both API routes and MCP tools):
 - `/lib/plaid.ts` - Plaid API client (link tokens, access tokens, transaction sync fetch)
 - `/lib/plaid-sync.ts` - `syncToken()` — fetches Plaid transactions, stages in reconciliation table, runs auto-match
 - `/lib/plaid-auto-match.ts` - `autoMatchPendingTransactions()` — learned payee-based auto-matching
-- `/lib/recurring.ts`, `/lib/recurring-processing.ts` - Recurring transaction logic
+- `/lib/recurring.ts`, `/lib/recurring-processing.ts`, `/lib/recurring-rules.ts` - Recurring transaction logic
 - `/lib/reports.ts` - Financial report logic (`groupSplits()`, `computeGrandTotal()`, `buildTopParentMap()`)
 - `/lib/utils.ts` - `cn()` utility for Tailwind class merging
 
@@ -724,6 +750,40 @@ payees. The importer has its own copy, `normalizeName()` in
 `scripts/import-moneydance/utils/format.ts`, which must stay behaviorally
 identical or an import creates duplicates of payees the app already has.
 
+### Modules Reachable From a Route or an MCP Tool Must Not Run Code at Import
+
+Anything an API route or an `mcp/tools/*` module imports — directly or through
+a chain — must contain **declarations only** at the top level. No CLI guard, no
+`await`, no I/O.
+
+The reason is the bundler, not the module system. `scripts/bundle-node-entrypoints.mjs`
+esbuild-bundles `mcp/server.ts` into the single `/app/mcp-server.mjs` that the
+Docker MCP client runs. Once a module is inlined there, `import.meta.url` is the
+**bundle's** URL, so the standard main-module guard
+
+```ts
+const isMainModule =
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+```
+
+evaluates **true** under `node /app/mcp-server.mjs` and runs whatever it guards.
+
+This shipped once. `lib/books.ts` imported `seedBook` from `db/seed.ts` for the
+demo-book feature, which pulled `db/seed.ts`'s CLI guard into the bundle, where
+it would have run `DROP SCHEMA public CASCADE` against the production database
+on the first MCP connection after deploy. `db/seed.ts` is now declarations only
+and its CLI lives in `db/seed-cli.ts`.
+
+Every ordinary gate is blind to this: `npm run mcp:dev` is `npx tsx mcp/server.ts`,
+where the imported module is separate and `argv[1]` is the server, so the guard
+is false — and vitest, `tsc` and ESLint never build the artifact at all.
+`tests/mcp/bundle-safety.test.ts` is the only check that does; it builds both
+bundle targets with the real config and asserts the output carries no
+`DROP SCHEMA` and no main-module guard. **Extracting code into `lib/` reads like
+a pure refactor, which is exactly why nobody looks** — check a module's
+top-level statements before making it reachable from a route or a tool.
+
 ## Database Management
 
 ### Schema Location
@@ -795,6 +855,7 @@ test isolation. The dev credential cannot move. Production moved instead.
 - `businessDaysOnly` (default false) shifts an occurrence that lands on a weekend to the following Monday — see Business-Day Occurrences below
 - Process via POST to `/api/b/[bookId]/recurring/process`
 - Cron endpoint at `/api/cron/recurring` runs hourly (via Docker `scheduler` sidecar; same sidecar runs Plaid sync — see below)
+- `/lib/recurring-rules.ts` is the single home for rule CRUD and projections, shared by the API routes and the MCP recurring tools
 
 ### Processing Due Rules
 1. Check if the *observed* date (`getOccurrenceDate(nextDate, businessDaysOnly)`) is `<= today` (plus `autoCreateDaysBefore`)
@@ -875,7 +936,7 @@ Auto-match runs automatically after every sync (both manual and cron). It uses a
 - **Pending rows**: Modified pending rows are simply updated in place
 
 ### Transaction Unlink
-- DELETE `/api/b/[bookId]/transactions/[id]/plaid/unlink` — Removes the Plaid link from a matched transaction (sets reconciliation back to `pending`, clears `isReconciled`)
+- POST `/api/b/[bookId]/transactions/[id]/plaid/unlink` — Removes the Plaid link from a matched transaction (sets reconciliation back to `pending`, clears `isReconciled`)
 
 ### Environment Variables
 | Variable | Purpose |
@@ -959,7 +1020,7 @@ Instrumented server events:
 | `sync_transaction_created` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
 | `sync_transaction_ignored` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
 | `sync_transaction_kept_local` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
-| `sync_transaction_unlinked` | DELETE `/api/b/[bookId]/transactions/[id]/plaid/unlink` | `bookId` |
+| `sync_transaction_unlinked` | POST `/api/b/[bookId]/transactions/[id]/plaid/unlink` | `bookId` |
 | `sync_transaction_amount_updated` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
 | `sync_transaction_auto_matched` | `autoMatchPendingTransactions()` in `/lib/plaid-auto-match.ts` (one per match, attributed to the book owner) | `bookId` |
 
@@ -1051,18 +1112,41 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 
 ### Available Tools
 
-**Discovery:**
+**Books:**
 - `list_books` — List books the authenticated user owns
+- `create_book` — Create a new accounting book
+- `update_book` — Rename a book, and optionally change its recurring-transaction projection window. `name` is always required; resend the current name to leave it unchanged
+- `create_demo_book` — Create a new book pre-filled with realistic sample data (about three years of transactions)
+- `delete_book` — Permanently delete a book and all of its data; requires `confirmBookName` to match the book's exact name
 
 **Accounts** (require `bookId`):
 - `list_accounts` — List accounts with balances, filterable by type and as-of date
 - `get_account_tree` — Hierarchical account tree grouped by type
+- `create_account` — Create an account in the chart of accounts
+- `update_account` — Update an account's fields
+- `delete_account` — Delete an account; refuses if it still has transactions or sub-accounts
 
 **Transactions** (require `bookId`):
 - `list_transactions` — List transactions with splits, payees, and investment data; filterable by account, date, with pagination
 - `search` — Search accounts, payees, and transactions by text or amount
 - `create_transaction` — Create a double-entry transaction with splits (must sum to zero)
 - `update_transaction` — Update an existing transaction's fields or replace splits
+- `delete_transaction` — Delete a transaction and all of its splits
+
+**Payees** (require `bookId`):
+- `list_payees` — List payees with transaction count and most recent transaction date; optional `search` (case-insensitive substring) and `limit`
+- `get_payee` — Get one payee, with its transaction count and last-used account
+- `create_payee` — Create a payee; refuses an exact-name repeat in the same book
+- `delete_payee` — Delete a payee; refuses if it still has transactions
+
+**Recurring** (require `bookId`):
+- `list_recurring_rules` — List recurring transaction rules with their payees and template splits
+- `create_recurring_rule` — Create a recurring transaction rule; template splits must sum to zero
+- `update_recurring_rule` — Update a rule; passing `templateSplits` replaces every existing split
+- `delete_recurring_rule` — Delete a rule and its template splits; transactions it already created are kept
+- `get_projected_transactions` — Project the transactions active rules will create over a date range, without creating anything
+- `list_recurring_transactions` — List transactions a recurring rule actually created in a date range
+- `process_recurring_rules` — Create the transactions rules are due for. With `processAll`, a rule that is not due is skipped, so a repeat call creates nothing more. With `ruleId`, that one rule is forced: its next occurrence is created whether or not it is due, so two identical calls create two transactions
 
 **Reports** (require `bookId`):
 - `get_income_statement` — Income/expense totals for a date range
@@ -1075,12 +1159,21 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 - `get_security_detail` — Security info, price history, transactions, and position
 - `create_security` — Create a new security (ETF, mutual fund, or stock); fails if the symbol already exists in the book
 
+**Issue Reports:**
+- `create_issue_report` — File a bug or improvement report about Counterpoise itself
+- `list_issue_reports` — List the authenticated user's own issue reports
+- `update_issue_report` — Change the description, type, or status of an issue report
+- `delete_issue_report` — Delete an issue report
+
+**System:**
+- `get_system_status` — Report the health of Counterpoise's background jobs (backup, backup pruning, recurring processing, bank sync, security price sync, search reindex)
+
 **Analytics:**
 - `analyze_usage` — Query PostHog for event summaries (requires PostHog env vars)
 
 ### Shared Transaction Logic
 
-`/lib/transactions.ts` contains `createTransaction()` and `updateTransaction()` shared by both API routes and MCP tools. Error classes:
+`/lib/transactions.ts` contains `createTransaction()`, `updateTransaction()`, and `deleteTransaction()` shared by both API routes and MCP tools. Error classes:
 - `TransactionValidationError` — invalid input (splits don't balance, missing fields)
 - `TransactionNotFoundError` — transaction ID doesn't exist in the book
 
@@ -1111,6 +1204,7 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 | `/lib/auth.ts` | Password hashing and verification |
 | `/lib/session.ts` | Session management |
 | `/lib/transactions.ts` | Shared create/update transaction logic (used by API routes and MCP) |
+| `/lib/recurring-rules.ts` | Shared recurring-rule reads and writes (used by API routes and MCP) |
 | `/lib/advisory-lock.ts` | `withAdvisoryLock()` — session-scoped lock on a reserved connection; its callback's `db` is not the pooled one |
 | `/lib/plaid-sync.ts` | Plaid transaction sync — fetches, stages, and auto-matches |
 | `/lib/plaid-auto-match.ts` | Learned payee-based auto-matching for Plaid transactions |
@@ -1127,8 +1221,12 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 | `/scripts/import-moneydance/index.ts` | Import orchestration |
 | `/scripts/posthog-export.ts` | CLI tool for exporting PostHog events |
 | `/mcp/auth.ts` | MCP API key authentication and book access verification |
-| `/mcp/server.ts` | MCP server entry point and tool registration |
+| `/mcp/server.ts` | MCP server entry point (connects the transport, registers no tools itself) |
+| `/mcp/register-all.ts` | `registerAllTools()` — the single place every `register*Tools` module is wired in |
 | `/scripts/bundle-node-entrypoints.mjs` | Bundles the MCP server and lot rebuild script into `dist/` for the Docker image |
+| `/scripts/bundle-config.mjs` | The esbuild options both the bundler and `tests/mcp/bundle-safety.test.ts` build with — shared so the test cannot check a different artifact than Docker ships |
+| `/db/seed.ts` | Sample dataset builders. **Declarations only — no top-level side effects.** Application code imports it (`lib/books.ts` → demo route + `create_demo_book`), so anything running at import time gets bundled into `/app/mcp-server.mjs` and runs on MCP startup |
+| `/db/seed-cli.ts` | CLI entry for `npm run db:seed`. Holds the main-module guard that used to live in `db/seed.ts`, where — once bundled — it matched `node /app/mcp-server.mjs` and dropped the production schemas on every MCP server start |
 | `/mcp/tools/usage.ts` | MCP tool for querying PostHog analytics |
 
 ## Debugging Tips

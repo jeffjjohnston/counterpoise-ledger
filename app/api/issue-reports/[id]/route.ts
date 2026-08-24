@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/db";
-import { issueReports } from "@/db/schema";
 import { getSession } from "@/lib/session";
-import { eq, and } from "drizzle-orm";
 import { updateIssueReportSchema } from "@/lib/schemas/issue-reports";
+import { updateIssueReport, deleteIssueReport, IssueReportNotFoundError } from "@/lib/issue-reports";
 
 export async function PUT(
   request: Request,
@@ -28,33 +27,19 @@ export async function PUT(
     if (!parsed.success) {
       return NextResponse.json({ error: parsed.error.issues[0].message }, { status: 400 });
     }
-    const { description, status, type } = parsed.data;
 
-    const updates: Record<string, unknown> = {};
-    if (description !== undefined) updates.description = description;
-    if (status !== undefined) updates.status = status;
-    if (type !== undefined) updates.type = type;
-
-    const db = getDb();
-    const [updated] = await db
-      .update(issueReports)
-      .set(updates)
-      .where(
-        and(
-          eq(issueReports.id, reportId),
-          eq(issueReports.userId, session.userId)
-        )
-      )
-      .returning();
-
-    if (!updated) {
-      return NextResponse.json(
-        { error: "Issue report not found" },
-        { status: 404 }
-      );
+    try {
+      const updated = await updateIssueReport(getDb(), session.userId, reportId, parsed.data);
+      return NextResponse.json(updated);
+    } catch (error) {
+      if (error instanceof IssueReportNotFoundError) {
+        return NextResponse.json(
+          { error: "Issue report not found" },
+          { status: 404 }
+        );
+      }
+      throw error;
     }
-
-    return NextResponse.json(updated);
   } catch (error) {
     console.error("Error updating issue report:", error);
     return NextResponse.json(
@@ -83,25 +68,18 @@ export async function DELETE(
       return NextResponse.json({ error: "Invalid ID" }, { status: 400 });
     }
 
-    const db = getDb();
-    const [deleted] = await db
-      .delete(issueReports)
-      .where(
-        and(
-          eq(issueReports.id, reportId),
-          eq(issueReports.userId, session.userId)
-        )
-      )
-      .returning();
-
-    if (!deleted) {
-      return NextResponse.json(
-        { error: "Issue report not found" },
-        { status: 404 }
-      );
+    try {
+      await deleteIssueReport(getDb(), session.userId, reportId);
+      return NextResponse.json({ success: true });
+    } catch (error) {
+      if (error instanceof IssueReportNotFoundError) {
+        return NextResponse.json(
+          { error: "Issue report not found" },
+          { status: 404 }
+        );
+      }
+      throw error;
     }
-
-    return NextResponse.json({ success: true });
   } catch (error) {
     console.error("Error deleting issue report:", error);
     return NextResponse.json(

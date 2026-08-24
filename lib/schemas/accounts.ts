@@ -52,13 +52,39 @@ export const createAccountSchema = z.object(
     // missing key and an empty string identically. `error` on z.string()
     // covers the "missing/wrong type" issue; `.min(1, ...)` covers "present
     // but empty" — both need the same message to reproduce that behavior.
-    name: z.string({ error: "Name and type are required" }).min(1, "Name and type are required"),
-    type: z.enum(accountTypeValues, {
-      error: "Invalid account type",
-    }),
-    subtype: accountSubtypeSchema.nullish(),
-    parentId: z.number().int().positive().nullish(),
-    icon: accountIconSchema.optional(),
+    name: z
+      .string({ error: "Name and type are required" })
+      .min(1, "Name and type are required")
+      .describe("Account name, as it will appear in the chart of accounts."),
+    type: z
+      .enum(accountTypeValues, {
+        error: "Invalid account type",
+      })
+      .describe(
+        "Account type: asset, liability, equity, income, or expense. You cannot change this after creation."
+      ),
+    subtype: accountSubtypeSchema
+      .nullish()
+      .describe(
+        "Account subtype: bank, credit_card, loan, investment, cash, or other. Set to " +
+          "'investment' to also create a paired cash sub-account automatically."
+      ),
+    parentId: z
+      .number()
+      .int()
+      .positive()
+      .nullish()
+      .describe(
+        "ID of the parent account, to nest this account under it. Omit for a top-level " +
+          "account. Use get_account_tree to find a parentId."
+      ),
+    icon: accountIconSchema
+      .optional()
+      .describe(
+        "A single emoji to show for this account. Only income and expense accounts show " +
+          "an icon. Send null to inherit the icon from the parent account instead of " +
+          "setting one directly."
+      ),
   },
   { error: "Name and type are required" }
 );
@@ -68,12 +94,34 @@ export type CreateAccountInput = z.infer<typeof createAccountSchema>;
 // PUT /api/b/[bookId]/accounts/[id] never accepts `type` — an account's type
 // cannot be changed after creation, so there is no `type` field here.
 export const updateAccountSchema = z.object({
-  name: z.string().optional(),
-  subtype: accountSubtypeSchema.nullish(),
-  parentId: z.number().int().positive().nullish(),
-  isActive: z.boolean().optional(),
-  isFavorite: z.boolean().optional(),
-  icon: accountIconSchema.optional(),
+  name: z.string().optional().describe("New account name."),
+  subtype: accountSubtypeSchema
+    .nullish()
+    .describe("New account subtype: bank, credit_card, loan, investment, cash, or other."),
+  parentId: z
+    .number()
+    .int()
+    .positive()
+    .nullish()
+    .describe(
+      "New parent account ID, to move this account under it. Send null to make it a " +
+        "top-level account."
+    ),
+  isActive: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set to false to deactivate the account, or true to reactivate it. For an " +
+        "investment account, this also updates its paired cash sub-account."
+    ),
+  isFavorite: z.boolean().optional().describe("Set to true to mark the account as a favorite."),
+  icon: accountIconSchema
+    .optional()
+    .describe(
+      "A single emoji to show for this account. Only income and expense accounts show " +
+        "an icon. Send null to inherit the icon from the parent account instead of " +
+        "setting one directly."
+    ),
 });
 
 export type UpdateAccountInput = z.infer<typeof updateAccountSchema>;

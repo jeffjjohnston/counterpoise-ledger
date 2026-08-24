@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v4";
 import { requireAuth } from "@/mcp/auth";
+import { READ_NETWORK } from "@/mcp/tools/_annotations";
 import {
   escapeHogQLString,
   parsePropertiesColumn,
@@ -8,12 +9,17 @@ import {
 } from "@/lib/posthog-query";
 
 export function registerUsageTools(server: McpServer) {
-  server.tool(
+  server.registerTool(
     "analyze_usage",
-    "Query PostHog for usage analytics — event counts, top pages, session summaries. Use to understand how the app is being used and identify usability issues.",
     {
-      days: z.number().min(1).max(90).default(7).describe("Number of days to look back"),
-      eventType: z.string().optional().describe("Filter to specific event type (e.g., 'transaction_created', '$pageview')"),
+      title: "Analyze Usage",
+      description:
+        "Query PostHog for usage analytics — event counts, top pages, session summaries. Use to understand how the app is being used and identify usability issues.",
+      inputSchema: {
+        days: z.number().min(1).max(90).default(7).describe("Number of days to look back"),
+        eventType: z.string().optional().describe("Filter to specific event type (e.g., 'transaction_created', '$pageview')"),
+      },
+      annotations: READ_NETWORK,
     },
     async ({ days, eventType }) => {
       const auth = await requireAuth();

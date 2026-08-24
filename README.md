@@ -95,7 +95,7 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 
 ## Prerequisites
 
-- Node.js 22+
+- Node.js 24+
 - npm
 - Docker (for PostgreSQL)
 

@@ -13,6 +13,7 @@ import {
 import { effectiveDateSql } from "@/lib/accounting";
 import { searchBook } from "@/lib/search";
 import { requireBookAuth } from "@/mcp/auth";
+import { READ } from "@/mcp/tools/_annotations";
 
 export function registerTransactionTools(server: McpServer) {
   server.registerTool(
@@ -61,6 +62,7 @@ export function registerTransactionTools(server: McpServer) {
           .default(0)
           .describe("Pagination offset"),
       },
+      annotations: READ,
     },
     async ({ bookId, accountId, payeeId, startDate, endDate, limit, offset }) => {
       const auth = await requireBookAuth(bookId);
@@ -224,6 +226,7 @@ export function registerTransactionTools(server: McpServer) {
           .optional()
           .describe("Limit transaction search end date (YYYY-MM-DD)"),
       },
+      annotations: READ,
     },
     async ({ bookId, query, startDate, endDate }) => {
       const auth = await requireBookAuth(bookId);

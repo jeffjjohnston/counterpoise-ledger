@@ -1,10 +1,9 @@
 import { NextResponse } from "next/server";
-import { eq, desc } from "drizzle-orm";
 import { getDb } from "@/db";
-import { issueReports } from "@/db/schema";
 import { getSession } from "@/lib/session";
 import { captureEvent } from "@/lib/posthog-server";
 import { createIssueReportSchema } from "@/lib/schemas/issue-reports";
+import { createIssueReport, listIssueReports } from "@/lib/issue-reports";
 
 export async function GET() {
   try {
@@ -16,12 +15,7 @@ export async function GET() {
       );
     }
 
-    const db = getDb();
-    const reports = await db
-      .select()
-      .from(issueReports)
-      .where(eq(issueReports.userId, session.userId))
-      .orderBy(desc(issueReports.createdAt));
+    const reports = await listIssueReports(getDb(), session.userId);
 
     return NextResponse.json(reports);
   } catch (error) {
@@ -47,18 +41,9 @@ export async function POST(request: Request) {
     if (!parsed.success) {
       return NextResponse.json({ error: parsed.error.issues[0].message }, { status: 400 });
     }
-    const { description, type, page } = parsed.data;
+    const { type, page } = parsed.data;
 
-    const db = getDb();
-    const [report] = await db
-      .insert(issueReports)
-      .values({
-        userId: session.userId,
-        description,
-        type,
-        page,
-      })
-      .returning();
+    const report = await createIssueReport(getDb(), session.userId, parsed.data);
 
     captureEvent(session.userId, "issue_report_created", {
       type,

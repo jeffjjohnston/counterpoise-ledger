@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { authenticateBookRequest, isError } from "@/lib/api-auth";
-import { transactions, recurringRules } from "@/db/schema";
-import { eq, and, gte, lte, isNotNull } from "drizzle-orm";
-import { effectiveDateSql } from "@/lib/accounting";
+import { listRecurringTransactions } from "@/lib/recurring-rules";
 import { recurringTransactionsQuery } from "@/lib/schemas/recurring";
 
 export async function GET(
@@ -25,26 +23,7 @@ export async function GET(
     if (isError(auth)) return auth.error;
     const { db, bookId: numericBookId } = auth;
 
-    const results = await db
-      .select({
-        transactionId: transactions.id,
-        date: effectiveDateSql.as("date"),
-        recurringRuleId: transactions.recurringRuleId,
-        ruleName: recurringRules.name,
-      })
-      .from(transactions)
-      .innerJoin(
-        recurringRules,
-        eq(transactions.recurringRuleId, recurringRules.id)
-      )
-      .where(
-        and(
-          eq(transactions.bookId, numericBookId),
-          isNotNull(transactions.recurringRuleId),
-          gte(effectiveDateSql, startDate),
-          lte(effectiveDateSql, endDate)
-        )
-      );
+    const results = await listRecurringTransactions(db, numericBookId, { startDate, endDate });
 
     return NextResponse.json(results);
   } catch (error) {

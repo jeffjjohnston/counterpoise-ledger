@@ -76,6 +76,9 @@ tmp/
 
 # git worktrees
 .worktrees/
+# CLAUDE.md documents this as the worktree home and vitest.config.ts
+# excludes it; nothing ignored it.
+.claude/worktrees/
 
 # Local-only maintainer configuration. Keep this file untracked. Tracking it
 # would put its contents into every archive built from this repository.

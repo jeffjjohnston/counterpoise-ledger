@@ -1,9 +1,20 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v4";
 import { getDb } from "@/db";
-import { getAccountsWithBalances } from "@/lib/accounts";
+import {
+  getAccountsWithBalances,
+  createAccount,
+  updateAccount,
+  deleteAccount,
+  AccountValidationError,
+  AccountNotFoundError,
+} from "@/lib/accounts";
 import { getDisplayBalance, buildAccountTree } from "@/lib/accounting";
 import { requireBookAuth } from "@/mcp/auth";
+import { CREATE, DESTRUCTIVE, READ, UPDATE } from "@/mcp/tools/_annotations";
+import { fail, ok } from "@/mcp/tools/_result";
+import { toolShape } from "@/mcp/tools/_tool-shape";
+import { createAccountSchema, updateAccountSchema } from "@/lib/schemas/accounts";
 import type { AccountWithBalance } from "@/types";
 
 function formatCurrencyString(cents: number): string {
@@ -36,6 +47,7 @@ export function registerAccountTools(server: McpServer) {
           .optional()
           .describe("Compute balances as of this date (YYYY-MM-DD)"),
       },
+      annotations: READ,
     },
     async ({ bookId, type, includeInactive, asOfDate }) => {
       const auth = await requireBookAuth(bookId);
@@ -64,14 +76,7 @@ export function registerAccountTools(server: McpServer) {
         };
       });
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
+      return ok(result);
     }
   );
 
@@ -84,6 +89,7 @@ export function registerAccountTools(server: McpServer) {
       inputSchema: {
         bookId: z.number().int().positive().describe("The book ID to query"),
       },
+      annotations: READ,
     },
     async ({ bookId }) => {
       const auth = await requireBookAuth(bookId);
@@ -113,14 +119,89 @@ export function registerAccountTools(server: McpServer) {
         treeByType[acctType] = buildAccountTree(accts);
       }
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(treeByType, null, 2),
-          },
-        ],
-      };
+      return ok(treeByType);
+    }
+  );
+
+  server.registerTool(
+    "create_account",
+    {
+      title: "Create Account",
+      description:
+        "Create an account in the chart of accounts. Creating an account with subtype 'investment' " +
+        "also creates its paired cash sub-account automatically. Use get_account_tree to find a parentId.",
+      inputSchema: {
+        bookId: z.number().int().positive().describe("The book ID"),
+        ...toolShape(createAccountSchema),
+      },
+      annotations: CREATE,
+    },
+    async ({ bookId, ...input }) => {
+      const auth = await requireBookAuth(bookId);
+      if ("isError" in auth) return auth;
+      try {
+        return ok(await createAccount(getDb(), bookId, input));
+      } catch (error) {
+        if (error instanceof AccountValidationError) return fail(error.message);
+        throw error;
+      }
+    }
+  );
+
+  server.registerTool(
+    "update_account",
+    {
+      title: "Update Account",
+      description:
+        "Update an account's fields. All fields are optional — only provided fields are changed. " +
+        "Use list_accounts or get_account_tree to find an accountId.",
+      inputSchema: {
+        bookId: z.number().int().positive().describe("The book ID"),
+        accountId: z.number().int().positive().describe("The account ID to update"),
+        ...toolShape(updateAccountSchema),
+      },
+      annotations: UPDATE,
+    },
+    async ({ bookId, accountId, ...input }) => {
+      const auth = await requireBookAuth(bookId);
+      if ("isError" in auth) return auth;
+      try {
+        return ok(await updateAccount(getDb(), bookId, accountId, input));
+      } catch (error) {
+        if (error instanceof AccountValidationError || error instanceof AccountNotFoundError) {
+          return fail(error.message);
+        }
+        throw error;
+      }
+    }
+  );
+
+  server.registerTool(
+    "delete_account",
+    {
+      title: "Delete Account",
+      description:
+        "Delete an account. Refuses to delete an account that still has transactions or " +
+        "sub-accounts — clear or reassign those first. This cannot be undone. " +
+        "Use list_accounts or get_account_tree to find an accountId.",
+      inputSchema: {
+        bookId: z.number().int().positive().describe("The book ID"),
+        accountId: z.number().int().positive().describe("The account ID to delete"),
+      },
+      annotations: DESTRUCTIVE,
+    },
+    async ({ bookId, accountId }) => {
+      const auth = await requireBookAuth(bookId);
+      if ("isError" in auth) return auth;
+      try {
+        await deleteAccount(getDb(), bookId, accountId);
+        return ok({ success: true, accountId });
+      } catch (error) {
+        if (error instanceof AccountValidationError || error instanceof AccountNotFoundError) {
+          return fail(error.message);
+        }
+        throw error;
+      }
     }
   );
 }

@@ -1,14 +1,14 @@
 import { NextResponse } from "next/server";
 import { authenticateBookRequest, isError } from "@/lib/api-auth";
-import { plaidTransactionReconciliation, transactions } from "@/db/schema";
-import { and, eq, isNull } from "drizzle-orm";
+import { transactions } from "@/db/schema";
+import { and, eq } from "drizzle-orm";
 import { captureEvent, diffTransactionFields } from "@/lib/posthog-server";
 import {
+  deleteTransaction,
   updateTransaction as updateTransactionShared,
   TransactionValidationError,
   TransactionNotFoundError,
 } from "@/lib/transactions";
-import { collectAffectedPairs, rebuildLotsForPairs } from "@/lib/lots-db";
 import { updateTransactionBodySchema } from "@/lib/schemas/transactions";
 
 export async function GET(
@@ -125,66 +125,13 @@ export async function DELETE(
 
     const transactionId = parseInt(id);
 
-    const result = await db.transaction(async (tx) => {
-      // Captured before the delete: the transaction's investment splits
-      // cascade away with it, so this is the last point their (account,
-      // security) pairs are still queryable.
-      const affectedPairs = await collectAffectedPairs(tx, numericBookId, transactionId);
-
-      // Explicit, not left to the FK. onDelete: "set null" clears the id but
-      // leaves resolution_status saying "matched" — that inconsistency is exactly
-      // what hides the row from the reconciliation queue forever.
-      await tx
-        .update(plaidTransactionReconciliation)
-        .set({
-          resolutionStatus: "pending",
-          matchedTransactionId: null,
-          resolvedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(plaidTransactionReconciliation.matchedTransactionId, transactionId),
-            eq(plaidTransactionReconciliation.bookId, numericBookId)
-          )
-        );
-
-      const deleted = await tx
-        .delete(transactions)
-        .where(and(eq(transactions.id, transactionId), eq(transactions.bookId, numericBookId)))
-        .returning();
-
-      // Sweep for a row stranded by a race with a concurrent auto-match: if
-      // auto-match claimed this row and set matchedTransactionId = transactionId
-      // in an uncommitted transaction, our reset above (scoped to that id) ran
-      // before the claim was visible and missed it. The delete above then
-      // blocked on the FK until auto-match committed, at which point
-      // ON DELETE SET NULL cleared the id but left resolutionStatus at
-      // "matched" — the same stranding the reset exists to prevent. Catch it
-      // here instead of narrowing the race further. Idempotent: normally
-      // matches nothing.
-      await tx
-        .update(plaidTransactionReconciliation)
-        .set({ resolutionStatus: "pending", resolvedAt: null, updatedAt: new Date() })
-        .where(
-          and(
-            eq(plaidTransactionReconciliation.bookId, numericBookId),
-            eq(plaidTransactionReconciliation.resolutionStatus, "matched"),
-            isNull(plaidTransactionReconciliation.matchedTransactionId)
-          )
-        );
-
-      // Lots are derived state: regenerate every pair this delete could affect.
-      await rebuildLotsForPairs(tx, numericBookId, affectedPairs);
-
-      return deleted;
-    });
-
-    if (result.length === 0) {
-      return NextResponse.json(
-        { error: "Transaction not found" },
-        { status: 404 }
-      );
+    try {
+      await deleteTransaction(db, numericBookId, transactionId);
+    } catch (error) {
+      if (error instanceof TransactionNotFoundError) {
+        return NextResponse.json({ error: "Transaction not found" }, { status: 404 });
+      }
+      throw error;
     }
 
     captureEvent(auth.userId, "transaction_deleted", { bookId: numericBookId });

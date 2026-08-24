@@ -83,13 +83,35 @@ const securityTypeSchema = z.enum(securityTypeValues, {
 // object-shape check would reject those same inputs with its generic
 // "Invalid input: expected object, ..." text instead. Same reasoning as
 // lib/schemas/auth.ts's loginSchema.
+//
+// The MCP create_security tool spreads this schema's .shape into its
+// inputSchema (mcp/tools/securities.ts), so each .describe() call here is
+// what the MCP client shows the model for that field — see the header
+// comment on lib/schemas/transactions.ts for why the two surfaces share one
+// schema. Wording is carried over verbatim from the tool's pre-drift,
+// hand-written inputSchema (git show fc93ea8:mcp/tools/securities.ts) except
+// for fixedPriceMicros, which the hand-written version never had a field for.
 export const createSecuritySchema = z.object(
   {
-    name: z.string({ error: NAME_REQUIRED_MESSAGE }).min(1, NAME_REQUIRED_MESSAGE),
-    symbol: z.string({ error: SYMBOL_REQUIRED_MESSAGE }).min(1, SYMBOL_REQUIRED_MESSAGE),
-    securityType: securityTypeSchema,
-    fetchPrices: z.boolean({ error: CREATE_FETCH_PRICES_MESSAGE }).optional(),
-    fixedPriceMicros: fixedPriceMicrosSchema,
+    name: z
+      .string({ error: NAME_REQUIRED_MESSAGE })
+      .min(1, NAME_REQUIRED_MESSAGE)
+      .describe("Display name of the security"),
+    symbol: z
+      .string({ error: SYMBOL_REQUIRED_MESSAGE })
+      .min(1, SYMBOL_REQUIRED_MESSAGE)
+      .describe("Ticker symbol (e.g. VTI, AAPL)"),
+    securityType: securityTypeSchema.describe("Type of security"),
+    fetchPrices: z
+      .boolean({ error: CREATE_FETCH_PRICES_MESSAGE })
+      .optional()
+      .describe("Whether to fetch prices automatically (defaults to true)"),
+    fixedPriceMicros: fixedPriceMicrosSchema.describe(
+      "Price in micros (1,000,000 = $1.00) that never moves, for a security " +
+        "such as a money market fund held at a fixed NAV. Setting this forces " +
+        "fetchPrices off, since a fixed price and automatic fetching would " +
+        "otherwise contradict each other."
+    ),
   },
   { error: NAME_REQUIRED_MESSAGE }
 );

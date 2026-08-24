@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
 import { authenticateBookRequest, isError } from "@/lib/api-auth";
-import { payees, transactions } from "@/db/schema";
-import { and, asc, eq, sql } from "drizzle-orm";
-import { normalizePayeeName } from "@/lib/payees";
-import { effectiveDateSql } from "@/lib/accounting";
+import { payees } from "@/db/schema";
+import { and, eq, sql } from "drizzle-orm";
+import { createPayee, listPayees, normalizePayeeName } from "@/lib/payees";
 import { createPayeeSchema, listPayeesQuery } from "@/lib/schemas/payees";
 
 export async function GET(
@@ -26,32 +25,7 @@ export async function GET(
     }
     const { search, limit } = parsedQuery.data;
 
-    const normalizedSearch = search ? normalizePayeeName(search) : "";
-    const bookFilter = eq(payees.bookId, numericBookId);
-    const whereClause = normalizedSearch
-      ? and(bookFilter, sql`lower(${payees.name}) like ${`%${normalizedSearch.toLowerCase()}%`}`)
-      : bookFilter;
-
-    const baseQuery = db
-      .select({
-        id: payees.id,
-        name: payees.name,
-        lastTransactionDate: sql<string | null>`max(${effectiveDateSql})`.as(
-          "lastTransactionDate"
-        ),
-        transactionCount: sql<number>`cast(count(${transactions.id}) as integer)`.as(
-          "transactionCount"
-        ),
-      })
-      .from(payees)
-      .leftJoin(transactions, eq(transactions.payeeId, payees.id))
-      .groupBy(payees.id)
-      .orderBy(asc(payees.name));
-
-    const filteredQuery = baseQuery.where(whereClause);
-    const payeeRows = limit ? await filteredQuery.limit(limit) : await filteredQuery;
-
-    return NextResponse.json(payeeRows);
+    return NextResponse.json(await listPayees(db, numericBookId, { search, limit }));
   } catch (error) {
     console.error("Error fetching payees:", error);
     return NextResponse.json({ error: "Failed to fetch payees" }, { status: 500 });
@@ -86,10 +60,7 @@ export async function POST(
       return NextResponse.json(existingPayee[0]);
     }
 
-    const [newPayee] = await db
-      .insert(payees)
-      .values({ name: normalizedName, bookId: numericBookId })
-      .returning();
+    const newPayee = await createPayee(db, numericBookId, { name: normalizedName });
 
     return NextResponse.json(newPayee);
   } catch (error) {

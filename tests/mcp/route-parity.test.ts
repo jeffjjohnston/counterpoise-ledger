@@ -94,26 +94,18 @@ describe("MCP route parity", () => {
     expect(empty).toEqual([]);
   });
 
-  // The realistic Plan 2-6 mistake: add the ROUTE_TOOLS entry for a route and
-  // forget to delete its pending-plan-N waiver. The route then looks both
-  // covered and waived, and the pending checklist under-reports silently.
+  // During Plans 2-6, the realistic mistake was adding the ROUTE_TOOLS entry
+  // for a route and forgetting to delete its pending-plan-N waiver: the route
+  // then looked both covered and waived, and the pending checklist
+  // under-reported silently. That waiver mechanism is gone (see
+  // route-coverage.ts), but the same mistake is possible with any waiver —
+  // this guard is what catches a route left mapped and waived at once.
   it("maps and waives disjoint sets of routes", () => {
     const both = Object.keys(ROUTE_TOOLS).filter((key) => key in ROUTE_WAIVERS);
     expect(
       both,
       "These routes are in both ROUTE_TOOLS and ROUTE_WAIVERS. Delete the stale waiver."
     ).toEqual([]);
-  });
-
-  // A typo like "pending-plan2" (missing the hyphen) would create a waiver
-  // that reads as permanent forever, since nothing would ever match it to
-  // delete it in the right plan.
-  it("gives every pending waiver a well-formed plan reference", () => {
-    const PENDING_PLAN_RE = /^pending-plan-[2-6]\b/;
-    const malformed = Object.entries(ROUTE_WAIVERS)
-      .filter(([, reason]) => reason.startsWith("pending") && !PENDING_PLAN_RE.test(reason))
-      .map(([key]) => key);
-    expect(malformed).toEqual([]);
   });
 
   // Guards against a stale TOOLS_WITHOUT_ROUTES entry — a name left behind

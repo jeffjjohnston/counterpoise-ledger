@@ -4,7 +4,16 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { Tool, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { registerAllTools } from "@/mcp/register-all";
-import { READ, READ_NETWORK, CREATE, UPDATE, DESTRUCTIVE } from "@/mcp/tools/_annotations";
+import {
+  READ,
+  READ_NETWORK,
+  CREATE,
+  UPDATE,
+  DESTRUCTIVE,
+  DESTRUCTIVE_NONIDEMPOTENT,
+  WRITE_NETWORK,
+} from "@/mcp/tools/_annotations";
+import * as annotationPresets from "@/mcp/tools/_annotations";
 
 let tools: Tool[];
 
@@ -46,6 +55,14 @@ export const EXPECTED_ANNOTATIONS: Record<string, ToolAnnotations> = {
   get_realized_gains: READ,
   get_security_detail: READ,
   create_security: CREATE,
+  list_securities: READ,
+  update_security: UPDATE,
+  delete_security: DESTRUCTIVE,
+  set_security_prices: UPDATE,
+  update_security_price: UPDATE,
+  delete_security_price: DESTRUCTIVE,
+  list_prices_due: READ,
+  fetch_tiingo_prices: READ_NETWORK,
   create_transaction: CREATE,
   update_transaction: DESTRUCTIVE,
   delete_transaction: DESTRUCTIVE,
@@ -66,6 +83,18 @@ export const EXPECTED_ANNOTATIONS: Record<string, ToolAnnotations> = {
   get_projected_transactions: READ,
   list_recurring_transactions: READ,
   process_recurring_rules: CREATE,
+  get_plaid_status: READ,
+  list_plaid_token_accounts: READ,
+  update_plaid_token: UPDATE,
+  delete_plaid_token: DESTRUCTIVE,
+  set_plaid_token_accounts: UPDATE,
+  sync_plaid_token: WRITE_NETWORK,
+  clear_plaid_sync_data: DESTRUCTIVE,
+  list_pending_plaid_transactions: READ,
+  get_transaction_plaid_link: READ,
+  unlink_plaid_transaction: UPDATE,
+  get_reconcile_candidates: READ,
+  reconcile_plaid_transaction: DESTRUCTIVE_NONIDEMPOTENT,
 };
 
 describe("tool annotations", () => {
@@ -89,7 +118,15 @@ describe("tool annotations", () => {
   );
 
   it("never defines a preset that is both readOnly and destructive", () => {
-    const presets = { READ, READ_NETWORK, CREATE, UPDATE, DESTRUCTIVE };
+    const presets = {
+      READ,
+      READ_NETWORK,
+      CREATE,
+      UPDATE,
+      DESTRUCTIVE,
+      DESTRUCTIVE_NONIDEMPOTENT,
+      WRITE_NETWORK,
+    };
     const contradictory = Object.entries(presets)
       .filter(([, preset]) => preset.readOnlyHint === true && preset.destructiveHint === true)
       .map(([name]) => name);
@@ -103,7 +140,15 @@ describe("tool annotations", () => {
   // distinction from READ_NETWORK for any client that applies the defaults.
   // These two tests exist so that cannot come back.
   it("sets openWorldHint explicitly on every preset", () => {
-    const presets = { READ, READ_NETWORK, CREATE, UPDATE, DESTRUCTIVE };
+    const presets = {
+      READ,
+      READ_NETWORK,
+      CREATE,
+      UPDATE,
+      DESTRUCTIVE,
+      DESTRUCTIVE_NONIDEMPOTENT,
+      WRITE_NETWORK,
+    };
     const implicit = Object.entries(presets)
       .filter(([, preset]) => preset.openWorldHint === undefined)
       .map(([name]) => name);
@@ -116,7 +161,13 @@ describe("tool annotations", () => {
   it("sets destructiveHint and idempotentHint explicitly on every write preset", () => {
     // The spec calls both "meaningful only when readOnlyHint == false", so the
     // read presets are exempt from idempotentHint by design.
-    const writePresets = { CREATE, UPDATE, DESTRUCTIVE };
+    const writePresets = {
+      CREATE,
+      UPDATE,
+      DESTRUCTIVE,
+      DESTRUCTIVE_NONIDEMPOTENT,
+      WRITE_NETWORK,
+    };
     const implicit = Object.entries(writePresets)
       .filter(
         ([, preset]) =>
@@ -127,6 +178,26 @@ describe("tool annotations", () => {
       implicit,
       "destructiveHint defaults to true — an unset write preset claims the tool destroys data"
     ).toEqual([]);
+  });
+
+  it("includes every exported preset in the preset-hygiene checks", () => {
+    // The three checks above take a hardcoded object. A preset added to
+    // _annotations.ts but not to those objects is silently unchecked, which
+    // is the failure this test exists to make impossible.
+    const checked = new Set([
+      "READ",
+      "READ_NETWORK",
+      "CREATE",
+      "UPDATE",
+      "DESTRUCTIVE",
+      "DESTRUCTIVE_NONIDEMPOTENT",
+      "WRITE_NETWORK",
+    ]);
+    const exported = Object.keys(annotationPresets).filter(
+      (name) => name === name.toUpperCase()
+    );
+
+    expect(exported.filter((name) => !checked.has(name))).toEqual([]);
   });
 
   // A tool that spreads a shared schema inherits that schema's descriptions —

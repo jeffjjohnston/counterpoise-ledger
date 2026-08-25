@@ -151,3 +151,33 @@ describe("fetchPlaidTransactionsSync", () => {
     ).rejects.toThrow("PLAID_CLIENT_ID environment variable not configured");
   });
 });
+
+describe("plaid error formatting", () => {
+  it("never puts the access token in a thrown message", async () => {
+    configurePlaidEnv();
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        json: async () => ({
+          error_message: "the login details of this item have changed",
+          error_code: "ITEM_LOGIN_REQUIRED",
+        }),
+      })
+    );
+
+    // syncToken's catch writes error.message straight into
+    // plaidTokens.lastError, and get_plaid_status hands lastError to a model.
+    // The whole reason that is safe: the message is built from Plaid's
+    // error_message and error_code, never from the request body that carries
+    // the access token.
+    await expect(fetchPlaidAccounts("access-sandbox-SECRET-VALUE")).rejects.toThrow(
+      "Plaid /accounts/get request failed: the login details of this item have changed (ITEM_LOGIN_REQUIRED)"
+    );
+
+    await expect(fetchPlaidAccounts("access-sandbox-SECRET-VALUE")).rejects.not.toThrow(
+      /access-sandbox-SECRET-VALUE/
+    );
+  });
+});

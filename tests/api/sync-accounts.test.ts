@@ -315,6 +315,185 @@ describe("Sync token accounts API", () => {
     expect(rows[0].counterpoiseAccountId).toBe(checking.id);
   });
 
+  // --------------------------------------------------------------------
+  // Characterization tests (Task 5, Step 1). These pin the route's exact
+  // refusal messages and its "writes nothing" guarantee BEFORE the PUT
+  // body moves into lib/plaid-tokens.ts's setTokenAccounts(). They must
+  // pass against the route as it stands today; the extraction is measured
+  // against them, not the other way around.
+  // --------------------------------------------------------------------
+
+  it("refuses a duplicate counterpoiseAccountId in the assignment list, with its exact message, and writes nothing", async () => {
+    const token = await createPlaidToken({
+      financialInstitution: "Chase",
+      itemId: "item-dup-counterpoise",
+      accessToken: "access-token",
+    });
+    await createPlaidAccount({
+      tokenId: token.id,
+      plaidAccountId: "plaid-account-1",
+      name: "Checking",
+      type: "depository",
+      subtype: "checking",
+    });
+    await createPlaidAccount({
+      tokenId: token.id,
+      plaidAccountId: "plaid-account-2",
+      name: "Savings",
+      type: "depository",
+      subtype: "savings",
+    });
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+
+    const response = await PUT(
+      new Request(`http://localhost/api/sync/tokens/${token.id}/accounts`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assignments: [
+            { plaidAccountId: "plaid-account-1", counterpoiseAccountId: checking.id },
+            { plaidAccountId: "plaid-account-2", counterpoiseAccountId: checking.id },
+          ],
+        }),
+      }),
+      { params: Promise.resolve({ bookId: "1", id: String(token.id) }) }
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe(
+      "A Counterpoise account cannot be assigned to more than one Plaid account"
+    );
+
+    const db = getDb();
+    const rows = await db
+      .select()
+      .from(plaidAccounts)
+      .where(eq(plaidAccounts.tokenId, token.id));
+    expect(rows.every((row) => row.counterpoiseAccountId === null)).toBe(true);
+  });
+
+  it("refuses an unknown plaidAccountId with its exact message, and writes nothing", async () => {
+    const token = await createPlaidToken({
+      financialInstitution: "Chase",
+      itemId: "item-unknown-exact",
+      accessToken: "access-token",
+    });
+    const link = await createPlaidAccount({
+      tokenId: token.id,
+      plaidAccountId: "plaid-account-1",
+      name: "Checking",
+      type: "depository",
+      subtype: "checking",
+    });
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+
+    const response = await PUT(
+      new Request(`http://localhost/api/sync/tokens/${token.id}/accounts`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assignments: [
+            { plaidAccountId: "missing-plaid-id", counterpoiseAccountId: checking.id },
+          ],
+        }),
+      }),
+      { params: Promise.resolve({ bookId: "1", id: String(token.id) }) }
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe(
+      "Unknown plaidAccountId for token: missing-plaid-id"
+    );
+
+    const db = getDb();
+    const [row] = await db.select().from(plaidAccounts).where(eq(plaidAccounts.id, link.id));
+    expect(row.counterpoiseAccountId).toBeNull();
+  });
+
+  it("refuses a counterpoiseAccountId that does not exist in this book, with its exact message, and writes nothing", async () => {
+    const token = await createPlaidToken({
+      financialInstitution: "Chase",
+      itemId: "item-invalid-counterpoise",
+      accessToken: "access-token",
+    });
+    const link = await createPlaidAccount({
+      tokenId: token.id,
+      plaidAccountId: "plaid-account-1",
+      name: "Checking",
+      type: "depository",
+      subtype: "checking",
+    });
+
+    const response = await PUT(
+      new Request(`http://localhost/api/sync/tokens/${token.id}/accounts`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assignments: [{ plaidAccountId: "plaid-account-1", counterpoiseAccountId: 999999 }],
+        }),
+      }),
+      { params: Promise.resolve({ bookId: "1", id: String(token.id) }) }
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe(
+      "One or more counterpoiseAccountId values are invalid"
+    );
+
+    const db = getDb();
+    const [row] = await db.select().from(plaidAccounts).where(eq(plaidAccounts.id, link.id));
+    expect(row.counterpoiseAccountId).toBeNull();
+  });
+
+  it("refuses a Counterpoise account already mapped to a different Plaid account, with its exact message, and writes nothing", async () => {
+    const tokenA = await createPlaidToken({
+      financialInstitution: "Bank A",
+      itemId: "item-a-exact",
+      accessToken: "access-token-a",
+    });
+    const tokenB = await createPlaidToken({
+      financialInstitution: "Bank B",
+      itemId: "item-b-exact",
+      accessToken: "access-token-b",
+    });
+    const sharedAccount = await createAccount({ name: "Joint Checking", type: "asset" });
+    await createPlaidAccount({
+      tokenId: tokenA.id,
+      plaidAccountId: "plaid-account-a",
+      name: "A Checking",
+      type: "depository",
+      subtype: "checking",
+      counterpoiseAccountId: sharedAccount.id,
+    });
+    const linkB = await createPlaidAccount({
+      tokenId: tokenB.id,
+      plaidAccountId: "plaid-account-b",
+      name: "B Checking",
+      type: "depository",
+      subtype: "checking",
+    });
+
+    const response = await PUT(
+      new Request(`http://localhost/api/sync/tokens/${tokenB.id}/accounts`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assignments: [{ plaidAccountId: "plaid-account-b", counterpoiseAccountId: sharedAccount.id }],
+        }),
+      }),
+      { params: Promise.resolve({ bookId: "1", id: String(tokenB.id) }) }
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe(
+      "One or more Counterpoise accounts are already mapped to another Plaid account"
+    );
+
+    const db = getDb();
+    const [row] = await db.select().from(plaidAccounts).where(eq(plaidAccounts.id, linkB.id));
+    expect(row.counterpoiseAccountId).toBeNull();
+  });
+
   afterAll(() => {
     process.env.PLAID_CLIENT_ID = originalEnv.PLAID_CLIENT_ID;
     process.env.PLAID_SECRET = originalEnv.PLAID_SECRET;

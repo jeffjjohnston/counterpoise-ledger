@@ -1,28 +1,9 @@
 import { NextResponse } from "next/server";
 import { authenticateBookRequest, isError } from "@/lib/api-auth";
 import { plaidTokens } from "@/db/schema";
-import { and, asc, eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { createTokenSchema } from "@/lib/schemas/sync";
-
-const maskAccessToken = (accessToken: string): string => {
-  if (accessToken.length <= 8) {
-    return "*".repeat(accessToken.length);
-  }
-
-  const prefix = accessToken.slice(0, 4);
-  const suffix = accessToken.slice(-4);
-  const middle = "*".repeat(Math.max(8, accessToken.length - 8));
-  return `${prefix}${middle}${suffix}`;
-};
-
-const toTokenListItem = (token: typeof plaidTokens.$inferSelect) => ({
-  id: token.id,
-  financialInstitution: token.financialInstitution,
-  itemId: token.itemId,
-  accessTokenMasked: maskAccessToken(token.accessToken),
-  createdAt: token.createdAt,
-  updatedAt: token.updatedAt,
-});
+import { listTokens, toTokenListItem } from "@/lib/plaid-tokens";
 
 export async function GET(
   request: Request,
@@ -34,13 +15,7 @@ export async function GET(
     if (isError(auth)) return auth.error;
     const { db, bookId: numericBookId } = auth;
 
-    const tokens = await db
-      .select()
-      .from(plaidTokens)
-      .where(eq(plaidTokens.bookId, numericBookId))
-      .orderBy(asc(plaidTokens.financialInstitution), asc(plaidTokens.itemId));
-
-    return NextResponse.json(tokens.map(toTokenListItem));
+    return NextResponse.json(await listTokens(db, numericBookId));
   } catch (error) {
     console.error("Error fetching sync tokens:", error);
     return NextResponse.json(

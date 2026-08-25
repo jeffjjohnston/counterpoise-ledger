@@ -47,12 +47,32 @@ All tools require a valid API key. Users create keys in the Counterpoise UI at t
 | `get_investment_positions` | Current portfolio positions with gain/loss |
 | `get_security_detail` | Security info, prices, and transaction history |
 | `create_security` | Create a new security (ETF, mutual fund, or stock) |
+| `list_securities` | List every security with shares, cost basis, latest price, market value, and income received |
+| `update_security` | Update a security's name, symbol, type, fetch setting, or fixed price (setting a fixed price forces fetching off) |
+| `delete_security` | Delete a security (refuses if it still has investment transactions, but not if it only has price history — that is erased too, permanently) |
+| `set_security_prices` | Record manual prices for securities, overwriting any existing price for the same security and date; malformed entries are skipped and reported in `discarded` |
+| `update_security_price` | Change a recorded price, or move it to another date |
+| `delete_security_price` | Delete one recorded price for a security on a specific date |
+| `list_prices_due` | List securities needing a manual price for the most recent market day |
+| `fetch_tiingo_prices` | Fetch the latest end-of-day prices from Tiingo; records nothing |
 | `create_issue_report` | File a bug or improvement report about Counterpoise itself |
 | `list_issue_reports` | List the authenticated user's own issue reports |
 | `update_issue_report` | Change the description, type, or status of an issue report |
 | `delete_issue_report` | Delete an issue report |
 | `get_system_status` | Report the health of Counterpoise's background jobs |
 | `analyze_usage` | Query PostHog for usage event summaries |
+| `get_plaid_status` | Every bank connection (access token masked), unreconciled transaction counts, and Plaid account mappings, in one call |
+| `list_plaid_token_accounts` | List a connection's bank accounts and each one's Counterpoise mapping |
+| `update_plaid_token` | Replace a connection's institution name and item id |
+| `delete_plaid_token` | Delete a connection, its account mappings, and its entire reconciliation history |
+| `set_plaid_token_accounts` | Map a connection's bank accounts to Counterpoise accounts |
+| `sync_plaid_token` | Fetch new, changed, and removed transactions from Plaid, stage them, and run auto-match |
+| `clear_plaid_sync_data` | Discard a connection's staged transactions and reset its sync cursor |
+| `list_pending_plaid_transactions` | Staged bank transactions nothing has reconciled yet — their ids are synthetic placeholders; never pass them to create_transaction, update_transaction, delete_transaction, or any other transaction tool |
+| `get_transaction_plaid_link` | The staged Plaid row a transaction is matched to, or `null` if entered by hand |
+| `unlink_plaid_transaction` | Remove a transaction's Plaid link; the bank transaction returns to the pending queue |
+| `get_reconcile_candidates` | The reconciliation queue for one linked bank account: staged transactions awaiting a decision, each with up to five ranked candidate matches and a suggested counter account |
+| `reconcile_plaid_transaction` | Resolve one staged bank transaction: match it to an existing transaction, match and rewrite that transaction's amount, create a new transaction from it, ignore it, keep what you already have, or unlink an already-resolved row (which also un-reconciles its transaction unless another bank row still matches it). Linking a row that is already linked is refused |
 
 ## Setup for Claude Code
 

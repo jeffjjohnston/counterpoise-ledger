@@ -62,16 +62,25 @@ const INVALID_PRICE_MICROS_MESSAGE = "Invalid priceMicros";
 // lib/schemas/auth.ts's loginSchema.
 export const updateSecurityPriceSchema = z.object(
   {
-    priceDate: z.iso.date(PRICE_DATE_REQUIRED_MESSAGE),
+    priceDate: z.iso
+      .date(PRICE_DATE_REQUIRED_MESSAGE)
+      .describe("The date this price applies to (YYYY-MM-DD). Pass a different date to move the entry."),
+    // `.int()` for the same reason as priceUpdateItemSchema below: micros are
+    // the integer unit and the column is bigint, so a fractional value here
+    // reached the UPDATE and failed as a 500 rather than a 400. It carries the
+    // ported message so the user-facing text is unchanged for every input that
+    // was already rejected.
     priceMicros: z
       .number({ error: INVALID_PRICE_MICROS_MESSAGE })
-      .positive(INVALID_PRICE_MICROS_MESSAGE),
+      .int(INVALID_PRICE_MICROS_MESSAGE)
+      .positive(INVALID_PRICE_MICROS_MESSAGE)
+      .describe("Price in micros (1,000,000 = $1.00)"),
     // Never type-checked by the original guard — `source ?? null` accepts
     // whatever is given. Left permissive (z.any()) rather than narrowed to
     // z.string() to avoid adding validation beyond what existed, the same
     // convention lib/schemas/recurring.ts uses for its own no-prior-guard
     // fields (e.g. templateDescription).
-    source: z.any().optional(),
+    source: z.any().optional().describe("Where the price came from, such as \"manual\""),
   },
   { error: PRICE_DATE_REQUIRED_MESSAGE }
 );
@@ -106,11 +115,22 @@ export type UpdateSecurityPriceInput = z.infer<typeof updateSecurityPriceSchema>
 const PRICE_UPDATES_ARRAY_MESSAGE = "priceUpdates must be an array";
 const NO_VALID_PRICE_UPDATES_MESSAGE = "No valid price updates provided";
 
-const priceUpdateItemSchema = z.object({
+// priceMicros is `.int()` because micros ARE the integer unit and the column
+// is bigint. Without it a fractional value like 1.5 passes this schema, is
+// classified writable, and then fails only when postgres serializes it for
+// the INSERT — aborting the whole batch instead of being reported in
+// `discarded`, which is the one thing this filtering schema exists to do.
+//
+// Note zod's `.int()` bounds to the SAFE integer range (< 2^53), which is
+// well inside bigint's (< 2^63). So nothing that passes here can overflow
+// the column: this closes the oversized case as well as the fractional one.
+export const priceUpdateItemSchema = z.object({
   securityId: z.number().int().positive(),
-  priceMicros: z.number().positive(),
+  priceMicros: z.number().int().positive(),
   priceDate: z.iso.date(),
 });
+
+export type PriceUpdateItem = z.infer<typeof priceUpdateItemSchema>;
 
 // The top-level `z.object(...)` also takes `{ error:
 // PRICE_UPDATES_ARRAY_MESSAGE }`. The original route's `const { priceUpdates
@@ -159,7 +179,10 @@ const SYMBOLS_MESSAGE = "symbols must be a non-empty array";
 // lib/schemas/auth.ts's loginSchema.
 export const tiingoFetchSchema = z.object(
   {
-    symbols: z.array(z.any(), { error: SYMBOLS_MESSAGE }).min(1, SYMBOLS_MESSAGE),
+    symbols: z
+      .array(z.any(), { error: SYMBOLS_MESSAGE })
+      .min(1, SYMBOLS_MESSAGE)
+      .describe("Ticker symbols to fetch the latest end-of-day price for (e.g. [\"VTI\", \"BND\"])"),
   },
   { error: SYMBOLS_MESSAGE }
 );

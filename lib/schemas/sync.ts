@@ -115,19 +115,27 @@ export const updateTokenSchema = z.object(
     financialInstitution: z
       .string({ error: UPDATE_TOKEN_REQUIRED_MESSAGE })
       .trim()
-      .min(1, UPDATE_TOKEN_REQUIRED_MESSAGE),
+      .min(1, UPDATE_TOKEN_REQUIRED_MESSAGE)
+      .describe("The bank or brokerage name for this connection. Required."),
     itemId: z
       .string({ error: UPDATE_TOKEN_REQUIRED_MESSAGE })
       .trim()
-      .min(1, UPDATE_TOKEN_REQUIRED_MESSAGE),
-    accessToken: z.preprocess(
-      (value) => {
-        if (typeof value !== "string") return undefined;
-        const trimmed = value.trim();
-        return trimmed === "" ? undefined : trimmed;
-      },
-      z.string().optional()
-    ),
+      .min(1, UPDATE_TOKEN_REQUIRED_MESSAGE)
+      .describe(
+        "Plaid's item id for this connection. Required, and must not already belong to another connection in this book."
+      ),
+    accessToken: z
+      .preprocess(
+        (value) => {
+          if (typeof value !== "string") return undefined;
+          const trimmed = value.trim();
+          return trimmed === "" ? undefined : trimmed;
+        },
+        z.string().optional()
+      )
+      .describe(
+        "The Plaid access token for this connection. Omit it (or send an empty string) to keep the token already on file — this is the only field that is not required."
+      ),
   },
   { error: UPDATE_TOKEN_REQUIRED_MESSAGE }
 );
@@ -174,7 +182,8 @@ const accountAssignmentSchema = z.object(
     plaidAccountId: z
       .string({ error: PLAID_ACCOUNT_ID_MESSAGE })
       .trim()
-      .min(1, PLAID_ACCOUNT_ID_MESSAGE),
+      .min(1, PLAID_ACCOUNT_ID_MESSAGE)
+      .describe("The Plaid account id to assign, from this connection's account list."),
     // No `.optional()`/`.nullish()`: the original guard treats a missing key
     // the same as any other non-null, non-positive-integer value (undefined
     // fails `Number.isInteger(undefined)`), so the key is required — it just
@@ -183,7 +192,10 @@ const accountAssignmentSchema = z.object(
       .number({ error: COUNTERPOISE_ACCOUNT_ID_MESSAGE })
       .int(COUNTERPOISE_ACCOUNT_ID_MESSAGE)
       .positive(COUNTERPOISE_ACCOUNT_ID_MESSAGE)
-      .nullable(),
+      .nullable()
+      .describe(
+        "The Counterpoise account id to map this Plaid account to, or null to unmap it. Required on every element — there is no way to leave it out."
+      ),
   },
   // Zod's per-field `{ error }` only covers a field failing its OWN type
   // check inside an already-object element; it does not cover the element
@@ -212,6 +224,13 @@ const accountAssignmentSchema = z.object(
 // throwing. Same reasoning as lib/schemas/auth.ts's loginSchema.
 export const assignAccountsSchema = z.object(
   {
+    // .describe() sits after both .refine() calls, not before: each .refine()
+    // returns a new schema instance, and zod v4 keeps .describe()'s metadata
+    // in a registry keyed by instance — a description attached before a
+    // .refine() does not carry forward onto the instance that chain produces,
+    // and annotations.test.ts's "describes every input field of every tool"
+    // catches exactly that (verified: describing before the refines left this
+    // field undescribed in the published tool schema).
     assignments: z
       .array(accountAssignmentSchema, { error: ASSIGNMENTS_ARRAY_MESSAGE })
       .refine(
@@ -227,6 +246,9 @@ export const assignAccountsSchema = z.object(
           return new Set(nonNullIds).size === nonNullIds.length;
         },
         { error: DUPLICATE_COUNTERPOISE_ACCOUNT_ID_MESSAGE }
+      )
+      .describe(
+        "The plaidAccountId-to-counterpoiseAccountId mappings to set. Each plaidAccountId you list is replaced with the counterpoiseAccountId given; a plaidAccountId this connection has but you omit is left alone."
       ),
   },
   { error: ASSIGNMENTS_ARRAY_MESSAGE }
@@ -244,12 +266,17 @@ export type AssignAccountsInput = z.infer<typeof assignAccountsSchema>;
 // just like the array-duplicate checks above, expressed here with
 // `.superRefine()` instead of `.refine()` since it needs to attach the
 // custom message to a specific field path.
-const RECONCILIATION_ID_MESSAGE = "reconciliationId is required"; // reconcile/route.ts:564
-const INVALID_ACTION_MESSAGE = "Invalid action"; // reconcile/route.ts:912
-const TRANSACTION_ID_MATCH_MESSAGE = "transactionId is required for match"; // reconcile/route.ts:581
+//
+// The `reconcile/route.ts:NNN` provenance markers these constants used to
+// carry are gone. That route is 111 lines now, so every one of them pointed
+// past the end of the file, and each guard the messages were ported from
+// lives somewhere else. Each marker below names its guard's home today.
+const RECONCILIATION_ID_MESSAGE = "reconciliationId is required"; // no runtime guard outside this schema any more
+const INVALID_ACTION_MESSAGE = "Invalid action"; // z.enum below, plus the resolver's trailing else at lib/plaid-reconcile.ts:582
+const TRANSACTION_ID_MATCH_MESSAGE = "transactionId is required for match"; // reconcileActionIssue() below
 const TRANSACTION_ID_MATCH_UPDATE_MESSAGE =
-  "transactionId is required for match_update_amount"; // reconcile/route.ts:655
-const COUNTER_ACCOUNT_ID_MESSAGE = "counterAccountId is required for create"; // reconcile/route.ts:786
+  "transactionId is required for match_update_amount"; // reconcileActionIssue() below
+const COUNTER_ACCOUNT_ID_MESSAGE = "counterAccountId is required for create"; // reconcileActionIssue() below
 
 const reconcileActionValues = [
   "match",
@@ -266,6 +293,44 @@ const isPositiveInt = (value: unknown): value is number =>
 const isInt = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value);
 
+export type ReconcileAction = (typeof reconcileActionValues)[number];
+
+/**
+ * The action-conditional field requirements: which of transactionId /
+ * counterAccountId a given action needs. Returns the one issue to report, or
+ * null.
+ *
+ * This exists as a function rather than an inline chain because it has two
+ * callers that must agree. reconcileSchema's superRefine below is the HTTP
+ * route's copy. resolveReconciliation() in lib/plaid-reconcile.ts is the MCP
+ * tool's, which needs its own because toolShape() spreads a schema's .shape
+ * and drops object-level refinements — the tool would otherwise accept
+ * `{ action: "match" }` with no transactionId and fail inside Drizzle.
+ *
+ * One function, two call sites — NOT a fifth copy of the action list. This
+ * chain, reconcileActionValues, SyncResolveActionPayload (types/index.ts) and
+ * the resolver's own action branches are already four lists kept in step by
+ * hand, and a 7th action added to the first two without a branch here gets no
+ * error. The resolver's trailing `else` throw is the net that actually catches
+ * that.
+ */
+export function reconcileActionIssue(data: {
+  action: ReconcileAction;
+  transactionId?: unknown;
+  counterAccountId?: unknown;
+}): { path: "transactionId" | "counterAccountId"; message: string } | null {
+  if (data.action === "match" && !isInt(data.transactionId)) {
+    return { path: "transactionId", message: TRANSACTION_ID_MATCH_MESSAGE };
+  }
+  if (data.action === "match_update_amount" && !isInt(data.transactionId)) {
+    return { path: "transactionId", message: TRANSACTION_ID_MATCH_UPDATE_MESSAGE };
+  }
+  if (data.action === "create" && !isPositiveInt(data.counterAccountId)) {
+    return { path: "counterAccountId", message: COUNTER_ACCOUNT_ID_MESSAGE };
+  }
+  return null;
+}
+
 export const reconcileSchema = z
   .object(
     {
@@ -276,8 +341,19 @@ export const reconcileSchema = z
       // ("Reconciliation row not found").
       reconciliationId: z
         .number({ error: RECONCILIATION_ID_MESSAGE })
-        .int(RECONCILIATION_ID_MESSAGE),
-      action: z.enum(reconcileActionValues, { error: INVALID_ACTION_MESSAGE }),
+        .int(RECONCILIATION_ID_MESSAGE)
+        .describe(
+          "The id of the staged Plaid transaction to resolve, from the reconciliation queue."
+        ),
+      action: z
+        .enum(reconcileActionValues, { error: INVALID_ACTION_MESSAGE })
+        .describe(
+          "What to do with this bank transaction. 'match' links it to an existing transaction; " +
+            "'match_update_amount' links it and rewrites that transaction's two splits to the " +
+            "bank's amount; 'create' writes a new two-split transaction from it; 'ignore' " +
+            "dismisses it; 'keep_local' clears a review flag and keeps what you already have; " +
+            "'unlink' returns an already-resolved row to the pending queue."
+        ),
       // Declared as `unknown`, not `z.number().optional()`: their
       // required-ness is conditional on `action` (checked below), and a bare
       // type-checked optional field would report zod's own "Invalid input:
@@ -287,14 +363,30 @@ export const reconcileSchema = z
       // wrong type, non-integer, (for counterAccountId) non-positive —
       // reports the one message the original single guard gave for all of
       // them.
-      transactionId: z.unknown().optional(),
-      counterAccountId: z.unknown().optional(),
+      transactionId: z
+        .unknown()
+        .optional()
+        .describe(
+          "The existing transaction to link to. Required for 'match' and 'match_update_amount', ignored otherwise."
+        ),
+      counterAccountId: z
+        .unknown()
+        .optional()
+        .describe(
+          "The account the other side of the new transaction posts to. Required for 'create', ignored otherwise, and it must not be the account this connection is linked to."
+        ),
       // Never validated by the original guard —
       // `typeof body.payeeName === "string" ? body.payeeName : (fallback)`
       // silently accepts any other type. Left as `unknown` so that leniency
       // isn't newly tightened; the real UI consumer (ReconciliationModal)
       // always sends a string here regardless.
-      payeeName: z.unknown().optional(),
+      payeeName: z
+        .unknown()
+        .optional()
+        .describe(
+          "The payee to record on a created transaction. Only read for 'create'; defaults to the bank's merchant name, then to the raw transaction name. " +
+            "If no payee with this name already exists in the book (case-insensitively), a new payee row is created — an additive, reversible side effect of 'create'."
+        ),
     },
     // Zod's per-field `{ error }` above only covers a field failing its own
     // type check inside an already-object body; it does not cover the body
@@ -307,31 +399,9 @@ export const reconcileSchema = z
     { error: RECONCILIATION_ID_MESSAGE }
   )
   .superRefine((data, ctx) => {
-    // This chain, reconcileActionValues above, SyncResolveActionPayload
-    // (types.ts), and the route's own action switch are four lists kept in
-    // sync by hand. Adding a 7th action to the first two without adding its
-    // branch here is silently accepted (no issue added — falls through with
-    // no error). See reconcile/route.ts's action switch for the matching
-    // safety net: its trailing `else` throw is what actually catches an
-    // action this superRefine has no case for.
-    if (data.action === "match" && !isInt(data.transactionId)) {
-      ctx.addIssue({
-        code: "custom",
-        message: TRANSACTION_ID_MATCH_MESSAGE,
-        path: ["transactionId"],
-      });
-    } else if (data.action === "match_update_amount" && !isInt(data.transactionId)) {
-      ctx.addIssue({
-        code: "custom",
-        message: TRANSACTION_ID_MATCH_UPDATE_MESSAGE,
-        path: ["transactionId"],
-      });
-    } else if (data.action === "create" && !isPositiveInt(data.counterAccountId)) {
-      ctx.addIssue({
-        code: "custom",
-        message: COUNTER_ACCOUNT_ID_MESSAGE,
-        path: ["counterAccountId"],
-      });
+    const issue = reconcileActionIssue(data);
+    if (issue) {
+      ctx.addIssue({ code: "custom", message: issue.message, path: [issue.path] });
     }
   });
 
@@ -365,7 +435,11 @@ export type ReconcileInput = z.infer<typeof reconcileSchema>;
 // no behavioral cost for any real caller (no UI path sends a fractional
 // accountId here).
 export const pendingTransactionsQuery = z.object({
-  accountId: z.coerce.number({ error: "Invalid accountId" }).int("Invalid accountId").optional(), // pending-transactions/route.ts:48
+  accountId: z.coerce
+    .number({ error: "Invalid accountId" })
+    .int("Invalid accountId")
+    .optional() // pending-transactions/route.ts:48
+    .describe("Limit the results to this Counterpoise account. Omit to return every account."),
 });
 
 export type PendingTransactionsQuery = z.infer<typeof pendingTransactionsQuery>;

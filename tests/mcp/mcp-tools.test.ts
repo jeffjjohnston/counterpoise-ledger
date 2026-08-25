@@ -12,9 +12,11 @@ import {
   createSecurity,
   createInvestmentSplit,
   createSecurityPrice,
+  createBook,
 } from "@/tests/helpers/db-utils";
 import { getDb } from "@/db";
-import { books, users } from "@/db/schema";
+import { books, securities, users } from "@/db/schema";
+import { eq } from "drizzle-orm";
 import { toDateString } from "@/lib/formatters";
 import { rebuildLots } from "@/lib/lots-db";
 import { createTransaction } from "@/lib/transactions";
@@ -607,6 +609,162 @@ describe("MCP Tools", () => {
       // Ordered by date DESC, so most recent first
       expect(data.transactions[0].description).toBe("Transaction 5");
       expect(data.transactions[1].description).toBe("Transaction 4");
+    });
+
+    it("filters by accountIds across several accounts", async () => {
+      const checking = await createAccount({ name: "Checking", type: "asset" });
+      const savings = await createAccount({ name: "Savings", type: "asset" });
+      const groceries = await createAccount({ name: "Groceries", type: "expense" });
+      // Neither leg of this one is in the accountIds filter below — it must
+      // be excluded. Without it, a filter that's ignored entirely would
+      // still pass: the book would contain exactly the two matching rows.
+      const vacationFund = await createAccount({ name: "Vacation Fund", type: "asset" });
+      const rent = await createAccount({ name: "Rent", type: "expense" });
+      await createTransactionWithSplits({
+        date: "2026-01-10", description: "From checking",
+        splits: [
+          { accountId: checking.id, amount: -100 },
+          { accountId: groceries.id, amount: 100 },
+        ],
+      });
+      await createTransactionWithSplits({
+        date: "2026-01-11", description: "From savings",
+        splits: [
+          { accountId: savings.id, amount: -200 },
+          { accountId: groceries.id, amount: 200 },
+        ],
+      });
+      await createTransactionWithSplits({
+        date: "2026-01-12", description: "From vacation fund",
+        splits: [
+          { accountId: vacationFund.id, amount: -300 },
+          { accountId: rent.id, amount: 300 },
+        ],
+      });
+
+      const { data, isError } = await callTool("list_transactions", {
+        bookId: 1,
+        accountIds: [checking.id, savings.id],
+      });
+
+      expect(isError).toBe(false);
+      expect(data.totalCount).toBe(2);
+      const descriptions = data.transactions
+        .map((t: { description: string }) => t.description)
+        .sort();
+      expect(descriptions).toEqual(["From checking", "From savings"]);
+      expect(descriptions).not.toContain("From vacation fund");
+    });
+
+    it("returns each transaction once when accountIds matches both of its legs", async () => {
+      const checking = await createAccount({ name: "Checking", type: "asset" });
+      const groceries = await createAccount({ name: "Groceries", type: "expense" });
+      // Not in the accountIds filter below — proves toHaveLength(1) is
+      // distinguishing rather than trivially true from an empty book.
+      const savings = await createAccount({ name: "Savings", type: "asset" });
+      const rent = await createAccount({ name: "Rent", type: "expense" });
+      await createTransactionWithSplits({
+        date: "2026-01-10", description: "Both legs",
+        splits: [
+          { accountId: checking.id, amount: -100 },
+          { accountId: groceries.id, amount: 100 },
+        ],
+      });
+      await createTransactionWithSplits({
+        date: "2026-01-11", description: "Unrelated",
+        splits: [
+          { accountId: savings.id, amount: -200 },
+          { accountId: rent.id, amount: 200 },
+        ],
+      });
+
+      const { data } = await callTool("list_transactions", {
+        bookId: 1,
+        accountIds: [checking.id, groceries.id],
+      });
+
+      expect(data.transactions).toHaveLength(1);
+      expect(data.transactions[0].description).toBe("Both legs");
+      expect(data.totalCount).toBe(1);
+    });
+
+    it("errors on a payeeId from another book rather than returning an empty list", async () => {
+      // An empty list reads as "this payee has no transactions", which is a
+      // wrong answer rather than an empty one.
+      const otherBook = await createBook({ name: "Other Book" });
+      const theirPayee = await createPayee({ name: "Theirs", bookId: otherBook.id });
+
+      const { data, isError } = await callTool("list_transactions", {
+        bookId: 1,
+        payeeId: theirPayee.id,
+      });
+
+      expect(isError).toBe(true);
+      expect(data.error).toBe("Invalid payeeId");
+    });
+
+    it("errors on an accountIds entry from another book rather than returning an empty list", async () => {
+      // Same failure shape as the payeeId case above: an empty list reads as
+      // "this account has no transactions", a wrong answer rather than an
+      // empty one.
+      const checking = await createAccount({ name: "Checking", type: "asset" });
+      const otherBook = await createBook({ name: "Other Book" });
+      const theirAccount = await createAccount({
+        name: "Theirs", type: "asset", bookId: otherBook.id,
+      });
+
+      const { data, isError } = await callTool("list_transactions", {
+        bookId: 1,
+        accountIds: [checking.id, theirAccount.id],
+      });
+
+      expect(isError).toBe(true);
+      expect(data.error).toBe("One or more accounts do not belong to this book");
+    });
+
+    it("accountIds wins over accountId when both are given and would select different rows", async () => {
+      const checking = await createAccount({ name: "Checking", type: "asset" });
+      const savings = await createAccount({ name: "Savings", type: "asset" });
+      const groceries = await createAccount({ name: "Groceries", type: "expense" });
+      await createTransactionWithSplits({
+        date: "2026-01-10", description: "From checking",
+        splits: [
+          { accountId: checking.id, amount: -100 },
+          { accountId: groceries.id, amount: 100 },
+        ],
+      });
+      await createTransactionWithSplits({
+        date: "2026-01-11", description: "From savings",
+        splits: [
+          { accountId: savings.id, amount: -200 },
+          { accountId: groceries.id, amount: 200 },
+        ],
+      });
+
+      const { data, isError } = await callTool("list_transactions", {
+        bookId: 1,
+        accountId: checking.id,
+        accountIds: [savings.id],
+      });
+
+      expect(isError).toBe(false);
+      expect(data.totalCount).toBe(1);
+      expect(data.transactions[0].description).toBe("From savings");
+    });
+
+    it("rejects a calendar-invalid startDate at the schema boundary instead of silently answering a wrong range", async () => {
+      // z.iso.date() checks the calendar, not just the shape — 2026-02-30
+      // does not exist. The MCP SDK reports schema-validation failures as a
+      // normal (non-JSON) error result rather than a rejected promise, so
+      // inspect it directly instead of going through the JSON-parsing
+      // callTool() helper.
+      const result = await client.callTool({
+        name: "list_transactions",
+        arguments: { bookId: 1, startDate: "2026-02-30" },
+      });
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+      expect(text).toMatch(/startDate/i);
     });
   });
 
@@ -1551,6 +1709,59 @@ describe("MCP Tools", () => {
     });
   });
 
+  /**
+   * Seed a held investment position: an investment account, its cash
+   * sub-account, an income account, a security, and one buy transaction.
+   * The buy goes through createTransaction() rather than the raw fixtures
+   * so rebuildLots() runs and produces a real FIFO lot — a bare
+   * createInvestmentSplit fixture writes no lot at all.
+   */
+  async function seedHeldPosition() {
+    const account = await createAccount({
+      name: "Brokerage",
+      type: "asset",
+      subtype: "investment",
+    });
+    const cashAccount = await createAccount({
+      name: "Brokerage Cash",
+      type: "asset",
+      isInvestmentCash: true,
+    });
+    const incomeAccount = await createAccount({
+      name: "Dividend Income",
+      type: "income",
+    });
+    const security = await createSecurity({
+      name: "Held Fund",
+      symbol: "HELD",
+      securityType: "etf",
+    });
+
+    await createTransaction(getDb(), 1, {
+      date: "2026-01-15",
+      description: "Buy HELD",
+      splits: [
+        { accountId: account.id, amount: 10000 },
+        { accountId: cashAccount.id, amount: -10000 },
+      ],
+      investmentSplits: [
+        {
+          securityId: security.id,
+          action: "buy",
+          sharesMicros: 2_000_000,
+          priceMicros: 50_000_000,
+        },
+      ],
+    });
+
+    return {
+      account,
+      security,
+      cashAccountId: cashAccount.id,
+      incomeAccountId: incomeAccount.id,
+    };
+  }
+
   // ---------- get_security_detail ----------
   describe("get_security_detail", () => {
     it("returns security info, prices, transactions, and position", async () => {
@@ -1701,6 +1912,208 @@ describe("MCP Tools", () => {
 
       expect(isError).toBe(false);
       expect(data.recentPrices).toHaveLength(3);
+    });
+
+    it("priceOffset skips the newest prices instead of re-returning them", async () => {
+      const security = await createSecurity({
+        name: "Vanguard Total Stock",
+        symbol: "VTI",
+        securityType: "etf",
+      });
+
+      // 10 prices, newest first once sorted: 2025-01-10 down to 2025-01-01.
+      for (let i = 1; i <= 10; i++) {
+        await createSecurityPrice({
+          securityId: security.id,
+          priceDate: `2025-01-${String(i).padStart(2, "0")}`,
+          priceMicros: 50_000_000 + i * 1_000_000,
+        });
+      }
+
+      const page1 = await callTool("get_security_detail", {
+        bookId: 1,
+        securityId: security.id,
+        priceLimit: 3,
+      });
+      const page2 = await callTool("get_security_detail", {
+        bookId: 1,
+        securityId: security.id,
+        priceLimit: 3,
+        priceOffset: 3,
+      });
+
+      expect(page1.data.recentPrices.map((p: { date: string }) => p.date)).toEqual([
+        "2025-01-10", "2025-01-09", "2025-01-08",
+      ]);
+      expect(page2.data.recentPrices.map((p: { date: string }) => p.date)).toEqual([
+        "2025-01-07", "2025-01-06", "2025-01-05",
+      ]);
+    });
+
+    it("get_security_detail omits lots unless includeLots is set", async () => {
+      const { account, security } = await seedHeldPosition();
+
+      const withoutLots = await callTool("get_security_detail", {
+        bookId: 1, securityId: security.id,
+      });
+      expect(withoutLots.data).not.toHaveProperty("lots");
+
+      const withLots = await callTool("get_security_detail", {
+        bookId: 1, securityId: security.id, includeLots: true,
+      });
+      expect(withLots.data.lots).toHaveLength(1);
+      expect(withLots.data.lots[0].accountId).toBe(account.id);
+      expect(withLots.data.lots[0]).toHaveProperty("acquiredDate");
+      expect(withLots.data.lots[0].shares).toBeGreaterThan(0);
+    });
+
+    it("get_security_detail reports the cash amount on dividend transactions", async () => {
+      const { account, security, cashAccountId, incomeAccountId } = await seedHeldPosition();
+      const txn = await createTransactionWithSplits({
+        bookId: 1, date: "2026-02-01", description: "Dividend",
+        splits: [
+          { accountId: cashAccountId, amount: 5000 },
+          { accountId: incomeAccountId, amount: -5000 },
+        ],
+      });
+      await createInvestmentSplit({
+        bookId: 1, transactionId: txn.id, accountId: account.id, securityId: security.id,
+        action: "dividend", sharesMicros: 0, priceMicros: 0,
+      });
+
+      const { data } = await callTool("get_security_detail", { bookId: 1, securityId: security.id });
+
+      const dividend = data.transactions.find((t: { action: string }) => t.action === "dividend");
+      expect(dividend.cashAmount).toBe(50);
+      const buy = data.transactions.find((t: { action: string }) => t.action === "buy");
+      expect(buy.cashAmount).toBeNull();
+    });
+
+    it("get_security_detail counts only the cash leg when a dividend withholds tax", async () => {
+      // A withheld-tax dividend has TWO positive debits: $85 to cash and $15
+      // to a tax expense account. Only the asset leg is cash received, so
+      // this must report 85 — summing every positive amount reports 100.
+      const { account, security, cashAccountId, incomeAccountId } = await seedHeldPosition();
+      const taxAccount = await createAccount({
+        bookId: 1, name: "Dividend Withholding", type: "expense", subtype: "other",
+      });
+      const txn = await createTransactionWithSplits({
+        bookId: 1, date: "2026-02-15", description: "Dividend, tax withheld",
+        splits: [
+          { accountId: cashAccountId, amount: 8500 },
+          { accountId: taxAccount.id, amount: 1500 },
+          { accountId: incomeAccountId, amount: -10000 },
+        ],
+      });
+      await createInvestmentSplit({
+        bookId: 1, transactionId: txn.id, accountId: account.id, securityId: security.id,
+        action: "dividend", sharesMicros: 0, priceMicros: 0,
+      });
+
+      const { data } = await callTool("get_security_detail", { bookId: 1, securityId: security.id });
+
+      const withheld = data.transactions.find(
+        (t: { description: string }) => t.description === "Dividend, tax withheld"
+      );
+      expect(withheld.cashAmount).toBe(85);
+    });
+
+    it("get_security_detail reports the ratio on a stock split transaction", async () => {
+      // A split is written with sharesMicros: 0, priceMicros: 0, so shares
+      // reads as 0 regardless — splitNumerator/splitDenominator are the only
+      // fields that carry the 4-for-1 ratio.
+      const { account, cashAccountId, security } = await seedHeldPosition();
+      const txn = await createTransactionWithSplits({
+        bookId: 1, date: "2026-03-01", description: "4-for-1 split",
+        splits: [{ accountId: cashAccountId, amount: 0 }],
+      });
+      await createInvestmentSplit({
+        bookId: 1, transactionId: txn.id, accountId: account.id, securityId: security.id,
+        action: "split", sharesMicros: 0, priceMicros: 0,
+        splitNumerator: 4, splitDenominator: 1,
+      });
+
+      const { data } = await callTool("get_security_detail", { bookId: 1, securityId: security.id });
+
+      const split = data.transactions.find((t: { action: string }) => t.action === "split");
+      expect(split.shares).toBe(0);
+      expect(split.splitNumerator).toBe(4);
+      expect(split.splitDenominator).toBe(1);
+      const buy = data.transactions.find((t: { action: string }) => t.action === "buy");
+      expect(buy.splitNumerator).toBeNull();
+      expect(buy.splitDenominator).toBeNull();
+    });
+  });
+
+  // ---------- list_securities ----------
+  describe("list_securities", () => {
+    it("list_securities returns a book's securities with position fields", async () => {
+      await createSecurity({ name: "Alpha Fund", symbol: "AAA", securityType: "etf" });
+
+      const { data, isError } = await callTool("list_securities", { bookId: 1 });
+
+      expect(isError).toBe(false);
+      expect(data).toHaveLength(1);
+      expect(data[0].symbol).toBe("AAA");
+      expect(data[0]).toHaveProperty("incomeCents", 0);
+    });
+  });
+
+  // ---------- update_security ----------
+  describe("update_security", () => {
+    it("update_security changes only the fields passed", async () => {
+      const sec = await createSecurity({ bookId: 1, name: "Old", symbol: "OLD", securityType: "etf" });
+
+      const { data, isError } = await callTool("update_security", {
+        bookId: 1, securityId: sec.id, name: "New",
+      });
+
+      expect(isError).toBe(false);
+      expect(data.name).toBe("New");
+      expect(data.symbol).toBe("OLD");
+    });
+
+    it("update_security fails for a security in another book and leaves it unchanged", async () => {
+      const other = await createBook({ name: "Other" });
+      const theirs = await createSecurity({
+        bookId: other.id, name: "Theirs", symbol: "THRS", securityType: "etf",
+      });
+
+      const { isError } = await callTool("update_security", {
+        bookId: 1, securityId: theirs.id, name: "Hijacked",
+      });
+
+      expect(isError).toBe(true);
+      const [after] = await getDb().select().from(securities).where(eq(securities.id, theirs.id));
+      expect(after.name).toBe("Theirs");
+    });
+  });
+
+  // ---------- delete_security ----------
+  describe("delete_security", () => {
+    it("delete_security refuses a security with investment transactions", async () => {
+      const account = await createAccount({
+        bookId: 1, name: "Brokerage", type: "asset", subtype: "investment",
+      });
+      const sec = await createSecurity({ bookId: 1, name: "Held", symbol: "HELD", securityType: "etf" });
+      const txn = await createTransactionWithSplits({
+        bookId: 1, date: "2026-01-15", description: "Buy",
+        splits: [
+          { accountId: account.id, amount: 100000 },
+          { accountId: account.id, amount: -100000 },
+        ],
+      });
+      await createInvestmentSplit({
+        bookId: 1, transactionId: txn.id, accountId: account.id, securityId: sec.id,
+        action: "buy", sharesMicros: 10_000_000, priceMicros: 10_000_000,
+      });
+
+      const { data, isError } = await callTool("delete_security", { bookId: 1, securityId: sec.id });
+
+      expect(isError).toBe(true);
+      expect(data.error).toContain("investment transactions");
+      const rows = await getDb().select().from(securities).where(eq(securities.id, sec.id));
+      expect(rows).toHaveLength(1);
     });
   });
 });

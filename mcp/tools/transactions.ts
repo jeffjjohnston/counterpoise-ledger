@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v4";
-import { eq, and, gte, lte, desc, sql, inArray } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { getDb } from "@/db";
 import {
   accounts,
@@ -10,10 +10,12 @@ import {
   investmentSplits,
   securities,
 } from "@/db/schema";
-import { effectiveDateSql } from "@/lib/accounting";
 import { searchBook } from "@/lib/search";
 import { requireBookAuth } from "@/mcp/auth";
 import { READ } from "@/mcp/tools/_annotations";
+import { fail } from "@/mcp/tools/_result";
+import { selectTransactionPage } from "@/lib/transactions-query";
+import { TransactionValidationError } from "@/lib/transactions";
 
 export function registerTransactionTools(server: McpServer) {
   server.registerTool(
@@ -21,7 +23,7 @@ export function registerTransactionTools(server: McpServer) {
     {
       title: "List Transactions",
       description:
-        "Query transactions with optional filters. Returns transactions with their splits (debit/credit entries), payee, and investment details. Use accountId to see transactions for a specific account. Results are ordered by date descending.",
+        "Query transactions with optional filters. Returns transactions with their splits (debit/credit entries), payee, and investment details. Use accountId for a single account, or accountIds for several at once. Results are ordered by date descending.",
       inputSchema: {
         bookId: z.number().int().positive().describe("The book ID to query"),
         accountId: z
@@ -30,6 +32,14 @@ export function registerTransactionTools(server: McpServer) {
           .positive()
           .optional()
           .describe("Filter to transactions involving this account"),
+        accountIds: z
+          .array(z.number().int().positive())
+          .min(1)
+          .optional()
+          .describe(
+            "Filter to transactions involving ANY of these accounts. Takes " +
+              "precedence over accountId when both are given."
+          ),
         payeeId: z
           .number()
           .int()
@@ -37,13 +47,13 @@ export function registerTransactionTools(server: McpServer) {
           .optional()
           .describe("Filter by payee"),
         startDate: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .iso
+          .date()
           .optional()
           .describe("Start date inclusive (YYYY-MM-DD)"),
         endDate: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .iso
+          .date()
           .optional()
           .describe("End date inclusive (YYYY-MM-DD)"),
         limit: z
@@ -64,47 +74,44 @@ export function registerTransactionTools(server: McpServer) {
       },
       annotations: READ,
     },
-    async ({ bookId, accountId, payeeId, startDate, endDate, limit, offset }) => {
+    async ({ bookId, accountId, accountIds, payeeId, startDate, endDate, limit, offset }) => {
       const auth = await requireBookAuth(bookId);
       if ("isError" in auth) return auth;
 
       const db = getDb();
 
-      // Build WHERE conditions
-      const conditions = [eq(transactions.bookId, bookId)];
-      if (accountId) {
-        conditions.push(
-          sql`${transactions.id} IN (SELECT transaction_id FROM transaction_splits WHERE account_id = ${accountId} AND book_id = ${bookId})`
-        );
-      }
-      if (payeeId) {
-        conditions.push(eq(transactions.payeeId, payeeId));
-      }
-      if (startDate) {
-        conditions.push(gte(effectiveDateSql, startDate));
-      }
-      if (endDate) {
-        conditions.push(lte(effectiveDateSql, endDate));
+      // accountIds wins over accountId, matching the web route's precedence.
+      const filterAccountIds =
+        accountIds ?? (accountId !== undefined ? [accountId] : null);
+
+      let page;
+      try {
+        page = await selectTransactionPage(db, bookId, {
+          accountIds: filterAccountIds,
+          payeeId: payeeId ?? null,
+          startDate: startDate ?? null,
+          endDate: endDate ?? null,
+          limit,
+          offset,
+        });
+      } catch (err) {
+        if (err instanceof TransactionValidationError) return fail(err.message);
+        throw err;
       }
 
-      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+      const txnIds = page.rows.map((row) => row.id);
+      const totalCount = page.totalCount ?? 0;
 
-      // Get transactions
-      const txnRows = await db
-        .select()
-        .from(transactions)
-        .where(whereClause)
-        .orderBy(desc(effectiveDateSql), desc(transactions.id))
-        .limit(limit)
-        .offset(offset);
-
-      // Get total count
-      const [{ count: totalCount }] = await db
-        .select({ count: sql<number>`CAST(COUNT(*) AS INTEGER)` })
-        .from(transactions)
-        .where(whereClause);
-
-      const txnIds = txnRows.map((t) => t.id);
+      // Hydrate the page, then restore the order the page select chose —
+      // an IN (...) query does not preserve it.
+      const unorderedTxnRows =
+        txnIds.length > 0
+          ? await db.select().from(transactions).where(inArray(transactions.id, txnIds))
+          : [];
+      const orderMap = new Map(txnIds.map((id, index) => [id, index]));
+      const txnRows = unorderedTxnRows.sort(
+        (a, b) => (orderMap.get(a.id) ?? 0) - (orderMap.get(b.id) ?? 0)
+      );
 
       // Batch-load splits for all transactions
       const allSplits = txnIds.length > 0
@@ -216,13 +223,13 @@ export function registerTransactionTools(server: McpServer) {
         bookId: z.number().int().positive().describe("The book ID to query"),
         query: z.string().min(1).describe("Search query"),
         startDate: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .iso
+          .date()
           .optional()
           .describe("Limit transaction search start date (YYYY-MM-DD)"),
         endDate: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .iso
+          .date()
           .optional()
           .describe("Limit transaction search end date (YYYY-MM-DD)"),
       },

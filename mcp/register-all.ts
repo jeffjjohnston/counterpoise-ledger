@@ -5,11 +5,14 @@ import { registerTransactionTools } from "./tools/transactions.js";
 import { registerReportTools } from "./tools/reports.js";
 import { registerInvestmentTools } from "./tools/investments.js";
 import { registerSecurityTools } from "./tools/securities.js";
+import { registerSecurityPriceTools } from "./tools/security-prices.js";
 import { registerUsageTools } from "./tools/usage.js";
 import { registerWriteTransactionTools } from "./tools/write-transactions.js";
 import { registerPayeeTools } from "./tools/payees.js";
 import { registerIssueReportTools } from "./tools/issue-reports.js";
 import { registerRecurringTools } from "./tools/recurring.js";
+import { registerPlaidTools } from "./tools/plaid.js";
+import { registerPlaidReconcileTools } from "./tools/plaid-reconcile.js";
 
 /**
  * Register every MCP tool this server exposes.
@@ -44,9 +47,12 @@ export function registerAllTools(server: McpServer): void {
   registerReportTools(server);
   registerInvestmentTools(server);
   registerSecurityTools(server);
+  registerSecurityPriceTools(server);
   registerUsageTools(server);
   registerWriteTransactionTools(server);
   registerPayeeTools(server);
   registerIssueReportTools(server);
   registerRecurringTools(server);
+  registerPlaidTools(server);
+  registerPlaidReconcileTools(server);
 }

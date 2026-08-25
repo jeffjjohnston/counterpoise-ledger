@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
 import { authenticateBookRequest, isError } from "@/lib/api-auth";
-import { investmentSplits, securities } from "@/db/schema";
-import { and, eq, sql } from "drizzle-orm";
+import { securities } from "@/db/schema";
+import { and, eq } from "drizzle-orm";
 import { updateSecuritySchema } from "@/lib/schemas/securities";
+import {
+  SecurityNotFoundError,
+  SecurityValidationError,
+  deleteSecurity,
+  updateSecurity,
+} from "@/lib/securities";
 
 export async function GET(
   request: Request,
@@ -63,45 +69,20 @@ export async function PUT(
     if (!parsed.success) {
       return NextResponse.json({ error: parsed.error.issues[0].message }, { status: 400 });
     }
-    const { name, symbol, securityType, fetchPrices, fixedPriceMicros } =
-      parsed.data;
 
-    // Setting a fixed price switches fetching off with it: there is no feed for
-    // a fixed NAV, and the cron and the price entry pill both read the pair.
-    // Clearing the fixed price leaves fetching where it was — turning it back
-    // on is the user's call.
-    const nextFetchPrices =
-      fixedPriceMicros !== undefined && fixedPriceMicros !== null
-        ? false
-        : fetchPrices;
-
-    const existingSecurity = await db.query.securities.findFirst({
-      where: and(eq(securities.id, securityId), eq(securities.bookId, numericBookId)),
-    });
-
-    if (!existingSecurity) {
-      return NextResponse.json({ error: "Security not found" }, { status: 404 });
+    try {
+      return NextResponse.json(
+        await updateSecurity(db, numericBookId, securityId, parsed.data)
+      );
+    } catch (err) {
+      if (err instanceof SecurityNotFoundError) {
+        return NextResponse.json({ error: "Security not found" }, { status: 404 });
+      }
+      if (err instanceof SecurityValidationError) {
+        return NextResponse.json({ error: err.message }, { status: 400 });
+      }
+      throw err;
     }
-
-    await db.update(securities)
-      .set({
-        ...(name !== undefined && { name }),
-        ...(symbol !== undefined && { symbol }),
-        ...(securityType !== undefined && { securityType }),
-        ...(nextFetchPrices !== undefined && { fetchPrices: nextFetchPrices }),
-        ...(fixedPriceMicros !== undefined && { fixedPriceMicros }),
-      })
-      .where(and(eq(securities.id, securityId), eq(securities.bookId, numericBookId)));
-
-    const updatedSecurity = await db.query.securities.findFirst({
-      where: and(eq(securities.id, securityId), eq(securities.bookId, numericBookId)),
-    });
-
-    if (!updatedSecurity) {
-      return NextResponse.json({ error: "Security not found" }, { status: 404 });
-    }
-
-    return NextResponse.json(updatedSecurity);
   } catch (error) {
     console.error("Error updating security:", error);
     return NextResponse.json(
@@ -127,36 +108,18 @@ export async function DELETE(
       return NextResponse.json({ error: "Invalid security id" }, { status: 400 });
     }
 
-    // Investment splits, lots, and prices all cascade from securities, so a
-    // delete here would silently erase the security's entire investment history
-    // while leaving the double-entry transactions in place.
-    const splitsCount = await db
-      .select({ count: sql<number>`cast(count(*) as integer)` })
-      .from(investmentSplits)
-      .where(
-        and(
-          eq(investmentSplits.securityId, securityId),
-          eq(investmentSplits.bookId, numericBookId)
-        )
-      );
-
-    if (splitsCount[0].count > 0) {
-      return NextResponse.json(
-        { error: "Cannot delete security with investment transactions" },
-        { status: 400 }
-      );
+    try {
+      await deleteSecurity(db, numericBookId, securityId);
+      return NextResponse.json({ success: true });
+    } catch (err) {
+      if (err instanceof SecurityValidationError) {
+        return NextResponse.json({ error: err.message }, { status: 400 });
+      }
+      if (err instanceof SecurityNotFoundError) {
+        return NextResponse.json({ error: "Security not found" }, { status: 404 });
+      }
+      throw err;
     }
-
-    const deleted = await db
-      .delete(securities)
-      .where(and(eq(securities.id, securityId), eq(securities.bookId, numericBookId)))
-      .returning();
-
-    if (deleted.length === 0) {
-      return NextResponse.json({ error: "Security not found" }, { status: 404 });
-    }
-
-    return NextResponse.json({ success: true });
   } catch (error) {
     console.error("Error deleting security:", error);
     return NextResponse.json(

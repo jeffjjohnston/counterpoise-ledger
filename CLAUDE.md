@@ -383,11 +383,16 @@ Shared issue-report logic (used by both API routes and MCP tools). These are sco
   - `createPayee()`, `deletePayee()` — writes; `deletePayee` refuses a payee that still has transactions
   - `PayeeValidationError`, `PayeeNotFoundError` - Error classes
 - `/lib/pricing.ts` - Security price data handling
-- `/lib/securities.ts` - Security validation (`SecurityValidationError`, `SecurityDuplicateError`) shared by API and MCP
+- `/lib/securities.ts` - Security reads and writes shared by API and MCP: `listSecurities()`, `createSecurity()`, `updateSecurity()`, `deleteSecurity()`. `deleteSecurity` refuses a security that still has investment splits — splits, lots, and prices all cascade from `securities`, so deleting one would erase its whole investment history while leaving the double-entry transactions in place. Errors: `SecurityValidationError`, `SecurityDuplicateError`, `SecurityNotFoundError`
+- `/lib/security-prices.ts` - Price writes and the price-entry queue shared by API and MCP: `setSecurityPrices()` (atomic batch upsert; takes the **raw** array so it can report which entries it discarded — `bulkPricesSchema` filters malformed items inside a `.transform()`, so a caller that parses first cannot say what it lost), `updateSecurityPrice()`, `deleteSecurityPrice()`, `listPricesDue()`. Error: `PriceEntryNotFoundError`
 - `/lib/expression.ts` - `evaluateExpression()` parser for amount inputs (supports `+`, `-`, `*`, `/`, parens — e.g., user can type `12.50 + 3` in an amount field)
 - `/lib/csv.ts` - CSV export helpers (`csvEscape()`, `triggerDownload()`) used by the securities and income statement pages
+- `/lib/transactions-query.ts` - The single transaction filter, shared by the register route and `list_transactions`: `selectTransactionPage()` (which rows, in what order, and optionally how many) and `countTransactionsBefore()` (how many sort ahead of a given row — the register's scroll-to-transaction affordance). It returns rows carrying the **effective** date, not bare ids, because the route anchors its running-balance sum on the oldest row of the page. The two surfaces previously built this filter twice and differently — MCP with a subquery on `transaction_splits`, the route with an inner join and `GROUP BY`. They agreed; nothing held them in agreement
+  - Presentation stays with each surface: the route keeps `ensureId`'s page widening, `balanceAccountId`/`startingBalance`, the `includeMeta` envelope and its relational hydration; `list_transactions` keeps its own row shaping. Only "which rows, in what order" is shared. `balanceAccountId` and `includeMeta` are deliberately absent from MCP — the first never filters which transactions come back (it only picks which account's splits seed the route's own `startingBalance` sum, and `get_account_balance_history` answers the equivalent question for MCP); the second is an envelope switch and the tool always returns `totalCount`
 - `/lib/merge-transactions.ts` - `mergeTransactionsForDisplay()` interleaves projected (recurring) and actual transactions in date order for the transaction list
 - `/lib/plaid.ts` - Plaid API client (link tokens, access tokens, transaction sync fetch)
+- `/lib/plaid-tokens.ts` - Plaid connection reads and writes shared by API routes and MCP tools: `getPlaidStatus()` (the Sync page's four polls in one call), `listTokenAccounts()` (an optional `refresh` re-pulls the account list from Plaid — the only reason this read is not folded into `getPlaidStatus`; the MCP tool does not expose this option, only the HTTP route does — see `mcp/tools/plaid.ts`), `updatePlaidToken()`, `deletePlaidToken()`, `setTokenAccounts()`, `clearSyncData()`. `maskAccessToken()` and `toTokenListItem()` (exported so the token-creation route can mask its own inserted row the same way) live here too. `getTokenOr404()` is not exported: it returns the unmasked row, including the raw `accessToken`, so nothing outside this file can reach it — every caller-facing read goes through `toTokenListItem()` or `toPlaidAccountPayload()` instead. Its parameter order is `(db, bookId, tokenId, …)`, matching every other exported function here, on purpose: a transposed `(tokenId, bookId)` pair type-checks silently and would query the wrong row. Errors: `PlaidTokenNotFoundError`, `PlaidTokenValidationError`, `PlaidRefreshError` (a refresh's Plaid call, or the write reconciling its response, failed — kept distinct from a plain database failure so callers can tell them apart)
+- `/lib/plaid-transactions.ts` - Staged Plaid rows and transaction links shared by API routes and MCP tools: `listPendingPlaidTransactions()`, `getTransactionPlaidLink()`, `unlinkPlaidTransaction()`. Error: `PlaidLinkNotFoundError`
 - `/lib/plaid-sync.ts` - `syncToken()` — fetches Plaid transactions, stages in reconciliation table, runs auto-match
 - `/lib/plaid-auto-match.ts` - `autoMatchPendingTransactions()` — learned payee-based auto-matching
 - `/lib/recurring.ts`, `/lib/recurring-processing.ts`, `/lib/recurring-rules.ts` - Recurring transaction logic
@@ -914,7 +919,7 @@ scheduled on or before `endDate` counts even when its shift lands past it.
 5. Auto-match runs on pending rows, then remaining items await manual reconciliation in the UI
 
 ### Sync Trigger Points
-- **Manual**: POST `/api/b/[bookId]/sync/tokens/[id]/sync` — syncs a single token on demand (per-account variant: POST `/api/b/[bookId]/sync/accounts/[id]/sync`)
+- **Manual**: POST `/api/b/[bookId]/sync/tokens/[id]/sync` — syncs a single token on demand. Sync is always per token: there is **no** per-account sync route. `DELETE` on that same path clears the token's staged sync data. The only route under `sync/accounts/[id]/` is `reconcile`
 - **Cron**: GET `/api/cron/plaid-sync` — syncs all tokens with linked accounts every 6 hours (via Docker `scheduler` sidecar at 12am, 6am, 12pm, 6pm). Requires `CRON_SECRET` bearer token. **Tokens with `isDemo = true` are excluded**, and `syncToken` refuses them outright. The seed gives a demo book a Plaid connection with a synthetic access token so the Sync page has something to show; it is linked to a liability account exactly like a real connection, so nothing but that column tells them apart. Without the exclusion, every demo book makes a guaranteed-failing call to Plaid every six hours and writes the rejection to `lastError`, which the Sync page renders as "Last sync failed". `syncToken`'s guard sits *above* its try block for that reason — the catch inside writes `lastError`, and a demo connection must not be recorded as a broken one.
 
 ### Auto-Match Algorithm (`/lib/plaid-auto-match.ts`)
@@ -928,7 +933,7 @@ Auto-match runs automatically after every sync (both manual and cron). It uses a
    - Atomically set `resolutionStatus = 'matched'`, mark the local transaction as reconciled (and `isFloating = false`), and stamp its `date` (see date rule below)
 3. **Per-link uniqueness**: A transaction can only be auto-matched once per Plaid account link (but the same transaction can match on different linked accounts for transfers)
 
-**Auto-match date rule**: When stamping the matched transaction's `date`, prefer the Plaid **authorization** date (closest to when the user entered the transaction) over the **posted** date. Fall back to the posted date only when it lands 7+ days after authorization (a gap that large means the posted/settlement date is the meaningful one), or when Plaid provides no `authorizedDate`. Note this differs from the manual `match` action in the reconcile route, which leaves the local transaction's date untouched.
+**Auto-match date rule**: When stamping the matched transaction's `date`, prefer the Plaid **authorization** date (closest to when the user entered the transaction) over the **posted** date. Fall back to the posted date only when it lands 7+ days after authorization (a gap that large means the posted/settlement date is the meaningful one), or when Plaid provides no `authorizedDate`. The manual `match` action in the reconcile route applies the same rule, but **only to a floating transaction** — it settles one by clearing `isFloating` and stamping this date. A non-floating transaction keeps the date the user entered.
 
 ### Sync Handling of Modified/Removed Transactions
 - **Modified**: If a previously matched/created row is modified by Plaid, it gets `reviewReason: 'plaid_modified'` with before/after metadata for human review
@@ -936,7 +941,18 @@ Auto-match runs automatically after every sync (both manual and cron). It uses a
 - **Pending rows**: Modified pending rows are simply updated in place
 
 ### Transaction Unlink
-- POST `/api/b/[bookId]/transactions/[id]/plaid/unlink` — Removes the Plaid link from a matched transaction (sets reconciliation back to `pending`, clears `isReconciled`)
+- POST `/api/b/[bookId]/transactions/[id]/plaid/unlink` — Removes the Plaid link from a matched transaction (sets reconciliation back to `pending`, clears `isReconciled`). The `isReconciled` clear is real, not aspirational: before the MCP-parity Plaid work, the route reset only the reconciliation row and left `transactions.isReconciled` untouched. A transaction stuck marked reconciled would assert a match to a bank record that no longer links to it — and since `getStaleUnmatched()` only flags rows with `isReconciled = false`, it could never resurface in the sync health check either.
+
+### Reconciliation
+
+`/lib/plaid-reconcile.ts` owns the queue read and the six-action resolver, shared by `sync/accounts/[id]/reconcile` and the two MCP tools. Six things about it are easy to get wrong:
+
+- **It does not take an advisory lock**, unlike `syncToken`. It mutates one already-staged row by id inside `db.transaction()` on the pooled connection, so Postgres row locking is the whole concurrency story. CLAUDE.md's reserved-connection warning is about `/lib/plaid-sync.ts`, not this file.
+- **`resolveReconciliation` checks the action's required field as its first statement**, before the transaction opens. That ordering is what makes the route report `"transactionId is required for match"` (400) ahead of `"Reconciliation row not found"` (404). Moving the check after the row load silently swaps the two answers.
+- **A bank row that is already linked cannot be linked again** — `match`, `match_update_amount` and `create` all refuse when `matchedTransactionId` is set and `reviewReason` is null. Without it a repeated `create` inserts a second transaction and repoints the link at it, orphaning the first (still marked reconciled, attached to nothing, and invisible to `getStaleUnmatched()`, which filters `isReconciled = false`). The `reviewReason` half is load-bearing: the queue is "pending OR flagged for review", `ReconciliationModal` renders those buttons for anything in it, so a row Plaid has since modified is both already-linked and legitimately re-linkable. What stays closed is what the UI cannot reach — `loadReconciliationRow` matches on id, link and book but not queue membership, so MCP can address a fully-resolved row long after it left the queue.
+- **`unlink` un-reconciles its transaction, but only when nothing else matches it.** Per-link uniqueness is enforced per link, so one transaction can be matched on two links at once — that is how a transfer reconciles against both sides — and an unconditional clear would make a correctly-reconciled transfer a false positive in the health check.
+- **Matching a floating transaction settles it**: `isFloating` is cleared and `date` stamped with `pickMatchedDate` (shared with the auto-matcher, not reimplemented). A floating transaction's stored date is its original entry date, so clearing the flag alone would snap it backwards in the register. A non-floating transaction keeps its date untouched — see the auto-match date rule above.
+- **The action-conditional rules live once**, in `reconcileActionIssue()` in `/lib/schemas/sync.ts`. `reconcileSchema`'s `superRefine` calls it for the route; `resolveReconciliation` calls it for MCP, because `toolShape()` spreads a schema's `.shape` and drops object-level refinements. Two call sites, one implementation — the action list is already kept in step by hand in four places and must not become five.
 
 ### Environment Variables
 | Variable | Purpose |
@@ -967,7 +983,7 @@ A security with a non-null `fixedPriceMicros` is valued at that price forever �
 
 - **One rule, applied at the read sites.** `fixedPriceRow()` in `/lib/investments.ts` builds the synthetic price row, dated today so it wins every "newest price" comparison. `getLatestPrices()` uses it (covering `getPositions`, `getMarketValuesByAccount`, the securities list, the pill, and MCP's `get_security_detail`, which builds its position from `getPositions`), and the security detail route uses it directly — that route replays positions itself instead of calling `getPositions`, which is why it is the one place that needs its own call
 - The fixed price **supersedes** any `securityPrices` rows, including ones recorded before the security was marked fixed-price. Those rows stay on the books as history and still render in the Price History tab; they no longer value the position
-- **Setting a fixed price forces `fetchPrices = false`** in both `createSecurity()` and the securities PUT route, so the two cannot contradict each other. Clearing the fixed price leaves fetching off — turning it back on is the user's call. The Tiingo cron and the Update Prices modal *also* filter on `fixedPriceMicros` rather than trusting that coupling
+- **Setting a fixed price forces `fetchPrices = false`** in both `createSecurity()` and `updateSecurity()`, which the securities PUT route and `update_security` both call. Clearing the fixed price leaves fetching off — turning it back on is the user's call. The Tiingo cron and the Update Prices modal *also* filter on `fixedPriceMicros` rather than trusting that coupling
 - The Update Prices modal renders a fixed-price security read-only ("Fixed at $1.00") with no Fetch checkbox, and the securities list marks its price cell `fixed`
 - The investment entry form prefills Price from the fixed price when the user **picks** the security (`selectSecurity()` in `/components/transactions/useInvestmentEntry.ts`) and labels the field "Price (fixed)". The bare `setSelectedSecurityId()` setter deliberately does not prefill: `TransactionForm` uses it to restore a saved transaction, which must keep the price it was recorded at. The field stays editable
 - Switching from a fixed-price security to an ordinary one clears the prefill, but **only if the field still holds exactly what was auto-filled** — a price the user typed survives a security change, as it does everywhere else in that form
@@ -1127,7 +1143,7 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 - `delete_account` — Delete an account; refuses if it still has transactions or sub-accounts
 
 **Transactions** (require `bookId`):
-- `list_transactions` — List transactions with splits, payees, and investment data; filterable by account, date, with pagination
+- `list_transactions` — List transactions with splits, payees, and investment data; filter by one account (`accountId`) or several (`accountIds`), by payee, and by date, with pagination. An out-of-book `payeeId` is an error, not an empty list
 - `search` — Search accounts, payees, and transactions by text or amount
 - `create_transaction` — Create a double-entry transaction with splits (must sum to zero)
 - `update_transaction` — Update an existing transaction's fields or replace splits
@@ -1156,8 +1172,18 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 
 **Investments** (require `bookId`):
 - `get_investment_positions` — Current positions with shares, cost basis, market value, gain/loss
-- `get_security_detail` — Security info, price history, transactions, and position
+- `list_securities` — List every security in a book with shares, cost basis, latest price, market value, and income received
+- `get_security_detail` — Security info, price history, transactions, and position. `includeLots` adds the open FIFO lots; dividend and capital-gain rows carry the cash received
 - `create_security` — Create a new security (ETF, mutual fund, or stock); fails if the symbol already exists in the book
+- `update_security` — Update a security's name, symbol, type, fetch setting, or fixed price; setting a fixed price forces fetching off
+- `delete_security` — Delete a security; refuses when it still has investment transactions
+
+**Security prices** (require `bookId`):
+- `set_security_prices` — Record manual prices; malformed entries are skipped and reported in `discarded`
+- `update_security_price` — Change a recorded price, or move it to another date
+- `delete_security_price` — Delete one recorded price
+- `list_prices_due` — Securities needing a manual price for the most recent market day
+- `fetch_tiingo_prices` — Fetch the latest end-of-day prices from Tiingo; records nothing
 
 **Issue Reports:**
 - `create_issue_report` — File a bug or improvement report about Counterpoise itself
@@ -1170,6 +1196,26 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 
 **Analytics:**
 - `analyze_usage` — Query PostHog for event summaries (requires PostHog env vars)
+
+**Plaid sync** (require `bookId`):
+- `get_plaid_status` — Every bank connection (access token masked), the count of transactions waiting to be reconciled, which accounts hold unmatched manually-entered transactions, and every Plaid account mapped to a Counterpoise account. Folds four separate UI polls into one call
+- `list_plaid_token_accounts` — List a connection's bank accounts and each one's Counterpoise mapping. `refresh` re-pulls the list from Plaid first; otherwise the read is local only
+- `update_plaid_token` — Full replace of a connection's institution name and item id. This tool cannot set the access token: a Plaid access token is re-obtainable only through the Link browser flow, so a hallucinated value would destroy the connection with no way to recover it
+- `delete_plaid_token` — Delete a connection, its account mappings, and its entire reconciliation history — the staged unreconciled transactions **and** every already-resolved row (matched, created, ignored)
+- `set_plaid_token_accounts` — Map a connection's bank accounts to Counterpoise accounts. Pass `counterpoiseAccountId: null` to unmap one
+- `sync_plaid_token` — Fetch new, changed, and removed transactions from Plaid for one connection, stage them, and run auto-match. Reaches Plaid and changes data; a demo connection cannot sync and says so
+- `clear_plaid_sync_data` — Discard a connection's staged transactions and reset its sync cursor, so the next sync starts over. Touches only this database; never calls Plaid
+- `list_pending_plaid_transactions` — Staged bank transactions nothing has reconciled yet. Their ids are synthetic placeholders — never pass them to `create_transaction`, `update_transaction`, `delete_transaction`, or any other transaction tool
+- `get_transaction_plaid_link` — The staged Plaid row a transaction is matched to, or `null` if the transaction was entered by hand
+- `unlink_plaid_transaction` — Remove a transaction's Plaid link. The bank transaction returns to the pending queue; the local transaction stops being reconciled
+- `get_reconcile_candidates` — The reconciliation queue for one linked bank account: staged transactions awaiting a decision, each with up to five ranked candidate matches and a suggested counter account
+- `reconcile_plaid_transaction` — Resolve one staged bank transaction: match it to an existing transaction, match and rewrite that transaction's amount, create a new transaction from it, ignore it, keep what you already have, or unlink an already-resolved row (which also un-reconciles its transaction unless another bank row still matches it). Linking a row that is already linked is refused
+
+### Tool Annotations
+
+Every `registerTool` call passes one preset from `/mcp/tools/_annotations.ts`: `READ`, `READ_NETWORK`, `CREATE`, `UPDATE`, `DESTRUCTIVE`, `WRITE_NETWORK`. A client can tell a query from a write without reading the description.
+
+`WRITE_NETWORK` is for a tool that both changes data and leaves the process to do it. `sync_plaid_token` is currently its only user — distinct from `READ_NETWORK`, which is for a tool that reaches out but changes nothing (`fetch_tiingo_prices`, `analyze_usage`, `list_plaid_token_accounts`). The presets are enumerated by hand in `tests/mcp/annotations.test.ts`. A preset added to `_annotations.ts` but not to that test's `checked` set escapes the hygiene checks.
 
 ### Shared Transaction Logic
 
@@ -1195,6 +1241,8 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 | `/lib/lots.ts` | Pure FIFO replay engine (no DB) |
 | `/lib/lots-db.ts` | `rebuildLots()` — the only inserter of lots and allocations at runtime (rows also disappear via FK cascade on deletes) |
 | `/lib/realized-gains.ts` | Realized gain/loss query shared by the report route and MCP |
+| `/lib/transactions-query.ts` | Shared transaction filter, page select, and position count |
+| `/lib/security-prices.ts` | Manual price writes, atomic batch upsert, and the price-entry queue |
 | `/scripts/rebuild-lots.ts` | Guarded backfill, run by the container entrypoint |
 | `/scripts/check-db-credential.sh` | Aborts container startup when `DATABASE_URL` uses the published default credential |
 | `/scripts/postgres-init/01-app-role.sh` | Creates the `counterpoise_app` role on first postgres initialization |
@@ -1206,6 +1254,9 @@ When running Counterpoise via Docker Compose, configure MCP clients to use `dock
 | `/lib/transactions.ts` | Shared create/update transaction logic (used by API routes and MCP) |
 | `/lib/recurring-rules.ts` | Shared recurring-rule reads and writes (used by API routes and MCP) |
 | `/lib/advisory-lock.ts` | `withAdvisoryLock()` — session-scoped lock on a reserved connection; its callback's `db` is not the pooled one |
+| `/lib/plaid-tokens.ts` | Plaid connection reads and writes; owns access-token masking |
+| `/lib/plaid-transactions.ts` | Staged Plaid rows and transaction links |
+| `/lib/plaid-reconcile.ts` | Reconciliation queue read and the six-action resolver, shared by the route and MCP |
 | `/lib/plaid-sync.ts` | Plaid transaction sync — fetches, stages, and auto-matches |
 | `/lib/plaid-auto-match.ts` | Learned payee-based auto-matching for Plaid transactions |
 | `/app/api/cron/plaid-sync/route.ts` | Cron endpoint for periodic Plaid sync (every 6 hours) |

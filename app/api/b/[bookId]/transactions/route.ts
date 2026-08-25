@@ -1,11 +1,16 @@
 import { NextResponse } from "next/server";
 import { authenticateBookRequest, isError } from "@/lib/api-auth";
-import { accounts, payees, transactions, transactionSplits } from "@/db/schema";
-import { and, desc, eq, gte, inArray, lt, lte, or, sql, type SQL } from "drizzle-orm";
+import { accounts, transactions, transactionSplits } from "@/db/schema";
+import { and, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { captureEvent } from "@/lib/posthog-server";
 import { type AppDb } from "@/db";
 import { createTransaction as createTransactionShared, TransactionValidationError } from "@/lib/transactions";
 import { effectiveDateSql } from "@/lib/accounting";
+import {
+  countTransactionsBefore,
+  selectTransactionPage,
+  type TransactionFilters,
+} from "@/lib/transactions-query";
 import {
   createTransactionBodySchema,
   listTransactionsQuery,
@@ -68,19 +73,13 @@ export async function GET(
     const offset = parsedQuery.data.offset ?? 0;
     const ensureId = parsedQuery.data.ensureId ?? null;
 
-    const dateFilters: SQL[] = [];
-    if (startDate) {
-      dateFilters.push(gte(effectiveDateSql, startDate));
-    }
-    if (endDate) {
-      dateFilters.push(lte(effectiveDateSql, endDate));
-    }
-
     let pageRows: Array<{ id: number; date: string }> = [];
     let totalCount = 0;
 
-    // These two only ever reach queries that are already book-scoped, but reject
-    // out-of-book ids outright rather than silently answering about nothing.
+    // balanceAccountId only ever reaches a query that is already book-scoped,
+    // but this route rejects an out-of-book id outright rather than silently
+    // answering about nothing. accountId(s) and payeeId get the same
+    // treatment, inside selectTransactionPage below.
     if (balanceAccountIdNumber !== null) {
       const [account] = await db
         .select({ id: accounts.id })
@@ -99,21 +98,15 @@ export async function GET(
       }
     }
 
-    if (payeeIdNumber !== null) {
-      const [payee] = await db
-        .select({ id: payees.id })
-        .from(payees)
-        .where(and(eq(payees.id, payeeIdNumber), eq(payees.bookId, numericBookId)));
-      if (!payee) {
-        return NextResponse.json({ error: "Invalid payeeId" }, { status: 400 });
-      }
-    }
-
-    const payeeFilter =
-      payeeIdNumber !== null ? eq(transactions.payeeId, payeeIdNumber) : null;
-
     const filteredAccountIds =
       accountIds ?? (accountIdNumber !== null ? [accountIdNumber] : null);
+
+    const filters: TransactionFilters = {
+      accountIds: filteredAccountIds,
+      payeeId: payeeIdNumber,
+      startDate: startDate ?? null,
+      endDate: endDate ?? null,
+    };
 
     // When ensureId is set, extend the limit so the target transaction is included
     if (ensureId !== null && offset === 0 && limitParam !== "0") {
@@ -123,122 +116,28 @@ export async function GET(
         .where(and(eq(transactions.id, ensureId), eq(transactions.bookId, numericBookId)));
 
       if (targetTxn) {
-        // Count how many transactions come before this one in desc date, desc id order
-        const positionFilter = or(
-          sql`${effectiveDateSql} > ${targetTxn.date}`,
-          and(
-            sql`${effectiveDateSql} = ${targetTxn.date}`,
-            sql`${transactions.id} > ${targetTxn.id}`
-          )
+        const positionCount = await countTransactionsBefore(
+          db,
+          numericBookId,
+          filters,
+          { date: targetTxn.date, id: targetTxn.id }
         );
-
-        let positionCount: number;
-        if (filteredAccountIds) {
-          const [result] = await db
-            .select({
-              count: sql<number>`cast(count(distinct ${transactions.id}) as integer)`.as("count"),
-            })
-            .from(transactions)
-            .innerJoin(
-              transactionSplits,
-              eq(transactionSplits.transactionId, transactions.id)
-            )
-            .where(
-              and(
-                eq(transactions.bookId, numericBookId),
-                inArray(transactionSplits.accountId, filteredAccountIds),
-                ...dateFilters,
-                ...(payeeFilter ? [payeeFilter] : []),
-                positionFilter
-              )
-            );
-          positionCount = result?.count ?? 0;
-        } else {
-          const filters = [
-            eq(transactions.bookId, numericBookId),
-            ...dateFilters,
-            ...(payeeFilter ? [payeeFilter] : []),
-            positionFilter,
-          ];
-          const [result] = await db
-            .select({
-              count: sql<number>`cast(count(*) as integer)`.as("count"),
-            })
-            .from(transactions)
-            .where(and(...filters));
-          positionCount = result?.count ?? 0;
-        }
 
         // Extend limit to include the target transaction (position is 0-indexed)
         limit = Math.max(limit, positionCount + 1);
       }
     }
 
-    if (filteredAccountIds) {
-      const accountFilters = [
-        eq(transactions.bookId, numericBookId),
-        inArray(transactionSplits.accountId, filteredAccountIds),
-        ...dateFilters,
-        ...(payeeFilter ? [payeeFilter] : []),
-      ];
-      const accountWhere = and(...accountFilters);
-
-      const baseQuery = db
-        .select({ id: transactions.id, date: effectiveDateSql.as("date") })
-        .from(transactions)
-        .innerJoin(
-          transactionSplits,
-          eq(transactionSplits.transactionId, transactions.id)
-        )
-        .where(accountWhere)
-        .groupBy(transactions.id, transactions.date)
-        .orderBy(desc(effectiveDateSql), desc(transactions.id));
-
-      const pageQuery =
-        limitParam !== "0" ? baseQuery.limit(limit).offset(offset) : baseQuery;
-
-      pageRows = await pageQuery;
-
-      if (includeMeta) {
-        const countResult = await db
-          .select({
-            count: sql<number>`cast(count(distinct ${transactions.id}) as integer)`.as("count"),
-          })
-          .from(transactions)
-          .innerJoin(
-            transactionSplits,
-            eq(transactionSplits.transactionId, transactions.id)
-          )
-          .where(accountWhere);
-
-        totalCount = countResult[0]?.count ?? 0;
-      }
-    } else {
-      const whereClause = (() => {
-        const filters = [eq(transactions.bookId, numericBookId), ...dateFilters, ...(payeeFilter ? [payeeFilter] : [])];
-        return and(...filters);
-      })();
-
-      const baseQuery = db
-        .select({ id: transactions.id, date: effectiveDateSql.as("date") })
-        .from(transactions)
-        .where(whereClause)
-        .orderBy(desc(effectiveDateSql), desc(transactions.id));
-
-      const pageQuery =
-        limitParam !== "0" ? baseQuery.limit(limit).offset(offset) : baseQuery;
-
-      pageRows = await pageQuery;
-
-      if (includeMeta) {
-        const countResult = await db
-          .select({ count: sql<number>`cast(count(*) as integer)`.as("count") })
-          .from(transactions)
-          .where(whereClause);
-
-        totalCount = countResult[0]?.count ?? 0;
-      }
-    }
+    const page = await selectTransactionPage(db, numericBookId, {
+      ...filters,
+      // "0" is this route's long-standing sentinel for "return everything";
+      // the library expresses that as a null limit.
+      limit: limitParam === "0" ? null : limit,
+      offset,
+      withCount: includeMeta,
+    });
+    pageRows = page.rows;
+    totalCount = page.totalCount ?? 0;
 
     const ids = pageRows.map((row) => row.id);
     type TransactionRow = Awaited<
@@ -305,7 +204,7 @@ export async function GET(
         eq(transactions.bookId, numericBookId),
         eq(transactionSplits.accountId, balanceAccountId),
         olderThanOldest,
-        ...(payeeFilter ? [payeeFilter] : []),
+        ...(payeeIdNumber !== null ? [eq(transactions.payeeId, payeeIdNumber)] : []),
       ];
 
       const balanceResult = await db
@@ -334,6 +233,9 @@ export async function GET(
 
     return NextResponse.json(allTransactions);
   } catch (error) {
+    if (error instanceof TransactionValidationError) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
     console.error("Error fetching transactions:", error);
     return NextResponse.json(
       { error: "Failed to fetch transactions" },

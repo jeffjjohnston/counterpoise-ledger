@@ -70,3 +70,44 @@ export const DESTRUCTIVE: ToolAnnotations = {
   idempotentHint: true,
   openWorldHint: false,
 };
+
+/**
+ * Removes data AND lands in a different state when repeated — unlike
+ * DESTRUCTIVE, whose idempotentHint promises a retry is safe.
+ * reconcile_plaid_transaction's 'create' action is the case that motivated
+ * this preset: loadReconciliationRow() in lib/plaid-reconcile.ts matches on
+ * id, link and book, but not on resolutionStatus, so a second 'create' call
+ * on the same reconciliationId does not detect that the row was already
+ * resolved. It runs the whole branch again — inserts a second transaction
+ * and overwrites matchedTransactionId to point at the new one. The first
+ * transaction stays in the ledger, marked reconciled, linked to nothing, and
+ * invisible to getStaleUnmatched() (which only flags isReconciled = false).
+ * A client that trusts idempotentHint and retries a timed-out call would
+ * create exactly that duplicate-plus-orphan pair in someone's real financial
+ * records. Use this preset for any tool with the same shape: destructive,
+ * and not safe to retry blindly.
+ */
+export const DESTRUCTIVE_NONIDEMPOTENT: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+
+/**
+ * Changes data AND leaves this process to do it — the Plaid sync. Distinct
+ * from READ_NETWORK, which is for a query that reaches out (Tiingo, PostHog)
+ * and changes nothing: a client that trusts READ_NETWORK's readOnlyHint
+ * could auto-approve this tool, which stages rows, mutates reconciliation
+ * state and commits a sync cursor.
+ *
+ * idempotentHint is false: a second sync is not a no-op. It fetches whatever
+ * Plaid has produced since the cursor this one committed, so running it twice
+ * can land in a different state than running it once.
+ */
+export const WRITE_NETWORK: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true,
+};

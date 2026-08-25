@@ -1,28 +1,13 @@
 import { NextResponse } from "next/server";
 import { authenticateBookRequest, isError } from "@/lib/api-auth";
-import { plaidTokens } from "@/db/schema";
-import { and, eq, ne } from "drizzle-orm";
 import { updateTokenSchema } from "@/lib/schemas/sync";
-
-const maskAccessToken = (accessToken: string): string => {
-  if (accessToken.length <= 8) {
-    return "*".repeat(accessToken.length);
-  }
-
-  const prefix = accessToken.slice(0, 4);
-  const suffix = accessToken.slice(-4);
-  const middle = "*".repeat(Math.max(8, accessToken.length - 8));
-  return `${prefix}${middle}${suffix}`;
-};
-
-const toTokenListItem = (token: typeof plaidTokens.$inferSelect) => ({
-  id: token.id,
-  financialInstitution: token.financialInstitution,
-  itemId: token.itemId,
-  accessTokenMasked: maskAccessToken(token.accessToken),
-  createdAt: token.createdAt,
-  updatedAt: token.updatedAt,
-});
+import {
+  deletePlaidToken,
+  parseTokenId,
+  PlaidTokenNotFoundError,
+  PlaidTokenValidationError,
+  updatePlaidToken,
+} from "@/lib/plaid-tokens";
 
 export async function PUT(
   request: Request,
@@ -34,54 +19,26 @@ export async function PUT(
     if (isError(auth)) return auth.error;
     const { db, bookId: numericBookId } = auth;
 
-    const tokenId = Number.parseInt(id, 10);
+    const tokenId = parseTokenId(id);
 
-    if (!Number.isFinite(tokenId)) {
+    if (tokenId === null) {
       return NextResponse.json({ error: "Invalid token id" }, { status: 400 });
-    }
-
-    const existingTokenRows = await db
-      .select()
-      .from(plaidTokens)
-      .where(and(eq(plaidTokens.id, tokenId), eq(plaidTokens.bookId, numericBookId)))
-      .limit(1);
-
-    if (existingTokenRows.length === 0) {
-      return NextResponse.json({ error: "Token not found" }, { status: 404 });
     }
 
     const parsed = updateTokenSchema.safeParse(await request.json());
     if (!parsed.success) {
       return NextResponse.json({ error: parsed.error.issues[0].message }, { status: 400 });
     }
-    const { financialInstitution, itemId, accessToken } = parsed.data;
 
-    const duplicateItemRows = await db
-      .select({ id: plaidTokens.id })
-      .from(plaidTokens)
-      .where(and(eq(plaidTokens.bookId, numericBookId), eq(plaidTokens.itemId, itemId), ne(plaidTokens.id, tokenId)))
-      .limit(1);
-
-    if (duplicateItemRows.length > 0) {
-      return NextResponse.json(
-        { error: "A token with this itemId already exists" },
-        { status: 409 }
-      );
-    }
-
-    const [updatedToken] = await db
-      .update(plaidTokens)
-      .set({
-        financialInstitution,
-        itemId,
-        ...(accessToken ? { accessToken } : {}),
-        updatedAt: new Date(),
-      })
-      .where(and(eq(plaidTokens.id, tokenId), eq(plaidTokens.bookId, numericBookId)))
-      .returning();
-
-    return NextResponse.json(toTokenListItem(updatedToken));
+    const updatedToken = await updatePlaidToken(db, numericBookId, tokenId, parsed.data);
+    return NextResponse.json(updatedToken);
   } catch (error) {
+    if (error instanceof PlaidTokenNotFoundError) {
+      return NextResponse.json({ error: "Token not found" }, { status: 404 });
+    }
+    if (error instanceof PlaidTokenValidationError) {
+      return NextResponse.json({ error: error.message }, { status: 409 });
+    }
     console.error("Error updating sync token:", error);
     return NextResponse.json(
       { error: "Failed to update sync token" },
@@ -100,20 +57,18 @@ export async function DELETE(
     if (isError(auth)) return auth.error;
     const { db, bookId: numericBookId } = auth;
 
-    const tokenId = Number.parseInt(id, 10);
+    const tokenId = parseTokenId(id);
 
-    if (!Number.isFinite(tokenId)) {
+    if (tokenId === null) {
       return NextResponse.json({ error: "Invalid token id" }, { status: 400 });
     }
 
-    const deleted = await db.delete(plaidTokens).where(and(eq(plaidTokens.id, tokenId), eq(plaidTokens.bookId, numericBookId))).returning();
-
-    if (deleted.length === 0) {
-      return NextResponse.json({ error: "Token not found" }, { status: 404 });
-    }
-
+    await deletePlaidToken(db, numericBookId, tokenId);
     return NextResponse.json({ success: true });
   } catch (error) {
+    if (error instanceof PlaidTokenNotFoundError) {
+      return NextResponse.json({ error: "Token not found" }, { status: 404 });
+    }
     console.error("Error deleting sync token:", error);
     return NextResponse.json(
       { error: "Failed to delete sync token" },

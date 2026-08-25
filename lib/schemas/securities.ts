@@ -146,11 +146,19 @@ export type CreateSecurityInput = z.infer<typeof createSecuritySchema>;
 const UPDATE_FETCH_PRICES_MESSAGE = "Fetch prices must be a boolean"; // securities/[id]/route.ts:60
 
 export const updateSecuritySchema = z.object({
-  name: z.string().optional(),
-  symbol: z.string().optional(),
-  securityType: securityTypeSchema.optional(),
-  fetchPrices: z.boolean({ error: UPDATE_FETCH_PRICES_MESSAGE }).optional(),
-  fixedPriceMicros: fixedPriceMicrosSchema,
+  name: z.string().optional().describe("New display name for the security"),
+  symbol: z.string().optional().describe("New ticker symbol (e.g. VTI, AAPL)"),
+  securityType: securityTypeSchema.optional().describe("New type of security"),
+  fetchPrices: z
+    .boolean({ error: UPDATE_FETCH_PRICES_MESSAGE })
+    .optional()
+    .describe("Whether to fetch prices automatically for this security"),
+  fixedPriceMicros: fixedPriceMicrosSchema.describe(
+    "Price in micros (1,000,000 = $1.00) that never moves, for a security " +
+      "such as a money market fund held at a fixed NAV. Setting this forces " +
+      "fetchPrices off. Pass null to clear it; fetching stays off until you " +
+      "turn it back on."
+  ),
 });
 
 export type UpdateSecurityInput = z.infer<typeof updateSecuritySchema>;

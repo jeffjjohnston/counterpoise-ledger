@@ -393,4 +393,127 @@ describe("GET /api/transactions", () => {
     expect(payload.transactions.length).toBeGreaterThan(1000);
     expect(payload.transactions.some((tx: { id: number }) => tx.id === ensureTransactionId)).toBe(true);
   });
+
+  it("returns a bare array, not the meta envelope, when includeMeta is absent", async () => {
+    // The dashboard widget (app/b/[bookId]/page.tsx) fetches without
+    // includeMeta and indexes the response directly. If the rewire always
+    // returns { transactions, ... }, that page renders nothing.
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const groceries = await createAccount({ name: "Groceries", type: "expense" });
+    await createTransactionWithSplits({
+      date: "2026-01-10", description: "Shop",
+      splits: [
+        { accountId: checking.id, amount: -1000 },
+        { accountId: groceries.id, amount: 1000 },
+      ],
+    });
+
+    const res = await GET(new Request("http://localhost/api/b/1/transactions"), {
+      params: Promise.resolve({ bookId: "1" }),
+    });
+    const body = await res.json();
+
+    expect(Array.isArray(body)).toBe(true);
+    expect(body).toHaveLength(1);
+    expect(body[0].description).toBe("Shop");
+  });
+
+  it("orders same-date transactions by id descending", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const groceries = await createAccount({ name: "Groceries", type: "expense" });
+    const first = await createTransactionWithSplits({
+      date: "2026-01-10", description: "First",
+      splits: [
+        { accountId: checking.id, amount: -100 },
+        { accountId: groceries.id, amount: 100 },
+      ],
+    });
+    const second = await createTransactionWithSplits({
+      date: "2026-01-10", description: "Second",
+      splits: [
+        { accountId: checking.id, amount: -200 },
+        { accountId: groceries.id, amount: 200 },
+      ],
+    });
+    expect(second.id).toBeGreaterThan(first.id);
+
+    const res = await GET(new Request("http://localhost/api/b/1/transactions"), {
+      params: Promise.resolve({ bookId: "1" }),
+    });
+    const body = await res.json();
+
+    // Newest id first on a date tie — the register depends on this to keep a
+    // just-entered transaction at the top of its day.
+    expect(body.map((t: { description: string }) => t.description)).toEqual([
+      "Second",
+      "First",
+    ]);
+  });
+
+  it("returns a disjoint second page for the same filter", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const groceries = await createAccount({ name: "Groceries", type: "expense" });
+    for (let i = 1; i <= 5; i++) {
+      await createTransactionWithSplits({
+        date: `2026-01-0${i}`, description: `Txn ${i}`,
+        splits: [
+          { accountId: checking.id, amount: -100 },
+          { accountId: groceries.id, amount: 100 },
+        ],
+      });
+    }
+
+    const page = async (offset: number) => {
+      const res = await GET(
+        new Request(
+          `http://localhost/api/b/1/transactions?accountId=${checking.id}&limit=2&offset=${offset}&includeMeta=true`
+        ),
+        { params: Promise.resolve({ bookId: "1" }) }
+      );
+      return res.json();
+    };
+
+    const first = await page(0);
+    const second = await page(2);
+
+    expect(first.transactions).toHaveLength(2);
+    expect(second.transactions).toHaveLength(2);
+    expect(first.totalCount).toBe(5);
+    expect(second.totalCount).toBe(5);
+    // No row appears on both pages.
+    const firstIds = first.transactions.map((t: { id: number }) => t.id);
+    const secondIds = second.transactions.map((t: { id: number }) => t.id);
+    expect(firstIds.filter((id: number) => secondIds.includes(id))).toEqual([]);
+  });
+
+  it("rejects a payeeId belonging to another book with 400", async () => {
+    const otherBook = await createBook({ name: "Other Book" });
+    const theirPayee = await createPayee({ name: "Theirs", bookId: otherBook.id });
+
+    const res = await GET(
+      new Request(`http://localhost/api/b/1/transactions?payeeId=${theirPayee.id}`),
+      { params: Promise.resolve({ bookId: "1" }) }
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Invalid payeeId");
+  });
+
+  it("rejects an accountId belonging to another book with 400", async () => {
+    // Previously returned [] with 200 — an out-of-book accountId read as
+    // "this account has no transactions", a wrong answer rather than an
+    // empty one. Now consistent with the payeeId case above.
+    const otherBook = await createBook({ name: "Other Book" });
+    const theirAccount = await createAccount({
+      name: "Theirs", type: "asset", bookId: otherBook.id,
+    });
+
+    const res = await GET(
+      new Request(`http://localhost/api/b/1/transactions?accountId=${theirAccount.id}`),
+      { params: Promise.resolve({ bookId: "1" }) }
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("One or more accounts do not belong to this book");
+  });
 });

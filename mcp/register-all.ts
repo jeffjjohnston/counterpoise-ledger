@@ -1,18 +1,18 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { registerBooksTools } from "./tools/books.js";
-import { registerAccountTools } from "./tools/accounts.js";
-import { registerTransactionTools } from "./tools/transactions.js";
-import { registerReportTools } from "./tools/reports.js";
-import { registerInvestmentTools } from "./tools/investments.js";
-import { registerSecurityTools } from "./tools/securities.js";
-import { registerSecurityPriceTools } from "./tools/security-prices.js";
-import { registerUsageTools } from "./tools/usage.js";
-import { registerWriteTransactionTools } from "./tools/write-transactions.js";
-import { registerPayeeTools } from "./tools/payees.js";
-import { registerIssueReportTools } from "./tools/issue-reports.js";
-import { registerRecurringTools } from "./tools/recurring.js";
-import { registerPlaidTools } from "./tools/plaid.js";
-import { registerPlaidReconcileTools } from "./tools/plaid-reconcile.js";
+import { registerBooksTools } from "./tools/books";
+import { registerAccountTools } from "./tools/accounts";
+import { registerTransactionTools } from "./tools/transactions";
+import { registerReportTools } from "./tools/reports";
+import { registerInvestmentTools } from "./tools/investments";
+import { registerSecurityTools } from "./tools/securities";
+import { registerSecurityPriceTools } from "./tools/security-prices";
+import { registerUsageTools } from "./tools/usage";
+import { registerWriteTransactionTools } from "./tools/write-transactions";
+import { registerPayeeTools } from "./tools/payees";
+import { registerIssueReportTools } from "./tools/issue-reports";
+import { registerRecurringTools } from "./tools/recurring";
+import { registerPlaidTools } from "./tools/plaid";
+import { registerPlaidReconcileTools } from "./tools/plaid-reconcile";
 
 /**
  * Register every MCP tool this server exposes.
@@ -29,10 +29,10 @@ import { registerPlaidReconcileTools } from "./tools/plaid-reconcile.js";
  * main() after initMcpAuth() resolved. That split predates the change that
  * made every tool — read and write alike — require auth at call time (see
  * mcp/auth.ts's requireAuth/requireBookAuth); an earlier design gated write
- * tool *registration* on having a valid key, per the console message text in
- * docs/superpowers/plans/2026-03-13-mcp-transactions-api-keys.md ("write
- * tools enabled" / "write tools disabled (read-only mode)"), which the
- * shipped code never actually implements — it registers write tools
+ * tool *registration* on having a valid key, per the console messages that
+ * design specified ("write tools enabled" / "write tools disabled
+ * (read-only mode)"), which the shipped code never actually implements — it
+ * registers write tools
  * unconditionally, regardless of the auth result. The split is a leftover of
  * that abandoned design, not a live invariant: registration only populates
  * this server's in-memory tool map, and no client can observe it before

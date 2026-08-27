@@ -22,8 +22,7 @@ export type McpToolResult = {
 export function ok(data: unknown): McpToolResult {
   // JSON.stringify(undefined) returns undefined, not a string — it would
   // break the declared `text: string` contract. No tool passes undefined
-  // today, but a void-returning tool is the natural way to hit this once
-  // Plans 2-6 add roughly 40 more.
+  // today, but a void-returning tool is the natural way to hit this.
   const text = data === undefined ? "null" : JSON.stringify(data, null, 2);
   return {
     content: [{ type: "text" as const, text }],

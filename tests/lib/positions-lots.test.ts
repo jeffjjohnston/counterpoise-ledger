@@ -66,14 +66,12 @@ describe("positions cost basis from lots", () => {
   // Confirmed on first run: getPositions().sharesMicros reports 2,666,667
   // while Σ investment_lots.remaining_shares_micros reports 2,666,666 for the
   // same book/security — a genuine 1-micro divergence between the two
-  // "shares outstanding" computations this app maintains, pre-existing this
-  // fix wave (not caused by Fix 1-6). See
-  // .superpowers/sdd/2026-08-11-investment-lot-tracking/final-fix-report.md
-  // for the full writeup. Filed here as `it.fails` — an assertion that is
-  // expected to fail — rather than either silently adjusting the expected
-  // value to match the buggy output (which the fix-wave instructions
-  // explicitly prohibited) or leaving a bare failing test that would break
-  // every future CI run for an issue outside this wave's approved scope.
+  // "shares outstanding" computations this app maintains. It predates the lot
+  // tracking work and was not introduced by it. Filed here as `it.fails` — an
+  // assertion that is expected to fail — rather than either silently adjusting
+  // the expected value to match the buggy output or leaving a bare failing
+  // test that would break every future CI run for an issue outside that
+  // work's approved scope.
   // Converting this back to a plain `it` is the signal that whoever fixes the
   // divergence should flip when they do.
   it.fails("keeps lot shares and replayed position shares in agreement across a split and a partial sell", async () => {

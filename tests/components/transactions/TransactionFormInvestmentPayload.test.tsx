@@ -19,11 +19,10 @@
 // would silently pass a refactor that adds or drops an undefined-valued key;
 // toStrictEqual requires the key sets to match exactly. Every value below,
 // including the explicit `undefined`s, is therefore load-bearing: it asserts
-// the real payload shape, not just the defined subset of it. See
-// task-1-report.md for the hand verification of each payload before it was
-// encoded here, and for the mutation evidence that these assertions actually
-// discriminate on `splits`/`investmentSplits` rather than merely on whether
-// onSubmit was called.
+// the real payload shape, not just the defined subset of it. Each payload was
+// hand-verified before it was encoded here, and mutation-tested to confirm
+// these assertions actually discriminate on `splits`/`investmentSplits`
+// rather than merely on whether onSubmit was called.
 //
 // Coverage gap: TransactionForm renders two different investment JSX trees
 // gated by its `compact` prop (`compact = !fullLayout && !editingTransaction`).

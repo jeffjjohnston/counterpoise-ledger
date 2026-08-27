@@ -12,10 +12,10 @@ import { z } from "zod/v4";
 //     against `securities` scoped to this book.
 // "Invalid security id" on the prices/[date] routes is left untouched for
 // the same reason given in lib/schemas/securities.ts: a route-segment
-// string, not a body or query field, out of this task's scope.
+// string, not a body or query field, out of this schema layer's scope.
 //
-// Rule settled during the final-review fix wave, so it doesn't get
-// re-litigated: WRITE paths get calendar validation (z.iso.date());
+// Settled rule, so it doesn't get re-litigated: WRITE paths get calendar
+// validation (z.iso.date());
 // READ-ONLY filters may stay presence-only. `priceDate` here and
 // `bulkPricesSchema.priceDate` below are both consumed by an INSERT/UPDATE —
 // `security_prices.price_date` is `text NOT NULL` with no CHECK constraint,
@@ -110,8 +110,7 @@ export type UpdateSecurityPriceInput = z.infer<typeof updateSecurityPriceSchema>
 // database; it is now filtered out like any other malformed item (silently
 // dropped, not a 400 — unless it's the last item standing, in which case
 // the request now 400s with "No valid price updates provided" where it
-// previously would have written the bad date). Flagged in
-// task-5-report.md.
+// previously would have written the bad date).
 const PRICE_UPDATES_ARRAY_MESSAGE = "priceUpdates must be an array";
 const NO_VALID_PRICE_UPDATES_MESSAGE = "No valid price updates provided";
 

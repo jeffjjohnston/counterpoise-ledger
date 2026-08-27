@@ -17,7 +17,7 @@ const testShortcuts: ShortcutDef[] = [
     id: "test-shortcut",
     keys: ["n"],
     description: "Test shortcut",
-    category: "Test",
+    category: "Page",
     action: vi.fn(),
   },
 ];

@@ -2,6 +2,7 @@ import { getDb } from "@/db";
 import { apiKeys, books } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { verifyApiKey } from "@/lib/api-keys";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 export type McpAuth = {
   userId: number;
@@ -9,6 +10,7 @@ export type McpAuth = {
 };
 
 let cachedAuth: McpAuth | null = null;
+const requestAuth = new AsyncLocalStorage<McpAuth>();
 let lastRevalidation = 0;
 const REVALIDATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -50,7 +52,12 @@ export async function initMcpAuth(): Promise<McpAuth | null> {
  * Get the cached MCP auth context. Returns null if no valid key was provided.
  */
 export function getMcpAuth(): McpAuth | null {
-  return cachedAuth;
+  return requestAuth.getStore() ?? cachedAuth;
+}
+
+/** Run an MCP operation with auth supplied by another trusted transport. */
+export function runWithMcpAuth<T>(auth: McpAuth, operation: () => T): T {
+  return requestAuth.run(auth, operation);
 }
 
 /**
@@ -96,6 +103,9 @@ export function bookAccessError(): McpErrorResponse {
  * revoked keys stop working without a process restart.
  */
 export async function requireAuth(): Promise<McpAuth | McpErrorResponse> {
+  const transportAuth = requestAuth.getStore();
+  if (transportAuth) return transportAuth;
+
   const auth = getMcpAuth();
   if (!auth) return authError();
 

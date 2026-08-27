@@ -729,10 +729,37 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
         {/* Simple mode */}
         {mode === "simple" && (
           <>
-          <div className="grid grid-cols-[7rem_1fr_1fr_auto_1fr_7rem_auto] gap-2 items-end pt-2">
-          <div className={isFloating ? "pointer-events-none" : ""} aria-disabled={isFloating || undefined} inert={isFloating || undefined}>
+          {/* Column template mirrors the register's colgroup below, so each
+              field sits over the column it fills and the column headers do the
+              labelling -- the fields used to carry their own labels, forty
+              pixels above an identical row of headers.
+
+              Date needs ~9rem for an MM/DD/YYYY field and the register's date
+              column is 5rem, so it borrows the difference back from Payee --
+              that is what `calc(32% - 3.5rem)` is for. It used to borrow from
+              the status gutter that led the register; the gutter now trails the
+              numbers, so there is nothing in front of Date left to take.
+
+              3.5rem is a fitted constant, not a derived one, and it cannot be
+              exact. `table-fixed` hands its leftover width to the *px* columns
+              in proportion to their declared widths, so the register's 5rem
+              date column renders at 5rem only when the table is narrow enough
+              to be over-subscribed, and wider than that otherwise (measured:
+              80px at a 1200px viewport, 99px at 1440px). A grid track cannot
+              follow that, so the ideal borrow moves with the viewport --
+              64px narrow, 45px wide -- and 56px splits it: the Payee/Accounts
+              boundary lands within ~11px of the register's across the desktop
+              range. The previous 9rem was exact at 1440px and 30px out at
+              1200px, so this trades an exact width for a bounded error.
+
+              Add spans status plus balance plus actions. The two account fields
+              share the Accounts column, as the register shares it between the
+              accounts a transaction touches. */}
+          <div className="grid grid-cols-[9rem_calc(32%_-_3.5rem)_24%_10rem_1fr] items-end pt-2 -mx-4">
+          <div className={`pl-4 pr-2 ${isFloating ? "pointer-events-none" : ""}`} aria-disabled={isFloating || undefined} inert={isFloating || undefined}>
             <DateInput
               label="Date"
+              labelHidden
               id="date"
               size="compact"
               value={isFloating ? toDateString(new Date()) : date}
@@ -741,72 +768,87 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               className={isFloating ? "opacity-50" : ""}
             />
           </div>
-          <PayeeAutocomplete
-            ref={payeeRef}
-            payees={payeeSuggestions}
-            textValue={payeeName}
-            onTextChange={setPayeeName}
-            label="Payee"
-            placeholder="Payee"
-            size="compact"
-
-            allowClear={false}
-          />
-          <AccountAutocomplete
-            label="From Account"
-            accounts={filteredSimpleAccounts}
-            value={fromAccountId}
-            onChange={handleFromAccountChange}
-            warning={selectedAccountMissing}
-            placeholder="From..."
-            showHierarchy={true}
-            allowClear={false}
-
-            size="compact"
-          />
-          <button
-            type="button"
-            onClick={() => {
-              setFromAccountId(toAccountId);
-              setToAccountId(fromAccountId);
-            }}
-            className="mb-0.5 p-1 rounded-md text-fg-tertiary hover:text-fg-secondary hover:bg-surface-tertiary transition-colors"
-            title="Swap accounts"
-            aria-label="Swap From and To accounts"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" />
-            </svg>
-          </button>
-          <AccountAutocomplete
-            label="To Account"
-            accounts={filteredSimpleAccounts}
-            value={toAccountId}
-            onChange={handleToAccountChange}
-            warning={selectedAccountMissing}
-            placeholder="To..."
-            showHierarchy={true}
-            allowClear={false}
-
-            size="compact"
-          />
-          <Input
-            type="text"
-            label="Amount"
-            id="amount"
-            size="compact"
-            value={simpleAmount}
-            onChange={(e) => setSimpleAmount(e.target.value)}
-            onBlur={() => {
-              setSimpleAmount(resolveAmountOnBlur(simpleAmount));
-            }}
-            placeholder="0.00"
-            required
-            selectOnFocus
-          />
-          <Button type="submit" size="sm" aria-label="Add Transaction" className="mb-px">
-            +
-          </Button>
+          <div className="pr-2">
+            <PayeeAutocomplete
+              ref={payeeRef}
+              payees={payeeSuggestions}
+              textValue={payeeName}
+              onTextChange={setPayeeName}
+              label="Payee"
+              labelHidden
+              placeholder="Payee"
+              size="compact"
+              allowClear={false}
+            />
+          </div>
+          <div className="flex items-end gap-1 min-w-0 pr-2">
+            <AccountAutocomplete
+              label="From Account"
+              labelHidden
+              accounts={filteredSimpleAccounts}
+              value={fromAccountId}
+              onChange={handleFromAccountChange}
+              warning={selectedAccountMissing}
+              placeholder="From..."
+              showHierarchy={true}
+              allowClear={false}
+              size="compact"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                setFromAccountId(toAccountId);
+                setToAccountId(fromAccountId);
+              }}
+              className="mb-0.5 p-1 rounded-md text-fg-tertiary hover:text-fg-secondary hover:bg-surface-tertiary transition-colors flex-shrink-0"
+              title="Swap accounts"
+              aria-label="Swap From and To accounts"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" />
+              </svg>
+            </button>
+            <AccountAutocomplete
+              label="To Account"
+              labelHidden
+              accounts={filteredSimpleAccounts}
+              value={toAccountId}
+              onChange={handleToAccountChange}
+              warning={selectedAccountMissing}
+              placeholder="To..."
+              showHierarchy={true}
+              allowClear={false}
+              size="compact"
+            />
+          </div>
+          <div className="pr-2">
+            <Input
+              type="text"
+              label="Amount"
+              labelHidden
+              id="amount"
+              size="compact"
+              value={simpleAmount}
+              onChange={(e) => setSimpleAmount(e.target.value)}
+              onBlur={() => {
+                setSimpleAmount(resolveAmountOnBlur(simpleAmount));
+              }}
+              placeholder="0.00"
+              required
+              selectOnFocus
+            />
+          </div>
+          {/* Labelled, and sized like the primary action it is. This was a bare
+              "+" at size="sm" -- roughly 26x26px, the smallest control in a form
+              it commits, and inconsistent with Journal and Investment modes,
+              whose identical action is a full "Add Transaction" button. The
+              aria-label stays: it contains the visible label, so it satisfies
+              Label in Name, and it says which thing is being added. */}
+          <div className="pr-4">
+            <Button type="submit" aria-label="Add Transaction" className="mb-px w-full">
+              Add
+            </Button>
+          </div>
         </div>
         {renderSelectedAccountWarning()}
         </>

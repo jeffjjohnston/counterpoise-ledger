@@ -11,6 +11,13 @@ interface AccountAutocompleteProps {
   value: number | null;
   onChange: (accountId: number | null) => void;
   label?: string;
+  /**
+   * Render the label as screen-reader-only text. For a field sitting under a
+   * column header that already names it -- the register's quick-entry row --
+   * where repeating the name on screen is noise but the accessible name is
+   * still required.
+   */
+  labelHidden?: boolean;
   placeholder?: string;
   className?: string;
   showHierarchy?: boolean;
@@ -27,6 +34,7 @@ export function AccountAutocomplete({
   value,
   onChange,
   label,
+  labelHidden,
   placeholder = "Search for an account...",
   className,
   showHierarchy = true,
@@ -259,12 +267,16 @@ export function AccountAutocomplete({
       {label && (
         <label
           htmlFor={inputId}
-          className={cn(
-            "block",
-            isCompact
-              ? "text-xs font-medium text-fg-tertiary mb-0 leading-tight"
-              : "text-sm font-medium text-fg-secondary mb-1"
-          )}
+          className={
+            labelHidden
+              ? "sr-only"
+              : cn(
+                  "block",
+                  isCompact
+                    ? "text-xs font-medium text-fg-tertiary mb-0 leading-tight"
+                    : "text-sm font-medium text-fg-secondary mb-1"
+                )
+          }
         >
           {label}
         </label>

@@ -187,7 +187,7 @@ describe("PUT /api/b/[bookId]/securities/[id]/prices/[date] schema wiring", () =
   });
 
   it("rejects a non-calendar priceDate ('banana') with 400 instead of deleting the real price and writing a bogus one", async () => {
-    // Important #2 from the final-review fix wave: this route deletes the
+    // This route deletes the
     // (security, date) row named in the URL and inserts a new one keyed on
     // the body's priceDate whenever the two differ. Before z.iso.date(),
     // "banana" passed shape validation, so the real 2025-01-15 price was

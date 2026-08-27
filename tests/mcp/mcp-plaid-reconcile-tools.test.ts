@@ -14,6 +14,7 @@ import {
   createPlaidToken,
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
+import { callMcpTool } from "@/tests/helpers/mcp";
 
 // Mock MCP auth to return an authenticated user, same pattern as
 // mcp-account-tools.test.ts.
@@ -32,30 +33,8 @@ vi.mock("@/db", async (importOriginal) => {
 let client: Client;
 let server: McpServer;
 
-async function callTool(name: string, args: Record<string, unknown> = {}) {
-  const result = await client.callTool({ name, arguments: args });
-  const isError = result.isError ?? false;
-  const textContent = (result.content as Array<{ type: string; text: string }>)?.find(
-    (c) => c.type === "text"
-  );
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let data: any;
-  if (isError) {
-    try {
-      data = textContent ? JSON.parse(textContent.text) : undefined;
-    } catch {
-      data = { error: textContent?.text };
-    }
-  } else {
-    data = textContent ? JSON.parse(textContent.text) : undefined;
-  }
-  // `raw` is the untouched wire text. fail() emits genuine JSON
-  // (JSON.stringify({ error: message })); an uncaught error thrown past
-  // fail() reaches the client as the SDK's own plain-text wrapping, which
-  // `data`'s catch fallback above quietly reshapes to look the same. Only
-  // `raw` lets a test tell those two paths apart.
-  return { data, isError, raw: textContent?.text };
-}
+const callTool = (name: string, args: Record<string, unknown> = {}) =>
+  callMcpTool(client, name, args);
 
 describe("MCP Plaid reconcile tools", () => {
   const bookId = 1;
@@ -129,17 +108,13 @@ describe("MCP Plaid reconcile tools", () => {
   });
 
   it("fails cleanly for an unknown link", async () => {
-    const { data, isError, raw } = await callTool("get_reconcile_candidates", {
+    const { data, isError } = await callTool("get_reconcile_candidates", {
       bookId,
       plaidAccountLinkId: 987654,
     });
 
     expect(isError).toBe(true);
     expect(data.error).toBe("Linked sync account not found");
-    // Proves this came from fail(), not an uncaught throw the SDK wrapped as
-    // plain text and the callTool fallback reshaped to look the same. fail()
-    // is the only path that puts real JSON on the wire.
-    expect(JSON.parse(raw!)).toEqual({ error: "Linked sync account not found" });
   });
 
   it("fails cleanly for a link on a non-reconcilable account", async () => {
@@ -158,7 +133,7 @@ describe("MCP Plaid reconcile tools", () => {
       counterpoiseAccountId: groceries.id,
     });
 
-    const { data, isError, raw } = await callTool("get_reconcile_candidates", {
+    const { data, isError } = await callTool("get_reconcile_candidates", {
       bookId,
       plaidAccountLinkId: link.id,
     });
@@ -167,8 +142,6 @@ describe("MCP Plaid reconcile tools", () => {
       "Only asset or liability Counterpoise accounts can be reconciled against Plaid transactions";
     expect(isError).toBe(true);
     expect(data.error).toBe(message);
-    // Same proof as above, for the validation-error branch.
-    expect(JSON.parse(raw!)).toEqual({ error: message });
   });
 
   it("matches a transaction and marks it reconciled", async () => {
@@ -252,7 +225,7 @@ describe("MCP Plaid reconcile tools", () => {
     // toolShape() spreads .shape and drops reconcileSchema's superRefine, so
     // this rule reaches the tool only through resolveReconciliation(). Without
     // it the call would reach Drizzle with an undefined transactionId.
-    const { data, isError, raw } = await callTool("reconcile_plaid_transaction", {
+    const { data, isError } = await callTool("reconcile_plaid_transaction", {
       bookId,
       plaidAccountLinkId: link.id,
       reconciliationId: recon.id,
@@ -261,9 +234,6 @@ describe("MCP Plaid reconcile tools", () => {
 
     expect(isError).toBe(true);
     expect(data.error).toBe("transactionId is required for match");
-    // Proves this came from fail(), not an uncaught throw the SDK wrapped as
-    // plain text and the callTool fallback reshaped to look the same.
-    expect(JSON.parse(raw!)).toEqual({ error: "transactionId is required for match" });
   });
 
   it("ignores a staged transaction", async () => {

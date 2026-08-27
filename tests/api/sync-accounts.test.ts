@@ -316,11 +316,11 @@ describe("Sync token accounts API", () => {
   });
 
   // --------------------------------------------------------------------
-  // Characterization tests (Task 5, Step 1). These pin the route's exact
-  // refusal messages and its "writes nothing" guarantee BEFORE the PUT
-  // body moves into lib/plaid-tokens.ts's setTokenAccounts(). They must
-  // pass against the route as it stands today; the extraction is measured
-  // against them, not the other way around.
+  // Characterization tests. These pin the route's exact refusal messages and
+  // its "writes nothing" guarantee across the move of the PUT body into
+  // lib/plaid-tokens.ts's setTokenAccounts(). They were written against the
+  // route before that extraction and must keep passing after it; the
+  // extraction is measured against them, not the other way around.
   // --------------------------------------------------------------------
 
   it("refuses a duplicate counterpoiseAccountId in the assignment list, with its exact message, and writes nothing", async () => {

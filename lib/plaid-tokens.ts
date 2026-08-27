@@ -53,13 +53,37 @@ export const toTokenListItem = (token: typeof plaidTokens.$inferSelect) => ({
 });
 
 export async function listTokens(db: AppDb, bookId: number) {
-  const tokens = await db
-    .select()
-    .from(plaidTokens)
-    .where(eq(plaidTokens.bookId, bookId))
-    .orderBy(asc(plaidTokens.financialInstitution), asc(plaidTokens.itemId));
+  const [tokens, counts] = await Promise.all([
+    db
+      .select()
+      .from(plaidTokens)
+      .where(eq(plaidTokens.bookId, bookId))
+      .orderBy(asc(plaidTokens.financialInstitution), asc(plaidTokens.itemId)),
+    // count(col) counts non-null values, so counting counterpoiseAccountId is
+    // exactly "how many of this connection's accounts are mapped". Both are cast
+    // because postgres.js serialises bigint aggregates as strings.
+    db
+      .select({
+        tokenId: plaidAccounts.tokenId,
+        totalAccountCount: sql<number>`cast(count(*) as integer)`.as("totalAccountCount"),
+        mappedAccountCount:
+          sql<number>`cast(count(${plaidAccounts.counterpoiseAccountId}) as integer)`.as(
+            "mappedAccountCount"
+          ),
+      })
+      .from(plaidAccounts)
+      .where(eq(plaidAccounts.bookId, bookId))
+      .groupBy(plaidAccounts.tokenId),
+  ]);
 
-  return tokens.map(toTokenListItem);
+  const countsByToken = new Map(counts.map((row) => [row.tokenId, row]));
+
+  return tokens.map((token) => ({
+    ...toTokenListItem(token),
+    // A connection with no Plaid accounts yet has no row in the aggregate.
+    totalAccountCount: countsByToken.get(token.id)?.totalAccountCount ?? 0,
+    mappedAccountCount: countsByToken.get(token.id)?.mappedAccountCount ?? 0,
+  }));
 }
 
 // Extracted from app/api/b/[bookId]/sync/pending-count/route.ts GET, unchanged.
@@ -189,6 +213,7 @@ export async function getAssignedAccounts(db: AppDb, bookId: number) {
       itemId: plaidTokens.itemId,
       plaidAccountId: plaidAccounts.plaidAccountId,
       plaidAccountName: plaidAccounts.name,
+      plaidAccountMask: plaidAccounts.mask,
       counterpoiseAccountId: plaidAccounts.counterpoiseAccountId,
       counterpoiseAccountName: accounts.name,
       lastSyncedAt: plaidTokens.lastSyncedAt,
@@ -233,6 +258,7 @@ export async function getAssignedAccounts(db: AppDb, bookId: number) {
       plaidTokens.itemId,
       plaidAccounts.plaidAccountId,
       plaidAccounts.name,
+      plaidAccounts.mask,
       plaidAccounts.counterpoiseAccountId,
       accounts.name,
       plaidTokens.id,

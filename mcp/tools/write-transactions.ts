@@ -17,11 +17,10 @@ import {
 // surfaces differ on — it comes from the URL over HTTP, so the shared schema
 // omits it and the tools add it back here.
 //
-// isReconciled was withheld from these tools until 2026-08-23. See
-// docs/superpowers/specs/2026-08-23-mcp-ui-parity-design.md, decisions 3
-// and 4. Decision 4 exposes isReconciled. Decision 3 explains the
-// destructiveHint on update_transaction and delete_transaction: it tells a
-// client to confirm before an update or delete lands. create_transaction
+// isReconciled was withheld from these tools until 2026-08-23, when the MCP
+// surface was brought to parity with the web UI. That same change explains
+// the destructiveHint on update_transaction and delete_transaction: it tells
+// a client to confirm before an update or delete lands. create_transaction
 // carries CREATE, not DESTRUCTIVE, so that hint does not apply to it.
 import {
   createTransactionBodySchema,

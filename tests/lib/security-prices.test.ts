@@ -11,7 +11,7 @@ import {
 } from "@/tests/helpers/db-utils";
 import { getDb } from "@/db";
 import { books, securityPrices } from "@/db/schema";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   setSecurityPrices,
   updateSecurityPrice,
@@ -21,6 +21,27 @@ import {
   PriceEntryConflictError,
 } from "@/lib/security-prices";
 import { SecurityValidationError, SecurityNotFoundError } from "@/lib/securities";
+
+/**
+ * Waits until some backend is blocked on a lock, which is how the move under
+ * test parks on the unique index behind the uncommitted holder. Polling the
+ * server beats sleeping: the handoff is observed, not guessed at.
+ */
+async function waitForBlockedWriter(db: ReturnType<typeof getDb>, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = (await db.execute(sql`
+      select count(*)::int as blocked
+      from pg_stat_activity
+      where datname = current_database() and wait_event_type = 'Lock'
+    `)) as unknown as { blocked: number }[];
+    if (Number(rows[0]?.blocked ?? 0) > 0) return;
+    if (Date.now() > deadline) {
+      throw new Error("timed out waiting for the move to block on the unique index");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
 
 describe("security prices shared logic", () => {
   let bookId: number;
@@ -238,6 +259,60 @@ describe("security prices shared logic", () => {
       expect(rows).toHaveLength(2);
       expect(rows.find((r) => r.priceDate === "2026-02-08")?.priceMicros).toBe(100_000_000);
       expect(rows.find((r) => r.priceDate === "2026-02-09")?.priceMicros).toBe(101_000_000);
+    });
+
+    // The occupancy check runs before the transaction opens and reads only
+    // committed rows, so a concurrent move onto the same date slips past it and
+    // collides at the unique index instead. The loser must still get a
+    // PriceEntryConflictError rather than a raw driver error.
+    it("maps a lost race for the target date to PriceEntryConflictError", async () => {
+      const db = getDb();
+      const sec = await seedSecurity({ bookId, name: "A", symbol: "AAA", securityType: "etf" });
+      await createSecurityPrice({
+        bookId, securityId: sec.id, priceDate: "2026-03-01", priceMicros: 100_000_000,
+      });
+
+      // Stands in for the winning writer: it claims the target date on another
+      // connection and holds the row uncommitted, which is exactly the window
+      // the pre-check cannot see into.
+      let letHolderCommit!: () => void;
+      const holderMayCommit = new Promise<void>((resolve) => {
+        letHolderCommit = resolve;
+      });
+      const holder = db.transaction(async (tx) => {
+        await tx.insert(securityPrices).values({
+          bookId,
+          securityId: sec.id,
+          priceDate: "2026-03-02",
+          priceMicros: 101_000_000,
+          source: null,
+        });
+        await holderMayCommit;
+      });
+
+      // Settled eagerly so the rejection is never momentarily unhandled.
+      const settled = updateSecurityPrice(db, bookId, sec.id, "2026-03-01", {
+        priceDate: "2026-03-02",
+        priceMicros: 102_000_000,
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+
+      await waitForBlockedWriter(db);
+      letHolderCommit();
+      await holder;
+
+      expect(await settled).toBeInstanceOf(PriceEntryConflictError);
+
+      // Losing the race must leave the source date untouched, not delete it.
+      const rows = await db
+        .select()
+        .from(securityPrices)
+        .where(eq(securityPrices.securityId, sec.id));
+      expect(rows.map((r) => r.priceDate).sort()).toEqual(["2026-03-01", "2026-03-02"]);
+      expect(rows.find((r) => r.priceDate === "2026-03-01")?.priceMicros).toBe(100_000_000);
+      expect(rows.find((r) => r.priceDate === "2026-03-02")?.priceMicros).toBe(101_000_000);
     });
   });
 

@@ -644,4 +644,50 @@ describe("TransactionForm simple mode", () => {
       expect(screen.queryByText(/won't appear in/i)).toBeNull();
     });
   });
+
+  it("commits the simple entry from a labelled button, not a bare glyph", () => {
+    renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={null} onSubmit={vi.fn()} />
+    );
+
+    const submit = screen.getByRole("button", { name: "Add Transaction" });
+    expect(submit).toHaveAttribute("type", "submit");
+    // Visible text, not a "+" explained only by an aria-label.
+    expect(submit.textContent).toBe("Add");
+    // size="md" rather than "sm": this is the primary action of the row.
+    expect(submit).toHaveClass("px-4", "py-2");
+  });
+
+  it("keeps every quick-entry field named, but hides the labels on screen", () => {
+    renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={null} onSubmit={vi.fn()} />
+    );
+
+    // The register's column headers do the labelling now -- these used to be a
+    // second row of labels forty pixels above an identical row of headers. The
+    // names survive for assistive technology and for these selectors.
+    for (const name of ["Date", "Payee", "From Account", "To Account", "Amount"]) {
+      const field = screen.getByLabelText(name);
+      expect(field).toBeInTheDocument();
+      const label = document.querySelector(`label[for="${field.id}"]`);
+      expect(label).toHaveClass("sr-only");
+    }
+  });
+
+  it("lays the quick-entry row out on the register's own column widths", () => {
+    const { container } = renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={null} onSubmit={vi.fn()} />
+    );
+
+    const grid = container.querySelector(".grid.items-end");
+    // Date takes the 9rem an MM/DD/YYYY field needs and borrows most of the
+    // overshoot back from Payee, so the Payee/Accounts boundary stays near the
+    // register's. The rest match TRANSACTION_TABLE_COLUMN_WIDTHS one for one.
+    // Kept in step by hand -- see the comment above the grid, which records why
+    // the borrow is a fitted 3.5rem and cannot be exact.
+    expect(grid).toHaveClass("grid-cols-[9rem_calc(32%_-_3.5rem)_24%_10rem_1fr]");
+    // No gap: a grid gap would push each column right of its table column,
+    // cumulatively. Spacing comes from cell padding, as it does in the table.
+    expect(grid?.className).not.toMatch(/\bgap-\d/);
+  });
 });

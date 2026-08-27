@@ -14,8 +14,10 @@ import { books, plaidAccounts, plaidTokens, plaidTransactionReconciliation } fro
 import {
   clearSyncData,
   deletePlaidToken,
+  getAssignedAccounts,
   getPlaidStatus,
   listTokenAccounts,
+  listTokens,
   PlaidTokenNotFoundError,
   PlaidTokenValidationError,
   setTokenAccounts,
@@ -78,6 +80,87 @@ describe("plaid-tokens shared logic", () => {
       const status = await getPlaidStatus(db, bookId);
 
       expect(status.tokens.map((t) => t.itemId)).toEqual(["item-mine"]);
+    });
+  });
+
+  describe("getAssignedAccounts", () => {
+    it("returns the Plaid account mask on each assigned account", async () => {
+      const db = getDb();
+      const token = await createPlaidToken({
+        bookId, financialInstitution: "Bank", itemId: "item-1",
+        accessToken: "access-sandbox-abcdefghijklmnop",
+      });
+      const account = await createAccount({ bookId, name: "Checking", type: "asset" });
+      await createPlaidAccount({
+        bookId, tokenId: token.id, plaidAccountId: "plaid-acct-1",
+        name: "Bank Checking", type: "depository", mask: "4567",
+        counterpoiseAccountId: account.id,
+      });
+
+      const rows = await getAssignedAccounts(db, bookId);
+
+      expect(rows[0].plaidAccountMask).toBe("4567");
+    });
+
+    it("returns null for an assigned account with no mask", async () => {
+      const db = getDb();
+      const token = await createPlaidToken({
+        bookId, financialInstitution: "Bank", itemId: "item-1",
+        accessToken: "access-sandbox-abcdefghijklmnop",
+      });
+      const account = await createAccount({ bookId, name: "Checking", type: "asset" });
+      await createPlaidAccount({
+        bookId, tokenId: token.id, plaidAccountId: "plaid-acct-1",
+        name: "No Mask", type: "depository", mask: null,
+        counterpoiseAccountId: account.id,
+      });
+
+      const rows = await getAssignedAccounts(db, bookId);
+
+      expect(rows.find((r) => r.plaidAccountName === "No Mask")?.plaidAccountMask).toBeNull();
+    });
+  });
+
+  describe("listTokens", () => {
+    it("counts mapped and total accounts per connection", async () => {
+      const db = getDb();
+      const token = await createPlaidToken({
+        bookId, financialInstitution: "Bank", itemId: "item-1",
+        accessToken: "access-sandbox-abcdefghijklmnop",
+      });
+      const checking = await createAccount({ bookId, name: "Checking", type: "asset" });
+      const savings = await createAccount({ bookId, name: "Savings", type: "asset" });
+      await createPlaidAccount({
+        bookId, tokenId: token.id, plaidAccountId: "plaid-acct-1",
+        name: "Checking", type: "depository", counterpoiseAccountId: checking.id,
+      });
+      await createPlaidAccount({
+        bookId, tokenId: token.id, plaidAccountId: "plaid-acct-2",
+        name: "Savings", type: "depository", counterpoiseAccountId: savings.id,
+      });
+      await createPlaidAccount({
+        bookId, tokenId: token.id, plaidAccountId: "plaid-acct-3",
+        name: "Unmapped", type: "depository", counterpoiseAccountId: null,
+      });
+
+      const tokens = await listTokens(db, bookId);
+
+      expect(tokens[0].totalAccountCount).toBe(3);
+      expect(tokens[0].mappedAccountCount).toBe(2);
+    });
+
+    it("reports zero counts for a connection with no Plaid accounts at all", async () => {
+      const db = getDb();
+      await createPlaidToken({
+        bookId, financialInstitution: "Bare Bank", itemId: "item-bare",
+        accessToken: "access-sandbox-bare",
+      });
+
+      const tokens = await listTokens(db, bookId);
+
+      const bare = tokens.find((t) => t.financialInstitution === "Bare Bank");
+      expect(bare?.totalAccountCount).toBe(0);
+      expect(bare?.mappedAccountCount).toBe(0);
     });
   });
 

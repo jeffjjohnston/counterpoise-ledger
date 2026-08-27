@@ -83,3 +83,24 @@ tmp/
 # Local-only maintainer configuration. Keep this file untracked. Tracking it
 # would put its contents into every archive built from this repository.
 .publicdeny
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
+
+# The beads working directory, ignored whole — the beads repo itself does the
+# same. Issue data lives in Dolt and travels as refs/dolt/data on the private
+# origin, so nothing here is a source of truth: .beads/issues.jsonl is only an
+# export, and the pre-commit hook rewrites it without staging it (export.auto
+# is true, export.git-add is false). A fresh clone recovers with `bd bootstrap`,
+# which wires the origin itself once it finds refs/dolt/data.
+#
+# This also puts each beads file behind the *first* publish gate.
+# scripts/publish-public.sh builds its tree with `git archive`, so an untracked
+# file cannot reach the mirror at all. .publicignore keeps its entry as the
+# second gate — see docs/private-operations.md.
+#
+# "`.beads/*`", not "`.beads/`": git does not descend into an excluded
+# directory, so the directory form would make a later negation such as
+# "`!.beads/formulas/`" silently do nothing.
+.beads/*

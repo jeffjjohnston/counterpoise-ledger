@@ -86,16 +86,15 @@ export type CreatePayeeInput = z.infer<typeof createPayeeSchema>;
 // `.catch(undefined)` reproduces that fallback instead of turning malformed
 // input into a new 400 — same idiom lib/schemas/securities.ts's limitParam
 // and lib/schemas/sync.ts's reconcileListQuery use for their own
-// never-fails limit/offset. `.int()` is added per this task's standing rule
-// for any coerced id/count (CLAUDE.md's Task 6 note): without it, a
+// never-fails limit/offset. `.int()` is added as the standing rule for any
+// coerced id/count: without it, a
 // fractional string like "5.5" would coerce to 5.5 and reach Drizzle's
 // `.limit(5.5)` unchanged — worse than the original's `parseInt` truncation
 // to 5 — so `.int()` turns that into the same "no limit" fallback instead of
-// a new 500. `.positive()` matches every other limit param in this plan
+// a new 500. `.positive()` matches every other limit param here
 // (securities.ts, sync.ts); it changes one edge case, a negative limit
 // string (e.g. "-5"), from a likely DB-level error (Postgres rejects a
-// negative LIMIT) to the same graceful "no limit" fallback — flagged, not
-// silently decided, in task-8-report.md.
+// negative LIMIT) to the same graceful "no limit" fallback.
 const listPayeesLimitParam = z.coerce.number<string>().int().positive().optional().catch(undefined);
 
 export const listPayeesQuery = z.object({

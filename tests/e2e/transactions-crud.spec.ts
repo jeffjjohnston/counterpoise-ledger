@@ -76,7 +76,7 @@ test.describe("transaction CRUD", () => {
     // Click elsewhere to close any calendar popup
     await page.getByRole("heading", { name: "All Transactions" }).click();
 
-    // Payee - use exact placeholder match (there's also a "Filter by payee..." input)
+    // Payee - exact match, so the filter popover's "Any payee" box can never win
     await page.getByPlaceholder("Payee", { exact: true }).fill("New Store");
 
     // From Account - click to focus (opens dropdown), type to filter, click matching button

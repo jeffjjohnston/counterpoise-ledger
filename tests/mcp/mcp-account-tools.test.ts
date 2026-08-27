@@ -8,6 +8,7 @@ import {
   createAccount,
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
+import { callMcpTool } from "@/tests/helpers/mcp";
 import { getDb } from "@/db";
 import { accounts } from "@/db/schema";
 import { and, eq } from "drizzle-orm";
@@ -28,32 +29,8 @@ vi.mock("@/db", async (importOriginal) => {
 let client: Client;
 let server: McpServer;
 
-async function callTool(name: string, args: Record<string, unknown> = {}) {
-  const result = await client.callTool({ name, arguments: args });
-  const isError = result.isError ?? false;
-  const textContent = (result.content as Array<{ type: string; text: string }>)?.find(
-    (c) => c.type === "text"
-  );
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let data: any;
-  if (isError) {
-    // A schema-level rejection is caught at the MCP SDK boundary before the
-    // handler runs, so the body is the SDK's plain-text message rather than
-    // our JSON envelope. Only error results can legitimately be non-JSON —
-    // fall back to wrapping the raw text the same way fail() would.
-    try {
-      data = textContent ? JSON.parse(textContent.text) : undefined;
-    } catch {
-      data = { error: textContent?.text };
-    }
-  } else {
-    // A success result is always our own ok(), so it is always JSON. Leave
-    // this path exactly as strict as it always was: a non-JSON body here is
-    // a real bug and should throw loudly, not degrade silently.
-    data = textContent ? JSON.parse(textContent.text) : undefined;
-  }
-  return { data, isError };
-}
+const callTool = (name: string, args: Record<string, unknown> = {}) =>
+  callMcpTool(client, name, args);
 
 describe("MCP Account Tools", () => {
   const bookId = 1;

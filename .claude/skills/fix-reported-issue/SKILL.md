@@ -15,6 +15,30 @@ description: >
 
 This skill handles the full lifecycle of a user-reported issue: find it, fix it, verify the fix, commit, and mark it resolved. The issue_reports table lives in the production PostgreSQL database and is populated by in-app user feedback.
 
+## Work tracking
+
+This project may use **beads** (`bd`) for issue tracking. Test for it once, before step 1:
+
+```bash
+command -v bd >/dev/null 2>&1 && bd ready
+```
+
+**If `bd` answers**, track the work in it:
+
+| When | Do |
+| --- | --- |
+| After step 3, before you edit anything | `bd create --title="<short summary>" --type=bug --priority=2 --description="issue_reports #<id>, reported on <page>: <the user's own words>"`, then `bd update <bead-id> --claim` |
+| Any time you find work you are **not** doing now | `bd create` it, with enough detail that nobody re-derives the investigation |
+| With step 7 | `bd close <bead-id> --reason="<what changed>"`, then `bd dolt push` |
+
+Three things about that table are load-bearing:
+
+- **Quote the report in the description.** A future reader has no access to the production database, so a bead that says "fix the sync page" is a dead end. Paste what the user wrote.
+- **`bd dolt push` is what makes the close durable.** Issue data lives in a local database; without the push it exists on one machine.
+- **Filing discovered work is the point.** A reported issue routinely exposes an adjacent bug, a missing test, or a refactor. Step 4 tells you to keep the change minimal, and that instruction only holds if the work you are declining has somewhere to go. Widening the fix, or dropping the finding silently, are both failures of this step.
+
+**If `bd` does not answer**, skip this section and change nothing else in the workflow. The issue_reports row is already the record of the fix; beads adds a home for the *discovered* work, which that row has no field for.
+
 ## Workflow
 
 ### 1. Get production database credentials
@@ -74,7 +98,7 @@ If tests fail due to your changes, fix them. If tests fail for unrelated reasons
 
 ### 6. Commit the change
 
-Stage only the files you changed and commit with a descriptive message. Reference the issue report ID in the commit body.
+Stage only the files you changed and commit with a descriptive message. Reference the issue report ID in the commit body, and the bead ID too if you created one.
 
 ### 7. Mark the issue as resolved
 
@@ -82,7 +106,7 @@ Stage only the files you changed and commit with a descriptive message. Referenc
 UPDATE issue_reports SET status = 'resolved' WHERE id = <issue_id>;
 ```
 
-Confirm the update succeeded (should show `UPDATE 1`).
+Confirm the update succeeded (should show `UPDATE 1`). If you opened a bead, close it here too — see Work tracking above.
 
 ### 8. Report to the user
 

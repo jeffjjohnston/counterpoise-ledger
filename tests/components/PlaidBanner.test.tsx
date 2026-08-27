@@ -19,6 +19,10 @@ const mockPlaidData: PlaidLinkData = {
   rawJson: '{"transaction_id":"plaid-txn-abc123","amount":45.00}',
 };
 
+function makePlaidData(overrides: Partial<PlaidLinkData> = {}): PlaidLinkData {
+  return { ...mockPlaidData, ...overrides };
+}
+
 describe("PlaidBanner", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -78,9 +82,19 @@ describe("PlaidBanner", () => {
     expect(screen.getByText(/transaction_id/)).toBeInTheDocument();
   });
 
+  it("confirms an unlink in a modal rather than window.confirm", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm");
+    render(<PlaidBanner plaidData={makePlaidData()} bookId="1" transactionId={7} onUnlinked={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /details/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Unlink from Plaid/i }));
+
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(await screen.findByText(/return to the pending queue/i)).toBeInTheDocument();
+  });
+
   it("calls onUnlinked after confirming unlink", async () => {
     const onUnlinked = vi.fn();
-    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
     vi.spyOn(globalThis, "fetch").mockResolvedValue({ ok: true, json: () => Promise.resolve({ success: true }) } as Response);
 
     render(
@@ -94,10 +108,7 @@ describe("PlaidBanner", () => {
 
     fireEvent.click(screen.getByText(/Details/));
     fireEvent.click(screen.getByText("Unlink from Plaid"));
-
-    expect(globalThis.confirm).toHaveBeenCalledWith(
-      "Unlink this transaction from Plaid? It will appear as an unmatched Plaid transaction in the Sync page."
-    );
+    fireEvent.click(screen.getByRole("button", { name: "Unlink" }));
 
     await waitFor(() => {
       expect(onUnlinked).toHaveBeenCalled();
@@ -109,8 +120,7 @@ describe("PlaidBanner", () => {
     );
   });
 
-  it("does not call onUnlinked when confirm is cancelled", () => {
-    vi.spyOn(globalThis, "confirm").mockReturnValue(false);
+  it("does not call onUnlinked when the unlink confirmation is closed", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
     render(
@@ -124,8 +134,25 @@ describe("PlaidBanner", () => {
 
     fireEvent.click(screen.getByText(/Details/));
     fireEvent.click(screen.getByText("Unlink from Plaid"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
+    expect(screen.queryByText(/return to the pending queue/i)).not.toBeInTheDocument();
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses an svg chevron rather than text triangles for the disclosure", () => {
+    render(
+      <PlaidBanner
+        plaidData={mockPlaidData}
+        bookId="1"
+        transactionId={7}
+        onUnlinked={vi.fn()}
+      />
+    );
+
+    const toggle = screen.getByRole("button", { name: /details/i });
+    expect(toggle.textContent).not.toMatch(/[▼▲]/);
+    expect(toggle.querySelector("svg")).not.toBeNull();
   });
 
   it("omits null fields from the detail view", () => {

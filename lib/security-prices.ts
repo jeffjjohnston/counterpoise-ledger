@@ -120,6 +120,22 @@ export class PriceEntryConflictError extends Error {
 }
 
 /**
+ * Does this error carry Postgres' duplicate-key SQLSTATE?
+ *
+ * Drizzle wraps driver errors, so 23505 sits on the cause rather than on the
+ * error the caller catches. The walk is bounded because a `cause` chain is not
+ * guaranteed acyclic.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; current != null && depth < 5; depth++) {
+    if ((current as { code?: unknown }).code === "23505") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
  * Confirm a security belongs to this book. Every price write is keyed on
  * (securityId, priceDate) alone — securityId is globally unique, so this
  * check is what makes those writes book-safe.
@@ -177,24 +193,36 @@ export async function updateSecurityPrice(
       throw new PriceEntryConflictError(priceDate);
     }
 
-    await db.transaction(async (tx) => {
-      await tx
-        .delete(securityPrices)
-        .where(
-          and(
-            eq(securityPrices.securityId, securityId),
-            eq(securityPrices.priceDate, currentDate),
-          ),
-        );
+    try {
+      await db.transaction(async (tx) => {
+        await tx
+          .delete(securityPrices)
+          .where(
+            and(
+              eq(securityPrices.securityId, securityId),
+              eq(securityPrices.priceDate, currentDate),
+            ),
+          );
 
-      await tx.insert(securityPrices).values({
-        securityId,
-        priceDate,
-        priceMicros,
-        source: source ?? null,
-        bookId,
+        await tx.insert(securityPrices).values({
+          securityId,
+          priceDate,
+          priceMicros,
+          source: source ?? null,
+          bookId,
+        });
       });
-    });
+    } catch (error) {
+      // The check above reads committed rows only, so a concurrent move onto
+      // this same date slips past it and collides here instead. Caught outside
+      // the transaction because the failed insert has already aborted it — and
+      // that rollback is what puts the deleted source row back, leaving both
+      // dates as they were.
+      if (isUniqueViolation(error)) {
+        throw new PriceEntryConflictError(priceDate);
+      }
+      throw error;
+    }
   } else {
     await db
       .update(securityPrices)

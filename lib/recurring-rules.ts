@@ -27,7 +27,7 @@ import type {
 import type { TransactionWithSplits } from "@/types";
 
 // ---------------------------------------------------------------------------
-// Error classes (Task 4 throws them; declared here so the module has one home)
+// Error classes (declared here so the module has one home)
 // ---------------------------------------------------------------------------
 
 /** Bad input to a recurring-rule write. */

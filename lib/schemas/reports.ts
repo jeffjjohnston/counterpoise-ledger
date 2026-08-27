@@ -21,8 +21,7 @@ import { z } from "zod/v4";
 // assigned. Callers therefore map every param — dates included — with
 // `|| undefined`, never `??`: `??` would let a bare `?startDate=` reach the
 // new `z.iso.date()` check below and turn a historically-silent no-op into a
-// brand-new 400. See task-8-report.md for the full per-param inventory this
-// reasoning produced.
+// brand-new 400.
 //
 // None of the three routes validated `startDate`/`endDate`'s *format*
 // before this change — only presence (and, on income-statement/
@@ -94,7 +93,7 @@ const REQUIRED_DATES_MESSAGE = "Both startDate and endDate are required";
 // `includeInactive` stays a bare optional string, not `z.coerce.boolean()`:
 // the route's own semantics are "truthy only on the literal string 'true'"
 // (income-statement/route.ts:19), computed after parsing, same convention
-// `listAccountsQuery.includeInactive` already established in Task 2.
+// `listAccountsQuery.includeInactive` already established.
 export const incomeStatementQuery = z
   .object({
     startDate: z.iso.date().optional(),

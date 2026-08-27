@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import { buildAccountHierarchyName, buildCategoryLabelMap, getEffectiveDate } from "@/lib/accounting";
-import { formatCurrency, formatDate, toDateString } from "@/lib/formatters";
+import { formatCurrency, formatDate, formatDateShort, toDateString } from "@/lib/formatters";
 import { cn } from "@/lib/utils";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import type { TransactionWithSplits, DisplayTransaction, AccountWithBalance } from "@/types";
@@ -12,7 +12,8 @@ import { CategoryIcon } from "@/components/ui/CategoryIcon";
 import { NoteIndicator } from "./NoteIndicator";
 
 const TRANSACTION_TABLE_COLUMN_WIDTHS = {
-  date: "w-[7rem]",
+  status: "w-[2.25rem]",
+  date: "w-[5rem]",
   payee: "w-[32%]",
   accounts: "w-[24%]",
   amount: "w-[8rem]",
@@ -29,13 +30,55 @@ const TRANSACTION_TABLE_COLUMN_WIDTHS = {
 // lg breakpoint, less the sidebar and padding). Left wider, Activity collapses to
 // zero and its text paints over Shares.
 const INVESTMENT_TABLE_COLUMN_WIDTHS = {
-  date: "w-[7rem]",
+  status: "w-[2.25rem]",
+  date: "w-[5rem]",
   activity: "w-[30%]",
   shares: "w-[7rem]",
   price: "w-[6rem]",
   amount: "w-[7.5rem]",
   balance: "w-[7rem]",
 } as const;
+
+// The register header pins to the top of the page's scroll container as the
+// filter bar and the entry form scroll away above it.
+//
+// Sticky lives on the `th` cells rather than on `thead` or `tr`: that is the
+// widest-supported form, and it is the only one that can carry the bottom
+// border. `border-collapse` here is `separate`, and borders set on `thead`/`tr`
+// are not painted in that mode -- which is why the header had no rule under it
+// to begin with, since `divide-y` on `tbody` only draws *between* tbody rows.
+//
+// Each cell needs its own opaque background: a sticky cell paints over the rows
+// passing beneath it, and a transparent one would let them show through.
+/**
+ * What a register row prints in its date column.
+ *
+ * The register is sorted by effective date, so same-day rows are adjacent and
+ * every row after the first of a day repeats a date the eye has just read. Only
+ * the first row of each day prints one.
+ *
+ * The year is dropped, because a register almost always sits inside a single
+ * one and the active filter says which -- but it comes back on the row where
+ * the year actually changes, so a register scrolling into last year still says
+ * so rather than silently renumbering.
+ *
+ * A repeat still carries its full date for assistive technology: the cell is
+ * blank to the eye, not to a screen reader reading the row on its own.
+ */
+function dateCellFor(effectiveDate: string, previousEffectiveDate: string | null) {
+  if (effectiveDate === previousEffectiveDate) {
+    return { visible: null, screenReaderOnly: formatDate(effectiveDate) };
+  }
+  const yearChanged =
+    previousEffectiveDate === null ||
+    effectiveDate.slice(0, 4) !== previousEffectiveDate.slice(0, 4);
+  return {
+    visible: yearChanged ? formatDate(effectiveDate) : formatDateShort(effectiveDate),
+    screenReaderOnly: null,
+  };
+}
+
+const STICKY_HEADER_CELL = "sticky top-0 z-10 bg-surface border-b border-border";
 
 // Widest tag is CAPGAIN; every tag reserves the same box so the symbols beside
 // them form a straight column.
@@ -298,6 +341,18 @@ export function TransactionList({
   const renderScheduledPill = () => (
     <span className="inline-flex items-center rounded-full bg-future px-2 py-0.5 text-xs font-medium text-fg-accent">
       Scheduled
+    </span>
+  );
+
+  // Floating is a date state, like Recurring and Scheduled, so it takes the same
+  // pill they do. It used to be a bare "~" jammed against the date with no
+  // separating space, explained only by a title attribute.
+  const renderFloatPill = () => (
+    <span
+      title="Floating — date advances to today until reconciled"
+      className="inline-flex flex-shrink-0 items-center rounded-full bg-future px-2 py-0.5 text-xs font-medium text-fg-accent"
+    >
+      Float
     </span>
   );
 
@@ -897,23 +952,21 @@ export function TransactionList({
       return renderAccountsForAllView(transaction);
     }
 
-    const isPositive = selectedSplit.amount > 0;
-
+    // No +/- glyph here, unlike renderMultiSplitTransaction and
+    // renderInvestmentAccounts. Those two show splits whose signs differ from
+    // each other, so the glyph tells them apart. These are `relatedSplits` —
+    // filtered to the splits opposing the selected account — so every glyph
+    // would be the same one, computed once from selectedSplit and printed on
+    // every line. That is the single bit the signed, colored amount already
+    // carries. renderSimpleTransaction keeps its names neutral for the same
+    // reason (finding #10); this path now agrees with it.
     return (
       <ul className="space-y-0.5">
-        {relatedSplits.map((split) => {
-          return (
-            <li key={split.id} className="flex items-center gap-1.5">
-              <span className={cn(
-                "text-xs font-medium w-3 text-right flex-shrink-0",
-                isPositive ? "text-fg-success" : "text-fg-danger"
-              )}>
-                {isPositive ? "+" : "\u2212"}
-              </span>
-              {renderAccountLabel(split.account)}
-            </li>
-          );
-        })}
+        {relatedSplits.map((split) => (
+          <li key={split.id} className="flex items-center gap-1.5">
+            {renderAccountLabel(split.account)}
+          </li>
+        ))}
       </ul>
     );
   };
@@ -961,83 +1014,87 @@ export function TransactionList({
 
   if (isLoading) {
     return (
-      <div className="overflow-x-auto">
-        <table className="w-full table-fixed">
-          <colgroup>
+      <table className="w-full table-fixed">
+        <colgroup>
+          {isInvestmentRegister ? (
+            <>
+              <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.date} />
+              <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.activity} />
+              <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.shares} />
+              <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.price} />
+              <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.amount} />
+              {selectedAccountId && <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.balance} />}
+              <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.status} />
+            </>
+          ) : (
+            <>
+              <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.date} />
+              <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.payee} />
+              <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.accounts} />
+              <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.amount} />
+              {selectedAccountId && <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.balance} />}
+              <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.status} />
+            </>
+          )}
+        </colgroup>
+        <thead>
+          <tr className="text-left text-xs font-medium text-fg-tertiary uppercase tracking-wider">
+            <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 whitespace-nowrap")}>Date</th>
             {isInvestmentRegister ? (
               <>
-                <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.date} />
-                <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.activity} />
-                <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.shares} />
-                <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.price} />
-                <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.amount} />
-                {selectedAccountId && <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.balance} />}
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3")}>Activity</th>
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 text-right")}>Shares</th>
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 text-right")}>Price</th>
               </>
             ) : (
               <>
-                <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.date} />
-                <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.payee} />
-                <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.accounts} />
-                <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.amount} />
-                {selectedAccountId && <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.balance} />}
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3")}>Payee</th>
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3")}>Accounts</th>
               </>
             )}
-          </colgroup>
-          <thead>
-            <tr className="text-left text-xs font-medium text-fg-tertiary uppercase tracking-wider">
-              <th className="px-4 py-3 whitespace-nowrap">Date</th>
-              {isInvestmentRegister ? (
-                <>
-                  <th className="px-4 py-3">Activity</th>
-                  <th className="px-4 py-3 text-right">Shares</th>
-                  <th className="px-4 py-3 text-right">Price</th>
-                </>
-              ) : (
-                <>
-                  <th className="px-4 py-3">Payee</th>
-                  <th className="px-4 py-3">Accounts</th>
-                </>
+            <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 text-right")}>Amount</th>
+            {selectedAccountId && <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 text-right")}>Balance</th>}
+            <th className={cn(STICKY_HEADER_CELL, "pl-0 pr-3 py-3")} aria-label="Reconciled" />
+            {hasRowActions && <th className={cn(STICKY_HEADER_CELL, "px-2 py-2")} aria-label="Actions" />}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-border-secondary">
+          {Array.from({ length: 8 }).map((_, i) => (
+            <tr key={i} data-testid="transaction-skeleton-row">
+              <td className="px-4 py-3">
+                <Skeleton className="h-4 w-16" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className="h-4 w-28" />
+              </td>
+              <td className="px-4 py-3">
+                <Skeleton className={cn("h-4", isInvestmentRegister ? "w-12 ml-auto" : "w-36")} />
+              </td>
+              {isInvestmentRegister && (
+                <td className="px-4 py-3">
+                  <Skeleton className="h-4 w-14 ml-auto" />
+                </td>
               )}
-              <th className="px-4 py-3 text-right">Amount</th>
-              {selectedAccountId && <th className="px-4 py-3 text-right">Balance</th>}
-              {hasRowActions && <th className="px-2 py-3" aria-label="Actions" />}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border-secondary">
-            {Array.from({ length: 8 }).map((_, i) => (
-              <tr key={i} data-testid="transaction-skeleton-row">
-                <td className="px-4 py-3">
-                  <Skeleton className="h-4 w-16" />
-                </td>
-                <td className="px-4 py-3">
-                  <Skeleton className="h-4 w-28" />
-                </td>
-                <td className="px-4 py-3">
-                  <Skeleton className={cn("h-4", isInvestmentRegister ? "w-12 ml-auto" : "w-36")} />
-                </td>
-                {isInvestmentRegister && (
-                  <td className="px-4 py-3">
-                    <Skeleton className="h-4 w-14 ml-auto" />
-                  </td>
-                )}
+              <td className="px-4 py-3">
+                <Skeleton className="h-4 w-16 ml-auto" />
+              </td>
+              {selectedAccountId && (
                 <td className="px-4 py-3">
                   <Skeleton className="h-4 w-16 ml-auto" />
                 </td>
-                {selectedAccountId && (
-                  <td className="px-4 py-3">
-                    <Skeleton className="h-4 w-16 ml-auto" />
-                  </td>
-                )}
-                {hasRowActions && (
-                  <td className="px-2 py-3">
-                    <Skeleton className="h-4 w-4 ml-auto" />
-                  </td>
-                )}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+              )}
+              <td className="pl-0 pr-3 py-3">
+                <Skeleton className="h-3.5 w-3.5 rounded-full" />
+              </td>
+              {hasRowActions && (
+                <td className="px-2 py-2">
+                  <Skeleton className="h-4 w-4 ml-auto" />
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     );
   }
 
@@ -1070,7 +1127,18 @@ export function TransactionList({
       aria-haspopup="menu"
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => openRowMenu(e, transaction)}
-      className="inline-flex h-7 w-7 items-center justify-center rounded-md text-fg-tertiary transition-colors hover:bg-surface-tertiary hover:text-fg-secondary"
+      className={cn(
+        "inline-flex h-7 w-7 items-center justify-center rounded-md text-fg-tertiary",
+        "transition-[color,background-color,opacity] hover:bg-surface-tertiary hover:text-fg-secondary",
+        // Hidden until the row is hovered or the trigger is focused. Opacity
+        // rather than display, so the cell keeps its size and the row does not
+        // reflow on hover. pointer-events follows the opacity so an invisible
+        // trigger cannot swallow a click meant to open the transaction; the
+        // keyboard path is unaffected, since focus and Enter ignore it.
+        "opacity-0 pointer-events-none",
+        "group-hover/row:opacity-100 group-hover/row:pointer-events-auto",
+        "focus-visible:opacity-100 focus-visible:pointer-events-auto"
+      )}
     >
       <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
         <circle cx="5" cy="12" r="1.6" />
@@ -1088,8 +1156,19 @@ export function TransactionList({
     transaction: DisplayTransaction,
     isPlaceholder: boolean
   ) => {
-    const testId = `transaction-amount-indicator-${transaction.id}`;
-    const base = "inline-block h-2.5 w-2.5 rounded-full flex-shrink-0";
+    const testId = `transaction-reconciled-indicator-${transaction.id}`;
+    // A 20px box holding a 14px dot. The box is the hit target -- the dot alone
+    // used to be 10px, which is a small thing to ask anyone to hit.
+    //
+    // `flex`, not `inline-flex`, and the distinction is load-bearing. An
+    // inline-level box shares its line with the strut -- the invisible box the
+    // cell's own font metrics contribute -- and the line grows to fit both, so a
+    // 20px inline-flex in a 20px line box measures 24px and the status column
+    // silently becomes what decides the row height (49px rows instead of 44px,
+    // measured). Block-level means no inline formatting context, no strut, and
+    // exactly 20px. In the mobile card it is a flex item either way.
+    const base = "flex h-5 w-5 items-center justify-center flex-shrink-0";
+    const dot = "block h-3.5 w-3.5 rounded-full";
     if (isPlaceholder) {
       return (
         <span data-testid={testId} aria-hidden className={cn(base, "invisible")} />
@@ -1104,8 +1183,10 @@ export function TransactionList({
         <span
           data-testid={testId}
           title={reconciled ? "Reconciled" : "Not reconciled"}
-          className={cn(base, visual)}
-        />
+          className={base}
+        >
+          <span className={cn(dot, visual)} />
+        </span>
       );
     }
     return (
@@ -1124,12 +1205,10 @@ export function TransactionList({
           e.stopPropagation();
           onToggleReconciled(transaction.id, !reconciled);
         }}
-        className={cn(
-          base,
-          "cursor-pointer transition-transform duration-150 hover:scale-125",
-          visual
-        )}
-      />
+        className={cn(base, "cursor-pointer transition-transform duration-150 hover:scale-125")}
+      >
+        <span className={cn(dot, visual)} />
+      </button>
     );
   };
 
@@ -1294,6 +1373,7 @@ export function TransactionList({
                       {isProjected && renderUpcomingPill()}
                       {isPlaidPending && renderPlaidPill()}
                       {!isProjected && !isPlaidPending && isFuture && renderScheduledPill()}
+                      {!isProjected && !isPlaidPending && transaction.isFloating && renderFloatPill()}
                       <span className={cn(
                         "text-sm font-medium truncate",
                         isProjected ? "text-fg-tertiary italic" : "text-fg"
@@ -1307,7 +1387,6 @@ export function TransactionList({
                       "text-xs mt-0.5",
                       isProjected ? "text-fg-tertiary italic" : "text-fg-tertiary"
                     )}>
-                      {transaction.isFloating && <span title="Floating — date advances to today until reconciled">~</span>}
                       {formatDate(getEffectiveDate(transaction))}
                     </div>
                   </div>
@@ -1365,7 +1444,6 @@ export function TransactionList({
 
   return (
     <>
-      <div className="overflow-x-auto">
       <table className="w-full table-fixed">
         <colgroup>
           {isInvestmentRegister ? (
@@ -1376,6 +1454,7 @@ export function TransactionList({
               <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.price} />
               <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.amount} />
               {selectedAccountId && <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.balance} />}
+              <col className={INVESTMENT_TABLE_COLUMN_WIDTHS.status} />
             </>
           ) : (
             <>
@@ -1384,36 +1463,42 @@ export function TransactionList({
               <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.accounts} />
               <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.amount} />
               {selectedAccountId && <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.balance} />}
+              <col className={TRANSACTION_TABLE_COLUMN_WIDTHS.status} />
             </>
           )}
           {hasRowActions && <col className="w-12" />}
         </colgroup>
         <thead>
           <tr className="text-left text-xs font-medium text-fg-tertiary uppercase tracking-wider">
-            <th className="px-4 py-3 whitespace-nowrap">Date</th>
+            <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 whitespace-nowrap")}>Date</th>
             {isInvestmentRegister ? (
               <>
-                <th className="px-4 py-3">Activity</th>
-                <th className="px-4 py-3 text-right">Shares</th>
-                <th className="px-4 py-3 text-right">Price</th>
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3")}>Activity</th>
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 text-right")}>Shares</th>
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 text-right")}>Price</th>
               </>
             ) : (
               <>
-                <th className="px-4 py-3">Payee</th>
-                <th className="px-4 py-3">Accounts</th>
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3")}>Payee</th>
+                <th className={cn(STICKY_HEADER_CELL, "px-4 py-3")}>Accounts</th>
               </>
             )}
-            <th className="px-4 py-3 text-right">Amount</th>
+            <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 text-right")}>Amount</th>
             {selectedAccountId && (
-              <th className="px-4 py-3 text-right">Balance</th>
+              <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 text-right")}>Balance</th>
             )}
-            {hasRowActions && <th className="px-2 py-3" aria-label="Actions" />}
+            <th className={cn(STICKY_HEADER_CELL, "pl-0 pr-3 py-3")} aria-label="Reconciled" />
+            {hasRowActions && <th className={cn(STICKY_HEADER_CELL, "px-2 py-2")} aria-label="Actions" />}
           </tr>
         </thead>
         <tbody className="divide-y divide-border-secondary">
-          {displayTransactions.map((transaction) => {
+          {displayTransactions.map((transaction, index) => {
             const { isProjected, isPlaidPending, amount, isPositive, balance, isFuture, isHighlightTarget, isTradeOnly } =
               renderTransactionRow(transaction);
+            const dateCell = dateCellFor(
+              getEffectiveDate(transaction),
+              index > 0 ? getEffectiveDate(displayTransactions[index - 1]) : null
+            );
 
             return (
               <tr
@@ -1427,7 +1512,9 @@ export function TransactionList({
                 onMouseDown={isProjected || isPlaidPending ? undefined : handleRowMouseDown}
                 onContextMenu={isProjected || isPlaidPending ? undefined : (e) => handleContextMenu(e, transaction)}
                 className={cn(
-                  "transition-colors",
+                  // Named group so the row-actions trigger can reveal itself on
+                  // hover without colliding with any other group in the tree.
+                  "group/row transition-colors",
                   isProjected
                     ? "cursor-pointer border-l-2 border-dashed border-border-future bg-future hover:bg-future-hover"
                     : isPlaidPending
@@ -1454,8 +1541,10 @@ export function TransactionList({
                   "px-4 py-3 text-sm whitespace-nowrap",
                   isProjected ? "text-fg-tertiary italic" : "text-fg-secondary"
                 )}>
-                  {transaction.isFloating && <span title="Floating — date advances to today until reconciled">~</span>}
-                  {formatDate(getEffectiveDate(transaction))}
+                  {dateCell.visible}
+                  {dateCell.screenReaderOnly && (
+                    <span className="sr-only">{dateCell.screenReaderOnly}</span>
+                  )}
                 </td>
                 {isInvestmentRegister ? (
                   renderInvestmentRegisterCells(transaction, {
@@ -1473,6 +1562,7 @@ export function TransactionList({
                         {isProjected && renderUpcomingPill()}
                         {isPlaidPending && renderPlaidPill()}
                         {!isProjected && !isPlaidPending && isFuture && renderScheduledPill()}
+                        {!isProjected && !isPlaidPending && transaction.isFloating && renderFloatPill()}
                         <span className="truncate">
                           {transaction.payee?.name ? (
                             transaction.payee.name
@@ -1499,8 +1589,9 @@ export function TransactionList({
                   </>
                 )}
                 <td
+                  data-testid={`transaction-amount-${transaction.id}`}
                   className={cn(
-                    "px-4 py-3 text-sm font-medium whitespace-nowrap",
+                    "px-4 py-3 text-sm font-medium text-right tabular-nums whitespace-nowrap",
                     isProjected
                       ? isTradeOnly
                         ? "text-fg-tertiary italic"
@@ -1518,14 +1609,9 @@ export function TransactionList({
                             : "text-fg"
                   )}
                 >
-                  <div className="flex items-center justify-end gap-1.5">
-                    <span className="tabular-nums">
-                      {selectedAccountId && isPositive && "+"}
-                      {selectedAccountId && !isPositive && "−"}
-                      {formatCurrency(Math.abs(amount))}
-                    </span>
-                    {renderReconciledIndicator(transaction, isProjected || isPlaidPending)}
-                  </div>
+                  {selectedAccountId && isPositive && "+"}
+                  {selectedAccountId && !isPositive && "−"}
+                  {formatCurrency(Math.abs(amount))}
                 </td>
                 {selectedAccountId && (
                   <td
@@ -1541,8 +1627,26 @@ export function TransactionList({
                     {isPlaidPending ? "—" : formatCurrency(balance)}
                   </td>
                 )}
+                {/* Cleared status trails the money rather than leading the row.
+                    It still gets its own column, so it reads as a vertical run
+                    the way a chequebook register's does -- but the run now sits
+                    against Amount and Balance, which is what anyone checking
+                    whether a figure has cleared is already looking at. The
+                    mobile card has always put the dot beside the amount; this
+                    is the register agreeing with it.
+
+                    It stops one column short of the row's end on purpose: the
+                    actions trigger keeps the last column, so reaching for the
+                    ⋯ menu cannot land on a toggle that writes on one click. */}
+                <td className="pl-0 pr-3 py-3">
+                  {renderReconciledIndicator(transaction, isProjected || isPlaidPending)}
+                </td>
+                {/* py-2, not py-3: the trigger is h-7 (28px) while every text
+                    cell beside it is a 20px line box, so at py-3 the button set
+                    the row height -- 52px against the 44px the type asks for,
+                    on every row. */}
                 {hasRowActions && (
-                  <td className="px-2 py-3 text-right">
+                  <td className="px-2 py-2 text-right">
                     {!isProjected &&
                       !isPlaidPending &&
                       hasRowMenuActions(transaction) &&
@@ -1554,7 +1658,6 @@ export function TransactionList({
           })}
         </tbody>
       </table>
-      </div>
 
       {/* Shared actions menu — opened by right-click or the ⋯ trigger */}
       {renderRowMenu()}

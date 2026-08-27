@@ -14,6 +14,7 @@ import {
   createSecurityPrice,
   createBook,
 } from "@/tests/helpers/db-utils";
+import { callMcpTool } from "@/tests/helpers/mcp";
 import { getDb } from "@/db";
 import { books, securities, users } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -46,15 +47,8 @@ let server: McpServer;
  * Call an MCP tool and parse the JSON text response.
  * Returns { data, isError } where data is the parsed first text content.
  */
-async function callTool(name: string, args: Record<string, unknown> = {}) {
-  const result = await client.callTool({ name, arguments: args });
-  const isError = result.isError ?? false;
-  const textContent = (result.content as Array<{ type: string; text: string }>)?.find(
-    (c) => c.type === "text"
-  );
-  const data = textContent ? JSON.parse(textContent.text) : undefined;
-  return { data, isError };
-}
+const callTool = (name: string, args: Record<string, unknown> = {}) =>
+  callMcpTool(client, name, args);
 
 /**
  * Insert a test user into the meta DB and return it.

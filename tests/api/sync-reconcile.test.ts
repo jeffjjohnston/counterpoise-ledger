@@ -1482,9 +1482,9 @@ describe("/api/sync/accounts/[id]/reconcile", () => {
     });
 
     // The GET twin of this test lives above; POST runs the same two link
-    // guards, and its own copy needs its own test — Task 3 moved the guards
-    // into lib/plaid-reconcile.ts, where they now throw instead of returning,
-    // so POST's catch is what turns them back into these two responses. The
+    // guards, and its own copy needs its own test — the guards now live in
+    // lib/plaid-reconcile.ts, where they throw instead of returning, so
+    // POST's catch is what turns them back into these two responses. The
     // body never gets parsed: the guard fires before request.json() is read.
     const response = await POST(
       new Request(`http://localhost/api/sync/accounts/${link.id}/reconcile`, {

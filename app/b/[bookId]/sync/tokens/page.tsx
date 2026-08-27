@@ -2,11 +2,16 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
 import { Button } from "@/components/ui/Button";
+import { ConfirmModal } from "@/components/ui/ConfirmModal";
+import { EmptyState } from "@/components/ui/EmptyState";
 import { Input } from "@/components/ui/Input";
+import { MenuButton } from "@/components/ui/MenuButton";
+import { Skeleton } from "@/components/ui/Skeleton";
 import { Modal } from "@/components/ui/Modal";
-import { Select } from "@/components/ui/Select";
 import { flattenAccounts } from "@/lib/accounting";
+import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import type {
@@ -45,14 +50,21 @@ export default function SyncTokensPage() {
   const [tokens, setTokens] = useState<PlaidTokenListItem[]>([]);
   const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const [showAddModal, setShowAddModal] = useState(false);
   const [form, setForm] = useState<NewTokenForm>(initialFormState);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [addError, setAddError] = useState<string | null>(null);
+
   const [showEditModal, setShowEditModal] = useState(false);
   const [editingToken, setEditingToken] = useState<PlaidTokenListItem | null>(null);
   const [editForm, setEditForm] = useState<EditTokenForm>(initialEditFormState);
   const [editSaving, setEditSaving] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+
+  const [deleteTarget, setDeleteTarget] = useState<PlaidTokenListItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [selectedToken, setSelectedToken] = useState<PlaidTokenListItem | null>(null);
@@ -61,20 +73,14 @@ export default function SyncTokensPage() {
   const [assignSaving, setAssignSaving] = useState(false);
   const [assignError, setAssignError] = useState<string | null>(null);
 
-  const accountOptions = useMemo(
-    () => [
-      { value: "", label: "None" },
-      ...accounts
-        .filter(
-          (account) =>
-            account.isActive &&
-            (account.subtype === "bank" || account.subtype === "credit_card")
-        )
-        .map((account) => ({
-          value: String(account.id),
-          label: account.name,
-        })),
-    ],
+  // Accounts a Plaid account can map to: active bank or credit-card accounts.
+  const assignableAccounts = useMemo(
+    () =>
+      accounts.filter(
+        (account) =>
+          account.isActive &&
+          (account.subtype === "bank" || account.subtype === "credit_card")
+      ),
     [accounts]
   );
 
@@ -82,6 +88,19 @@ export default function SyncTokensPage() {
     const data = await apiGet<PlaidTokenListItem[]>(`/api/b/${bookId}/sync/tokens`);
     setTokens(Array.isArray(data) ? data : []);
   }, [bookId]);
+
+  // The row behind the assignment modal reports "N of M accounts mapped" and
+  // gates the amber warning on it. Both the Plaid refresh (which upserts
+  // plaidAccounts server-side) and a save change those numbers, so the list
+  // has to be re-read or the row keeps reporting the state before the fix.
+  // Best-effort: a stale count is a far smaller problem than losing the modal.
+  const refreshTokenCounts = useCallback(async () => {
+    try {
+      await fetchTokens();
+    } catch {
+      // Left stale until the next load.
+    }
+  }, [fetchTokens]);
 
   const fetchAccounts = useCallback(async () => {
     // Degrades to [] on failure rather than throwing — the account list only
@@ -105,7 +124,7 @@ export default function SyncTokensPage() {
         setError(null);
         await Promise.all([fetchTokens(), fetchAccounts()]);
       } catch (fetchError) {
-        const message = toMessage(fetchError, "Failed to load sync token data");
+        const message = toMessage(fetchError, "Failed to load bank connections");
         setError(message);
       } finally {
         setLoading(false);
@@ -117,33 +136,43 @@ export default function SyncTokensPage() {
     void fetchInitialData();
   }, [fetchAccounts, fetchTokens]);
 
+  const closeAddModal = () => {
+    setShowAddModal(false);
+    setForm(initialFormState);
+    setAddError(null);
+    setSubmitting(false);
+  };
+
   const handleAddToken = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSubmitting(true);
-    setError(null);
+    setAddError(null);
 
     try {
       await apiPost(`/api/b/${bookId}/sync/tokens`, form);
-      setForm(initialFormState);
       await fetchTokens();
+      closeAddModal();
     } catch (submitError) {
-      const message = toMessage(submitError, "Failed to add token");
-      setError(message);
+      const message = toMessage(submitError, "Failed to add connection");
+      setAddError(message);
     } finally {
       setSubmitting(false);
     }
   };
 
   const handleDeleteToken = async (tokenId: number) => {
-    if (!confirm("Are you sure you want to delete this token?")) return;
+    setError(null);
+    setDeleting(true);
 
     try {
-      setError(null);
       await apiDelete(`/api/b/${bookId}/sync/tokens/${tokenId}`);
       await fetchTokens();
     } catch (deleteError) {
-      const message = toMessage(deleteError, "Failed to delete token");
+      const message = toMessage(deleteError, "Failed to remove connection");
       setError(message);
+    } finally {
+      setDeleting(false);
+      setDeleteTarget(null);
     }
   };
 
@@ -179,7 +208,7 @@ export default function SyncTokensPage() {
       await fetchTokens();
       closeEditModal();
     } catch (saveError) {
-      const message = toMessage(saveError, "Failed to update token");
+      const message = toMessage(saveError, "Failed to update connection");
       setEditError(message);
     } finally {
       setEditSaving(false);
@@ -205,6 +234,8 @@ export default function SyncTokensPage() {
     } finally {
       setAssignLoading(false);
     }
+
+    await refreshTokenCounts();
   };
 
   const closeAssignModal = () => {
@@ -246,6 +277,7 @@ export default function SyncTokensPage() {
         }
       );
       setPlaidAccounts(Array.isArray(payload) ? payload : []);
+      await refreshTokenCounts();
       closeAssignModal();
     } catch (saveError) {
       const message = toMessage(saveError, "Failed to save assignments");
@@ -258,9 +290,9 @@ export default function SyncTokensPage() {
   if (loading) {
     return (
       <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="animate-pulse space-y-4">
+        <div className="space-y-4">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="h-16 bg-surface-tertiary rounded-lg" />
+            <Skeleton key={i} className="h-16 rounded-lg" />
           ))}
         </div>
       </div>
@@ -270,49 +302,13 @@ export default function SyncTokensPage() {
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold text-fg">Manage Sync Tokens</h1>
-        <Button variant="secondary" onClick={() => router.push(`/b/${bookId}/sync`)}>
-          Back to Sync
-        </Button>
-      </div>
-
-      <div className="bg-surface rounded-lg border border-border p-6 mb-6">
-        <h2 className="text-lg font-semibold text-fg mb-4">Add Token</h2>
-        <form className="grid grid-cols-1 md:grid-cols-3 gap-4" onSubmit={handleAddToken}>
-          <Input
-            id="financialInstitution"
-            label="Financial Institution"
-            value={form.financialInstitution}
-            onChange={(event) =>
-              setForm((prev) => ({
-                ...prev,
-                financialInstitution: event.target.value,
-              }))
-            }
-          />
-          <Input
-            id="itemId"
-            label="Item ID"
-            value={form.itemId}
-            onChange={(event) =>
-              setForm((prev) => ({ ...prev, itemId: event.target.value }))
-            }
-          />
-          <Input
-            id="accessToken"
-            label="Access Token"
-            type="password"
-            value={form.accessToken}
-            onChange={(event) =>
-              setForm((prev) => ({ ...prev, accessToken: event.target.value }))
-            }
-          />
-          <div className="md:col-span-3">
-            <Button type="submit" disabled={submitting}>
-              {submitting ? "Adding..." : "Add Token"}
-            </Button>
-          </div>
-        </form>
+        <h1 className="text-2xl font-bold text-fg">Bank connections</h1>
+        <div className="inline-flex items-center gap-2">
+          <Button onClick={() => setShowAddModal(true)}>Add connection</Button>
+          <Button variant="secondary" onClick={() => router.push(`/b/${bookId}/sync`)}>
+            Back to Sync
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -322,67 +318,176 @@ export default function SyncTokensPage() {
       )}
 
       {tokens.length === 0 ? (
-        <div className="bg-surface rounded-lg border border-border p-6 text-fg-tertiary">
-          No tokens configured yet.
+        <div className="bg-surface rounded-lg border border-border">
+          <EmptyState
+            title="No banks connected yet"
+            description="Add a connection to start syncing transactions from your bank."
+            action={{ label: "Add connection", onClick: () => setShowAddModal(true) }}
+          />
         </div>
       ) : (
         <div className="bg-surface rounded-lg border border-border overflow-x-auto">
-          <table className="w-full min-w-[760px]">
+          <table className="w-full min-w-[520px]">
             <thead>
               <tr className="text-left text-xs font-medium text-fg-tertiary uppercase tracking-wider bg-surface-secondary">
-                <th className="px-4 py-3">Financial Institution</th>
-                <th className="px-4 py-3">Item ID</th>
+                <th className="px-4 py-3">Bank</th>
                 <th className="px-4 py-3 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border-secondary">
-              {tokens.map((token) => (
-                <tr key={token.id}>
-                  <td className="px-4 py-3 text-sm text-fg">
-                    {token.financialInstitution}
-                  </td>
-                  <td className="px-4 py-3 text-sm text-fg-secondary">{token.itemId}</td>
-                  <td className="px-4 py-3 text-right">
-                    <div className="inline-flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => handleOpenEditModal(token)}
-                      >
-                        Edit
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => handleOpenAssignModal(token)}
-                      >
-                        Assign Accounts
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="danger"
-                        onClick={() => handleDeleteToken(token.id)}
-                      >
-                        Remove
-                      </Button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {tokens.map((token) => {
+                const isFullyMapped =
+                  token.totalAccountCount > 0 &&
+                  token.mappedAccountCount === token.totalAccountCount;
+                const hasUnmapped = token.totalAccountCount > token.mappedAccountCount;
+                // A connection with nothing loaded from the bank yet is not
+                // "mapped" — treat it as needing attention too, not as a
+                // healthy zero-of-zero.
+                const needsAttention = token.totalAccountCount === 0 || hasUnmapped;
+
+                return (
+                  <tr key={token.id} className={cn(needsAttention && "bg-warning-subtle")}>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={cn(
+                            "h-2 w-2 flex-none rounded-full",
+                            needsAttention ? "bg-[var(--fg-warning)]" : "bg-[var(--fg-success)]"
+                          )}
+                          role="status"
+                          aria-label={
+                            isFullyMapped
+                              ? "All accounts mapped"
+                              : token.totalAccountCount === 0
+                                ? "Accounts not loaded yet"
+                                : "Some accounts not mapped"
+                          }
+                        />
+                        <span className="text-sm font-medium text-fg">
+                          {token.financialInstitution}
+                        </span>
+                      </div>
+                      {token.totalAccountCount === 0 ? (
+                        <p className="mt-0.5 text-13 text-fg-warning">
+                          Accounts have not been loaded from the bank yet — Map accounts will fetch them.
+                          <span className="text-border"> · </span>
+                          <span className="font-mono text-xs">{token.itemId}</span>
+                        </p>
+                      ) : hasUnmapped ? (
+                        <p className="mt-0.5 text-13 text-fg-warning">
+                          {token.mappedAccountCount} of {token.totalAccountCount} accounts mapped — the rest
+                          will not sync until you map them.
+                          <span className="text-border"> · </span>
+                          <span className="font-mono text-xs">{token.itemId}</span>
+                        </p>
+                      ) : (
+                        <p className="mt-0.5 text-13 text-fg-tertiary">
+                          {token.mappedAccountCount} of {token.totalAccountCount} accounts mapped
+                          <span className="text-border"> · </span>
+                          <span className="font-mono text-xs">{token.itemId}</span>
+                        </p>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="inline-flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant={needsAttention ? "primary" : "secondary"}
+                          onClick={() => void handleOpenAssignModal(token)}
+                        >
+                          Map accounts
+                        </Button>
+                        <MenuButton
+                          label={`${token.financialInstitution} actions`}
+                          items={[
+                            { label: "Edit", onSelect: () => handleOpenEditModal(token) },
+                            {
+                              label: "Remove connection",
+                              variant: "danger",
+                              onSelect: () => setDeleteTarget(token),
+                            },
+                          ]}
+                        />
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
       )}
 
+      <Modal isOpen={showAddModal} onClose={closeAddModal} title="Add connection">
+        <div className="mb-5 rounded-lg border border-border bg-accent-subtle p-3">
+          <p className="text-13 leading-relaxed text-fg-secondary">
+            Counterpoise does not run Plaid&rsquo;s sign-in flow itself. Run{" "}
+            <code className="rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-xs">
+              npm run plaid:link
+            </code>{" "}
+            to sign in at your bank; it prints the item ID and access token to paste below.
+          </p>
+        </div>
+        <form className="space-y-4" onSubmit={handleAddToken}>
+          <Input
+            id="financialInstitution"
+            label="Bank name"
+            value={form.financialInstitution}
+            onChange={(event) =>
+              setForm((prev) => ({
+                ...prev,
+                financialInstitution: event.target.value,
+              }))
+            }
+          />
+          <div>
+            <Input
+              id="itemId"
+              label="Item ID"
+              value={form.itemId}
+              onChange={(event) =>
+                setForm((prev) => ({ ...prev, itemId: event.target.value }))
+              }
+            />
+            <p className="mt-1 text-xs text-fg-tertiary">
+              Starts with <span className="font-mono">item-</span>. Identifies the connection at Plaid.
+            </p>
+          </div>
+          <div>
+            <Input
+              id="accessToken"
+              label="Access Token"
+              type="password"
+              value={form.accessToken}
+              onChange={(event) =>
+                setForm((prev) => ({ ...prev, accessToken: event.target.value }))
+              }
+            />
+            <p className="mt-1 text-xs text-fg-tertiary">
+              Starts with <span className="font-mono">access-</span>. Stored on the server; never shown again.
+            </p>
+          </div>
+          {addError && <p className="text-sm text-fg-danger">{addError}</p>}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="secondary" onClick={closeAddModal}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={submitting}>
+              {submitting ? "Adding…" : "Add connection"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
       <Modal
         isOpen={showEditModal}
         onClose={closeEditModal}
-        title="Edit Token"
+        title="Edit connection"
       >
         <form className="space-y-4" onSubmit={handleSaveEditedToken}>
           <Input
             id="edit-financialInstitution"
-            label="Financial Institution"
+            label="Bank name"
             value={editForm.financialInstitution}
             onChange={(event) =>
               setEditForm((prev) => ({
@@ -402,7 +507,7 @@ export default function SyncTokensPage() {
           <div>
             <Input
               id="edit-accessToken"
-              label="New Access Token"
+              label="New access token"
               type="password"
               value={editForm.accessToken}
               onChange={(event) =>
@@ -424,7 +529,7 @@ export default function SyncTokensPage() {
               Cancel
             </Button>
             <Button type="submit" disabled={editSaving}>
-              {editSaving ? "Saving..." : "Save"}
+              {editSaving ? "Saving…" : "Save"}
             </Button>
           </div>
         </form>
@@ -433,24 +538,30 @@ export default function SyncTokensPage() {
       <Modal
         isOpen={showAssignModal}
         onClose={closeAssignModal}
-        title={`Assign Accounts${selectedToken ? ` - ${selectedToken.financialInstitution}` : ""}`}
+        title={`Map accounts${selectedToken ? ` - ${selectedToken.financialInstitution}` : ""}`}
         size="lg"
       >
         {assignLoading ? (
-          <p className="text-sm text-fg-secondary">Refreshing accounts from Plaid...</p>
+          <div className="flex items-center gap-3 py-6">
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-border border-t-accent" />
+            <p className="text-sm text-fg-secondary">Refreshing accounts from Plaid…</p>
+          </div>
         ) : assignError ? (
           <div className="space-y-3">
             <p className="text-sm text-fg-danger">{assignError}</p>
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
               <Button variant="secondary" onClick={closeAssignModal}>
                 Close
+              </Button>
+              <Button onClick={() => selectedToken && void handleOpenAssignModal(selectedToken)}>
+                Try again
               </Button>
             </div>
           </div>
         ) : plaidAccounts.length === 0 ? (
           <div className="space-y-3">
             <p className="text-sm text-fg-secondary">
-              No Plaid accounts were returned for this token.
+              No accounts were returned for this connection.
             </p>
             <div className="flex justify-end">
               <Button variant="secondary" onClick={closeAssignModal}>
@@ -479,21 +590,18 @@ export default function SyncTokensPage() {
                         : ""}
                     </p>
                   </div>
-                  <Select
-                    id={`assignment-${plaidAccount.plaidAccountId}`}
-                    label="Counterpoise Account"
-                    value={
-                      plaidAccount.counterpoiseAccountId !== null
-                        ? String(plaidAccount.counterpoiseAccountId)
-                        : ""
-                    }
-                    options={accountOptions}
-                    onChange={(event) =>
+                  <AccountAutocomplete
+                    accounts={assignableAccounts}
+                    value={plaidAccount.counterpoiseAccountId}
+                    onChange={(accountId) =>
                       handleAssignmentChange(
                         plaidAccount.plaidAccountId,
-                        event.target.value
+                        accountId === null ? "" : String(accountId)
                       )
                     }
+                    label="Counterpoise account"
+                    placeholder="Search accounts…"
+                    allowClear
                   />
                 </div>
               ))}
@@ -503,12 +611,33 @@ export default function SyncTokensPage() {
                 Cancel
               </Button>
               <Button onClick={handleSaveAssignments} disabled={assignSaving}>
-                {assignSaving ? "Saving..." : "Save Assignments"}
+                {assignSaving ? "Saving…" : "Save assignments"}
               </Button>
             </div>
           </div>
         )}
       </Modal>
+
+      <ConfirmModal
+        isOpen={deleteTarget !== null}
+        title={`Remove ${deleteTarget?.financialInstitution ?? "connection"}?`}
+        confirmLabel="Remove connection"
+        busy={deleting}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          if (deleteTarget) void handleDeleteToken(deleteTarget.id);
+        }}
+        body={
+          <>
+            <p>
+              This also removes every account mapping for this connection and its entire
+              reconciliation history — the staged transactions still waiting, and every row
+              you have already matched, created or ignored.
+            </p>
+            <p>Transactions in your ledger are not deleted; they stop being linked to a bank record.</p>
+          </>
+        }
+      />
     </div>
   );
 }

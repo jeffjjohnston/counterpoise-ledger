@@ -94,12 +94,12 @@ describe("MCP route parity", () => {
     expect(empty).toEqual([]);
   });
 
-  // During Plans 2-6, the realistic mistake was adding the ROUTE_TOOLS entry
-  // for a route and forgetting to delete its pending-plan-N waiver: the route
-  // then looked both covered and waived, and the pending checklist
-  // under-reported silently. That waiver mechanism is gone (see
-  // route-coverage.ts), but the same mistake is possible with any waiver —
-  // this guard is what catches a route left mapped and waived at once.
+  // While the tools were being added a route at a time, the realistic mistake
+  // was adding the ROUTE_TOOLS entry for a route and forgetting to delete its
+  // pending-plan-N waiver: the route then looked both covered and waived, and
+  // the pending checklist under-reported silently. That waiver mechanism is
+  // gone (see route-coverage.ts), but the same mistake is possible with any
+  // waiver — this guard is what catches a route left mapped and waived at once.
   it("maps and waives disjoint sets of routes", () => {
     const both = Object.keys(ROUTE_TOOLS).filter((key) => key in ROUTE_WAIVERS);
     expect(

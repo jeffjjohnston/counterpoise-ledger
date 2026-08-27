@@ -103,6 +103,8 @@ export type PlaidTokenListItem = Pick<
   financialInstitution: string;
   itemId: string;
   accessTokenMasked: string;
+  mappedAccountCount: number;
+  totalAccountCount: number;
 };
 
 export type PlaidAccountAssignment = Pick<
@@ -120,6 +122,7 @@ export type AssignedSyncAccount = {
   itemId: string;
   plaidAccountId: string;
   plaidAccountName: string;
+  plaidAccountMask: string | null;
   counterpoiseAccountId: number;
   counterpoiseAccountName: string;
   lastSyncedAt: string | null;

@@ -768,7 +768,7 @@ export async function updateTransaction(
  *      DELETE SET NULL then clears the id but leaves resolutionStatus at
  *      "matched". No test covers this step: reproducing the race needs two
  *      concurrent sessions, and a single-process test cannot create that
- *      interleaving. Mutation testing during Task 4 confirmed the gap:
+ *      interleaving. Mutation testing confirmed the gap:
  *      removing step 2 or step 3 alone still leaves the row "pending" in
  *      every single-threaded test, because each step masks the other's
  *      absence. A maintainer who deletes this step would see a fully green

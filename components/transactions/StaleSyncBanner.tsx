@@ -76,11 +76,11 @@ export function StaleSyncBanner({
   return (
     <div
       className={cn(
-        "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3",
+        "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border-warning bg-warning-subtle p-3",
         className
       )}
     >
-      <span className="inline-block h-2 w-2 flex-none rounded-full bg-amber-500" />
+      <span className="inline-block h-2 w-2 flex-none rounded-full bg-[var(--fg-warning)]" />
       <div className="min-w-0 text-sm font-medium">
         {data.totalCount}{" "}
         {data.totalCount === 1 ? "transaction" : "transactions"} older than 9

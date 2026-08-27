@@ -10,6 +10,19 @@ All tools require a valid API key. Users create keys in the Counterpoise UI at t
 - Each key is scoped to the user who created it — they can only access books they own
 - The key is verified at server startup, cached in memory, and periodically revalidated so revoked keys stop working without a process restart
 
+### WebMCP / site tools
+
+When an authenticated book is open in a browser that supports WebMCP, the web
+application also publishes this same tool registry as site tools. No API key is
+needed in that case: calls are proxied through the Counterpoise application and
+use the signed-in user's session and the currently open book. Book-scoped tools
+have `bookId` filled in by the server rather than accepting it from the agent.
+
+Tool names, descriptions, JSON schemas, annotations, handlers, and results all
+come from the MCP server registration, so adding or changing an MCP tool updates
+the WebMCP surface without maintaining a second catalog. Browsers without
+WebMCP support continue to use the application normally.
+
 ## Available Tools
 
 | Tool | Description |

@@ -8,6 +8,7 @@ import {
   createAccount,
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
+import { callMcpTool } from "@/tests/helpers/mcp";
 import { getDb } from "@/db";
 import { transactions } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -28,32 +29,8 @@ vi.mock("@/db", async (importOriginal) => {
 let client: Client;
 let server: McpServer;
 
-async function callTool(name: string, args: Record<string, unknown> = {}) {
-  const result = await client.callTool({ name, arguments: args });
-  const isError = result.isError ?? false;
-  const textContent = (result.content as Array<{ type: string; text: string }>)?.find(
-    (c) => c.type === "text"
-  );
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let data: any;
-  if (isError) {
-    // A schema-level rejection is caught at the MCP SDK boundary before the
-    // handler runs, so the body is the SDK's plain-text message rather than
-    // our JSON envelope. Only error results can legitimately be non-JSON —
-    // fall back to wrapping the raw text the same way fail() would.
-    try {
-      data = textContent ? JSON.parse(textContent.text) : undefined;
-    } catch {
-      data = { error: textContent?.text };
-    }
-  } else {
-    // A success result is always our own ok(), so it is always JSON. Leave
-    // this path exactly as strict as it always was: a non-JSON body here is
-    // a real bug and should throw loudly, not degrade silently.
-    data = textContent ? JSON.parse(textContent.text) : undefined;
-  }
-  return { data, isError };
-}
+const callTool = (name: string, args: Record<string, unknown> = {}) =>
+  callMcpTool(client, name, args);
 
 describe("MCP Write Transaction Tools", () => {
   const bookId = 1;
@@ -447,16 +424,25 @@ describe("MCP Write Transaction Tools", () => {
     });
 
     it("rejects a fixed price that is not a positive whole number of micros", async () => {
-      const { data, isError } = await callTool("create_security", {
-        bookId,
-        name: "Bad Fixed Price",
-        symbol: "BADFX",
-        securityType: "mutual_fund",
-        fixedPriceMicros: 0,
+      // The zod schema rejects this before the handler runs, so the SDK
+      // reports it as a plain-text error result rather than our JSON
+      // envelope. That is the one error body callMcpTool() refuses to
+      // decode, so inspect the result directly — the same way the
+      // schema-boundary tests in mcp-tools.test.ts do.
+      const result = await client.callTool({
+        name: "create_security",
+        arguments: {
+          bookId,
+          name: "Bad Fixed Price",
+          symbol: "BADFX",
+          securityType: "mutual_fund",
+          fixedPriceMicros: 0,
+        },
       });
 
-      expect(isError).toBe(true);
-      expect(data.error).toMatch(/positive whole number of micros/);
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+      expect(text).toMatch(/positive whole number of micros/);
     });
   });
 });

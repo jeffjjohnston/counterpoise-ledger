@@ -274,6 +274,66 @@ describe("KeyboardShortcutProvider", () => {
     expect(action).not.toHaveBeenCalled();
   });
 
+  it("does not dispatch an Enter shortcut while a button has focus", () => {
+    const action = vi.fn();
+    const shortcuts: ShortcutDef[] = [
+      {
+        id: "test-enter",
+        keys: ["Enter"],
+        description: "Confirm",
+        category: "Page",
+        action,
+      },
+    ];
+
+    render(
+      <Wrapper>
+        <ShortcutRegistrar shortcuts={shortcuts} />
+        <button data-testid="focus-target">Ignore</button>
+        <ContextDisplay />
+      </Wrapper>
+    );
+
+    fireEvent.click(screen.getByText("Register"));
+
+    // The listener is on the capture phase and calls preventDefault(), so
+    // taking Enter here would suppress the browser's own Enter-to-click.
+    const target = screen.getByTestId("focus-target");
+    target.focus();
+    fireEvent.keyDown(target, { key: "Enter" });
+
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it("still dispatches a letter shortcut while a button has focus", () => {
+    const action = vi.fn();
+    const shortcuts: ShortcutDef[] = [
+      {
+        id: "test-letter",
+        keys: ["i"],
+        description: "Ignore",
+        category: "Page",
+        action,
+      },
+    ];
+
+    render(
+      <Wrapper>
+        <ShortcutRegistrar shortcuts={shortcuts} />
+        <button data-testid="focus-target">Ignore</button>
+        <ContextDisplay />
+      </Wrapper>
+    );
+
+    fireEvent.click(screen.getByText("Register"));
+
+    const target = screen.getByTestId("focus-target");
+    target.focus();
+    fireEvent.keyDown(target, { key: "i" });
+
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
   it("closes overlay on Escape when overlay is open", () => {
     function OpenButton() {
       const { setOverlayOpen } = useKeyboardShortcuts();

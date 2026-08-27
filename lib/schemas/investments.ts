@@ -5,14 +5,11 @@ import { z } from "zod/v4";
 // left behind: both are read-only aggregate queries whose only guard is a
 // query-param shape check.
 //
-// Not in the brief's own file list — the brief's "Create" line names only
-// lib/schemas/reports.ts and lib/schemas/payees.ts, but the interfaces it
-// asks this task to produce (`accountValuesQuery`, `positionsQuery`) need a
-// home, and neither reports.ts nor payees.ts is the right one. Every other
-// resource in this plan gets its own schema file named after the resource
-// (accounts.ts, securities.ts, sync.ts, recurring.ts, transactions.ts) — this
-// file follows that same convention rather than being wedged into an
-// unrelated one. Flagged in task-8-report.md rather than done silently.
+// `accountValuesQuery` and `positionsQuery` need a home, and neither
+// reports.ts nor payees.ts is the right one. Every other resource here gets
+// its own schema file named after the resource (accounts.ts, securities.ts,
+// sync.ts, recurring.ts, transactions.ts) — this file follows that same
+// convention rather than being wedged into an unrelated one.
 
 // ---------------------------------------------------------------------------
 // accountValuesQuery — GET /api/b/[bookId]/investments/account-values
@@ -61,9 +58,8 @@ export type AccountValuesQuery = z.infer<typeof accountValuesQuery>;
 // unchanged by this schema either way. `.int()` IS added despite no prior
 // guard requiring it: `parseInt("5.5", 10)` truncates to 5 and was silently
 // accepted before, while a bare `z.coerce.number()` would carry 5.5 through
-// unchanged into `getPositions(db, bookId, 5.5)` — worse than before (see
-// CLAUDE.md's Task 6 note on this exact trap). No real caller sends a
-// fractional accountId here.
+// unchanged into `getPositions(db, bookId, 5.5)` — worse than before. No
+// real caller sends a fractional accountId here.
 const INVALID_ACCOUNT_ID_MESSAGE = "Invalid accountId"; // positions/route.ts:22
 
 export const positionsQuery = z.object({

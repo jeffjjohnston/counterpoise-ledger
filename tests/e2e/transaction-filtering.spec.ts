@@ -1,5 +1,32 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { buildSeedData } from "./seed-data";
+
+/**
+ * The filter controls are not in the header. They sit behind a Filters button
+ * in a popover (components/transactions/TransactionFilters.tsx), with each
+ * active filter shown back as a removable chip. Every test here therefore
+ * opens the popover before touching a control, and closes it afterwards so
+ * the assertions run against the page a user would actually be looking at.
+ */
+async function openFilters(page: Page) {
+  await page.getByRole("button", { name: "Filters" }).click();
+  const panel = page.getByRole("dialog", { name: "Transaction filters" });
+  await expect(panel).toBeVisible();
+  return panel;
+}
+
+/**
+ * Toggles the popover shut with its own button rather than Escape. The
+ * component closes on a document-level Escape, but so do the register's other
+ * overlays, so driving the button keeps this test independent of which one
+ * would win.
+ */
+async function closeFilters(page: Page) {
+  await page.getByRole("button", { name: "Filters" }).click();
+  await expect(
+    page.getByRole("dialog", { name: "Transaction filters" })
+  ).toBeHidden();
+}
 
 test.describe("transaction filtering", () => {
   test("filters transactions by date range", async ({ page }) => {
@@ -13,12 +40,15 @@ test.describe("transaction filtering", () => {
     const initialCount = await page.locator("tbody tr").count();
     expect(initialCount).toBeGreaterThan(10);
 
-    // Set date range to last year only
-    const startInput = page.getByPlaceholder("Start date");
-    const endInput = page.getByPlaceholder("End date");
+    // Set date range to last year only. Both fields are native date inputs, so
+    // they take the seed's YYYY-MM-DD strings directly.
+    const filters = await openFilters(page);
+    await filters.getByLabel("From", { exact: true }).fill(seed.dates.lastYearStart);
+    await filters.getByLabel("To", { exact: true }).fill(seed.dates.lastYearEnd);
+    await closeFilters(page);
 
-    await startInput.fill(seed.dates.lastYearStart);
-    await endInput.fill(seed.dates.lastYearEnd);
+    // The active range is reported back as a chip once the popover is shut.
+    await expect(page.getByRole("button", { name: /^Clear .+ filter$/ }).first()).toBeVisible();
 
     // Wait for filtered results — only last-year transactions should remain
     // Last year has 3 transactions: Salary (Acme Corp), Groceries (Whole Foods), Buy VTI
@@ -47,12 +77,14 @@ test.describe("transaction filtering", () => {
     await expect(page.locator("tbody tr").first()).toBeVisible();
 
     // Use the payee filter
-    const payeeFilter = page.getByPlaceholder("Filter by payee...");
+    const filters = await openFilters(page);
+    const payeeFilter = filters.getByPlaceholder("Any payee");
     await payeeFilter.click();
     await payeeFilter.fill("Whole Foods");
 
     // Select from dropdown
-    await page.locator("button").filter({ hasText: /^Whole Foods$/ }).first().click();
+    await filters.getByRole("button", { name: "Whole Foods", exact: true }).click();
+    await closeFilters(page);
 
     // Wait for filtered results — only Whole Foods transactions visible
     await expect(async () => {
@@ -76,8 +108,10 @@ test.describe("transaction filtering", () => {
     await expect(page.locator("tbody tr").first()).toBeVisible();
 
     // Apply a restrictive date range (only last year)
-    await page.getByPlaceholder("Start date").fill(seed.dates.lastYearStart);
-    await page.getByPlaceholder("End date").fill(seed.dates.lastYearEnd);
+    let filters = await openFilters(page);
+    await filters.getByLabel("From", { exact: true }).fill(seed.dates.lastYearStart);
+    await filters.getByLabel("To", { exact: true }).fill(seed.dates.lastYearEnd);
+    await closeFilters(page);
 
     // Wait for filter to apply — should have fewer rows
     await expect(async () => {
@@ -85,8 +119,13 @@ test.describe("transaction filtering", () => {
       expect(count).toBeLessThan(10);
     }).toPass({ timeout: 10000 });
 
-    // Clear the date range using the Clear button
-    await page.getByRole("button", { name: "Clear" }).click();
+    // Clear the date range using the popover's Clear dates button. The header
+    // chip's own remove button clears the same state, but its accessible name
+    // embeds the formatted range, and the mobile chip carries a near-identical
+    // one — this button names itself the same way whatever the range is.
+    filters = await openFilters(page);
+    await filters.getByRole("button", { name: "Clear dates" }).click();
+    await closeFilters(page);
 
     // All transactions should reappear (transfers + named ones)
     await expect(async () => {

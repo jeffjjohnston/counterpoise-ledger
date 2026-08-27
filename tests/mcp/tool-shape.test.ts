@@ -35,8 +35,7 @@ describe("toolShape", () => {
 
   // zod v4 leaves _zod.def.checks UNDEFINED on a plain object rather than
   // setting it to []. Measured, not assumed: a bare `checks.length` read
-  // throws TypeError on every clean schema, which is the shape the Plan 2
-  // note suggested.
+  // throws TypeError on every clean schema.
   it("treats a plain object's absent `checks` as zero rather than crashing", () => {
     const schema = z.object({ a: z.string() });
     expect(

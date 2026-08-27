@@ -9,6 +9,7 @@ import {
   createPayee,
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
+import { callMcpTool } from "@/tests/helpers/mcp";
 import { getDb } from "@/db";
 import { payees } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -30,25 +31,8 @@ vi.mock("@/db", async (importOriginal) => {
 let client: Client;
 let server: McpServer;
 
-async function callTool(name: string, args: Record<string, unknown> = {}) {
-  const result = await client.callTool({ name, arguments: args });
-  const isError = result.isError ?? false;
-  const textContent = (result.content as Array<{ type: string; text: string }>)?.find(
-    (c) => c.type === "text"
-  );
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let data: any;
-  if (isError) {
-    try {
-      data = textContent ? JSON.parse(textContent.text) : undefined;
-    } catch {
-      data = { error: textContent?.text };
-    }
-  } else {
-    data = textContent ? JSON.parse(textContent.text) : undefined;
-  }
-  return { data, isError };
-}
+const callTool = (name: string, args: Record<string, unknown> = {}) =>
+  callMcpTool(client, name, args);
 
 describe("MCP Payee Tools", () => {
   const bookId = 1;

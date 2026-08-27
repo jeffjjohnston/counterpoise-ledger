@@ -35,7 +35,7 @@ export function registerPlaidTools(server: McpServer) {
     {
       title: "Get Plaid Status",
       description:
-        "The state of a book's bank connections in one call: each connection (with its access token masked), how many synced transactions are waiting to be reconciled, which accounts hold manually-entered transactions no bank transaction has matched, and every Plaid account mapped to a Counterpoise account with its own pending and review counts.",
+        "The state of a book's bank connections in one call: each connection (with its access token masked, and how many of the bank accounts it exposes are mapped to a Counterpoise account as mappedAccountCount of totalAccountCount), how many synced transactions are waiting to be reconciled, which accounts hold manually-entered transactions no bank transaction has matched, and every Plaid account mapped to a Counterpoise account — its plaidAccountMask (the last digits the bank shows) and its own pending and review counts.",
       inputSchema: {
         bookId: z.number().int().positive().describe("The book ID to query"),
       },

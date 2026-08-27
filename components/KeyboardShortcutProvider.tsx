@@ -11,11 +11,32 @@ import {
 } from "react";
 import { useRouter, useParams } from "next/navigation";
 
+/**
+ * Every category a shortcut may be registered under, in the order the `?`
+ * overlay lists them.
+ *
+ * One list, read by both sides on purpose. The overlay used to keep its own
+ * ordering array and *filter* through it, so a category registered here but
+ * missing there lost its shortcuts with no error — which is why the price
+ * entry pill's P never appeared in the overlay. Because `category` is typed
+ * from this list, a new one is now a compile error until it is added here,
+ * and adding it here is what puts it in the overlay.
+ */
+export const SHORTCUT_CATEGORIES = [
+  "General",
+  "Navigation",
+  "Page",
+  "Transactions",
+  "Sync",
+] as const;
+
+export type ShortcutCategory = (typeof SHORTCUT_CATEGORIES)[number];
+
 export type ShortcutDef = {
   id: string;
   keys: string[];
   description: string;
-  category: string;
+  category: ShortcutCategory;
   action: () => void;
 };
 
@@ -46,6 +67,42 @@ function isTypingInField(): boolean {
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
   if ((el as HTMLElement).isContentEditable) return true;
   return false;
+}
+
+// Enter and Space are how a keyboard activates the control it is focused on.
+const ACTIVATION_KEYS = new Set(["Enter", " ", "Spacebar"]);
+
+const ACTIVATABLE_TAGS = new Set(["BUTTON", "A", "SUMMARY", "OPTION"]);
+const ACTIVATABLE_ROLES = new Set([
+  "button",
+  "link",
+  "menuitem",
+  "menuitemcheckbox",
+  "menuitemradio",
+  "option",
+  "tab",
+  "checkbox",
+  "radio",
+  "switch",
+]);
+
+/**
+ * Is focus on something the browser itself would activate?
+ *
+ * The listener below runs on the capture phase and calls preventDefault(), so a
+ * shortcut bound to Enter or Space suppresses the native activation of a
+ * focused button or link. A keyboard user who tabs to Ignore in the
+ * reconciliation queue and presses Enter would get the shortcut instead of
+ * Ignore — matching a transaction they did not choose. Only the activation keys
+ * consult this; every other key has no default action on these elements, so a
+ * letter or arrow shortcut still works with a button focused.
+ */
+function isFocusOnActivatableElement(): boolean {
+  const el = document.activeElement as HTMLElement | null;
+  if (!el) return false;
+  if (ACTIVATABLE_TAGS.has(el.tagName)) return true;
+  const role = el.getAttribute("role");
+  return role !== null && ACTIVATABLE_ROLES.has(role);
 }
 
 function PrefixIndicator({ prefix }: { prefix: string }) {
@@ -227,6 +284,9 @@ export function KeyboardShortcutProvider({
 
       // Don't handle keys with Ctrl/Cmd/Alt modifiers
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      // Never take Enter or Space away from the control the user has focused.
+      if (ACTIVATION_KEYS.has(e.key) && isFocusOnActivatableElement()) return;
 
       // Normalize single letters to lowercase so Caps Lock / Shift don't break matching
       const key = e.key.length === 1 && e.key >= "A" && e.key <= "Z"

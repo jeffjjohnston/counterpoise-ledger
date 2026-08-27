@@ -15,8 +15,7 @@ import { InvestmentPositionsSection } from "@/components/transactions/Investment
 import { StaleSyncBanner } from "@/components/transactions/StaleSyncBanner";
 import { PRICES_SAVED_EVENT } from "@/lib/events";
 import { Modal } from "@/components/ui/Modal";
-import { DateRangeFilter } from "@/components/ui/DateRangeFilter";
-import { PayeeAutocomplete } from "@/components/ui/PayeeAutocomplete";
+import { TransactionFilters } from "@/components/transactions/TransactionFilters";
 import {
   flattenAccounts,
   buildAccountTree,
@@ -188,6 +187,18 @@ function TransactionsPageInner() {
       }
       return next;
     });
+  }, []);
+
+  // showUpcoming is remembered across visits, so every path that changes it has
+  // to write it back -- there is more than one now that the checkbox lives in
+  // the filter popover and a chip can clear it.
+  const handleShowUpcomingChange = useCallback((next: boolean) => {
+    setShowUpcoming(next);
+    try {
+      localStorage.setItem("showUpcoming", String(next));
+    } catch {
+      // Ignore localStorage errors
+    }
   }, []);
 
   const clearDateFilter = useCallback(() => {
@@ -954,36 +965,19 @@ function TransactionsPageInner() {
                   </button>
                 )}
               </div>
-              <div className="hidden lg:flex items-center gap-4">
-                <label className="flex items-center gap-1.5 text-xs text-fg-tertiary">
-                  <input
-                    type="checkbox"
-                    checked={showUpcoming}
-                    onChange={(e) => {
-                      setShowUpcoming(e.target.checked);
-                      try {
-                        localStorage.setItem("showUpcoming", String(e.target.checked));
-                      } catch {
-                        // Ignore localStorage errors
-                      }
-                    }}
-                    className="rounded text-purple-600 focus:ring-purple-500"
-                  />
-                  Recurring
-                </label>
-                <PayeeAutocomplete
-                  payees={payees}
-                  value={selectedPayeeId}
-                  onChange={setSelectedPayeeId}
-                  placeholder="Filter by payee..."
-                  className="min-w-[9rem]"
-                />
-                <DateRangeFilter
+              <div className="hidden lg:flex items-center">
+                <TransactionFilters
                   startDate={startDate}
                   endDate={endDate}
                   onStartDateChange={setStartDate}
                   onEndDateChange={setEndDate}
-                  onClear={clearDateFilter}
+                  onClearDates={clearDateFilter}
+                  dateFilterLabel={dateFilterLabel}
+                  payees={payees}
+                  selectedPayeeId={selectedPayeeId}
+                  onPayeeChange={setSelectedPayeeId}
+                  showUpcoming={showUpcoming}
+                  onShowUpcomingChange={handleShowUpcomingChange}
                 />
               </div>
             </div>

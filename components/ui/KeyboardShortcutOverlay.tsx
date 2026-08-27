@@ -1,7 +1,10 @@
 "use client";
 
 import { useRef } from "react";
-import { useKeyboardShortcuts } from "@/components/KeyboardShortcutProvider";
+import {
+  useKeyboardShortcuts,
+  SHORTCUT_CATEGORIES,
+} from "@/components/KeyboardShortcutProvider";
 
 function getKeyLabel(key: string): string {
   if (key === "Escape") return "Esc";
@@ -42,8 +45,11 @@ export function KeyboardShortcutOverlay() {
     return acc;
   }, {});
 
-  const categoryOrder = ["General", "Navigation", "Page"];
-  const sortedCategories = categoryOrder.filter((c) => groups[c]);
+  // SHORTCUT_CATEGORIES is both the ordering here and the type of
+  // ShortcutDef.category, so this can only ever skip a category nothing
+  // registered under. A second hand-maintained list here is what used to drop
+  // the price entry pill's P silently.
+  const sortedCategories = SHORTCUT_CATEGORIES.filter((c) => groups[c]);
 
   return (
     <div

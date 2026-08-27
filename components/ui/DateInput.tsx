@@ -5,6 +5,13 @@ import { useEffect, useRef, useState } from "react";
 
 interface DateInputProps {
   label?: string;
+  /**
+   * Render the label as screen-reader-only text. For a field sitting under a
+   * column header that already names it -- the register's quick-entry row --
+   * where repeating the name on screen is noise but the accessible name is
+   * still required.
+   */
+  labelHidden?: boolean;
   id?: string;
   value: string; // YYYY-MM-DD
   onChange: (value: string) => void;
@@ -55,6 +62,37 @@ function parseMDY(s: string): { year: number; month: number; day: number } | nul
   return { year, month: month - 1, day };
 }
 
+// Arrow keys move the highlight by whole days; Page Up/Down by whole months.
+const DAY_STEPS: Record<string, number> = {
+  ArrowLeft: -1,
+  ArrowRight: 1,
+  ArrowUp: -7,
+  ArrowDown: 7,
+};
+const MONTH_STEPS: Record<string, number> = { PageUp: -1, PageDown: 1 };
+
+function shiftDays(ymd: string, days: number): string {
+  const p = parseYMD(ymd);
+  if (!p) return ymd;
+  // The local-time Date constructor rolls month and year over for us.
+  const d = new Date(p.year, p.month, p.day + days);
+  return toYMD(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function shiftMonths(ymd: string, months: number): string {
+  const p = parseYMD(ymd);
+  if (!p) return ymd;
+  const target = new Date(p.year, p.month + months, 1);
+  // Clamp into the target month, so Jan 31 steps to Feb 28 rather than Mar 3.
+  const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+  return toYMD(target.getFullYear(), target.getMonth(), Math.min(p.day, lastDay));
+}
+
+function todayYMD(): string {
+  const now = new Date();
+  return toYMD(now.getFullYear(), now.getMonth(), now.getDate());
+}
+
 function formatMDY(value: string): string {
   const p = parseYMD(value);
   if (!p) return value;
@@ -63,6 +101,7 @@ function formatMDY(value: string): string {
 
 export function DateInput({
   label,
+  labelHidden,
   id,
   value,
   onChange,
@@ -75,8 +114,16 @@ export function DateInput({
   const [open, setOpen] = useState(false);
   const [inputText, setInputText] = useState(() => formatMDY(value));
   const [editing, setEditing] = useState(false);
+  // The day the arrow keys are sitting on. Non-null means the field is in
+  // calendar-navigation mode: arrow keys move this highlight instead of the
+  // caret, and nothing is committed until Enter. Null means plain text entry.
+  const [navDate, setNavDate] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Set on mousedown when the field is not yet focused, so the click that
+  // follows can tell "the click that opened the calendar" from a later click
+  // asking for a caret.
+  const pointerFocusRef = useRef(false);
 
   const parsed = parseYMD(value);
   const [viewYear, setViewYear] = useState(parsed?.year ?? new Date().getFullYear());
@@ -100,6 +147,7 @@ export function DateInput({
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
         setOpen(false);
         setEditing(false);
+        setNavDate(null);
       }
     }
     document.addEventListener("mousedown", handleClick);
@@ -124,13 +172,93 @@ export function DateInput({
     }
   }
 
-  function selectDay(day: number) {
-    const ymd = toYMD(viewYear, viewMonth, day);
+  function selectDate(ymd: string) {
     setInputText(formatMDY(ymd));
     setEditing(false);
+    setNavDate(null);
     onChange(ymd);
     setOpen(false);
     inputRef.current?.focus();
+  }
+
+  // Where arrow-key navigation starts: the current value, or today when the
+  // field is empty or holds something unparseable.
+  function navigationStart() {
+    return parseYMD(value) ? value : todayYMD();
+  }
+
+  function moveHighlight(ymd: string) {
+    setNavDate(ymd);
+    setOpen(true);
+    const p = parseYMD(ymd);
+    if (p) {
+      setViewYear(p.year);
+      setViewMonth(p.month);
+    }
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Escape") {
+      setOpen(false);
+      setNavDate(null);
+      commitInput();
+      return;
+    }
+
+    if (navDate === null) {
+      // Text entry: Up/Down re-arms calendar navigation, so a field the user
+      // clicked into twice is not a dead end for the keyboard.
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        moveHighlight(navigationStart());
+      }
+      return;
+    }
+
+    const dayStep = DAY_STEPS[e.key];
+    if (dayStep !== undefined) {
+      e.preventDefault();
+      moveHighlight(shiftDays(navDate, dayStep));
+      return;
+    }
+
+    const monthStep = MONTH_STEPS[e.key];
+    if (monthStep !== undefined) {
+      e.preventDefault();
+      moveHighlight(shiftMonths(navDate, monthStep));
+      return;
+    }
+
+    // Enter only claims the keystroke once the highlight has actually moved.
+    // Focusing the field opens the calendar on its own, so claiming it always
+    // would stop Enter submitting a form the user never navigated in.
+    if (e.key === "Enter" && navDate !== value) {
+      e.preventDefault();
+      selectDate(navDate);
+    }
+  }
+
+  function handleFocus() {
+    setOpen(true);
+    setNavDate(navigationStart());
+  }
+
+  function handleMouseDown() {
+    pointerFocusRef.current = document.activeElement !== inputRef.current;
+  }
+
+  function handleClick() {
+    if (pointerFocusRef.current) {
+      // The click that focused the field: leave the arrow keys on the calendar.
+      pointerFocusRef.current = false;
+      return;
+    }
+    // A later click is asking for a caret, so the arrow keys go back to the
+    // text. Reopening the calendar is separate from that: picking a date
+    // closes it and refocuses the field, so no further focus event can fire
+    // and the mouse would otherwise have no way back in.
+    setNavDate(null);
+    setOpen(true);
   }
 
   // Build calendar grid
@@ -153,6 +281,7 @@ export function DateInput({
   function handleInputChange(text: string) {
     setInputText(text);
     setEditing(true);
+    setNavDate(null);
     if (!open) setOpen(true);
     const p = parseMDY(text);
     if (p) {
@@ -164,6 +293,7 @@ export function DateInput({
 
   function commitInput() {
     setEditing(false);
+    setNavDate(null);
     const p = parseMDY(inputText);
     if (p) {
       onChange(toYMD(p.year, p.month, p.day));
@@ -177,12 +307,16 @@ export function DateInput({
       {label && (
         <label
           htmlFor={id}
-          className={cn(
-            "block",
-            isCompact
-              ? "text-xs font-medium text-fg-tertiary mb-0 leading-tight"
-              : "text-sm font-medium text-fg-secondary mb-1"
-          )}
+          className={
+            labelHidden
+              ? "sr-only"
+              : cn(
+                  "block",
+                  isCompact
+                    ? "text-xs font-medium text-fg-tertiary mb-0 leading-tight"
+                    : "text-sm font-medium text-fg-secondary mb-1"
+                )
+          }
         >
           {label}
         </label>
@@ -194,14 +328,11 @@ export function DateInput({
         value={inputText}
         placeholder="MM/DD/YYYY"
         onChange={(e) => handleInputChange(e.target.value)}
-        onFocus={() => setOpen(true)}
+        onFocus={handleFocus}
+        onMouseDown={handleMouseDown}
+        onClick={handleClick}
         onBlur={() => commitInput()}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            setOpen(false);
-            commitInput();
-          }
-        }}
+        onKeyDown={handleKeyDown}
         required={required}
         className={cn(
           "block w-full border border-border bg-surface-inset text-fg placeholder:text-fg-tertiary focus:border-border-focus focus:outline-none focus:ring-1 focus:ring-border-focus text-sm",
@@ -257,18 +388,21 @@ export function DateInput({
               if (day === null) return <div key={i} />;
               const dateStr = toYMD(viewYear, viewMonth, day);
               const isSelected = dateStr === value;
+              const isHighlighted = dateStr === navDate;
               const isToday =
                 dateStr === toYMD(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
               return (
                 <button
                   key={i}
                   type="button"
-                  onClick={() => selectDay(day)}
+                  onClick={() => selectDate(dateStr)}
+                  data-highlighted={isHighlighted ? "true" : undefined}
                   className={cn(
                     "text-xs py-1 rounded-md hover:bg-accent-subtle",
                     isSelected && "bg-accent text-fg-on-accent hover:bg-accent-hover",
                     !isSelected && isToday && "font-bold text-fg-accent",
-                    !isSelected && !isToday && "text-fg"
+                    !isSelected && !isToday && "text-fg",
+                    isHighlighted && "ring-2 ring-inset ring-border-focus"
                   )}
                 >
                   {day}

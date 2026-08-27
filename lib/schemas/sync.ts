@@ -27,11 +27,9 @@ import { z } from "zod/v4";
 //     shape guards at all.
 //
 // "Invalid token id" / "Invalid linked account id" (every route with an
-// :id path segment) are left untouched by this task, the same precedent
-// Task 2 and Task 5 established: a Next.js route-segment string is not a
-// request body or query param, so it's not this schema layer's job.
-//
-// See task-6-report.md for the full guard classification.
+// :id path segment) are left untouched here, the same precedent set
+// elsewhere: a Next.js route-segment string is not a request body or query
+// param, so it's not this schema layer's job.
 
 // ---------------------------------------------------------------------------
 // createTokenSchema — POST /api/b/[bookId]/sync/tokens
@@ -206,8 +204,8 @@ const accountAssignmentSchema = z.object(
   // object missing the field gets. This second argument reproduces that:
   // it's the element-level type-check message, so `{ assignments: [null] }`
   // now reports PLAID_ACCOUNT_ID_MESSAGE instead of zod's default "Invalid
-  // input: expected object, received null". Verified directly (see
-  // task-6-report.md's fix-round section) rather than assumed.
+  // input: expected object, received null". Verified directly rather than
+  // assumed.
   { error: PLAID_ACCOUNT_ID_MESSAGE }
 );
 
@@ -395,7 +393,7 @@ export const reconcileSchema = z
     // check treated all of those the same as a body simply missing
     // `reconciliationId`, landing on this same message — this second
     // argument reproduces that for a non-object POST body. Verified
-    // directly (see task-6-report.md's fix-round section).
+    // directly.
     { error: RECONCILIATION_ID_MESSAGE }
   )
   .superRefine((data, ctx) => {

@@ -24,7 +24,7 @@ import { toolShape } from "@/mcp/tools/_tool-shape";
  * files, not the route, are the shared library. This tool calls them
  * directly and repeats the route's small try/catch, rather than adding a
  * third file (lib/system-status.ts) that would hold nothing but that
- * try/catch. See the design doc's Task 5 notes for the fuller reasoning.
+ * try/catch.
  */
 
 export function registerIssueReportTools(server: McpServer) {

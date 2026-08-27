@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { setupTestDatabase, resetTestDatabase, createUser } from "@/tests/helpers/db-utils";
+import { callMcpTool } from "@/tests/helpers/mcp";
 import { getDb } from "@/db";
 import { books } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -35,25 +36,8 @@ vi.mock("@/db/seed", async (importActual) => {
 let client: Client;
 let server: McpServer;
 
-async function callTool(name: string, args: Record<string, unknown> = {}) {
-  const result = await client.callTool({ name, arguments: args });
-  const isError = result.isError ?? false;
-  const textContent = (result.content as Array<{ type: string; text: string }>)?.find(
-    (c) => c.type === "text"
-  );
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let data: any;
-  if (isError) {
-    try {
-      data = textContent ? JSON.parse(textContent.text) : undefined;
-    } catch {
-      data = { error: textContent?.text };
-    }
-  } else {
-    data = textContent ? JSON.parse(textContent.text) : undefined;
-  }
-  return { data, isError };
-}
+const callTool = (name: string, args: Record<string, unknown> = {}) =>
+  callMcpTool(client, name, args);
 
 describe("MCP Book Tools", () => {
   const userId = 1; // matches the mocked requireAuth() above

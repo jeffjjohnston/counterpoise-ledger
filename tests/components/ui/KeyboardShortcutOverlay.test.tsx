@@ -4,6 +4,7 @@ import { KeyboardShortcutOverlay } from "@/components/ui/KeyboardShortcutOverlay
 import {
   KeyboardShortcutProvider,
   useKeyboardShortcuts,
+  SHORTCUT_CATEGORIES,
   type ShortcutDef,
 } from "@/components/KeyboardShortcutProvider";
 
@@ -234,5 +235,36 @@ describe("KeyboardShortcutOverlay", () => {
 
     expect(screen.getByText("Page")).toBeInTheDocument();
     expect(screen.getByText("Edit selected")).toBeInTheDocument();
+  });
+
+  // The overlay's ordering used to be a hand-maintained allowlist, separate
+  // from the categories components actually register under, and it filtered
+  // rather than sorted — so a category in one list and not the other lost its
+  // shortcuts silently. That is why the price entry pill's P never appeared
+  // here. SHORTCUT_CATEGORIES is now the single list both sides read, and this
+  // test walks it, so a category added later is covered the day it is added.
+  it("renders a shortcut registered under every declared category", () => {
+    const probes: ShortcutDef[] = SHORTCUT_CATEGORIES.map((category, i) => ({
+      id: `probe-${category}`,
+      keys: [String(i)],
+      description: `Probe ${category}`,
+      category,
+      action: vi.fn(),
+    }));
+
+    render(
+      <Wrapper>
+        <PageShortcuts shortcuts={probes} />
+        <OpenOverlayButton />
+      </Wrapper>
+    );
+
+    fireEvent.click(screen.getByText("Register shortcuts"));
+    fireEvent.click(screen.getByText("Open shortcuts"));
+
+    for (const category of SHORTCUT_CATEGORIES) {
+      expect(screen.getByText(category)).toBeInTheDocument();
+      expect(screen.getByText(`Probe ${category}`)).toBeInTheDocument();
+    }
   });
 });

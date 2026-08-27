@@ -31,9 +31,8 @@ beforeAll(async () => {
  * Every tool this server registers, mapped to the preset it must carry.
  * Presets come from the constants themselves — not re-spelled literals — so a
  * change to a preset's hint values propagates here instead of drifting out of
- * sync. Plans 2-6 add roughly 40 more tools against this same suite; a new
- * tool that is missing a row here fails the coverage test below rather than
- * going unchecked.
+ * sync. A new tool that is missing a row here fails the coverage test below
+ * rather than going unchecked.
  */
 export const EXPECTED_ANNOTATIONS: Record<string, ToolAnnotations> = {
   list_books: READ,
@@ -201,9 +200,9 @@ describe("tool annotations", () => {
   });
 
   // A tool that spreads a shared schema inherits that schema's descriptions —
-  // or its lack of them. Plan 1 shipped create_security with every field
+  // or its lack of them. create_security once shipped with every field
   // description silently stripped, because lib/schemas/securities.ts carried
-  // none. This is the guard for that, and it binds the 16 tools Plan 2 adds.
+  // none. This is the guard for that, and it binds every tool.
   it("describes every input field of every tool", () => {
     const undescribed: string[] = [];
     const inspectedPaths: string[] = [];

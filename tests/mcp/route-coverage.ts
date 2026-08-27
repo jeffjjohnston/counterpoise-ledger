@@ -7,12 +7,12 @@
  * "no tool for this route" and "deliberately no tool for this route" looked
  * identical, and five domains fell out of MCP coverage unnoticed.
  *
- * Every waiver here is now a decision, not a promise. The `pending-plan-N`
- * mechanism that tracked the MCP parity project's staged rollout was removed
- * with the last plan of the MCP parity project — the routes it deferred all
- * have tools. A future deferral should get a dated comment naming what will
- * cover the route, not a revived scheme: the value was in every route being
- * accounted for, which the two tables below still deliver.
+ * Every waiver here is now a decision, not a promise. An earlier
+ * `pending-plan-N` mechanism tracked routes that were staged to get a tool
+ * later; it is gone, and the routes it deferred all have tools. A future
+ * deferral should get a dated comment naming what will cover the route, not a
+ * revived scheme: the value was in every route being accounted for, which the
+ * two tables below still deliver.
  */
 
 export const ROUTE_TOOLS: Record<string, string[]> = {
@@ -100,6 +100,14 @@ export const ROUTE_WAIVERS: Record<string, string> = {
     "produce, so there is no legitimate way for an MCP caller to supply one — a tool that " +
     "accepted a caller-supplied credential here would be a way to write an arbitrary token into " +
     "the database.",
+  "GET /b/[bookId]/webmcp":
+    "This route is the MCP tool list itself, served over HTTP so the browser's WebMCP bridge " +
+    "can read it. A tool that lists the tools would be circular.",
+  "POST /b/[bookId]/webmcp":
+    "This route is the MCP tool dispatcher itself, served over HTTP for the same bridge. It " +
+    "calls a tool that registerAllTools already registered, so a tool for it would be circular. " +
+    "It also takes its bookId from the URL, not from an argument — see withoutBookId() in " +
+    "mcp/webmcp.ts.",
   "GET /b/[bookId]/accounts/[id]": "Covered by list_accounts.",
   "GET /b/[bookId]/transactions/[id]": "Covered by list_transactions.",
   "GET /b/[bookId]/securities/[id]": "Covered by get_security_detail.",

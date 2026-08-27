@@ -11,11 +11,10 @@ import { z } from "zod/v4";
 //     SecurityDuplicateError -> 409) — a SELECT against `securities`.
 //
 // "Invalid security id" (every route that takes an :id path segment) is
-// left untouched by this task: it's a Next.js route-segment string, not a
-// request body or query param, and Task 2 established the precedent of
-// leaving that parsing to the route (accounts/[id]/route.ts's
-// `parseInt(id)` is not schema-validated at all). See task-5-report.md for
-// the full 16-guard classification.
+// left untouched here: it's a Next.js route-segment string, not a request
+// body or query param, and the established precedent is to leave that
+// parsing to the route (accounts/[id]/route.ts's `parseInt(id)` is not
+// schema-validated at all).
 
 // Value list mirrors the `enum` decoration on securities.securityType in
 // db/schema.ts — a bare Postgres `text` column, no CHECK constraint (see
@@ -43,8 +42,7 @@ const securityTypeValues = ["etf", "mutual_fund", "stock"] as const;
 // createTransactionBodySchema's relationship with lib/transactions.ts's own
 // guards (lib/schemas/transactions.ts) rather than removing validation from
 // a shared lib that MCP also depends on independently. The resulting
-// overlap — both layers checking the same four things — is reported in
-// full in task-5-report.md rather than left undocumented.
+// overlap — both layers checking the same four things — is deliberate.
 const NAME_REQUIRED_MESSAGE = "Name is required"; // lib/securities.ts:57
 const SYMBOL_REQUIRED_MESSAGE = "Symbol is required"; // lib/securities.ts:60
 const SECURITY_TYPE_MESSAGE = // lib/securities.ts:63-65
@@ -142,7 +140,7 @@ export type CreateSecurityInput = z.infer<typeof createSecuritySchema>;
 // DB-level enforcement (same bug class as accounts.ts's `subtype` and
 // recurring.ts's `frequency` on their own update routes) — today PUT
 // accepts and silently persists any string here. This is a deliberate
-// tightening, not a side effect; see task-5-report.md.
+// tightening, not a side effect.
 const UPDATE_FETCH_PRICES_MESSAGE = "Fetch prices must be a boolean"; // securities/[id]/route.ts:60
 
 export const updateSecuritySchema = z.object({
@@ -193,7 +191,7 @@ export type UpdateSecurityInput = z.infer<typeof updateSecuritySchema>;
 // back to the default; "12abc" -> NaN, likewise falls back). A
 // truncatable-but-not-fully-numeric limit/offset value is the only input
 // this changes, and only from "the truncated value" to "the default" — it
-// still never produces a 400. Flagged in task-5-report.md.
+// still never produces a 400.
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 

@@ -5,6 +5,13 @@ import { InputHTMLAttributes, forwardRef } from "react";
 
 interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "size"> {
   label?: string;
+  /**
+   * Render the label as screen-reader-only text. For a field sitting under a
+   * column header that already names it -- the register's quick-entry row --
+   * where repeating the name on screen is noise but the accessible name is
+   * still required.
+   */
+  labelHidden?: boolean;
   error?: string;
   size?: "default" | "compact";
   /** Select the full value on focus — for amount-style fields where the
@@ -13,19 +20,23 @@ interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "size">
 }
 
 export const Input = forwardRef<HTMLInputElement, InputProps>(
-  ({ className, label, error, id, size = "default", selectOnFocus, onFocus, ...props }, ref) => {
+  ({ className, label, labelHidden, error, id, size = "default", selectOnFocus, onFocus, ...props }, ref) => {
     const isCompact = size === "compact";
     return (
       <div className="w-full">
         {label && (
           <label
             htmlFor={id}
-            className={cn(
-              "block",
-              isCompact
-                ? "text-xs font-medium text-fg-tertiary mb-0 leading-tight"
-                : "text-sm font-medium text-fg-secondary mb-1"
-            )}
+            className={
+              labelHidden
+                ? "sr-only"
+                : cn(
+                    "block",
+                    isCompact
+                      ? "text-xs font-medium text-fg-tertiary mb-0 leading-tight"
+                      : "text-sm font-medium text-fg-secondary mb-1"
+                  )
+            }
           >
             {label}
           </label>

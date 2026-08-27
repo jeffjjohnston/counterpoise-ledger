@@ -434,7 +434,11 @@ describe("TransactionList", () => {
       />
     );
 
-    expect(screen.getAllByText("+")).toHaveLength(2);
+    // Direction is carried by the amount, not by a glyph repeated once per
+    // related account (both of these splits oppose the selected account).
+    expect(screen.getByTestId("transaction-amount-3"))
+      .toHaveTextContent("+$10.00");
+    expect(screen.queryByText("+")).not.toBeInTheDocument();
     expect(screen.getByText("Groceries")).toBeInTheDocument();
     expect(screen.getByText("Utilities")).toBeInTheDocument();
     expect(screen.queryByText("Checking")).not.toBeInTheDocument();
@@ -503,7 +507,9 @@ describe("TransactionList", () => {
     );
 
     expect(screen.getByText("Salary")).toBeInTheDocument();
-    expect(screen.getAllByText("−")).toHaveLength(1);
+    expect(screen.getByTestId("transaction-amount-4"))
+      .toHaveTextContent("−$15.00");
+    expect(screen.queryByText("−")).not.toBeInTheDocument();
     expect(screen.queryByText("Savings")).not.toBeInTheDocument();
   });
 
@@ -571,8 +577,10 @@ describe("TransactionList", () => {
     );
 
     expect(screen.getByText("Checking")).toBeInTheDocument();
-    // Negative amount on liability = charge, shown as minus
-    expect(screen.getAllByText("−")).toHaveLength(1);
+    // Negative amount on liability = charge, shown as a minus on the amount
+    expect(screen.getByTestId("transaction-amount-5"))
+      .toHaveTextContent("−$45.00");
+    expect(screen.queryByText("−")).not.toBeInTheDocument();
     expect(screen.queryByText("Credit Card")).not.toBeInTheDocument();
 
     unmount();
@@ -640,8 +648,85 @@ describe("TransactionList", () => {
     );
 
     expect(screen.getByText("Checking")).toBeInTheDocument();
-    // Positive amount on liability = payment, shown as plus
-    expect(screen.getAllByText("+")).toHaveLength(1);
+    // Positive amount on liability = payment, shown as a plus on the amount
+    expect(screen.getByTestId("transaction-amount-6"))
+      .toHaveTextContent("+$45.00");
+    expect(screen.queryByText("+")).not.toBeInTheDocument();
+  });
+
+  describe("floating transactions", () => {
+    const floating: TransactionWithSplits[] = [
+      {
+        ...baseTransaction,
+        id: 70,
+        bookId: 1,
+        isFloating: true,
+        date: "2024-02-01",
+        payee: { id: 7, bookId: 1, name: "Landlord", createdAt: new Date() },
+        payeeId: 7,
+        splits: [
+          {
+            id: 701,
+            bookId: 1,
+            transactionId: 70,
+            accountId: 1,
+            amount: -2000,
+            account: mockAccounts[0],
+          },
+          {
+            id: 702,
+            bookId: 1,
+            transactionId: 70,
+            accountId: 2,
+            amount: 2000,
+            account: mockAccounts[1],
+          },
+        ],
+      },
+    ];
+
+    it("labels a floating transaction with a Float pill in the register", () => {
+      render(
+        <TransactionList
+          transactions={floating}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={vi.fn()}
+        />
+      );
+
+      expect(screen.getByText("Float")).toBeInTheDocument();
+      // The bare "~" it used to prefix the date with is gone.
+      expect(screen.queryByText(/^~/)).not.toBeInTheDocument();
+    });
+
+    it("labels a floating transaction with a Float pill on the mobile card", () => {
+      isMobileRef.value = true;
+      render(
+        <TransactionList
+          transactions={floating}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={vi.fn()}
+        />
+      );
+
+      expect(screen.getByText("Float")).toBeInTheDocument();
+      expect(screen.queryByText(/^~/)).not.toBeInTheDocument();
+    });
+
+    it("does not show a Float pill on a settled transaction", () => {
+      render(
+        <TransactionList
+          transactions={[{ ...floating[0], isFloating: false }]}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={vi.fn()}
+        />
+      );
+
+      expect(screen.queryByText("Float")).not.toBeInTheDocument();
+    });
   });
 
   it("shows investment action details when viewing an investment account", () => {
@@ -1279,8 +1364,8 @@ describe("TransactionList", () => {
       />
     );
 
-    const actualIndicator = screen.getByTestId("transaction-amount-indicator-20");
-    const projectedIndicator = screen.getByTestId("transaction-amount-indicator--20");
+    const actualIndicator = screen.getByTestId("transaction-reconciled-indicator-20");
+    const projectedIndicator = screen.getByTestId("transaction-reconciled-indicator--20");
 
     expect(actualIndicator).not.toHaveClass("invisible");
     expect(projectedIndicator).toHaveClass("invisible");
@@ -1464,17 +1549,20 @@ describe("TransactionList", () => {
       (row) => row.querySelectorAll("td")[0]?.textContent?.trim() || ""
     );
 
+    // The register prints the year on its first row and the day alone after
+    // that, and blanks a date that repeats the row above -- the last row here
+    // reads as empty to the eye and carries an sr-only date for a reader.
     expect(rowDates).toEqual([
       "Apr 1, 2026",
-      "Mar 27, 2026",
-      "Mar 23, 2026",
-      "Mar 19, 2026",
-      "Mar 16, 2026",
+      "Mar 27",
+      "Mar 23",
+      "Mar 19",
+      "Mar 16",
       "Mar 16, 2026",
     ]);
 
     const mar16Rows = rows.filter((row) =>
-      row.querySelectorAll("td")[0]?.textContent?.includes("Mar 16, 2026")
+      row.querySelectorAll("td")[0]?.textContent?.includes("Mar 16")
     );
     expect(mar16Rows).toHaveLength(2);
     expect(mar16Rows[0].textContent).not.toContain("Recurring");
@@ -1746,6 +1834,198 @@ describe("TransactionList", () => {
     expect(screen.queryByText("No transactions found")).not.toBeInTheDocument();
   });
 
+  it("keeps the row-actions trigger out of the row height calculation", () => {
+    const { container } = render(
+      <TransactionList
+        transactions={oneRow}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        onToggleReconciled={vi.fn()}
+      />
+    );
+
+    // The trigger is h-7 (28px) and every text cell is a 20px line box, so the
+    // actions cell has to carry less vertical padding or the button, not the
+    // type, decides how tall a row is.
+    const textCell = container.querySelector("tbody td");
+    const actionsCell = container.querySelector("tbody tr td:last-child");
+    expect(textCell).toHaveClass("py-3");
+    expect(actionsCell).toHaveClass("py-2");
+  });
+
+  it("reveals the row-actions trigger on hover and on focus, not always", () => {
+    const { container } = render(
+      <TransactionList
+        transactions={oneRow}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        onToggleReconciled={vi.fn()}
+      />
+    );
+
+    const trigger = screen.getByLabelText("Transaction actions");
+    expect(trigger).toHaveClass("opacity-0", "pointer-events-none");
+    expect(trigger).toHaveClass("group-hover/row:opacity-100", "focus-visible:opacity-100");
+    // The row owns the named group the trigger keys off.
+    expect(container.querySelector("tbody tr")).toHaveClass("group/row");
+  });
+
+  describe("date column", () => {
+    const onDate = (id: number, date: string): TransactionWithSplits => ({
+      ...baseTransaction,
+      id,
+      bookId: 1,
+      date,
+      splits: [
+        { id: id * 10, bookId: 1, transactionId: id, accountId: 1, amount: -100, account: mockAccounts[0] },
+        { id: id * 10 + 1, bookId: 1, transactionId: id, accountId: 2, amount: 100, account: mockAccounts[1] },
+      ],
+    });
+
+    const dateCells = (container: HTMLElement) =>
+      [...container.querySelectorAll("tbody tr")].map(
+        (row) => row.querySelectorAll("td")[0]?.textContent ?? ""
+      );
+
+    it("prints the date once per day and drops the year", () => {
+      const { container } = render(
+        <TransactionList
+          transactions={[onDate(1, "2024-02-02"), onDate(2, "2024-02-01"), onDate(3, "2024-02-01")]}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={vi.fn()}
+        />
+      );
+
+      const [first, second, third] = dateCells(container);
+      // First row of the register carries the year; the next day does not.
+      expect(first).toBe("Feb 2, 2024");
+      expect(second).toBe("Feb 1");
+      // Same day as the row above: blank to the eye, still dated for a reader.
+      expect(third).toBe("Feb 1, 2024");
+      expect(
+        container.querySelectorAll("tbody tr")[2].querySelector(".sr-only")
+      ).toHaveTextContent("Feb 1, 2024");
+    });
+
+    it("brings the year back on the row where it changes", () => {
+      const { container } = render(
+        <TransactionList
+          transactions={[onDate(1, "2024-01-02"), onDate(2, "2023-12-31")]}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={vi.fn()}
+        />
+      );
+
+      expect(dateCells(container)).toEqual(["Jan 2, 2024", "Dec 31, 2023"]);
+    });
+  });
+
+  // An empty register renders the empty state, not the table, so these need a row.
+  const oneRow: TransactionWithSplits[] = [
+    {
+      ...baseTransaction,
+      id: 80,
+      bookId: 1,
+      splits: [
+        { id: 801, bookId: 1, transactionId: 80, accountId: 1, amount: -500, account: mockAccounts[0] },
+        { id: 802, bookId: 1, transactionId: 80, accountId: 2, amount: 500, account: mockAccounts[1] },
+      ],
+    },
+  ];
+
+  it("trails cleared status behind the money, and money alone in Amount", () => {
+    const { container } = render(
+      <TransactionList
+        transactions={oneRow}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        onToggleReconciled={vi.fn()}
+      />
+    );
+
+    const indicator = screen.getByTestId("transaction-reconciled-indicator-80");
+    const amount = screen.getByTestId("transaction-amount-80");
+    const cells = [...container.querySelectorAll("tbody tr td")];
+
+    // Cleared status sits with the numbers it qualifies -- Amount, Balance,
+    // status -- rather than across the row from them.
+    expect(cells[cells.length - 4]).toBe(amount);
+    expect(cells[cells.length - 2]).toContainElement(indicator);
+
+    // ...but the actions trigger keeps the last column. Reaching for the row
+    // menu must never land on the reconcile toggle, which writes on one click.
+    expect(cells[cells.length - 1]).toContainElement(
+      screen.getByRole("button", { name: "Transaction actions" })
+    );
+
+    // Amount carries the amount and nothing else.
+    expect(amount).not.toContainElement(indicator);
+    expect(amount.textContent).toBe("−$5.00");
+  });
+
+  it("gives the reconcile control a hit target larger than the dot it shows", () => {
+    render(
+      <TransactionList
+        transactions={oneRow}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        onToggleReconciled={vi.fn()}
+      />
+    );
+
+    const control = screen.getByTestId("transaction-reconciled-indicator-80");
+    // 20px box around a 14px dot: the box is what you have to hit.
+    expect(control).toHaveClass("h-5", "w-5");
+    // Block-level, so the gutter cell has no line strut to grow past 20px and
+    // become what sets the row height.
+    expect(control).toHaveClass("flex");
+    expect(control.className).not.toContain("inline-flex");
+    expect(control.firstElementChild).toHaveClass("h-3.5", "w-3.5");
+  });
+
+  it("pins the register header and gives it a rule beneath it", () => {
+    const { container } = render(
+      <TransactionList
+        transactions={oneRow}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        isLoading={false}
+      />
+    );
+
+    const headers = [...container.querySelectorAll("thead th")];
+    expect(headers.length).toBeGreaterThan(0);
+    for (const th of headers) {
+      // Opaque background matters as much as the sticky: a transparent sticky
+      // cell lets the rows scrolling underneath show through it.
+      expect(th).toHaveClass("sticky", "top-0", "bg-surface", "border-b");
+    }
+  });
+
+  it("does not wrap the register in a scroll container", () => {
+    // Any overflow value other than `visible` makes the wrapper a scroll
+    // container, and the sticky header would pin to it rather than to the
+    // page -- scrolling away with the register.
+    const { container } = render(
+      <TransactionList
+        transactions={oneRow}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        isLoading={false}
+      />
+    );
+
+    expect(container.querySelector('[class*="overflow-x"]')).toBeNull();
+  });
+
   // The register is `table-fixed`: the browser satisfies every fixed-width column
   // first and gives only what is left to the percentage columns. When the fixed
   // columns alone exceed the container, the percentage column collapses to 0px and
@@ -1800,6 +2080,8 @@ describe("TransactionList", () => {
       />
     );
 
+    // The status gutter trails the numeric columns now, so the leading columns
+    // are indexed straight from the front.
     const columns = container.querySelectorAll("colgroup col");
     expect(columns[1]).toHaveClass("w-[32%]");
     expect(columns[2]).toHaveClass("w-[24%]");
@@ -1935,7 +2217,7 @@ describe("TransactionList", () => {
         />
       );
 
-      const dot = screen.getByTestId("transaction-amount-indicator-500");
+      const dot = screen.getByTestId("transaction-reconciled-indicator-500");
       expect(dot.tagName).toBe("BUTTON");
 
       fireEvent.click(dot);
@@ -1954,9 +2236,9 @@ describe("TransactionList", () => {
         />
       );
 
-      const hollow = screen.getByTestId("transaction-amount-indicator-500");
-      expect(hollow.className).toContain("border");
-      expect(hollow.className).not.toContain("bg-fg-success");
+      const hollow = screen.getByTestId("transaction-reconciled-indicator-500");
+      expect(hollow.firstElementChild?.className).toContain("border");
+      expect(hollow.firstElementChild?.className).not.toContain("bg-fg-success");
 
       rerender(
         <TransactionList
@@ -1968,8 +2250,8 @@ describe("TransactionList", () => {
         />
       );
 
-      const filled = screen.getByTestId("transaction-amount-indicator-500");
-      expect(filled.className).toContain("bg-fg-success");
+      const filled = screen.getByTestId("transaction-reconciled-indicator-500");
+      expect(filled.firstElementChild?.className).toContain("bg-fg-success");
     });
 
     it("makes the overflow menu reachable on mobile (the only reconcile path on touch)", () => {
@@ -2318,7 +2600,7 @@ describe("TransactionList Plaid pending rows", () => {
     );
 
     const indicator = screen.getByTestId(
-      "transaction-amount-indicator--1000000001"
+      "transaction-reconciled-indicator--1000000001"
     );
     expect(indicator.tagName).toBe("SPAN");
     expect(indicator).toHaveClass("invisible");

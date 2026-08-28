@@ -104,3 +104,9 @@ tmp/
 # directory, so the directory form would make a later negation such as
 # "`!.beads/formulas/`" silently do nothing.
 .beads/*
+
+# Xcode (ios/ client)
+xcuserdata/
+*.xcuserstate
+DerivedData/
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist

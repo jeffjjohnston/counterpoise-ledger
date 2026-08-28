@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Xcode merges the generated Info.plist keys (bundle name, version,
+	     scene manifest, orientations) into this file at build time; only the
+	     keys it cannot generate belong here. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- A Counterpoise install reached over the internet must use HTTPS.
+		     The one exception is a server on the local network, which is how
+		     the app is developed against `npm run dev` on a laptop. -->
+		<key>NSAllowsArbitraryLoads</key>
+		<false/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Counterpoise connects to your accounting server, which may be running on your local network.</string>
+</dict>
+</plist>

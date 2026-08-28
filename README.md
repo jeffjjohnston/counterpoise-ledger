@@ -74,6 +74,9 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 - **API Keys** - Per-user `cpk_` keys managed on the Account page, scrypt-hashed at rest
 - **Usage Analytics** - Optional PostHog integration for usage events (no financial data captured)
 
+### iOS Client
+- **SwiftUI App** - Basic native client for accounts, the ledger, and simple entry (see [ios/README.md](ios/README.md))
+
 ### User Experience
 - **Clean Modern UI** - Built with Tailwind CSS for a polished interface
 - **Responsive Design** - Works on desktop and mobile devices

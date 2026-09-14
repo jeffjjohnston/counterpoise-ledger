@@ -287,7 +287,7 @@ export function AccountAutocomplete({
           id={inputId}
           type="text"
           className={cn(
-            "block w-full border border-border bg-surface-inset text-fg placeholder:text-fg-tertiary focus:border-border-focus focus:outline-none focus:ring-1 focus:ring-border-focus text-sm",
+            "block w-full border border-border bg-surface-inset text-fg placeholder:text-fg-tertiary focus:border-border-focus focus:outline-hidden focus:ring-1 focus:ring-border-focus text-sm",
             isCompact ? "rounded-md px-2 py-1" : "rounded-md px-3 py-2",
             warning && "border-fg-warning ring-1 ring-fg-warning"
           )}

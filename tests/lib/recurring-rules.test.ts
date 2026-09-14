@@ -116,6 +116,32 @@ describe("recurring-rules reads", () => {
       const rules = await listRecurringRules(getDb(), bookId);
       expect(rules.map((r) => r.name)).toEqual(["Mine"]);
     });
+
+    it("breaks a tie between rules sharing a nextDate by name", async () => {
+      const { checking, rent } = await fixture();
+
+      // Inserted in reverse-alphabetical order so an id- or insertion-order
+      // tiebreak would report them in the wrong order.
+      const zeta = await createRecurringRule({
+        name: "Zeta", frequency: "monthly", startDate: "2026-01-01",
+        nextDate: "2026-08-01", bookId,
+        templateSplits: [
+          { accountId: rent.id, amount: 100 },
+          { accountId: checking.id, amount: -100 },
+        ],
+      });
+      const alpha = await createRecurringRule({
+        name: "Alpha", frequency: "monthly", startDate: "2026-01-01",
+        nextDate: "2026-08-01", bookId,
+        templateSplits: [
+          { accountId: rent.id, amount: 200 },
+          { accountId: checking.id, amount: -200 },
+        ],
+      });
+
+      const rules = await listRecurringRules(getDb(), bookId);
+      expect(rules.map((r) => r.id)).toEqual([alpha.id, zeta.id]);
+    });
   });
 
   describe("getRecurringRule", () => {
@@ -525,10 +551,12 @@ describe("updateRecurringRule", () => {
     // committed. Measured, not predicted — dropping the check makes the
     // length assertion below report 4 splits on the victim rule, because the
     // DELETE is scoped to the caller's book and matches nothing while the
-    // INSERT names the victim's rule id directly. Nothing rejects that:
-    // recurring_template_splits.recurring_rule_id is a plain FK to
-    // recurring_rules.id, with no composite (bookId, recurringRuleId)
-    // constraint behind it.
+    // INSERT names the victim's rule id directly. That measurement predates
+    // the composite key: recurring_template_splits now carries a
+    // (book_id, recurring_rule_id) foreign key against recurring_rules,
+    // added in migration 0019, so the database rejects the cross-book insert
+    // as well. The application check stays because it answers with a 404
+    // rather than a constraint violation.
     const { checking } = await fixture();
     const otherBook = await createBook({ name: "Other" });
     const a = await createAccount({
@@ -639,6 +667,43 @@ describe("updateRecurringRule", () => {
 
     const updated = await updateRule(getDb(), bookId, rule.id, { name: "Rent (renamed)" });
     expect(updated.nextDate).toBe("2026-09-15");
+  });
+
+  it("keeps nextDate on a rename when the rule carries day fields its frequency ignores", async () => {
+    // updateRecurringRule writes only the columns its input names, so a
+    // partial update — an MCP update_recurring_rule, or a raw PUT — can switch
+    // a rule to monthly and leave the daysOfWeek its weekly schedule used
+    // sitting in the row. The edit form then posts null for every field the
+    // current frequency does not use, which is the same schedule spelled
+    // differently: getNextDate's monthly branch reads daysOfMonth and interval
+    // and nothing else. Recomputing here re-derives nextDate from the anchor
+    // and silently drops a cadence the user set by hand.
+    const { checking, rent } = await fixture();
+    const rule = await createRecurringRule({
+      name: "Rent", frequency: "monthly", startDate: "2026-01-15",
+      daysOfWeek: [1], weekOfMonth: "2",
+      // Shifted off the anchor's own day by hand, the way the form's editable
+      // "Next occurrence" lets a user do. A monthly-on-the-15th cadence never
+      // produces the 20th, so a recompute cannot land back on this value —
+      // without that gap the assertion passes whether or not the bug is fixed.
+      nextDate: "2026-09-20", bookId,
+      templateSplits: [
+        { accountId: rent.id, amount: 100 },
+        { accountId: checking.id, amount: -100 },
+      ],
+    });
+
+    const updated = await updateRule(getDb(), bookId, rule.id, {
+      name: "Rent (renamed)",
+      frequency: "monthly",
+      interval: 1,
+      daysOfWeek: null,
+      weekOfMonth: null,
+      daysOfMonth: null,
+      startDate: "2026-01-15",
+    });
+
+    expect(updated.nextDate).toBe("2026-09-20");
   });
 
   it("honours an explicit nextDate over the recompute", async () => {
@@ -882,5 +947,64 @@ describe("payee resolution rolls back with the rule write", () => {
       .where(eq(payees.name, "Real Landlord"));
     expect(created).toBeDefined();
     expect(rule.payeeId).toBe(created.id);
+  });
+});
+
+describe("updateRecurringRule schedule recompute", () => {
+  // The edit modal posts every schedule field on every save, a pure rename
+  // included. Presence of those fields must not be read as a change:
+  // recomputing re-derives nextDate from startDate, which re-anchors the
+  // cadence onto the start date's weekday. A rule that runs on Mondays loses
+  // that phase exactly this way: the transactions it generates keep falling on
+  // Monday while its stored nextDate moves to the weekday of the start date.
+  const weeklyEveryFourWeeks = async () => {
+    const { checking, rent } = await fixture();
+    const rule = await createRecurringRule({
+      name: "Streaming Service",
+      frequency: "weekly",
+      interval: 4,
+      startDate: "2025-04-01", // a Tuesday
+      nextDate: "2026-09-14", // a Monday — the cadence the rule actually runs
+      bookId,
+      templateSplits: [
+        { accountId: rent.id, amount: 400 },
+        { accountId: checking.id, amount: -400 },
+      ],
+    });
+    return { rule, checking, rent };
+  };
+
+  it("leaves nextDate alone when a rename resends the schedule unchanged", async () => {
+    const { rule } = await weeklyEveryFourWeeks();
+
+    const updated = await updateRule(getDb(), bookId, rule.id, {
+      name: "Streaming Service (renamed)",
+      frequency: "weekly",
+      interval: 4,
+      daysOfWeek: null,
+      // The form's "Every week" option; the stored column is null. The two
+      // mean the same thing to getNextDate, so this is not a change.
+      weekOfMonth: "every",
+      daysOfMonth: null,
+      startDate: "2025-04-01",
+    });
+
+    expect(updated.name).toBe("Streaming Service (renamed)");
+    expect(updated.nextDate).toBe("2026-09-14");
+  });
+
+  it("recomputes nextDate when the interval actually changes", async () => {
+    const { rule } = await weeklyEveryFourWeeks();
+
+    const updated = await updateRule(getDb(), bookId, rule.id, {
+      frequency: "weekly",
+      interval: 1,
+      daysOfWeek: null,
+      weekOfMonth: "every",
+      daysOfMonth: null,
+      startDate: "2025-04-01",
+    });
+
+    expect(updated.nextDate).not.toBe("2026-09-14");
   });
 });

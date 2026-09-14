@@ -365,7 +365,7 @@ export default function BookSelectorPage() {
             value={newBookName}
             onChange={(e) => setNewBookName(e.target.value)}
             placeholder="Book name"
-            className="flex-1 rounded-lg border border-border bg-surface-inset px-4 py-2 text-sm text-fg placeholder:text-fg-tertiary focus:outline-none focus:ring-2 focus:ring-border-focus focus:border-transparent"
+            className="flex-1 rounded-lg border border-border bg-surface-inset px-4 py-2 text-sm text-fg placeholder:text-fg-tertiary focus:outline-hidden focus:ring-2 focus:ring-border-focus focus:border-transparent"
             disabled={creating || creatingDemo}
           />
           <button
@@ -563,7 +563,7 @@ export default function BookSelectorPage() {
               onChange={(e) => setEditingIssueDescription(e.target.value)}
               disabled={savingIssue || deletingIssue}
               rows={3}
-              className="w-full rounded-lg border border-border bg-surface-inset px-3 py-2 text-sm text-fg placeholder:text-fg-tertiary focus:outline-none focus:ring-2 focus:ring-border-focus focus:border-transparent resize-y"
+              className="w-full rounded-lg border border-border bg-surface-inset px-3 py-2 text-sm text-fg placeholder:text-fg-tertiary focus:outline-hidden focus:ring-2 focus:ring-border-focus focus:border-transparent resize-y"
             />
           </div>
 
@@ -577,7 +577,7 @@ export default function BookSelectorPage() {
                 value={editingIssueType}
                 onChange={(e) => setEditingIssueType(e.target.value)}
                 disabled={savingIssue || deletingIssue}
-                className="w-full rounded-lg border border-border bg-surface-inset px-3 py-2 text-sm text-fg focus:outline-none focus:ring-2 focus:ring-border-focus focus:border-transparent"
+                className="w-full rounded-lg border border-border bg-surface-inset px-3 py-2 text-sm text-fg focus:outline-hidden focus:ring-2 focus:ring-border-focus focus:border-transparent"
               >
                 <option value="bug">Bug</option>
                 <option value="improvement">Improvement</option>
@@ -593,7 +593,7 @@ export default function BookSelectorPage() {
                 value={editingIssueStatus}
                 onChange={(e) => setEditingIssueStatus(e.target.value)}
                 disabled={savingIssue || deletingIssue}
-                className="w-full rounded-lg border border-border bg-surface-inset px-3 py-2 text-sm text-fg focus:outline-none focus:ring-2 focus:ring-border-focus focus:border-transparent"
+                className="w-full rounded-lg border border-border bg-surface-inset px-3 py-2 text-sm text-fg focus:outline-hidden focus:ring-2 focus:ring-border-focus focus:border-transparent"
               >
                 <option value="new">New</option>
                 <option value="resolved">Resolved</option>

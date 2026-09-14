@@ -184,7 +184,8 @@ describe("getRealizedGains", () => {
     expect(unknown).toBeDefined();
     expect(unknown!.sharesMicros).toBe(soldShares - boughtShares);
 
-    // Sell's total net proceeds: 23,649,932 shares * $404.576461 = $9,568.21
+    // Sell's total net proceeds: 23_649_932 microshares — about 23.65 shares —
+    // at $404.576461 = $9,568.21
     // gross (956_821 cents), less the $17.67 fee (1_767 cents).
     const totalNetProceedsCents = 956_821 - feesCents;
     const allocatedProceeds = allocated.reduce((sum, r) => sum + r.proceedsCents, 0);

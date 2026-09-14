@@ -1,0 +1,91 @@
+# Development database only. Run with: docker compose -f docker-compose.dev.yml up -d --wait
+# This project and its volume are separate from docker-compose.yml (production).
+name: counterpoise-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: counterpoise
+      POSTGRES_PASSWORD: counterpoise
+      POSTGRES_DB: counterpoise
+      TZ: ${TZ:-America/New_York}
+      # The sweep's own connection, and it is deliberately not the app's.
+      #
+      # DATABASE `postgres`, NOT counterpoise_dev: DROP DATABASE cannot run
+      # from inside the database it drops, so the sweep needs a maintenance
+      # connection that is never itself a candidate.
+      #
+      # ROLE `counterpoise`, the bootstrap one: a per-run test database is
+      # owned by whoever created it, and the suite connects as this role. DROP
+      # DATABASE is refused under any role that owns none of them.
+      #
+      # HOST 127.0.0.1, because this runs inside the database container — see
+      # the entrypoint below. The credential is the published dev default,
+      # allowlisted by name in .gitleaks.toml. Production's equivalents —
+      # DATABASE_URL and POSTGRES_PASSWORD alike — have no default anywhere
+      # and arrive only through .env.production.local.
+      SWEEP_DATABASE_URL: postgresql://counterpoise:counterpoise@127.0.0.1:5432/postgres
+      # record-status.sh defaults this to /backups/status, which is a
+      # production path: that mount does not exist here and nothing in dev
+      # reads the file. Container-local, so it goes when the container goes;
+      # `docker logs counterpoise-dev-postgres-1` is where the outcome is read.
+      STATUS_DIR: /tmp/sweep-status
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Tracked, and the same mount production's scheduler service takes.
+      - ./scripts/scheduler:/scheduler:ro
+    # CROND RUNS BESIDE POSTGRES, IN THIS CONTAINER, rather than in a scheduler
+    # service of its own. Production separates them because its scheduler also
+    # reaches the app over the network and writes backups; the dev sweep talks
+    # only to the database sitting in this very container, and a developer
+    # machine should not run a second container to hold one crontab line.
+    #
+    # The override still ends in the image's own entrypoint, which is what runs
+    # initdb and creates POSTGRES_USER/POSTGRES_DB on a fresh volume. `exec`
+    # makes postgres PID 1, so `docker stop` reaches it and the healthcheck
+    # below means what it says.
+    #
+    # `crond -f` BACKGROUNDED BY THE SHELL, not `crond -b`. Both put cron
+    # behind postgres, but -b daemonizes, and busybox's daemonize closes stdio:
+    # the job's output then goes nowhere reachable. -f keeps the stdout the
+    # shell inherited, which is the container's, and busybox crond relays a
+    # job's output to it when no mailer is configured. Measured in this image:
+    # with -f the job's echo reaches `docker logs`; with -b it is lost.
+    #
+    # AND THE JOB DOES NOT REDIRECT TO /proc/1/fd/1, which is how production's
+    # scheduler reaches its log. There PID 1 is crond's own shell, running as
+    # root; here PID 1 is postgres. Writing to another process's fd through
+    # /proc needs access this container does not have — measured, it is
+    # "Permission denied" as root AND as postgres, and because the redirect is
+    # what fails, the job body never runs at all. That is a silent sweep, so a
+    # repository test pins both halves of this.
+    #
+    # NO check-db-credential.sh. Production's scheduler runs that guard first,
+    # and it exists to refuse exactly the published counterpoise:counterpoise
+    # credential this file authenticates with.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat <<'CRONTAB' | crontab -
+        # Reclaim the databases finished vitest runs left behind, every two
+        # hours at :30 — off the minute-0 crowd. The script decides what is
+        # reclaimable: older than SWEEP_MIN_AGE (12h, because the run's start
+        # time is what the name records) and with no session connected.
+        30 */2 * * * echo "[test-db-sweep] $$(date +\%F\ \%T)"; /scheduler/sweep-test-databases.sh
+        CRONTAB
+        crond -f -l 2 &
+        exec docker-entrypoint.sh postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U counterpoise -d counterpoise"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    name: counterpoise_dev_pgdata

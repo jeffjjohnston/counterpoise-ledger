@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures";
 
 function accountRow(page: import("@playwright/test").Page, name: string) {
   return page
@@ -12,9 +12,10 @@ function uniqueName(prefix: string) {
 
 async function createLiabilityAccount(
   page: import("@playwright/test").Page,
+  bookId: number,
   name: string
 ) {
-  const response = await page.request.post("/api/b/1/accounts", {
+  const response = await page.request.post(`/api/b/${bookId}/accounts`, {
     data: {
       name,
       type: "liability",
@@ -27,8 +28,8 @@ async function createLiabilityAccount(
 }
 
 test.describe("account management", () => {
-  test("displays chart of accounts", async ({ page }) => {
-    await page.goto("/b/1/accounts");
+  test("displays chart of accounts", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/accounts`);
     await expect(
       page.getByRole("heading", { name: "Chart of Accounts" })
     ).toBeVisible();
@@ -36,10 +37,10 @@ test.describe("account management", () => {
     await expect(page.getByText("Savings")).toBeVisible();
   });
 
-  test("creates a new account", async ({ page }) => {
+  test("creates a new account", async ({ page, bookId }) => {
     const accountName = uniqueName("Credit Card");
 
-    await page.goto("/b/1/accounts");
+    await page.goto(`/b/${bookId}/accounts`);
     await page.getByRole("button", { name: "New Account" }).click();
     await expect(
       page.getByRole("heading", { name: "New Account" })
@@ -56,12 +57,12 @@ test.describe("account management", () => {
     await expect(page.getByRole("link", { name: accountName, exact: true })).toBeVisible();
   });
 
-  test("edits an account", async ({ page }) => {
+  test("edits an account", async ({ page, bookId }) => {
     const originalName = uniqueName("Credit Card");
     const updatedName = uniqueName("Visa Card");
-    await createLiabilityAccount(page, originalName);
+    await createLiabilityAccount(page, bookId, originalName);
 
-    await page.goto("/b/1/accounts");
+    await page.goto(`/b/${bookId}/accounts`);
 
     const row = accountRow(page, originalName);
     await expect(row).toBeVisible();
@@ -80,11 +81,11 @@ test.describe("account management", () => {
     await expect(page.getByRole("link", { name: updatedName, exact: true })).toBeVisible();
   });
 
-  test("toggles account inactive", async ({ page }) => {
+  test("toggles account inactive", async ({ page, bookId }) => {
     const accountName = uniqueName("Visa Card");
-    await createLiabilityAccount(page, accountName);
+    await createLiabilityAccount(page, bookId, accountName);
 
-    await page.goto("/b/1/accounts");
+    await page.goto(`/b/${bookId}/accounts`);
 
     const row = accountRow(page, accountName);
     await expect(row).toBeVisible();
@@ -97,11 +98,11 @@ test.describe("account management", () => {
     await expect(page.getByRole("link", { name: accountName, exact: true })).toBeVisible();
   });
 
-  test("deletes an account with no transactions", async ({ page }) => {
+  test("deletes an account with no transactions", async ({ page, bookId }) => {
     const accountName = uniqueName("Disposable Card");
-    await createLiabilityAccount(page, accountName);
+    await createLiabilityAccount(page, bookId, accountName);
 
-    await page.goto("/b/1/accounts");
+    await page.goto(`/b/${bookId}/accounts`);
 
     page.on("dialog", (dialog) => dialog.accept());
 

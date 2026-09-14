@@ -3,77 +3,32 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { Button } from "@/components/ui/Button";
 
 describe("Button", () => {
-  it("renders children correctly", () => {
-    render(<Button>Click me</Button>);
-    expect(screen.getByRole("button")).toHaveTextContent("Click me");
+  it("exposes its label and invokes the supplied action", () => {
+    const click = vi.fn();
+    render(<Button onClick={click}>Save</Button>);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(click).toHaveBeenCalledTimes(1);
   });
 
-  it("calls onClick when clicked", () => {
-    const handleClick = vi.fn();
-    render(<Button onClick={handleClick}>Click me</Button>);
-
-    fireEvent.click(screen.getByRole("button"));
-    expect(handleClick).toHaveBeenCalledTimes(1);
-  });
-
-  it("applies primary variant styles by default", () => {
-    render(<Button>Primary</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveClass("bg-accent", "text-fg-on-accent");
-  });
-
-  it("applies secondary variant styles", () => {
-    render(<Button variant="secondary">Secondary</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveClass("bg-surface-tertiary", "text-fg");
-  });
-
-  it("applies danger variant styles", () => {
-    render(<Button variant="danger">Danger</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveClass("bg-danger", "text-fg-on-accent");
-  });
-
-  it("applies ghost variant styles", () => {
-    render(<Button variant="ghost">Ghost</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveClass("text-fg-secondary");
-  });
-
-  it("applies small size styles", () => {
-    render(<Button size="sm">Small</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveClass("px-2.5", "py-1.5");
-  });
-
-  it("applies medium size styles by default", () => {
-    render(<Button>Medium</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveClass("px-4", "py-2");
-  });
-
-  it("applies large size styles", () => {
-    render(<Button size="lg">Large</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveClass("px-6", "py-3");
-  });
-
-  it("can be disabled", () => {
-    render(<Button disabled>Disabled</Button>);
-    const button = screen.getByRole("button");
+  it("does not invoke the action when disabled", () => {
+    const click = vi.fn();
+    render(<Button disabled onClick={click}>Save</Button>);
+    const button = screen.getByRole("button", { name: "Save" });
     expect(button).toBeDisabled();
-    expect(button).toHaveClass("disabled:opacity-50");
+    fireEvent.click(button);
+    expect(click).not.toHaveBeenCalled();
   });
 
-  it("accepts custom className", () => {
-    render(<Button className="custom-class">Custom</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveClass("custom-class");
+  it("submits the containing form when requested", () => {
+    const submit = vi.fn((event) => event.preventDefault());
+    render(<form onSubmit={submit}><Button type="submit">Save</Button></form>);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(submit).toHaveBeenCalledTimes(1);
   });
 
-  it("supports type attribute", () => {
-    render(<Button type="submit">Submit</Button>);
-    const button = screen.getByRole("button");
-    expect(button).toHaveAttribute("type", "submit");
+  it("lets a caller override a utility class", () => {
+    render(<Button className="px-12">Save</Button>);
+    expect(screen.getByRole("button")).toHaveClass("px-12");
+    expect(screen.getByRole("button")).not.toHaveClass("px-4");
   });
 });

@@ -520,16 +520,16 @@ describe("SyncPage", () => {
     // Each label names sync freshness, never mapping completeness — that is
     // the connections page's dot, and the two must not read as one signal.
     const failed = screen.getByLabelText("Citi: last sync failed");
-    expect(failed.className).toContain("bg-[var(--fg-danger)]");
+    expect(failed.className).toContain("bg-(--fg-danger)");
 
     const never = screen.getByLabelText("Ally: never synced");
-    expect(never.className).toContain("bg-[var(--fg-warning)]");
+    expect(never.className).toContain("bg-(--fg-warning)");
 
     const stale = screen.getByLabelText("Chase: last synced more than 24 hours ago");
-    expect(stale.className).toContain("bg-[var(--fg-warning)]");
+    expect(stale.className).toContain("bg-(--fg-warning)");
 
     const fresh = screen.getByLabelText("Amex: synced within the last 24 hours");
-    expect(fresh.className).toContain("bg-[var(--fg-success)]");
+    expect(fresh.className).toContain("bg-(--fg-success)");
   });
 
   it("keeps one error surface when a retry fails on an already-failing connection", async () => {

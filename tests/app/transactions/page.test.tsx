@@ -104,6 +104,7 @@ const positionsPayload: unknown[] = [];
 describe("TransactionsPage", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     pushMock.mockReset();
     replaceMock.mockReset();
@@ -399,6 +400,188 @@ describe("TransactionsPage", () => {
     expect(pushMock).toHaveBeenCalledWith(
       "/b/1/transactions?accountId=42&highlight=99"
     );
+  });
+
+  it("navigates client-side even outside the test environment", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return { ok: true, json: async () => transactionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/positions")) {
+        return { ok: true, json: async () => positionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/account-values")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url === "/api/b/1/payees") {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url.startsWith("/api/b/1/sync/stale-unmatched")) {
+        return {
+          ok: true,
+          json: async () => ({ totalCount: 0, accounts: [] }),
+        } as Response;
+      }
+      if (url.startsWith("/api/b/1/sync/pending-transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    // The page used to full-reload here, guarded by NODE_ENV !== "test" — so
+    // the suite only ever saw the router.push fallback and could not tell the
+    // two apart. Stub the environment the guard tested to pin the real path.
+    const assignMock = vi.fn();
+    vi.stubGlobal("location", { ...window.location, assign: assignMock });
+
+    render(<TransactionsPage />);
+
+    await waitFor(() => {
+      expect(transactionListProps?.onNavigateToAccount).toBeTypeOf("function");
+    });
+
+    vi.stubEnv("NODE_ENV", "production");
+    try {
+      (
+        transactionListProps?.onNavigateToAccount as (
+          a: number,
+          t: number
+        ) => void
+      )(42, 99);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(pushMock).toHaveBeenCalledWith(
+      "/b/1/transactions?accountId=42&highlight=99"
+    );
+  });
+
+  it("re-fetches the target account and keeps the highlight after a client navigation", async () => {
+    const targetAccounts = [
+      ...accountsPayload,
+      {
+        id: 42,
+        name: "Checking",
+        type: "asset",
+        subtype: "bank",
+        parentId: null,
+        isFavorite: false,
+        isInvestmentCash: false,
+        icon: null,
+        balance: 0,
+      },
+    ];
+
+    const highlightedTransaction = {
+      id: 99,
+      bookId: 1,
+      date: "2026-02-05",
+      description: "Rent",
+      checkNumber: null,
+      notes: null,
+      payeeId: null,
+      isReconciled: false,
+      isFloating: false,
+      recurringRuleId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      payee: null,
+      splits: [],
+      investmentSplits: [],
+    } as unknown as TransactionWithSplits;
+
+    const transactionsUrls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => targetAccounts } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        transactionsUrls.push(url);
+        // Only the target account holds the highlighted row, so a stale
+        // fetch for the previous account cannot satisfy the assertions below.
+        if (url.includes("accountId=42")) {
+          return {
+            ok: true,
+            json: async () => ({
+              transactions: [highlightedTransaction],
+              startingBalance: 0,
+              totalCount: 1,
+            }),
+          } as Response;
+        }
+        return { ok: true, json: async () => transactionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/positions")) {
+        return { ok: true, json: async () => positionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/account-values")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url === "/api/b/1/payees") {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url.startsWith("/api/b/1/sync/stale-unmatched")) {
+        return {
+          ok: true,
+          json: async () => ({ totalCount: 0, accounts: [] }),
+        } as Response;
+      }
+      if (url.startsWith("/api/b/1/sync/pending-transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    // A full page reload refreshes everything by construction; client
+    // navigation does not. Drive the URL the way the App Router does so the
+    // list has to re-fetch on its own.
+    pushMock.mockImplementation((url: string) => {
+      searchParamsValue = new URLSearchParams(url.split("?")[1] ?? "");
+    });
+
+    const { rerender } = render(<TransactionsPage />);
+
+    await waitFor(() => {
+      expect(transactionListProps?.onNavigateToAccount).toBeTypeOf("function");
+    });
+
+    await act(async () => {
+      (
+        transactionListProps?.onNavigateToAccount as (
+          a: number,
+          t: number
+        ) => void
+      )(42, 99);
+    });
+
+    await act(async () => {
+      rerender(<TransactionsPage />);
+    });
+
+    await waitFor(() => {
+      expect(
+        transactionsUrls.some(
+          (url) => url.includes("accountId=42") && url.includes("ensureId=99")
+        )
+      ).toBe(true);
+      expect(transactionListProps?.highlightTransactionId).toBe(99);
+      expect(
+        (transactionListProps?.transactions as TransactionWithSplits[]).map(
+          (tx) => tx.id
+        )
+      ).toContain(99);
+    });
   });
 
   it("stops auto-retrying after a failed \"load more\" and lets the user retry manually", async () => {

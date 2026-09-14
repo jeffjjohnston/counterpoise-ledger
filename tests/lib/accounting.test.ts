@@ -954,8 +954,8 @@ describe("resolveAccountIconSource", () => {
 });
 
 describe("buildCategoryLabelMap", () => {
-  // Mirrors the real book: `accounts.name` stores the full colon path, and
-  // the category tree is two levels deep.
+  // `accounts.name` stores the full colon path, and the category tree these
+  // labels are built for is two levels deep.
   const auto = { id: 1, name: "Automobile", type: "expense", icon: "🚗", parentId: null };
   const gasoline = { id: 2, name: "Automobile:Gasoline", type: "expense", icon: null, parentId: 1 };
   const charging = { id: 3, name: "Automobile:Charging", type: "expense", icon: "⚡", parentId: 1 };
@@ -1001,8 +1001,8 @@ describe("buildCategoryLabelMap", () => {
   });
 
   it("keeps identical leaf names distinct by icon", () => {
-    // The two real collisions in the production book, both under different
-    // roots and so already separated by their inherited icons.
+    // Two leaves with the same name under different roots, which is the case
+    // the inherited icon has to separate.
     const tech = { id: 8, name: "Technology", type: "expense", icon: "💻", parentId: null };
     const techAcc = { id: 9, name: "Technology:Accessories", type: "expense", icon: null, parentId: 8 };
     const autoAcc = { id: 10, name: "Automobile:Accessories", type: "expense", icon: null, parentId: 1 };

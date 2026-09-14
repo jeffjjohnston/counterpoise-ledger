@@ -1,6 +1,18 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "../tailwind.config.ts";
+
+/* Preserve the v3 defaults while utilities override them in their own layer. */
+@layer base {
+  *, ::before, ::after, ::backdrop, ::file-selector-button {
+    border-color: var(--color-gray-200, currentColor);
+  }
+  button:not(:disabled), [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  input::placeholder, textarea::placeholder {
+    color: var(--color-gray-400);
+  }
+}
 
 /* ── General Sans ── */
 @font-face {
@@ -49,7 +61,6 @@
   --bg-warning-subtle: #fffbeb;
   --bg-future: #eef4ff;
   --bg-future-hover: #dcebfe;
-  --border-future: #6dacf0;
 
   --fg-primary: #09090b;
   --fg-secondary: #52525b;
@@ -91,7 +102,6 @@
   --bg-warning-subtle: #451a03;
   --bg-future: #0d1729;
   --bg-future-hover: #132240;
-  --border-future: #2d6cc4;
 
   --fg-primary: #fafafa;
   --fg-secondary: #a1a1aa;

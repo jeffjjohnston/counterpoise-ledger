@@ -2,24 +2,68 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**This file is the index.** It holds the commands, the rules that apply
+everywhere, and the warnings you must read before you act. Everything else is in
+`guides/`, one file per subject. Read the guide for the subject you are about to
+touch. The guides carry the reasons, and a rule without its reason is the rule
+that gets undone.
+
+This checkout is for development only. Production runs from a separate checkout
+on `main` — `~/prod/counterpoise` unless `COUNTERPOISE_BUILD_DIR` says otherwise —
+with its own `.env.production.local` and `backups/`. Use `docker-compose.dev.yml`
+here; `docker-compose.yml` is production-only.
+
 ## Project Overview
 
 Counterpoise is a multi-book personal finance accounting application built with Next.js 16, implementing true double-entry bookkeeping with investment tracking. The app uses a PostgreSQL database for all data storage, supports user authentication, and includes a Moneydance import tool.
+
+## Guides
+
+| Guide | Read it before you |
+| --- | --- |
+| [guides/architecture.md](guides/architecture.md) | Add a route, a page, or a database query. Holds the tech stack, the layered flow, and the three kinds of `db` |
+| [guides/api-route-patterns.md](guides/api-route-patterns.md) | Write or change an API route |
+| [guides/schema.md](guides/schema.md) | Work with any table. One entry per table, with the fields that are easy to get wrong |
+| [guides/library-reference.md](guides/library-reference.md) | Write a helper. It is probably already there — this lists every `lib/` function and every critical file |
+| [guides/investments.md](guides/investments.md) | Touch investment splits, positions, or FIFO lots |
+| [guides/securities-and-prices.md](guides/securities-and-prices.md) | Change price fetching, fixed-price securities, or the price entry pill |
+| [guides/recurring-transactions.md](guides/recurring-transactions.md) | Change recurring rules, their processing, or business-day shifts |
+| [guides/plaid-sync.md](guides/plaid-sync.md) | Change bank sync, auto-match, or reconciliation |
+| [guides/mcp-server.md](guides/mcp-server.md) | Add or change an MCP tool. Lists all 59 tools |
+| [guides/components-and-ui.md](guides/components-and-ui.md) | Build or change UI |
+| [guides/testing.md](guides/testing.md) | Write a test, or claim that work is done |
+| [guides/database-management.md](guides/database-management.md) | Change the schema, add a migration, or touch the production database |
+| [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md) | Add an import to a route or an MCP tool, or write a payee, date, or split helper |
+| [guides/moneydance-import.md](guides/moneydance-import.md) | Change the importer |
+| [guides/posthog-analytics.md](guides/posthog-analytics.md) | Add or query an analytics event |
+| [guides/release-and-deploy.md](guides/release-and-deploy.md) | Release, deploy, or change CI |
+| [guides/worktrees.md](guides/worktrees.md) | Work in a git worktree |
+| [guides/debugging.md](guides/debugging.md) | Debug a query, an unbalanced transaction, or a wrong position |
+
+## Skills
+
+Repository workflows are skills under `.claude/skills/`. Prefer the skill over
+driving its scripts by hand — each one carries the order of operations and the
+checks that the scripts alone do not enforce.
+
+| Skill | Use it to |
+| --- | --- |
+| `verify` | Drive a UI change end-to-end against the local dev server, when tests alone do not prove it works |
 
 ## Development Commands
 
 ### Essential Commands
 ```bash
-docker volume create counterpoise_pgdata  # Create persistent data volume (first time only)
-docker compose up -d      # Start PostgreSQL (required before dev/test)
+docker compose -f docker-compose.dev.yml up -d --wait  # Dedicated dev/test PostgreSQL on localhost:5432
 npm run dev               # Start development server (http://localhost:3000)
 npm run build             # Build for production
 npm run lint              # Run ESLint
 npx tsc --noEmit          # Type-check without emitting files
 
 # Testing
-npm run db:create-test-dbs # Create counterpoise_dev + per-worker test databases (one-time setup)
-npm test                  # Run all unit tests with Vitest
+npm run db:create-test-dbs # Create counterpoise_dev + counterpoise_e2e (one-time setup)
+npm test                  # Run Vitest once (node, DOM, and database projects)
+npx vitest run            # Run Vitest directly
 npm run test:ui          # Run tests with interactive UI
 npm run test:coverage    # Generate test coverage report
 npm run test:e2e         # Run Playwright E2E tests
@@ -38,81 +82,16 @@ npm run mcp:dev          # Start MCP server for AI access to accounting data
 # MCP (Docker — production)
 docker exec -i counterpoise-app-1 node /app/mcp-server.mjs  # Run MCP server via Docker
 
-# Release & Deploy
-./scripts/release.sh [patch|minor|major]  # Bump version, tag, push, create PR to main
-./scripts/deploy.sh                       # Pull main, rebuild Docker, restart app
+# Release & Deploy — read guides/release-and-deploy.md first
+./scripts/release.sh [patch|minor|major] [--skip-checks] [--no-pr]  # In a RELEASE CHECKOUT: bump, name and push release/vX.Y.Z, open PR to main
+./scripts/deploy.sh --ref <commit> [--yes]                          # Publish tag vX.Y.Z once at that commit, rebuild Docker
 ```
-
-### Release & Deploy Workflow
-
-Uses semantic versioning with a squash-merge PR flow. GitHub is configured for squash merges on PRs to main.
-
-```
-dev branch (daily work)
-    │
-    ▼
-./scripts/release.sh patch     ← runs checks, bumps version, tags, creates PR
-    │
-    ▼
-GitHub PR: dev → main          ← CI runs lint/typecheck/tests; review & fix
-    │
-    ▼
-Squash-merge PR on GitHub      ← all commits become one commit on main
-    │
-    ▼
-./scripts/deploy.sh            ← builds, moves tag, rebases dev; resumable if it fails
-```
-
-**Key details:**
-- **Version semantics**: `patch` (bug fixes), `minor` (new features), `major` (breaking changes)
-- **Tag accuracy**: `release.sh` creates the tag on dev; `deploy.sh` moves it to the squash commit on main (so the tag always points to exactly what's deployed, even if PR review commits landed after the version bump)
-- **Branch sync**: `deploy.sh` records dev's HEAD as the fork point in `.git/DEPLOY_FORK_POINT` before mutating anything. Since deploy runs after the squash merge, everything on dev at that moment was in the squash. The rebase (`git rebase --onto main <fork-point> dev`) drops those commits and replays only work added afterwards, then force-pushes dev. The file is removed only once that push succeeds, so **its presence means a sync is still pending** and a re-run will finish it — including from `main`, which is where a failed deploy leaves you. If no fork point can be determined, the script deploys and then exits non-zero rather than skipping the sync silently.
-- **Resuming a failed deploy**: just re-run `./scripts/deploy.sh`. It restores the branch it started on, names the stage that failed, and lists what did not happen. `--yes` skips the "already up to date" prompt for scripted runs; `--fork-point=<sha>` supplies the fork point by hand if the resume file was lost.
-- **CI**: GitHub Actions (`.github/workflows/ci.yml`) runs on every PR to main — lint, type-check, tests against a PostgreSQL service container, and a `production-build` job that builds with **no database service**, since a page querying the database at build time passes E2E (which has one) and fails `docker build` (which does not)
-- **After release.sh, before merging**: Additional commits can be pushed to dev to address PR feedback. These get included in the squash merge. The version tag is corrected at deploy time.
-- **The session-hash migration is not reversible by redeploying the previous image.** Once the `sessions.token` column is renamed to `token_hash`, the old code queries a column that no longer exists and 500s on every authenticated request. Rolling back requires a forward migration (or a new fix-forward deploy), not an image rollback.
-
-### After Making Code Changes
-After modifying TypeScript files, always run `npx tsc --noEmit` to check for type errors and fix any that arise before considering the task complete.
-
-Run that exact command — `release.sh` and CI do, and it is the one that gates a
-release. In particular do **not** verify with `--incremental false`: it bypasses
-`tsconfig.tsbuildinfo` and so cannot reproduce what the release gate sees.
-
-If `tsc` reports errors that contradict `tsconfig.json` — classically
-`TS2737: BigInt literals are not available when targeting lower than ES2020`
-while `target` already says ES2020 — the incremental cache is replaying
-diagnostics recorded under the previous options. Changing `target` does not
-reliably invalidate them. Delete `tsconfig.tsbuildinfo` and re-run; the
-regenerated cache is correct from then on. This is local only: the file is
-gitignored, so CI never sees it.
 
 ### Running Individual Tests
 ```bash
-npx vitest tests/lib/accounting.test.ts           # Run specific test file
+npx vitest run tests/lib/accounting.test.ts           # Run specific test file
 npx vitest tests/lib/accounting.test.ts -t "validateSplits"  # Run specific test
 ```
-
-### Working in Git Worktrees
-Worktrees live under `.claude/worktrees/<name>/`. A fresh worktree has **no `node_modules`** of its own, which matters differently per tool:
-
-| Tool | Needs `node_modules` in the worktree? | Why |
-| ---- | ------------------------------------- | --- |
-| Vitest, `tsc`, ESLint | No | Node resolves `node_modules` upward to the main checkout |
-| `next dev`, `next build` | **Yes** — run `npm ci` first (~4s warm) | Turbopack computes its own project root and refuses to look above it |
-
-Symlinking `node_modules` into a worktree does **not** work — Turbopack rejects it outright:
-
-```
-Error: Symlink [project]/node_modules is invalid, it points out of the filesystem root
-```
-
-So run the dev server or E2E suite from a worktree only after `npm ci` in that worktree.
-
-**Gotchas after installing into a worktree:**
-- `vitest.config.ts` includes a broad `**/*.test.{ts,tsx}` pattern that would otherwise glob into `.claude/worktrees/` and run a *second* copy of every test. With a worktree-local `node_modules` those load a second React and fail with `Invalid hook call`. The `exclude: [...configDefaults.exclude, "**/.claude/worktrees/**"]` entry prevents this — don't drop it, and keep the `configDefaults` spread (a bare `exclude` *replaces* the defaults rather than extending them, re-enabling `node_modules` scanning).
-- `next dev` rewrites `AGENTS.md`, appending a `nextjs-agent-rules` block. It shows up as an unexpected uncommitted change — leave it out of unrelated commits (`git checkout -- AGENTS.md`).
-- The E2E standalone build (`next build --webpack`) leaves a stray `.claude/worktrees/node_modules/` holding traced `next`/`styled-jsx` copies. Delete it.
 
 ### Import Scripts
 ```bash
@@ -125,148 +104,23 @@ npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existi
 
 Create the target book first, then use `npm run db:list-books` to discover its ID. `npm run db:seed` (without args) creates a sample `admin` user, sample book, and seed data.
 
-## Architecture Overview
+## Rules That Apply Everywhere
 
-### Tech Stack
-- **Framework**: Next.js 16 with App Router
-- **Language**: TypeScript (strict mode)
-- **Database**: PostgreSQL with postgres.js driver
-- **ORM**: Drizzle ORM (type-safe queries)
-- **Testing**: Vitest (unit), Playwright (E2E)
-- **Styling**: Tailwind CSS
+### After Making Code Changes
 
-### Path Aliases
-All imports use `@/` prefix mapping to project root:
-```typescript
-import { getDb } from "@/db";
-import { validateSplits } from "@/lib/accounting";
-```
+After you change TypeScript files, always run `npx tsc --noEmit` and fix every
+error before you call the task complete. Run that exact command — `release.sh`
+and CI run it, and it is the command that gates a release. If it reports errors
+that contradict `tsconfig.json`, the incremental cache is stale: see
+[guides/testing.md](guides/testing.md).
 
-### PostgreSQL Database
-All data lives in a PostgreSQL database. Local development defaults to `postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev` when `DATABASE_URL` is unset. Docker deployment uses a separate `counterpoise` database via `.env.production.local`. Meta tables (users, sessions, books) and book-scoped tables coexist in one schema, with a `bookId` foreign key on every book-scoped table for data isolation.
+### Reading an exit code through a pipe
 
-```
-counterpoise (PostgreSQL database)
-├── users, sessions, apiKeys, books, issueReports (meta tables)
-├── accounts                        (+ bookId FK)
-├── transactions, transactionSplits (+ bookId FK)
-├── securities, securityPrices      (+ bookId FK)
-├── investmentSplits, investmentLots, investmentLotAllocations (+ bookId FK)
-├── recurringRules, recurringTemplateSplits (+ bookId FK)
-├── payees                          (+ bookId FK)
-└── plaidTokens, plaidAccounts, plaidTransactionReconciliation (+ bookId FK)
-```
-
-- **Schema**: All tables defined in `/db/schema.ts`
-- **Connection**: `getDb()` from `/db/index.ts` returns a cached Drizzle instance (does NOT auto-migrate; use `runMigrations()` explicitly in scripts)
-- **Pages** live under `/app/b/[bookId]/...` (e.g., `/app/b/[bookId]/transactions/page.tsx`)
-- **API routes** live under `/app/api/b/[bookId]/...` (e.g., `/app/api/b/[bookId]/transactions/route.ts`)
-- **Auth routes** at `/app/api/auth/...` (login, register, logout, me, password, api-keys)
-- **Book management** at `/app/api/books/...`
-
-### Layered Architecture
-```
-Client Components (React)
-    ↓
-API Routes (/app/api/b/[bookId]/*/route.ts)
-    ↓
-Auth + Book ID (/lib/api-auth.ts → getDb + bookId)
-    ↓
-Business Logic (/lib/*.ts)
-    ↓
-Data Access (Drizzle ORM, filtered by bookId)
-    ↓
-PostgreSQL Database
-```
-
-### Database Connection
-```typescript
-// In API routes — always use authenticateBookRequest to get the book's DB:
-import { authenticateBookRequest } from "@/lib/api-auth";
-
-export async function GET(request: Request, { params }: { params: Promise<{ bookId: string }> }) {
-  const { bookId } = await params;
-  const auth = await authenticateBookRequest(bookId);
-  if (isError(auth)) return auth.error;
-  const { db } = auth;
-  // Use db (Drizzle ORM instance for this book)
-}
-
-// In scripts (seed, import) — use getDb directly, and run migrations first:
-import { getDb, runMigrations } from "@/db";
-await runMigrations();
-const db = getDb();
-```
-
-A third kind of `db` exists and does **not** behave like the other two.
-`withAdvisoryLock` (`/lib/advisory-lock.ts`) hands its callback a Drizzle
-instance bound to a *reserved* postgres.js connection. Reserved connections
-expose only `types`, `typed`, `unsafe`, `notify`, `array`, `json`, `file` and
-`release`; `options`, `begin` and `savepoint` belong to the pool, and Drizzle
-needs all three — it writes type parsers to `client.options`, implements
-`db.transaction()` as `client.begin(...)`, and a nested transaction as
-`client.savepoint(...)`. `getDbForConnection` in `/db/index.ts` grafts them on,
-so always go through it rather than `drizzle(connection)`.
-
-The missing transaction grafts silently disabled Plaid auto-matching for four
-releases: `autoMatchPendingTransactions` claims each row in a transaction, so
-every sync with something to match died on `this.client.begin is not a
-function` — and did so *after* committing its cursor and clearing `lastError`,
-which is why the failure surfaced as an error banner that a manual re-sync
-appeared to fix. Any new `db.transaction(...)` reachable from inside the lock
-depends on those grafts.
-
-## Database Schema & Accounting Model
-
-### Core Tables
-- **accounts**: Chart of accounts with hierarchical structure (parent-child)
-  - Types: `asset`, `liability`, `equity`, `income`, `expense`
-  - Subtypes: `bank`, `credit_card`, `loan`, `investment`, `cash`, `other`
-  - Special field: `isInvestmentCash` for auto-created investment cash accounts
-  - `icon` (nullable): one emoji grapheme. **`null` means "inherit from the parent account" — never "no icon".** Resolved at render time by `resolveAccountIcon()`/`resolveAccountIconSource()`; only `income`/`expense` accounts show a picker or resolve an icon for display
-
-- **transactions**: Main transaction records with date, description, payee
-  - Links to `payees` (optional) and `recurringRules` (optional)
-
-- **transactionSplits**: Double-entry splits (debits/credits)
-  - Positive amounts = debits, negative = credits
-  - Must sum to zero per transaction
-
-- **securities**: Investment securities (stocks, ETFs, mutual funds)
-  - Fields: name, symbol, securityType (etf/mutual_fund/stock), fetchPrices, fixedPriceMicros
-  - `fixedPriceMicros` (nullable): a price that never moves — a money market fund at a $1.00 NAV. Non-null means fixed-price (see Fixed-Price Securities below); null means the price comes from `securityPrices`
-
-- **securityPrices**: Historical price data per security per date
-  - Composite key: securityId + priceDate
-
-- **investmentSplits**: Investment-specific transaction data
-  - Actions: `buy`, `sell`, `dividend`, `capGain`, `fee`, `split`
-  - Links to `securities`, `investmentLots`, and accounts
-  - Stores shares and prices in micros (1,000,000 = 1 share/dollar)
-
-- **investmentLots**: FIFO lot tracking, scoped to (book, account, security)
-  - Quantities live on the row: `originalSharesMicros`/`originalBasisCents` and `remainingSharesMicros`/`remainingBasisCents`
-  - `acquiredDate` drives the short vs long-term holding period
-- **investmentLotAllocations**: which lots a sell consumed, and how much of each
-  - One row per (sell split, lot): `sharesMicros`, `basisCents`, `proceedsCents`
-  - Realized gain is always `proceedsCents - basisCents`; never stored
-
-- **recurringRules** / **recurringTemplateSplits**: Recurring transaction templates
-
-- **apiKeys**: User API keys for MCP server authentication
-  - Fields: `userId`, `name`, `keyHash` (scrypt), `keyPrefix` (first 8 chars for lookup), `lastUsedAt`
-
-- **issueReports**: In-app issue reports (meta table — scoped to `userId`, not `bookId`)
-  - Fields: `userId`, `description`, `type` (`bug`/`improvement`/`other`), `page`, `status` (`new`/`resolved`/`wontfix`)
-  - Written by `ReportIssueModal`; consumed by the `fix-reported-issue` skill
-
-- **plaidTokens** / **plaidAccounts** / **plaidTransactionReconciliation**: Plaid bank sync integration
-  - `plaidTokens`: Stores Plaid access tokens and `syncCursor` for incremental transaction sync
-  - `plaidAccounts`: Links Plaid accounts to Counterpoise accounts (`counterpoiseAccountId`)
-  - `plaidTransactionReconciliation`: Staged Plaid transactions awaiting reconciliation
-    - `resolutionStatus`: `pending`, `matched`, `created`, `ignored`
-    - `reviewReason`: `plaid_modified` or `plaid_removed` (flags items needing human review)
-    - `matchedTransactionId`: FK to local transaction when matched (manually or auto-matched)
+A pipeline reports the exit status of its **last** command. `some-check | tail -5`
+therefore reports `tail`'s status, and `tail` almost always succeeds. The check
+can fail and the shell still says 0. Redirect to a file and read the file, or
+`set -o pipefail` for that one command. Two agents lost a cycle to this on the
+same day: see [guides/testing.md](guides/testing.md).
 
 ### Critical Accounting Rules
 
@@ -296,1010 +150,40 @@ depends on those grafts.
    - When reconciling a floating transaction: set `isFloating=false`, update `date` to cleared date, set `isReconciled=true`
    - Stored `date` field retains the original entry date while floating; it's overwritten with the cleared date on reconciliation
 
-## Key Business Logic Files
-
-### `/lib/accounting.ts`
-Core accounting functions:
-- `validateSplits(splits)` - Ensures debits = credits
-- `getNormalBalanceSign(type)` - Returns 1 or -1 based on account type
-- `getDisplayBalance(balance, type)` - Converts to display format
-- `buildAccountTree()` - Creates hierarchical account structure
-- `buildAccountHierarchyName()` - Creates display names (e.g., "Parent -> Child")
-- `getNextDate()`, `getInitialNextDate()`, `describeRecurrence()` - Recurring transaction helpers
-- `buildBuySplits()`, `buildSellSplits()`, `buildDividendSplits()`, `buildCapGainSplits()` - Investment split builders
-- `mapInvestmentActionToSplits()`, `validateInvestmentAction()` - Investment action helpers
-- `groupAccountsByType()` - Group accounts by type for display
-- `resolveAccountIcon()` - Walks `parentId` upward and returns the first icon found; an account's own icon wins, `null` means no ancestor has one either
-- `resolveAccountIconSource()` - Same walk, also returns the short name of the ancestor the icon came from (for "Inherits 🚗 from Automobile")
-- `buildCategoryLabelMap()` - Precomputes icon/text/title per category account, memoized once per account list; holds entries only for `income`/`expense` accounts — a lookup miss is the deliberate fallback to today's full-path display, which is what keeps every renderer free of an `account.type` check
-
-### `/lib/investments.ts`
-Investment calculations:
-- `aggregatePositions(splits, securities, prices)` - Calculates current positions (shares and market value only)
-- `getPositions(db, bookId, accountId?)` - Full position query with market values; cost basis is summed from `investmentLots.remainingBasisCents`, not recomputed from splits (see Lot Tracking below)
-- `getMarketValuesByAccount(db, bookId, asOfDate?)` - Aggregate market value by account
-
-### `/lib/formatters.ts`
-Display formatting:
-- `formatCurrency(cents)` - Converts cents to USD string
-- `formatDate(dateString)` - Formats YYYY-MM-DD for display
-- `formatDateShort(dateString)` - Short date format
-- `toDateString(date)` - Convert Date to YYYY-MM-DD
-- `parseCurrency(string)` - Parses user input to cents
-- `getAccountShortName(name)` - Extract short name from full path
-
-### `/lib/api-auth.ts`
-Authentication and book access:
-- `authenticateRequest()` - Basic auth for non-book routes
-- `authenticateBookRequest(bookId)` - Book-scoped auth, returns `{ db, bookId, userId, book }`
-- `isError()` - Type guard for auth error checking. On failure the result carries the
-  response as `auth.error` (the type is `{ error: NextResponse }`) — **not** `auth.response`
-
-### `/lib/api-keys.ts`
-API key management:
-- `generateApiKey()` - Creates `cpk_` + 48 hex char key
-- `getKeyPrefix(key)` - Extracts first 8 chars for DB lookup
-- `hashApiKey(key)` - Scrypt hash for storage
-- `verifyApiKey(key, hash)` - Timing-safe scrypt verification
-
-### `/lib/auth.ts` & `/lib/session.ts`
-User authentication:
-- `hashPassword()`, `verifyPassword()` - Scrypt-based password handling
-- `createSession()`, `getSession()`, `destroySession()` - 30-day session management with HTTP-only cookies
-
-### `/lib/transactions.ts`
-Shared transaction logic (used by both API routes and MCP tools):
-- `createTransaction(db, bookId, input)` - Creates a transaction with splits and optional investment splits
-- `updateTransaction(db, bookId, transactionId, input)` - Updates fields and/or replaces splits
-- `deleteTransaction(db, bookId, transactionId)` - Deletes a transaction, its splits, and its investment splits
-- `TransactionValidationError` - Invalid input (splits don't balance, etc.)
-- `TransactionNotFoundError` - Transaction ID doesn't exist in the book
-
-### `/lib/accounts.ts`
-Shared account logic (used by both API routes and MCP tools):
-- `getAccountsWithBalances(db, bookId, opts?)` - Accounts with computed balances
-- `createAccount(db, bookId, input)` - Creates an account; an `investment` subtype also gets its paired cash sub-account
-- `updateAccount(db, bookId, accountId, input)` - Updates an account's fields
-- `deleteAccount(db, bookId, accountId)` - Deletes an account; refuses when it still has transactions or children
-- `ensureInvestmentCashAccount()`, `isInvestmentAccount()` - Investment cash pairing helpers
-- `AccountValidationError`, `AccountNotFoundError` - Error classes both surfaces map to their own status codes
-
-### `/lib/books.ts`
-Shared book logic (used by both API routes and MCP tools):
-- `createBook(db, userId, input)`, `updateBook(db, userId, bookId, input)` — note `name` is required on update; resend the current name to change only `upcomingDays`
-- `deleteBook(db, userId, bookId, confirmBookName)` - Deletes a book and, by FK cascade, its whole ledger. `confirmBookName` must match the stored name **exactly** — this guard is the only thing standing between MCP and an entire book, and the design doc's decision 3 records why it exists. Do not relax the comparison
-- `createDemoBook(db, userId)` - Creates a book and fills it with the `db/seed.ts` sample dataset. The only caller allowed to reach `seedBook`, and it always passes the id of the book it just created — `seedBook` deletes the target book's rows first, so a caller-supplied id would be a data-loss bug
-- `BookValidationError`, `BookNotFoundError` - Error classes
-
-### `/lib/issue-reports.ts`
-Shared issue-report logic (used by both API routes and MCP tools). These are scoped to `userId`, not `bookId`:
-- `createIssueReport()`, `listIssueReports()`, `updateIssueReport()`, `deleteIssueReport()`
-- `IssueReportValidationError`, `IssueReportNotFoundError` - Error classes
-
-### Other lib files
-- `/lib/payees.ts` - Payee reads and writes shared by API routes and MCP tools:
-  - `normalizePayeeName()` for deduplication (trims, collapses whitespace runs, straightens curly quotes; does **not** lowercase)
-  - `listPayees(db, bookId, {search, limit})`, `getPayee()`, `getPayeeLastAccountId()`, `getPayeeDetail()` — the reads behind `GET /payees`, `GET /payees/[id]`, `GET /payees/[id]/last-account` and the `list_payees`/`get_payee` tools. `getPayeeDetail()` is `getPayee` + `getPayeeLastAccountId`, which is why MCP folds the last-account route into `get_payee`
-  - `createPayee()`, `deletePayee()` — writes; `deletePayee` refuses a payee that still has transactions
-  - `PayeeValidationError`, `PayeeNotFoundError` - Error classes
-- `/lib/pricing.ts` - Security price data handling
-- `/lib/securities.ts` - Security reads and writes shared by API and MCP: `listSecurities()`, `createSecurity()`, `updateSecurity()`, `deleteSecurity()`. `deleteSecurity` refuses a security that still has investment splits — splits, lots, and prices all cascade from `securities`, so deleting one would erase its whole investment history while leaving the double-entry transactions in place. Errors: `SecurityValidationError`, `SecurityDuplicateError`, `SecurityNotFoundError`
-- `/lib/security-prices.ts` - Price writes and the price-entry queue shared by API and MCP: `setSecurityPrices()` (atomic batch upsert; takes the **raw** array so it can report which entries it discarded — `bulkPricesSchema` filters malformed items inside a `.transform()`, so a caller that parses first cannot say what it lost), `updateSecurityPrice()`, `deleteSecurityPrice()`, `listPricesDue()`. `updateSecurityPrice` treats a date change as a move, and refuses one onto an occupied date with `PriceEntryConflictError`. It checks for an occupant *before* opening the transaction so the delete never runs, then maps a duplicate-key violation from inside it to the same error — the pre-check reads committed rows only, so a concurrent move onto that date slips past it and collides at the unique index. Errors: `PriceEntryNotFoundError`, `PriceEntryConflictError`
-- `/lib/expression.ts` - `evaluateExpression()` parser for amount inputs (supports `+`, `-`, `*`, `/`, parens — e.g., user can type `12.50 + 3` in an amount field)
-- `/lib/csv.ts` - CSV export helpers (`csvEscape()`, `triggerDownload()`) used by the securities and income statement pages
-- `/lib/transactions-query.ts` - The single transaction filter, shared by the register route and `list_transactions`: `selectTransactionPage()` (which rows, in what order, and optionally how many) and `countTransactionsBefore()` (how many sort ahead of a given row — the register's scroll-to-transaction affordance). It returns rows carrying the **effective** date, not bare ids, because the route anchors its running-balance sum on the oldest row of the page. The two surfaces previously built this filter twice and differently — MCP with a subquery on `transaction_splits`, the route with an inner join and `GROUP BY`. They agreed; nothing held them in agreement
-  - Presentation stays with each surface: the route keeps `ensureId`'s page widening, `balanceAccountId`/`startingBalance`, the `includeMeta` envelope and its relational hydration; `list_transactions` keeps its own row shaping. Only "which rows, in what order" is shared. `balanceAccountId` and `includeMeta` are deliberately absent from MCP — the first never filters which transactions come back (it only picks which account's splits seed the route's own `startingBalance` sum, and `get_account_balance_history` answers the equivalent question for MCP); the second is an envelope switch and the tool always returns `totalCount`
-- `/lib/merge-transactions.ts` - `mergeTransactionsForDisplay()` interleaves projected (recurring) and actual transactions in date order for the transaction list
-- `/lib/plaid.ts` - Plaid API client (link tokens, access tokens, transaction sync fetch)
-- `/lib/plaid-tokens.ts` - Plaid connection reads and writes shared by API routes and MCP tools: `getPlaidStatus()` (the Sync page's four polls in one call), `listTokenAccounts()` (an optional `refresh` re-pulls the account list from Plaid — the only reason this read is not folded into `getPlaidStatus`; the MCP tool does not expose this option, only the HTTP route does — see `mcp/tools/plaid.ts`), `updatePlaidToken()`, `deletePlaidToken()`, `setTokenAccounts()`, `clearSyncData()`. `maskAccessToken()` and `toTokenListItem()` (exported so the token-creation route can mask its own inserted row the same way) live here too. `getTokenOr404()` is not exported: it returns the unmasked row, including the raw `accessToken`, so nothing outside this file can reach it — every caller-facing read goes through `toTokenListItem()` or `toPlaidAccountPayload()` instead. Its parameter order is `(db, bookId, tokenId, …)`, matching every other exported function here, on purpose: a transposed `(tokenId, bookId)` pair type-checks silently and would query the wrong row. Errors: `PlaidTokenNotFoundError`, `PlaidTokenValidationError`, `PlaidRefreshError` (a refresh's Plaid call, or the write reconciling its response, failed — kept distinct from a plain database failure so callers can tell them apart)
-- `/lib/plaid-transactions.ts` - Staged Plaid rows and transaction links shared by API routes and MCP tools: `listPendingPlaidTransactions()`, `getTransactionPlaidLink()`, `unlinkPlaidTransaction()`. Error: `PlaidLinkNotFoundError`
-- `/lib/plaid-sync.ts` - `syncToken()` — fetches Plaid transactions, stages in reconciliation table, runs auto-match
-- `/lib/plaid-auto-match.ts` - `autoMatchPendingTransactions()` — learned payee-based auto-matching
-- `/lib/recurring.ts`, `/lib/recurring-processing.ts`, `/lib/recurring-rules.ts` - Recurring transaction logic
-- `/lib/reports.ts` - Financial report logic (`groupSplits()`, `computeGrandTotal()`, `buildTopParentMap()`)
-- `/lib/utils.ts` - `cn()` utility for Tailwind class merging
-
-## API Route Patterns
-
-### Book-Scoped CRUD Pattern
-All data routes are under `/app/api/b/[bookId]/`. Every query is `await`ed
-(PostgreSQL via postgres.js is async — there is no `.all()`), every body is
-parsed by a zod schema from `/lib/schemas/`, and every handler wraps its work in
-try/catch so failures keep the `{ error }` envelope:
-
-```typescript
-// GET /api/b/[bookId]/resource/route.ts
-export async function GET(request: Request, { params }: { params: Promise<{ bookId: string }> }) {
-  try {
-    const { bookId } = await params;
-    const auth = await authenticateBookRequest(bookId);
-    if (isError(auth)) return auth.error;
-    const { db, bookId: numericBookId } = auth;
-
-    const results = await db.select().from(table).where(eq(table.bookId, numericBookId));
-    return NextResponse.json(results);
-  } catch (error) {
-    console.error("Error fetching resources:", error);
-    return NextResponse.json({ error: "Failed to fetch resources" }, { status: 500 });
-  }
-}
-
-// POST /api/b/[bookId]/resource/route.ts
-export async function POST(request: Request, { params }: { params: Promise<{ bookId: string }> }) {
-  try {
-    const { bookId } = await params;
-    const auth = await authenticateBookRequest(bookId);
-    if (isError(auth)) return auth.error;
-    const { db, bookId: numericBookId } = auth;
-
-    // Never spread the raw body into values(): the schema is what stops a
-    // client setting bookId, id, or any other column it does not own.
-    const parsed = createResourceSchema.safeParse(await request.json());
-    if (!parsed.success) {
-      return NextResponse.json({ error: parsed.error.issues[0].message }, { status: 400 });
-    }
-
-    const [created] = await db
-      .insert(table)
-      .values({ ...parsed.data, bookId: numericBookId })
-      .returning();
-    return NextResponse.json(created);
-  } catch (error) {
-    console.error("Error creating resource:", error);
-    return NextResponse.json({ error: "Failed to create resource" }, { status: 500 });
-  }
-}
-```
-
-Any id referencing another row (`parentId`, `payeeId`, `balanceAccountId`, …)
-must be confirmed to belong to this book before use — a zod schema proves it is
-an integer, not that it is *yours*. See `accounts/route.ts` for the pattern.
-
-### Transaction Creation Pattern
-See `/app/api/b/[bookId]/transactions/route.ts` for full example:
-1. Authenticate and get book DB
-2. Parse and validate input
-3. Validate splits balance to zero
-4. Check if investment splits required
-5. Create/lookup payee (normalized name matching)
-6. Insert transaction, splits, and investment splits atomically
-7. Return fully populated transaction with relations
-
-## Investment Transaction Handling
-
-### Creating Investment Transactions
-Use builder functions from `lib/accounting.ts`:
-```typescript
-// Buy 100 shares at $50.00 with $10 fee
-const splits = buildBuySplits({
-  securityAccountId: 5,
-  cashAccountId: 6,
-  feeAccountId: 7,
-  sharesMicros: 100_000_000,  // 100 shares
-  priceMicros: 50_000_000,    // $50.00
-  feesCents: 1000,            // $10.00
-});
-```
-
-### Investment Split Validation
-Before creating investment transactions, validate:
-1. Investment account exists and is active
-2. Security exists
-3. Shares and prices are positive and finite
-4. For sells: lot matching will be applied (FIFO)
-
-### Lot Tracking
-
-Lots and allocations are **derived state**, not something any write path is
-meant to populate directly. `rebuildLots()` in `/lib/lots-db.ts` is the only
-code that **inserts** rows into `investment_lots` or `investment_lot_allocations`
-at runtime — but it is not the only thing that ever writes those tables, and
-an earlier version of this section overstated that it was. Two other paths
-touch them:
-- The Moneydance importer's own superseded Pass 1/2 (below) insert
-  `investment_lots` directly while building the initial import — never
-  `investment_lot_allocations` — and a `rebuildLots` pass run later in the
-  same import (after stock splits are imported — see Moneydance Import
-  System below) regenerates `investment_lots` from the splits Pass 1/2 just
-  wrote, so their direct writes never survive the import.
-- Rows disappear via FK cascade (`onDelete: "cascade"` in `/db/schema.ts`)
-  wherever a transaction, investment split, or lot is deleted, without going
-  through `rebuildLots` at all: deleting a transaction cascades to its
-  investment splits and their lot allocations (the transaction DELETE route,
-  `tests/helpers/db-utils.ts` test teardown); deleting a lot cascades to its
-  allocations (`scripts/import-moneydance/overwrite.ts`, which deletes
-  `investment_lots` directly and never touches `investment_lot_allocations`
-  itself). Grepping TypeScript for `insert`/`update`/`delete` cannot see a
-  cascade declared in the DDL, which is exactly how this claim ended up wrong
-  more than once — check the schema, not just the call sites.
-
-Aside from those two paths, `rebuildLots` is the sole writer. It deletes and
-regenerates one (account, security) pair by replaying that pair's investment
-splits through the pure `replayLots()` engine in `/lib/lots.ts`.
-
-Every write path that can change a pair's split history calls `rebuildLots`
-inside the same DB transaction as the write itself: `createTransaction`,
-`updateTransaction` (for both the prior and current pairs, since an edit can
-move a split to a different security or account), and the transaction DELETE
-route. Recompute-over-increment is deliberate: transactions are freely
-backdated, so an incremental engine has no cheap way to answer which existing
-allocations a newly inserted earlier buy invalidates — recomputing the whole
-pair from its splits sidesteps that question entirely.
-
-`rebuildLots` takes `pg_advisory_xact_lock(accountId, securityId)` as its
-*first* statement, before it even runs the SELECT that reads the pair's
-splits. The lock has to come first because the rows it inserts are computed
-from that read — locking only at the later DELETE would leave the read itself
-unprotected, letting two concurrent rebuilds of the same pair each read a
-stale view and then both write from it. This locking only works when
-`rebuildLots` runs inside an explicit `db.transaction(...)`: the advisory lock
-is released at commit or rollback, so a caller that passes the top-level `db`
-instead of a `tx` acquires and releases it within its own implicit
-single-statement transaction and gets no protection across calls. Every
-production call site passes a real `tx`.
-
-The deploy-time backfill (`/scripts/rebuild-lots.ts`, run by
-`docker-entrypoint.sh` after migrations, guarded — see Critical Files
-Reference) does every book and pair inside **one transaction**, not one per
-pair. That's what makes its "allocations already exist" guard trustworthy:
-with per-pair commits, a crash partway through plus Docker's
-`restart: unless-stopped` on the `app` service would let the guard see partial
-progress as "already populated" on the next boot and silently skip the
-remaining pairs — serving zero cost basis for them while reporting success. A
-failure aborts container startup on purpose, because the alternative is
-serving that zero cost basis with no visible error. Note that this only
-catches a rebuild that *fails*. A rebuild that succeeds and is wrong — say
-from a bug in `replayLots` — starts up cleanly and serves incorrect cost
-basis and realized gains with no error anywhere, which no automated signal
-here can distinguish from a correct one.
-
-Short positions (sell-to-open) are **not** modeled — the `action` enum has no
-open/close discriminator, `lib/investments.ts` skips positions with
-`sharesMicros <= 0` in two places, and short-lot economics invert the normal
-basis/proceeds relationship. See the design doc's Out of Scope section before
-attempting to add them.
-
-**Floating transactions drift, latently.** `rebuildLots` materializes
-`effectiveDateSql` into `investment_lots.acquiredDate` at rebuild time — a
-snapshot, not a live value. A **floating** transaction's effective date
-advances to today every day until it's reconciled, but a floating buy's
-persisted `acquiredDate` freezes at whatever "today" was on the last rebuild
-and does not follow it. Left open, the lot looks older than it actually is
-(biasing term classification toward long-term) and its FIFO ordering can drift
-relative to fixed-date trades. This is checked as of this writing: production
-has zero floating transactions of any kind, so the drift is latent, not
-observed. The pair self-heals on any write that triggers `rebuildLots` for
-it — nothing to fix, nothing to migrate.
-
-The Moneydance importer's own Pass 1 (create buys and lots) and Pass 2 (FIFO
-sell matching) — see Moneydance Import System below — are now superseded by a
-`rebuildLots` call in its own phase near the end of the import, after stock
-splits are imported, and are slated for deletion in a later release alongside
-`investmentSplits.lotId`. The rebuild has to run after stock splits, not
-inside the investment transactions phase that writes Pass 1/2's rows: a sell
-that follows an imported stock split needs the split's "split" action row
-present before replay, or the engine matches it against pre-split share
-counts and corrupts cost basis, realized gains, and holding term.
-That column has no remaining **reader** in production code — Pass 2 above is
-still its only writer, setting it to a value nothing ever reads back — and
-the missing reader is exactly the precondition for dropping the column. The
-drop itself is deliberately deferred to a separate release. Adding the lots
-tables and columns was backward compatible,
-so this release can be rolled back from; dropping `lotId` in the same release
-would not be, because the previous image still queries that column on every
-transaction read and would 500 on rollback (the same trap CLAUDE.md records
-above for the session-hash migration).
-
-## Moneydance Import System
-
-### Import Architecture
-Located in `/scripts/import-moneydance/`, the importer runs this flow:
-1. **Accounts** - Creates chart of accounts + auto-generates investment cash accounts
-2. **Opening Balances** - Sets initial balances for accounts (loans, etc.)
-3. **Payees** - Imports and deduplicates payees
-4. **Standard Transactions** - Non-investment transactions
-5. **Investment Transactions** - Two-pass: buys first, then FIFO sell matching
-6. **Security Prices** - Historical price data
-7. **Stock Splits** - Corporate actions
-8. **Lot Rebuild** - Runs `rebuildLots` over every affected `(account, security)` pair, in `index.ts` (not inside the Investment Transactions phase). Must come after Stock Splits: a sell that follows an imported split needs the split's "split" action row on the books first, or the FIFO replay matches it against pre-split share counts and corrupts cost basis, realized gains, and holding term for that pair.
-9. **Recurring Reminders** - Converts eligible reminders into recurring rules
-
-### CLI Usage
-```bash
-npx tsx scripts/import-moneydance/index.ts <path-to-json> --book-id <id> [options]
-
-Options:
-  --book-id <id>    Book ID to import into (required)
-  --dry-run         Parse and validate without writing to database
-  --no-inactive     Skip inactive accounts
-  --no-hidden       Skip hidden accounts
-  --verbose         Show detailed progress
-```
-
-### Key Import Classes
-- `IdMapper` (in `types.ts`) - Maps Moneydance UUIDs to Counterpoise integer IDs
-- Phase parsers in `/parsers/` directory: `accounts.ts`, `opening-balances.ts`, `payees.ts`, `transactions.ts`, `investment-transactions.ts`, `security-prices.ts`, `stock-splits.ts`, `reminders.ts`
-
-### Important Import Details
-- Investment transactions use two-pass processing:
-  - Pass 1: Create all buys and lots
-  - Pass 2: Match sells to lots using FIFO
-  - Both passes' hand-written lot writes (Pass 1's inserts, Pass 2's `closedTransactionId` update and `investmentSplits.lotId` stamping — the importer never touches `investment_lot_allocations`) are superseded by a `rebuildLots` call over every affected pair in the Lot Rebuild phase, which runs after Stock Splits, not inside this phase (see Lot Tracking above and Import Architecture's stage list) — Pass 1/2's own lot bookkeeping is dead weight kept only until `investmentSplits.lotId` is dropped in a later release
-- Share conversion: Moneydance uses variable precision (typically 10^5), Counterpoise uses micros (10^6)
-- **Bug fix applied**: Sell transactions must store `sharesMicros` as positive values
-
-## Testing Guidelines
-
-### Test Organization
-```
-/tests
-  ├─ lib/           # Unit tests for business logic
-  ├─ api/           # Integration tests for API routes
-  ├─ app/           # App/page tests
-  ├─ components/    # Component tests
-  ├─ db/            # Database tests
-  ├─ hooks/         # Hook tests
-  ├─ import/        # Import functionality tests
-  ├─ mcp/           # MCP tools tests
-  ├─ e2e/           # Playwright E2E tests
-  └─ helpers/       # Test utilities (db setup, mocks)
-```
-
-### Writing Tests
-- Use Vitest for unit and integration tests
-- Run `npm run db:create-test-dbs` once to create per-worker PostgreSQL test databases
-- Each test worker gets its own isolated PostgreSQL database
-- Use test helpers from `/tests/helpers/db.ts` for setup
-- Follow existing patterns in `/tests/lib/accounting.test.ts`
-- Calling a lib function with the pooled `getDb()` does **not** cover the
-  reserved-connection path. Anything reachable from `withAdvisoryLock` needs a
-  test that goes through the lock — passing the pooled db is exactly how the
-  auto-match transaction bug reached production despite ~20 auto-match tests
-
-### Test Coverage
-Focus coverage on:
-- Business logic functions (`/lib/*.ts`)
-- API route validation
-- Investment calculations (critical for accuracy)
-
-## Component Development
-
-### UI Component Library
-Located in `/components/ui/`:
-- `Button.tsx`, `Input.tsx`, `Select.tsx`, `Tabs.tsx` - Form controls
-- `Modal.tsx` - Dialog container
-- `Card.tsx` - Card layout
-- `Toast.tsx` - Notification toasts
-- `DateRangeFilter.tsx` - Date range filtering
-- `DateInput.tsx` - Date input field
-- `Skeleton.tsx` - Loading skeleton placeholders
-- `EmptyState.tsx` - Empty state displays
-- `ThemeToggle.tsx` - Dark/light theme toggle
-- `Textarea.tsx` - Multi-line text input
-- `AccountAutocomplete.tsx` - Account selection with type-ahead search
-- `PayeeAutocomplete.tsx` - Payee selection with search
-- `SecurityAutocomplete.tsx` - Security selection with search
-- `CategoryIcon.tsx` - Renders a resolved category icon in a fixed-width box; the only component that knows an icon is an emoji
-
-### Feature Components
-Organized by domain:
-- `/components/accounts/` - Account management (AccountList, AccountForm, AccountCard, PositionsTable, IconPicker)
-- `/components/transactions/` - Transaction forms and lists (TransactionForm, TransactionList, SplitEditor, InvestmentPositionsSection, NoteIndicator)
-- `/components/securities/` - Security management (SecurityForm, PriceHistoryEditForm, StockSplitEditForm, UpdatePricesModal)
-- `/components/reports/` - Financial reports (ReportConfigPanel, ReportTable)
-- `/components/sync/` - Plaid sync (ReconciliationModal)
-- `/components/layout/` - Navigation (Navbar, BookNavbar, PriceEntryPill)
-- `/components/ThemeProvider.tsx` - Root theme provider
-- `/components/KeyboardShortcutProvider.tsx` + `/components/ui/KeyboardShortcutOverlay.tsx` - Global keyboard shortcut system. Register shortcuts in client components via `useRegisterShortcuts()` from `/hooks/useRegisterShortcuts.ts`; press `?` to view the overlay.
-  - A shortcut's `category` is typed from `SHORTCUT_CATEGORIES` in the provider, which is also the order the overlay lists categories in. **One list, on purpose.** The overlay used to keep a second ordering array and *filter* through it, so a category registered but not listed there lost its shortcuts with no error — the price entry pill's `P` never appeared in the overlay for that reason. Adding a category means adding it to `SHORTCUT_CATEGORIES`; nothing else compiles until you do.
-- `/components/ReportIssueModal.tsx` - In-app issue reporting (writes to `issue_reports` table; consumed by the `fix-reported-issue` skill)
-- `/components/transactions/PlaidBanner.tsx` - Banner shown on transactions linked to a Plaid reconciliation row
-
-### Client vs Server Components
-- Pages are Server Components by default
-- Use `"use client"` for interactive components
-- API data fetching happens in Server Components or via client fetch
-- Use `useBookId()` from `/hooks/useBookId.ts` for current book ID; `useIsMobile()` from `/hooks/useIsMobile.ts` for responsive logic; `useRegisterShortcuts()` from `/hooks/useRegisterShortcuts.ts` for keyboard shortcut registration
-
-### The Mobile/Desktop Breakpoint Is In Two Places
-
-The layout switch is **`lg` (1024px)**, and it is declared twice: as Tailwind
-`lg:` classes in `BookNavbar.tsx`, `transactions/page.tsx` and
-`accounts/page.tsx`, and as `MOBILE_BREAKPOINT` in `/hooks/useIsMobile.ts`.
-**The two must move together.** The CSS controls the navbar, sidebar, drawer and
-FAB; the hook is what `TransactionList.tsx` reads to render the card list
-instead of the register table. Change one alone and you get a half-switched
-layout — the sidebar hides while the crushed table stays.
-
-It is `lg`, not `md`, because the desktop navbar needs ~1019px. At `md` (768px)
-every portrait iPad rendered a navbar it could not fit, which pushed More,
-Search, Report an issue and the user menu off-screen entirely, and scrolled the
-whole document sideways. The book-name button is capped (`sm:max-w-[10rem]`) so
-that width stays bounded no matter how long a book is named.
-
-Two register tables are `table-fixed` with a `<colgroup>` mixing `rem` and `%`
-widths. Fixed widths are satisfied first, so when they exceed the container the
-percentage column collapses to **0px** and its text paints over its neighbour —
-this is how the Activity column disappeared. Keep the fixed columns under 36rem;
-`TransactionList.test.tsx` asserts that budget.
-
-## Common Patterns & Gotchas
-
-### Transaction Balance Validation
-Before inserting transactions, always validate:
-```typescript
-import { validateSplits } from "@/lib/accounting";
-if (!validateSplits(splits)) {
-  throw new Error("Transaction splits must sum to zero");
-}
-```
-
-### Investment Shares Sign
-Investment split `sharesMicros` should ALWAYS be positive. The `action` field determines direction:
-- Buy: positive shares added to position
-- Sell: positive shares subtracted from position (sign applied in calculation)
-
-### Date Formatting
-- Database stores dates as `YYYY-MM-DD` strings
-- Use `toDateString()` from `lib/formatters.ts` to convert Date objects
-- Use `formatDate()` for display formatting
-
-### Payee Normalization
-Payees are deduplicated using normalized names:
-```typescript
-import { normalizePayeeName } from "@/lib/payees";
-const normalized = normalizePayeeName(input); // Trims, collapses whitespace runs, normalizes curly quotes to '
-```
-
-**It does not lowercase** — "IKEA" and "Ikea" are deliberately distinct
-payees. The importer has its own copy, `normalizeName()` in
-`scripts/import-moneydance/utils/format.ts`, which must stay behaviorally
-identical or an import creates duplicates of payees the app already has.
-
-### Modules Reachable From a Route or an MCP Tool Must Not Run Code at Import
-
-Anything an API route or an `mcp/tools/*` module imports — directly or through
-a chain — must contain **declarations only** at the top level. No CLI guard, no
-`await`, no I/O.
-
-The reason is the bundler, not the module system. `scripts/bundle-node-entrypoints.mjs`
-esbuild-bundles `mcp/server.ts` into the single `/app/mcp-server.mjs` that the
-Docker MCP client runs. Once a module is inlined there, `import.meta.url` is the
-**bundle's** URL, so the standard main-module guard
-
-```ts
-const isMainModule =
-  process.argv[1] !== undefined &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-```
-
-evaluates **true** under `node /app/mcp-server.mjs` and runs whatever it guards.
-
-This shipped once. `lib/books.ts` imported `seedBook` from `db/seed.ts` for the
-demo-book feature, which pulled `db/seed.ts`'s CLI guard into the bundle, where
-it would have run `DROP SCHEMA public CASCADE` against the production database
-on the first MCP connection after deploy. `db/seed.ts` is now declarations only
-and its CLI lives in `db/seed-cli.ts`.
-
-Every ordinary gate is blind to this: `npm run mcp:dev` is `npx tsx mcp/server.ts`,
-where the imported module is separate and `argv[1]` is the server, so the guard
-is false — and vitest, `tsc` and ESLint never build the artifact at all.
-`tests/mcp/bundle-safety.test.ts` is the only check that does; it builds both
-bundle targets with the real config and asserts the output carries no
-`DROP SCHEMA` and no main-module guard. **Extracting code into `lib/` reads like
-a pure refactor, which is exactly why nobody looks** — check a module's
-top-level statements before making it reachable from a route or a tool.
-
-## Database Management
-
-### Schema Location
-- All tables (meta + book-scoped): `/db/schema.ts`
-
-### Making Schema Changes
-1. Edit `/db/schema.ts`
-2. Run `npm run db:generate` to create a migration in `/db/migrations/`
-3. Run `npm run db:migrate` to apply the migration
-4. Commit **all** generated files: the SQL migration (`db/migrations/NNNN_*.sql`), the snapshot (`db/migrations/meta/NNNN_snapshot.json`), and the updated journal (`db/migrations/meta/_journal.json`). Drizzle needs the snapshot to compute future diffs correctly.
-5. Update TypeScript types (Drizzle auto-generates)
-
-Migrations are NOT auto-applied by `getDb()`. Use `npm run db:migrate` (or `runMigrations()` in scripts). Test helpers handle migrations for tests.
-
-### ⚠️ Never Manually Alter the Production Database
-Do not use `ALTER TABLE`, `CREATE INDEX`, or other DDL statements directly against the production database. Drizzle tracks applied migrations by hash in its `__drizzle_migrations` table — manual changes desync the schema from the migration history, causing future migrations to fail (e.g., `column already exists`). Always make schema changes through `db/schema.ts` → `npm run db:generate` → deploy.
-
-### Database Location
-- Local PostgreSQL default: `postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev`
-- The `counterpoise_dev` database is created by `npm run db:create-test-dbs` — Docker Compose only creates the `counterpoise` database
-- Docker deployment database: `counterpoise`, reached as the **`counterpoise_app`** role, not the bootstrap one
-- Override with `DATABASE_URL` environment variable
-- Run `docker compose up -d` to start the local PostgreSQL instance
-- Inspect with `npx drizzle-kit studio` (see Essential Commands)
-
-### Two Roles, One Instance
-
-`counterpoise` (bootstrap superuser) and `counterpoise_app` (owner of the
-production database, **not** a superuser) share one PostgreSQL instance.
-
-The split exists because the bootstrap credential is *published* —
-`.env.example`, the README, and four hardcoded fallbacks (`db/index.ts:10`,
-`scripts/create-test-dbs.ts`, `scripts/docker-migrate.mjs`,
-`playwright.config.ts`) all carry `counterpoise:counterpoise`. That is
-deliberate: those open `counterpoise_dev`, `counterpoise_e2e` and
-`counterpoise_test_0..8`, which are disposable, and `tests/setup.ts` builds a
-*different* connection string per worker — so exporting one `DATABASE_URL` to
-re-point them would collapse all eight workers onto one database and destroy
-test isolation. The dev credential cannot move. Production moved instead.
-
-- `scripts/postgres-init/01-app-role.sh` creates the role from `APP_DB_PASSWORD`
-  on **first initialization only**. The postgres image skips
-  `/docker-entrypoint-initdb.d` once the volume holds a database, so setting
-  that variable later does nothing. Same trap as `POSTGRES_PASSWORD`, which
-  `initdb` reads and nothing else — editing it on a populated volume is
-  silently ignored, and the role's password changes only via `ALTER ROLE`.
-- `scripts/check-db-credential.sh` runs from `docker-entrypoint.sh` before
-  migrations and aborts startup when `DATABASE_URL` carries the published
-  default. It is **not** a `${APP_DB_PASSWORD:?}` guard in `docker-compose.yml`:
-  Compose interpolates the whole file before selecting services, so a required
-  variable there also blocks `docker compose up -d postgres`, `ps`, `logs` and
-  `down` (measured). Checking the connection string also catches the operator
-  who sets `APP_DB_PASSWORD` and forgets to update `DATABASE_URL`.
-- Migrating a pre-existing instance was a one-off, already done for the only
-  such deployment. The README no longer carries the procedure; recover it from
-  git history if it is ever needed again (`git log -S "REASSIGN OWNED BY" --
-  README.md`). The trap it documents still holds: **never** `REASSIGN OWNED BY`
-  — databases are shared objects, so it retitles every database the role owns
-  instance-wide, dev and test included. A per-database ownership loop is what
-  that migration needs.
-
-## Recurring Transactions
-
-### How Recurring Rules Work
-- Stored in `recurring_rules` table with frequency and date settings
-- Template splits stored in `recurring_template_splits`
-- `nextDate` field tracks next due date
-- `autoCreateDaysBefore` (default 0) lets a rule's transaction be auto-created up to N days before it's due
-- `businessDaysOnly` (default false) shifts an occurrence that lands on a weekend to the following Monday — see Business-Day Occurrences below
-- Process via POST to `/api/b/[bookId]/recurring/process`
-- Cron endpoint at `/api/cron/recurring` runs hourly (via Docker `scheduler` sidecar; same sidecar runs Plaid sync — see below)
-- `/lib/recurring-rules.ts` is the single home for rule CRUD and projections, shared by the API routes and the MCP recurring tools
-
-### Processing Due Rules
-1. Check if the *observed* date (`getOccurrenceDate(nextDate, businessDaysOnly)`) is `<= today` (plus `autoCreateDaysBefore`)
-2. Create new transaction from template, dated the observed date
-3. Calculate next date using `getNextDate()` function — from the **scheduled** `nextDate`, never the observed one
-4. Update rule's `nextDate`
-5. If past `endDate`, deactivate rule
-
-### Business-Day Occurrences
-`getOccurrenceDate(scheduledDate, businessDaysOnly)` in `/lib/recurring.ts` is
-the single place the shift is applied, and it is applied at *read* time — when a
-scheduled date becomes a transaction date — never written back into the rule.
-Storing the shifted date in `nextDate` would make `getNextDate()` compute the
-following occurrence from the Monday, so a rule due on the 15th would creep to
-the 17th and stay there.
-
-Everything that turns a rule into dates goes through it: `processRecurringRuleById`
-and `processAllRecurringRules` (`/lib/recurring-processing.ts`), the projection
-route (`/app/api/b/[bookId]/recurring/projected/route.ts`), the recurring page's
-due badge, "Next:" line and calendar, and the global search page's "Next Date"
-column (`lib/search.ts` carries `businessDaysOnly` through so the two pages
-cannot disagree). `isRecurringRuleDue()` takes `businessDaysOnly` as an optional
-4th argument and compares the observed date, so a rule whose occurrence falls on
-a Saturday is not due — and is not created — until the Monday it will be dated.
-
-`advanceNextDateToFuture()` (`/lib/accounting.ts`) needs the observed date too,
-for the opposite reason: it decides which scheduled occurrence to *store* when a
-rule is created or its schedule is edited. Comparing raw dates against today
-threw away a Saturday occurrence for a rule created on that Sunday or Monday,
-even though the rule would still have created the transaction on the Monday. It
-takes an optional `observe` transform rather than a `businessDaysOnly` flag:
-`lib/recurring.ts` already imports `lib/accounting.ts`, so a flag would need
-either a circular import or a second copy of the shift inside `accounting.ts`.
-Callers pass `(date) => getOccurrenceDate(date, businessDaysOnly)`; the default
-leaves dates alone.
-
-Two consequences worth knowing:
-- **Weekends are the whole definition of "non-business day."** Bank holidays are
-  not modeled, the same limitation `getNextBusinessDay()` in `/lib/accounting.ts`
-  documents. `advanceToBusinessDay()` next to it is the "when is this observed?"
-  variant — it leaves a weekday alone, where `getNextBusinessDay()` always moves.
-- **Two occurrences can collapse onto one observed date.** A daily rule's Saturday
-  and Sunday both land on Monday, and both transactions are created. That is two
-  occurrences observed the same day, not a duplicate.
-
-`endDate` still bounds the **scheduled** date, not the observed one: an occurrence
-scheduled on or before `endDate` counts even when its shift lands past it.
-
-## Plaid Bank Sync
-
-### How Plaid Sync Works
-1. User connects a bank via Plaid Link (stores access token in `plaidTokens`)
-2. User maps Plaid accounts to Counterpoise accounts (stored in `plaidAccounts`)
-3. Sync fetches new/modified/removed transactions from Plaid's transaction sync API
-4. Transactions are staged in `plaidTransactionReconciliation` as `pending`
-5. Auto-match runs on pending rows, then remaining items await manual reconciliation in the UI
-
-### Sync Trigger Points
-- **Manual**: POST `/api/b/[bookId]/sync/tokens/[id]/sync` — syncs a single token on demand. Sync is always per token: there is **no** per-account sync route. `DELETE` on that same path clears the token's staged sync data. The only route under `sync/accounts/[id]/` is `reconcile`
-- **Cron**: GET `/api/cron/plaid-sync` — syncs all tokens with linked accounts every 6 hours (via Docker `scheduler` sidecar at 12am, 6am, 12pm, 6pm). Requires `CRON_SECRET` bearer token. **Tokens with `isDemo = true` are excluded**, and `syncToken` refuses them outright. The seed gives a demo book a Plaid connection with a synthetic access token so the Sync page has something to show; it is linked to a liability account exactly like a real connection, so nothing but that column tells them apart. Without the exclusion, every demo book makes a guaranteed-failing call to Plaid every six hours and writes the rejection to `lastError`, which the Sync page renders as "Last sync failed". `syncToken`'s guard sits *above* its try block for that reason — the catch inside writes `lastError`, and a demo connection must not be recorded as a broken one.
-
-### Auto-Match Algorithm (`/lib/plaid-auto-match.ts`)
-Auto-match runs automatically after every sync (both manual and cron). It uses a learned payee map built from previously human-matched reconciliation rows:
-1. **Build payee map**: Query all `matched` reconciliation rows to create a map of normalized Plaid merchant names → Counterpoise payee IDs
-2. **For each pending row** (without `reviewReason`):
-   - Look up the Plaid merchant name in the payee map
-   - Find candidate transactions with: exact amount match, matching payee ID, on the mapped Counterpoise account
-   - Filter candidates to ±1 day of **either** the Plaid authorization date **or** the posted date (the union keeps delayed settlements in range — a transaction the user entered on the posted date matches even when the authorization date is 7+ days earlier — without matching anything in the gap between the two dates)
-   - If exactly one or more candidates remain, pick the first (ordered by date, then ID)
-   - Atomically set `resolutionStatus = 'matched'`, mark the local transaction as reconciled (and `isFloating = false`), and stamp its `date` (see date rule below)
-3. **Per-link uniqueness**: A transaction can only be auto-matched once per Plaid account link (but the same transaction can match on different linked accounts for transfers)
-
-**Auto-match date rule**: When stamping the matched transaction's `date`, prefer the Plaid **authorization** date (closest to when the user entered the transaction) over the **posted** date. Fall back to the posted date only when it lands 7+ days after authorization (a gap that large means the posted/settlement date is the meaningful one), or when Plaid provides no `authorizedDate`. The manual `match` action in the reconcile route applies the same rule, but **only to a floating transaction** — it settles one by clearing `isFloating` and stamping this date. A non-floating transaction keeps the date the user entered.
-
-### Sync Handling of Modified/Removed Transactions
-- **Modified**: If a previously matched/created row is modified by Plaid, it gets `reviewReason: 'plaid_modified'` with before/after metadata for human review
-- **Removed**: If a previously resolved row is removed by Plaid, it gets `reviewReason: 'plaid_removed'`
-- **Pending rows**: Modified pending rows are simply updated in place
-
-### Transaction Unlink
-- POST `/api/b/[bookId]/transactions/[id]/plaid/unlink` — Removes the Plaid link from a matched transaction (sets reconciliation back to `pending`, clears `isReconciled`). The `isReconciled` clear is real, not aspirational: before the MCP-parity Plaid work, the route reset only the reconciliation row and left `transactions.isReconciled` untouched. A transaction stuck marked reconciled would assert a match to a bank record that no longer links to it — and since `getStaleUnmatched()` only flags rows with `isReconciled = false`, it could never resurface in the sync health check either.
-
-### Reconciliation
-
-`/lib/plaid-reconcile.ts` owns the queue read and the six-action resolver, shared by `sync/accounts/[id]/reconcile` and the two MCP tools. Six things about it are easy to get wrong:
-
-- **It does not take an advisory lock**, unlike `syncToken`. It mutates one already-staged row by id inside `db.transaction()` on the pooled connection, so Postgres row locking is the whole concurrency story. CLAUDE.md's reserved-connection warning is about `/lib/plaid-sync.ts`, not this file.
-- **`resolveReconciliation` checks the action's required field as its first statement**, before the transaction opens. That ordering is what makes the route report `"transactionId is required for match"` (400) ahead of `"Reconciliation row not found"` (404). Moving the check after the row load silently swaps the two answers.
-- **A bank row that is already linked cannot be linked again** — `match`, `match_update_amount` and `create` all refuse when `matchedTransactionId` is set and `reviewReason` is null. Without it a repeated `create` inserts a second transaction and repoints the link at it, orphaning the first (still marked reconciled, attached to nothing, and invisible to `getStaleUnmatched()`, which filters `isReconciled = false`). The `reviewReason` half is load-bearing: the queue is "pending OR flagged for review", `ReconciliationModal` renders those buttons for anything in it, so a row Plaid has since modified is both already-linked and legitimately re-linkable. What stays closed is what the UI cannot reach — `loadReconciliationRow` matches on id, link and book but not queue membership, so MCP can address a fully-resolved row long after it left the queue.
-- **`unlink` un-reconciles its transaction, but only when nothing else matches it.** Per-link uniqueness is enforced per link, so one transaction can be matched on two links at once — that is how a transfer reconciles against both sides — and an unconditional clear would make a correctly-reconciled transfer a false positive in the health check.
-- **Matching a floating transaction settles it**: `isFloating` is cleared and `date` stamped with `pickMatchedDate` (shared with the auto-matcher, not reimplemented). A floating transaction's stored date is its original entry date, so clearing the flag alone would snap it backwards in the register. A non-floating transaction keeps its date untouched — see the auto-match date rule above.
-- **The action-conditional rules live once**, in `reconcileActionIssue()` in `/lib/schemas/sync.ts`. `reconcileSchema`'s `superRefine` calls it for the route; `resolveReconciliation` calls it for MCP, because `toolShape()` spreads a schema's `.shape` and drops object-level refinements. Two call sites, one implementation — the action list is already kept in step by hand in four places and must not become five.
-
-### Environment Variables
-| Variable | Purpose |
-| -------- | ------- |
-| `PLAID_CLIENT_ID` | Plaid API client ID |
-| `PLAID_SECRET` | Plaid API secret |
-| `PLAID_ENV` | Plaid environment (`sandbox`, `development`, `production`) |
-| `CRON_SECRET` | Shared secret for cron endpoint auth (also used by recurring cron) |
-
-### Key Classes and Functions
-- `syncToken(db, bookId, tokenId)` — Main sync entry point, returns `SyncTokenResult` with counts of added/modified/removed/auto-matched. Serialised per token by `withAdvisoryLock`, so the cron and a manual click cannot fetch the same Plaid pages twice; the loser gets `SyncTokenError` 409 rather than waiting. The whole sync therefore runs on a reserved connection — see Database Connection above
-- `SyncTokenError` — Error class with HTTP status (404 token not found, 400 invalid config)
-- `autoMatchPendingTransactions(db, bookId, linkIds)` — Returns count of successful auto-matches
-- `buildPayeeMap(db, bookId)` — Builds the learned payee map from historical matches
-- `isPlaidConfigured()` — Checks if all three Plaid env vars are set
-
-## Security Price Sync
-
-Security prices come from Tiingo's end-of-day API. Shared fetch logic lives in `/lib/tiingo.ts` (`fetchLatestTiingoPrices()`, `isTiingoConfigured()`); requires `TIINGO_API_KEY`.
-
-- **Manual**: The Update Prices modal on `/securities` fetches latest prices via POST `/api/b/[bookId]/security-prices/tiingo`, then saves user-reviewed values via `/security-prices/bulk`
-- **Cron**: GET `/api/cron/price-sync` fetches latest prices for all securities with `fetchPrices = true` across all books (Docker `scheduler` sidecar, Tue–Sat 6am ET — early morning after each market day). Requires `CRON_SECRET` bearer token; skips when `TIINGO_API_KEY` is unset
-- The cron never overwrites an existing price for the same (security, date) — manual entries always win, and re-runs after market holidays are no-ops (Tiingo returns the prior market day's close, whose date is already recorded)
-- Securities with `fetchPrices = false` (e.g. options, which have no Tiingo feed) are excluded and rely on manual price entry
-
-### Fixed-Price Securities
-A security with a non-null `fixedPriceMicros` is valued at that price forever — a money market fund at a $1.00 NAV. It is set on the Add/Edit Security form and cleared by unticking the same checkbox.
-
-- **One rule, applied at the read sites.** `fixedPriceRow()` in `/lib/investments.ts` builds the synthetic price row, dated today so it wins every "newest price" comparison. `getLatestPrices()` uses it (covering `getPositions`, `getMarketValuesByAccount`, the securities list, the pill, and MCP's `get_security_detail`, which builds its position from `getPositions`), and the security detail route uses it directly — that route replays positions itself instead of calling `getPositions`, which is why it is the one place that needs its own call
-- The fixed price **supersedes** any `securityPrices` rows, including ones recorded before the security was marked fixed-price. Those rows stay on the books as history and still render in the Price History tab; they no longer value the position
-- **Setting a fixed price forces `fetchPrices = false`** in both `createSecurity()` and `updateSecurity()`, which the securities PUT route and `update_security` both call. Clearing the fixed price leaves fetching off — turning it back on is the user's call. The Tiingo cron and the Update Prices modal *also* filter on `fixedPriceMicros` rather than trusting that coupling
-- The Update Prices modal renders a fixed-price security read-only ("Fixed at $1.00") with no Fetch checkbox, and the securities list marks its price cell `fixed`
-- The investment entry form prefills Price from the fixed price when the user **picks** the security (`selectSecurity()` in `/components/transactions/useInvestmentEntry.ts`) and labels the field "Price (fixed)". The bare `setSelectedSecurityId()` setter deliberately does not prefill: `TransactionForm` uses it to restore a saved transaction, which must keep the price it was recorded at. The field stays editable
-- Switching from a fixed-price security to an ordinary one clears the prefill, but **only if the field still holds exactly what was auto-filled** — a price the user typed survives a security change, as it does everywhere else in that form
-- Ticking Fixed price with no usable amount blocks submission rather than sending `null`, which would read as "not fixed" while the box still shows ticked. Unticking the box is the only way to clear a fixed price
-- Prices are written into form fields by `formatPriceMicrosInput()` in `/lib/formatters.ts` — at least cents, never rounded to them. That text is what the form sends back on the next save, so rounding a NAV like 1.0025 there would silently rewrite the security's value
-
-### Quick Price Entry Pill
-Manually-priced securities are prompted for via a navbar pill (`/components/layout/PriceEntryPill.tsx`), visible on every book page:
-- GET `/api/b/[bookId]/securities/prices-due` returns securities with `fetchPrices = false`, no fixed price, an open position (via `getPositions()`), and no price for the due date
-- The due date is the newest price date across `fetchPrices = true` securities (the cron keeps these current, so this tracks the last market day through holidays); falls back to the last calendar weekday when the book has no fetchable prices
-- The pill (`● N prices due`) opens a popover form: one row per security (symbol, input prefilled with the last saved mark), first field focused with value selected, Enter saves all via `/security-prices/bulk`, Escape closes
-- Pressing `P` opens the popover from any book page; there is no dismissal — the pill is quiet until prices are entered
-- After a save the pill dispatches a `counterpoise:security-prices-saved` window event (exported as `PRICES_SAVED_EVENT`); the transactions page listens and refreshes so the positions table picks up new market values
-- Lists derive from open positions, so rolled/expired options drop off without configuration
-
-## PostHog Analytics
-
-Counterpoise includes PostHog integration for usage analytics. No financial data is captured — events track actions (e.g., "transaction created") with metadata like `bookId` and `splitCount`.
-
-### Environment Variables
-
-| Variable | Context | Purpose |
-| -------- | ------- | ------- |
-| `NEXT_PUBLIC_POSTHOG_KEY` | Build-time | Public project API key (inlined into JS bundle) |
-| `NEXT_PUBLIC_POSTHOG_HOST` | Build-time | PostHog instance URL |
-| `POSTHOG_PERSONAL_API_KEY` | Runtime (server) | Personal API key for querying PostHog REST API |
-
-In Docker, the `NEXT_PUBLIC_*` vars are passed as **build args** in `docker-compose.yml` → `Dockerfile` so Next.js can inline them. The personal API key is a runtime env var via `env_file`.
-
-### Client-Side Tracking
-
-- **`/app/posthog-provider.tsx`** — Wraps app with `PostHogProvider`, initializes SDK, auto-identifies returning users via `/api/auth/me`
-- **`/app/posthog-pageview.tsx`** — Captures `$pageview` on SPA route changes (pathname + search params)
-- **`/lib/posthog-client.ts`** — Helpers: `identifyUser(userId)` (called on login), `resetUser()` (called on logout)
-
-### Server-Side Event Capture
-
-- **`/lib/posthog-server.ts`** — Singleton `posthog-node` client with `captureEvent(userId, event, properties?)`. Returns null/no-op if PostHog is not configured.
-
-Instrumented server events:
-| Event | Route | Properties |
-|-------|-------|-----------|
-| `transaction_created` | POST `/api/b/[bookId]/transactions` | `bookId`, `hasInvestmentSplits`, `splitCount` |
-| `transaction_updated` | PUT `/api/b/[bookId]/transactions/[id]` | `bookId`, `fieldsChanged`, `splitsAccountsChanged` |
-| `transaction_deleted` | DELETE `/api/b/[bookId]/transactions/[id]` | `bookId` |
-| `account_created` | POST `/api/b/[bookId]/accounts` | `bookId`, `type`, `subtype` |
-| `recurring_rule_created` | POST `/api/b/[bookId]/recurring` | `bookId` |
-| `report_generated` | GET `/api/b/[bookId]/reports/*` | `bookId`, `reportType` |
-| `sync_transaction_matched` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
-| `sync_transaction_created` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
-| `sync_transaction_ignored` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
-| `sync_transaction_kept_local` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
-| `sync_transaction_unlinked` | POST `/api/b/[bookId]/transactions/[id]/plaid/unlink` | `bookId` |
-| `sync_transaction_amount_updated` | POST `/api/b/[bookId]/sync/accounts/[id]/reconcile` | `bookId` |
-| `sync_transaction_auto_matched` | `autoMatchPendingTransactions()` in `/lib/plaid-auto-match.ts` (one per match, attributed to the book owner) | `bookId` |
-
-### PostHog Query API Client
-
-- **`/lib/posthog-query.ts`** — `runHogQLQuery(query)` runs HogQL via `POST /api/projects/@current/query/` (the `@current` alias is required for project-scoped personal API keys). Also `escapeHogQLString()` and `parsePropertiesColumn()` (HogQL returns `properties` as a JSON string). The legacy `/api/event/` endpoint is deprecated and silently returns only ~1 day of events — never use it for historical analysis.
-
-### CLI Event Export
-
-```bash
-npx tsx scripts/posthog-export.ts [--days N] [--output FILE]
-```
-- Batch exports events via the PostHog Query API (HogQL, paginated) for analysis
-- `--days N` — Lookback period (default: 7)
-- `--output FILE` — Write JSON to file (omit for stdout)
-- Requires `POSTHOG_PERSONAL_API_KEY` and `NEXT_PUBLIC_POSTHOG_HOST`
-
-### MCP Tool: `analyze_usage`
-
-Defined in `/mcp/tools/usage.ts`. Queries PostHog for event summaries.
-- **Input**: `days` (1–90, default 7), optional `eventType` filter
-- **Output**: `totalEvents`, `eventCounts` (sorted by frequency), `recentEvents` (last 20)
-- Requires `POSTHOG_PERSONAL_API_KEY` and `NEXT_PUBLIC_POSTHOG_HOST`
-
-## MCP Server
-
-Counterpoise includes a Model Context Protocol (MCP) server that gives AI assistants read and write access to accounting data. The server uses stdio transport and runs via `npm run mcp:dev`.
-
-### Authentication
-
-All MCP tools require a valid `COUNTERPOISE_API_KEY` environment variable. The key is verified at startup via `initMcpAuth()` in `/mcp/auth.ts`, cached in memory, and periodically revalidated so revoked keys stop working without a process restart.
-
-**How it works:**
-1. User creates an API key in the UI at `/account` (ApiKeyManager component)
-2. Key is `cpk_` + 48 hex chars; only the scrypt hash is stored in the `apiKeys` table
-3. User provides the key to their MCP client via environment variable
-4. On startup, `initMcpAuth()` looks up candidates by `keyPrefix` (first 8 chars), then verifies with scrypt
-5. Each tool call checks auth via `requireAuth()` or `requireBookAuth(bookId)`, and `requireAuth()` periodically re-checks that the key still exists
-
-**Auth helpers** in `/mcp/auth.ts`:
-- `requireAuth()` — returns `McpAuth` (userId, keyId) or an MCP error response
-- `requireBookAuth(bookId)` — chains auth + book ownership check (book must belong to the user)
-- Both return `{ isError: true, content: [...] }` on failure, checked via `"isError" in result`
-
-### MCP Client Configuration
-
-```json
-{
-  "mcpServers": {
-    "counterpoise": {
-      "command": "npm",
-      "args": ["run", "mcp:dev"],
-      "cwd": "/path/to/counterpoise",
-      "env": {
-        "COUNTERPOISE_API_KEY": "cpk_..."
-      }
-    }
-  }
-}
-```
-
-### Docker MCP Client Configuration
-
-When running Counterpoise via Docker Compose, configure MCP clients to use `docker exec` with the API key passed via `-e`:
-
-```json
-{
-  "mcpServers": {
-    "counterpoise": {
-      "command": "docker",
-      "args": ["exec", "-i", "-e", "COUNTERPOISE_API_KEY=cpk_...", "counterpoise-app-1", "node", "/app/mcp-server.mjs"]
-    }
-  }
-}
-```
-
-**Prerequisites:**
-- Generate an API key at `/account` in the web UI
-- The `app` container must be running (`docker compose up -d`)
-- `/app/mcp-server.mjs` is bundled at image build time by `scripts/bundle-node-entrypoints.mjs` (Dockerfile builder stage)
-- Each user provides their own API key in the MCP client config — no container rebuild needed
-
-### Environment Variables
-
-| Variable | Purpose |
-| -------- | ------- |
-| `COUNTERPOISE_API_KEY` | User API key for MCP authentication (required) |
-| `DATABASE_URL` | PostgreSQL connection string (defaults to local dev DB) |
-
-### Available Tools
-
-**Books:**
-- `list_books` — List books the authenticated user owns
-- `create_book` — Create a new accounting book
-- `update_book` — Rename a book, and optionally change its recurring-transaction projection window. `name` is always required; resend the current name to leave it unchanged
-- `create_demo_book` — Create a new book pre-filled with realistic sample data (about three years of transactions)
-- `delete_book` — Permanently delete a book and all of its data; requires `confirmBookName` to match the book's exact name
-
-**Accounts** (require `bookId`):
-- `list_accounts` — List accounts with balances, filterable by type and as-of date
-- `get_account_tree` — Hierarchical account tree grouped by type
-- `create_account` — Create an account in the chart of accounts
-- `update_account` — Update an account's fields
-- `delete_account` — Delete an account; refuses if it still has transactions or sub-accounts
-
-**Transactions** (require `bookId`):
-- `list_transactions` — List transactions with splits, payees, and investment data; filter by one account (`accountId`) or several (`accountIds`), by payee, and by date, with pagination. An out-of-book `payeeId` is an error, not an empty list
-- `search` — Search accounts, payees, and transactions by text or amount
-- `create_transaction` — Create a double-entry transaction with splits (must sum to zero)
-- `update_transaction` — Update an existing transaction's fields or replace splits
-- `delete_transaction` — Delete a transaction and all of its splits
-
-**Payees** (require `bookId`):
-- `list_payees` — List payees with transaction count and most recent transaction date; optional `search` (case-insensitive substring) and `limit`
-- `get_payee` — Get one payee, with its transaction count and last-used account
-- `create_payee` — Create a payee; refuses an exact-name repeat in the same book
-- `delete_payee` — Delete a payee; refuses if it still has transactions
-
-**Recurring** (require `bookId`):
-- `list_recurring_rules` — List recurring transaction rules with their payees and template splits
-- `create_recurring_rule` — Create a recurring transaction rule; template splits must sum to zero
-- `update_recurring_rule` — Update a rule; passing `templateSplits` replaces every existing split
-- `delete_recurring_rule` — Delete a rule and its template splits; transactions it already created are kept
-- `get_projected_transactions` — Project the transactions active rules will create over a date range, without creating anything
-- `list_recurring_transactions` — List transactions a recurring rule actually created in a date range
-- `process_recurring_rules` — Create the transactions rules are due for. With `processAll`, a rule that is not due is skipped, so a repeat call creates nothing more. With `ruleId`, that one rule is forced: its next occurrence is created whether or not it is due, so two identical calls create two transactions
-
-**Reports** (require `bookId`):
-- `get_income_statement` — Income/expense totals for a date range
-- `get_report_data` — Raw split data for custom analysis
-- `get_account_balance_history` — Running balance over time for an account
-- `get_realized_gains` — Realized capital gains/losses per lot disposed of, with short/long-term totals
-
-**Investments** (require `bookId`):
-- `get_investment_positions` — Current positions with shares, cost basis, market value, gain/loss
-- `list_securities` — List every security in a book with shares, cost basis, latest price, market value, and income received
-- `get_security_detail` — Security info, price history, transactions, and position. `includeLots` adds the open FIFO lots; dividend and capital-gain rows carry the cash received
-- `create_security` — Create a new security (ETF, mutual fund, or stock); fails if the symbol already exists in the book
-- `update_security` — Update a security's name, symbol, type, fetch setting, or fixed price; setting a fixed price forces fetching off
-- `delete_security` — Delete a security; refuses when it still has investment transactions
-
-**Security prices** (require `bookId`):
-- `set_security_prices` — Record manual prices; malformed entries are skipped and reported in `discarded`
-- `update_security_price` — Change a recorded price, or move it to another date
-- `delete_security_price` — Delete one recorded price
-- `list_prices_due` — Securities needing a manual price for the most recent market day
-- `fetch_tiingo_prices` — Fetch the latest end-of-day prices from Tiingo; records nothing
-
-**Issue Reports:**
-- `create_issue_report` — File a bug or improvement report about Counterpoise itself
-- `list_issue_reports` — List the authenticated user's own issue reports
-- `update_issue_report` — Change the description, type, or status of an issue report
-- `delete_issue_report` — Delete an issue report
-
-**System:**
-- `get_system_status` — Report the health of Counterpoise's background jobs (backup, backup pruning, recurring processing, bank sync, security price sync, search reindex)
-
-**Analytics:**
-- `analyze_usage` — Query PostHog for event summaries (requires PostHog env vars)
-
-**Plaid sync** (require `bookId`):
-- `get_plaid_status` — Every bank connection (access token masked), the count of transactions waiting to be reconciled, which accounts hold unmatched manually-entered transactions, and every Plaid account mapped to a Counterpoise account. Folds four separate UI polls into one call
-- `list_plaid_token_accounts` — List a connection's bank accounts and each one's Counterpoise mapping. `refresh` re-pulls the list from Plaid first; otherwise the read is local only
-- `update_plaid_token` — Full replace of a connection's institution name and item id. This tool cannot set the access token: a Plaid access token is re-obtainable only through the Link browser flow, so a hallucinated value would destroy the connection with no way to recover it
-- `delete_plaid_token` — Delete a connection, its account mappings, and its entire reconciliation history — the staged unreconciled transactions **and** every already-resolved row (matched, created, ignored)
-- `set_plaid_token_accounts` — Map a connection's bank accounts to Counterpoise accounts. Pass `counterpoiseAccountId: null` to unmap one
-- `sync_plaid_token` — Fetch new, changed, and removed transactions from Plaid for one connection, stage them, and run auto-match. Reaches Plaid and changes data; a demo connection cannot sync and says so
-- `clear_plaid_sync_data` — Discard a connection's staged transactions and reset its sync cursor, so the next sync starts over. Touches only this database; never calls Plaid
-- `list_pending_plaid_transactions` — Staged bank transactions nothing has reconciled yet. Their ids are synthetic placeholders — never pass them to `create_transaction`, `update_transaction`, `delete_transaction`, or any other transaction tool
-- `get_transaction_plaid_link` — The staged Plaid row a transaction is matched to, or `null` if the transaction was entered by hand
-- `unlink_plaid_transaction` — Remove a transaction's Plaid link. The bank transaction returns to the pending queue; the local transaction stops being reconciled
-- `get_reconcile_candidates` — The reconciliation queue for one linked bank account: staged transactions awaiting a decision, each with up to five ranked candidate matches and a suggested counter account
-- `reconcile_plaid_transaction` — Resolve one staged bank transaction: match it to an existing transaction, match and rewrite that transaction's amount, create a new transaction from it, ignore it, keep what you already have, or unlink an already-resolved row (which also un-reconciles its transaction unless another bank row still matches it). Linking a row that is already linked is refused
-
-### Tool Annotations
-
-Every `registerTool` call passes one preset from `/mcp/tools/_annotations.ts`: `READ`, `READ_NETWORK`, `CREATE`, `UPDATE`, `DESTRUCTIVE`, `WRITE_NETWORK`. A client can tell a query from a write without reading the description.
-
-`WRITE_NETWORK` is for a tool that both changes data and leaves the process to do it. `sync_plaid_token` is currently its only user — distinct from `READ_NETWORK`, which is for a tool that reaches out but changes nothing (`fetch_tiingo_prices`, `analyze_usage`, `list_plaid_token_accounts`). The presets are enumerated by hand in `tests/mcp/annotations.test.ts`. A preset added to `_annotations.ts` but not to that test's `checked` set escapes the hygiene checks.
-
-### Shared Transaction Logic
-
-`/lib/transactions.ts` contains `createTransaction()`, `updateTransaction()`, and `deleteTransaction()` shared by both API routes and MCP tools. Error classes:
-- `TransactionValidationError` — invalid input (splits don't balance, missing fields)
-- `TransactionNotFoundError` — transaction ID doesn't exist in the book
-
-### API Key Management
-
-- **Routes**: `/app/api/auth/api-keys/route.ts` (GET, POST), `/app/api/auth/api-keys/[id]/route.ts` (DELETE)
-- **UI**: `/components/account/ApiKeyManager.tsx` on the `/account` page
-- **Library**: `/lib/api-keys.ts` — `generateApiKey()`, `hashApiKey()`, `verifyApiKey()`, `getKeyPrefix()`
-
-## Critical Files Reference
-
-| File | Purpose |
-|------|---------|
-| `/db/schema.ts` | All table definitions and relations (meta + book-scoped) |
-| `/db/index.ts` | Database connection (`getDb()`) with postgres.js driver, `runMigrations()` for explicit migration |
-| `/db/create-book.ts` | Migration folder path constant |
-| `/lib/accounting.ts` | Core accounting logic and validation |
-| `/lib/investments.ts` | Position and market value calculation (cost basis now comes from lots, not this file); `fixedPriceRow()` for fixed-price securities |
-| `/lib/lots.ts` | Pure FIFO replay engine (no DB) |
-| `/lib/lots-db.ts` | `rebuildLots()` — the only inserter of lots and allocations at runtime (rows also disappear via FK cascade on deletes) |
-| `/lib/realized-gains.ts` | Realized gain/loss query shared by the report route and MCP |
-| `/lib/transactions-query.ts` | Shared transaction filter, page select, and position count |
-| `/lib/security-prices.ts` | Manual price writes, atomic batch upsert, and the price-entry queue |
-| `/scripts/rebuild-lots.ts` | Guarded backfill, run by the container entrypoint |
-| `/scripts/check-db-credential.sh` | Aborts container startup when `DATABASE_URL` uses the published default credential |
-| `/scripts/postgres-init/01-app-role.sh` | Creates the `counterpoise_app` role on first postgres initialization |
-| `/lib/reports.ts` | Financial report logic |
-| `/lib/api-auth.ts` | API authentication and book access |
-| `/lib/api-keys.ts` | API key generation, hashing, and verification |
-| `/lib/auth.ts` | Password hashing and verification |
-| `/lib/session.ts` | Session management |
-| `/lib/transactions.ts` | Shared create/update transaction logic (used by API routes and MCP) |
-| `/lib/recurring-rules.ts` | Shared recurring-rule reads and writes (used by API routes and MCP) |
-| `/lib/advisory-lock.ts` | `withAdvisoryLock()` — session-scoped lock on a reserved connection; its callback's `db` is not the pooled one |
-| `/lib/plaid-tokens.ts` | Plaid connection reads and writes; owns access-token masking |
-| `/lib/plaid-transactions.ts` | Staged Plaid rows and transaction links |
-| `/lib/plaid-reconcile.ts` | Reconciliation queue read and the six-action resolver, shared by the route and MCP |
-| `/lib/plaid-sync.ts` | Plaid transaction sync — fetches, stages, and auto-matches |
-| `/lib/plaid-auto-match.ts` | Learned payee-based auto-matching for Plaid transactions |
-| `/app/api/cron/plaid-sync/route.ts` | Cron endpoint for periodic Plaid sync (every 6 hours) |
-| `/lib/tiingo.ts` | Shared Tiingo price fetching (`fetchLatestTiingoPrices()`, `isTiingoConfigured()`) |
-| `/app/api/cron/price-sync/route.ts` | Cron endpoint for automatic security price updates (Tue–Sat 6am ET) |
-| `/lib/posthog-server.ts` | Server-side PostHog singleton and `captureEvent()` |
-| `/lib/posthog-client.ts` | Client-side PostHog helpers (`identifyUser`, `resetUser`) |
-| `/hooks/useBookId.ts` | Client hook for current book ID |
-| `/app/api/b/[bookId]/transactions/route.ts` | Main transaction API |
-| `/scripts/release.sh` | Version bump, tag, push, and PR creation |
-| `/scripts/deploy.sh` | Build, move tag, rebase dev; resumable via `.git/DEPLOY_FORK_POINT` |
-| `.github/workflows/ci.yml` | CI pipeline for PRs to main |
-| `/scripts/import-moneydance/index.ts` | Import orchestration |
-| `/scripts/posthog-export.ts` | CLI tool for exporting PostHog events |
-| `/mcp/auth.ts` | MCP API key authentication and book access verification |
-| `/mcp/server.ts` | MCP server entry point (connects the transport, registers no tools itself) |
-| `/mcp/register-all.ts` | `registerAllTools()` — the single place every `register*Tools` module is wired in |
-| `/scripts/bundle-node-entrypoints.mjs` | Bundles the MCP server and lot rebuild script into `dist/` for the Docker image |
-| `/scripts/bundle-config.mjs` | The esbuild options both the bundler and `tests/mcp/bundle-safety.test.ts` build with — shared so the test cannot check a different artifact than Docker ships |
-| `/db/seed.ts` | Sample dataset builders. **Declarations only — no top-level side effects.** Application code imports it (`lib/books.ts` → demo route + `create_demo_book`), so anything running at import time gets bundled into `/app/mcp-server.mjs` and runs on MCP startup |
-| `/db/seed-cli.ts` | CLI entry for `npm run db:seed`. Holds the main-module guard that used to live in `db/seed.ts`, where — once bundled — it matched `node /app/mcp-server.mjs` and dropped the production schemas on every MCP server start |
-| `/mcp/tools/usage.ts` | MCP tool for querying PostHog analytics |
-
-## Debugging Tips
-
-### View SQL Queries
-Drizzle doesn't log by default. Add logging in API routes:
-```typescript
-const result = db.select()...;
-console.log("Query result:", result);
-```
-
-### Check Split Balance
-If transaction creation fails, log the split total:
-```typescript
-const total = splits.reduce((sum, s) => sum + s.amount, 0);
-console.log("Split total (must be 0):", total);
-```
-
-### Investment Position Issues
-Check these common causes:
-1. Incorrect sign in `sharesMicros` (should be positive)
-2. Missing or incorrect `action` field
-3. Price or shares not converted to micros
-4. Lot tracking out of sync (re-run import if needed)
+### Read the guide before you touch these
+
+Each line is a rule that has already cost this project a defect. The guide holds
+the incident that produced it.
+
+- **Merge release PRs with a merge commit, never a squash.** This preserves
+  release ancestry when reconciling `dev` with `main` →
+  [guides/release-and-deploy.md](guides/release-and-deploy.md)
+- **Never alter the production database with direct DDL.** Drizzle tracks
+  applied migrations by hash, and a manual change desyncs the schema from the
+  migration history → [guides/database-management.md](guides/database-management.md)
+- **A module an API route or an MCP tool imports must contain declarations
+  only.** No CLI guard, no top-level `await`, no I/O. A bundled main-module
+  guard once nearly ran `DROP SCHEMA public CASCADE` against production →
+  [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md)
+- **`withAdvisoryLock` hands its callback a different `db`.** It is bound to a
+  reserved connection that has no `transaction()`. Go through
+  `getDbForConnection`, never `drizzle(connection)` →
+  [guides/architecture.md](guides/architecture.md)
+- **Lots and allocations are derived state.** `rebuildLots()` is the only
+  runtime inserter. The transaction CRUD paths call it inside the same
+  transaction as the write; the importer and the seed are the exceptions, and
+  rebuild per pair afterwards → [guides/investments.md](guides/investments.md)
+- **Never spread a raw request body into `values()`.** The zod schema is what
+  stops a client setting `bookId` or `id`. An id that references another row
+  must also be proved to belong to this book →
+  [guides/api-route-patterns.md](guides/api-route-patterns.md)
+- **`isError(auth)` puts the response on `auth.error`, not `auth.response`** →
+  [guides/library-reference.md](guides/library-reference.md)
+- **`normalizePayeeName()` does not lowercase.** "IKEA" and "Ikea" are
+  deliberately distinct payees → [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md)
+- **The mobile/desktop breakpoint is declared in two places** — Tailwind `lg:`
+  classes and `MOBILE_BREAKPOINT`. They must move together →
+  [guides/components-and-ui.md](guides/components-and-ui.md)
+- **A tool's `inputSchema` must go through `toolShape()`.** Spreading `.shape`
+  drops `.refine()` and `.superRefine()`, so the tool accepts input the HTTP
+  route rejects → [guides/mcp-server.md](guides/mcp-server.md)

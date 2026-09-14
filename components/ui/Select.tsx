@@ -33,7 +33,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
           ref={ref}
           id={id}
           className={cn(
-            "block w-full rounded-md border border-border text-fg bg-surface-inset focus:border-border-focus focus:outline-none focus:ring-1 focus:ring-border-focus text-sm",
+            "block w-full rounded-md border border-border text-fg bg-surface-inset focus:border-border-focus focus:outline-hidden focus:ring-1 focus:ring-border-focus text-sm",
             isCompact ? "px-2 py-0 h-[30px]" : "px-3 py-2",
             error && "border-border-danger focus:border-border-danger focus:ring-border-danger",
             className

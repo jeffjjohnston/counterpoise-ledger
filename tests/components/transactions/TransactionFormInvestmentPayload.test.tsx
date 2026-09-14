@@ -3,9 +3,8 @@
 // afterEach, setup(), and enterInvestmentMode()) from
 // TransactionFormInvestment.test.tsx instead of importing it.
 //
-// This is a gate: a later task verifies this file's integrity by checking
-// that `git log` shows exactly one commit touching it. If it imported a
-// shared fixture module, someone could change that fixture and silently
+// The duplication is deliberate. If it imported a shared fixture module,
+// someone could change that fixture and silently
 // change what this gate asserts while this file itself stayed untouched,
 // and the integrity check would still pass. Self-containment is what makes
 // the check mean something. Do not "fix" this duplication — it is
@@ -30,9 +29,9 @@
 // so only the compact branch is exercised — same as the existing
 // TransactionFormInvestment.test.tsx suite. The full/desktop branch (a
 // separate JSX tree with different labels, e.g. "Investment Account" instead
-// of "Inv. Account") is untested by this file. A later task collapsing the
-// two investment JSX trees into one component must account for both label
-// sets; this gate cannot see whether that collapse preserves the desktop
+// of "Inv. Account") is untested by this file. Collapsing the two investment
+// JSX trees into one component would have to account for both label sets;
+// this file cannot see whether such a change preserves the desktop
 // branch's behavior.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";

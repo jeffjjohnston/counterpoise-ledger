@@ -122,8 +122,6 @@ export interface ImportStats {
     buys: number;
     sells: number;
     dividends: number;
-    lots: number;
-    orphanedSells: number;
   };
   securityPrices?: {
     total: number;
@@ -150,17 +148,6 @@ export interface TransactionSplit {
   pamt?: number; // Cash amount in cents
   acctid?: string;
   secid?: string; // Security ID (for "sec" splits)
-}
-
-export interface InvestmentLot {
-  id: number;
-  securityId: number;
-  openedTransactionId: number | null;
-  closedTransactionId: number | null;
-  createdAt: Date;
-  // Fields tracked during import for FIFO matching (not in DB)
-  accountId: number;
-  remainingShares: number;
 }
 
 export class IdMapper {

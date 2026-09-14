@@ -12,7 +12,7 @@ This script imports data from Moneydance JSON exports into a Counterpoise book d
 - **Phase 5**: Import security price history
 - **Phase 6**: Import stock splits
 - **Phase 7**: Import recurring reminders as recurring rules
-- **Safe**: Dry-run mode for validation
+- **Safe**: Dry-run mode, which previews rather than validates — see below
 - **Progress**: Detailed statistics and error reporting
 - **Fast**: Batch processing with progress tracking
 
@@ -25,7 +25,7 @@ No additional dependencies needed. Uses existing project dependencies.
 ### Basic Import
 
 ```bash
-# Dry run to validate (recommended first step)
+# Dry run to preview (recommended first step; see the dry-run note below)
 npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existing-book-id> --dry-run
 
 # Actual import
@@ -38,7 +38,7 @@ The destination book must already exist. Create one in the app first, or run `np
 
 ```bash
 --book-id <id>         # Book ID to import into (required)
---dry-run              # Parse and validate without writing to database
+--dry-run              # Parse and preview without writing to the database
 --overwrite            # Remove existing data in target book before import
 --no-inactive          # Skip inactive accounts
 --no-hidden            # Skip hidden accounts
@@ -62,6 +62,21 @@ npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existi
 # Full import with detailed logging
 npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existing-book-id> --verbose
 ```
+
+### What `--dry-run` does, and does not
+
+It parses the export and reports what it WOULD do. It is a preview, not a
+validation pass:
+
+- standard transactions do not go through `validateTransaction` or the account
+  checks, so a transaction that would be rejected on a real run is counted as
+  imported here;
+- only the first few records are printed, while the totals count everything;
+- investment handling classifies actions; no lot replay happens, so nothing
+  here exercises the FIFO matching that a real import performs in phase 6.5.
+
+A clean dry run therefore means the file parsed and the phases ran. It does not
+mean the import will succeed.
 
 ## What Gets Imported
 
@@ -98,7 +113,9 @@ npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existi
 - Buy/sell transactions with FIFO lot tracking
 - Dividend payments
 - Capital gain distributions
-- Two-pass processing: buys first, then sells matched to lots
+- Writes the investment transactions and their splits. Lots are NOT built here:
+  phase 6.5 replays every affected pair chronologically, after stock splits are
+  imported, so a split changes the share counts before any lot is matched
 
 ### Phase 5: Security Prices
 - Historical price data from `csnap` objects
@@ -203,8 +220,10 @@ npx tsx scripts/import-moneydance/index.ts --help
 
 ### Database errors
 ```bash
-# Ensure PostgreSQL is running
-docker compose up -d
+# Ensure the DEVELOPMENT PostgreSQL is running. The default compose file is
+# production-only and publishes no host port, so it cannot serve the psql
+# command below.
+docker compose -f docker-compose.dev.yml up -d --wait
 
 # Verify connection
 PGPASSWORD=counterpoise psql -h localhost -U counterpoise -d counterpoise_dev -c '\dt'

@@ -336,8 +336,6 @@ async function main() {
   console.log(`    Buys: ${investmentStats.buys}`);
   console.log(`    Sells: ${investmentStats.sells}`);
   console.log(`    Dividends: ${investmentStats.dividends}`);
-  console.log(`    Lots: ${investmentStats.lots}`);
-  console.log(`    Orphaned Sells: ${investmentStats.orphanedSells}`);
   console.log(`    Errors: ${investmentStats.errors.length}`);
 
   console.log("  Security Prices:");

@@ -5,6 +5,7 @@ import {
   createAccount,
   createBook,
   createPayee,
+  createRecurringRule,
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
 import { getDb } from "@/db";
@@ -225,6 +226,114 @@ describe("transactions query", () => {
 
       expect(rows).toHaveLength(3);
       expect(totalCount).toBe(3);
+    });
+
+    it("returns only the transactions one recurring rule created", async () => {
+      const db = getDb();
+      const { checking, groceries } = await seedThree();
+      const rule = await createRecurringRule({
+        bookId, name: "Rent", frequency: "monthly",
+        startDate: "2026-01-01", nextDate: "2026-02-01",
+        templateSplits: [
+          { accountId: checking.id, amount: -100 },
+          { accountId: groceries.id, amount: 100 },
+        ],
+      });
+      const fromRule = await createTransactionWithSplits({
+        bookId, date: "2026-01-15", description: "Rent",
+        recurringRuleId: rule.id,
+        splits: [
+          { accountId: checking.id, amount: -100 },
+          { accountId: groceries.id, amount: 100 },
+        ],
+      });
+
+      const { rows, totalCount } = await selectTransactionPage(db, bookId, {
+        recurringRuleId: rule.id,
+      });
+
+      // seedThree made three transactions with no rule; only the fourth
+      // carries one.
+      expect(rows.map((r) => r.id)).toEqual([fromRule.id]);
+      expect(totalCount).toBe(1);
+    });
+
+    it("does not surface another book's transaction stamped with this rule's id", async () => {
+      const db = getDb();
+      const { checking, groceries } = await seedThree();
+      const rule = await createRecurringRule({
+        bookId, name: "Rent", frequency: "monthly",
+        startDate: "2026-01-01", nextDate: "2026-02-01",
+        templateSplits: [
+          { accountId: checking.id, amount: -100 },
+          { accountId: groceries.id, amount: 100 },
+        ],
+      });
+      const mine = await createTransactionWithSplits({
+        bookId, date: "2026-01-15", description: "Mine",
+        recurringRuleId: rule.id,
+        splits: [
+          { accountId: checking.id, amount: -100 },
+          { accountId: groceries.id, amount: 100 },
+        ],
+      });
+
+      // recurring_rules.id is a global serial and transactions.recurring_rule_id
+      // carries no (bookId, recurringRuleId) composite constraint, so nothing in
+      // the schema stops another book's row pointing at this rule. The bookId
+      // predicate is the only thing that keeps it out of this answer; drop it
+      // and this test fails.
+      const other = await createBook({ name: "Other Book" });
+      const theirAccount = await createAccount({
+        bookId: other.id, name: "Theirs", type: "asset",
+      });
+      const theirExpense = await createAccount({
+        bookId: other.id, name: "Their Expense", type: "expense",
+      });
+      await createTransactionWithSplits({
+        bookId: other.id, date: "2026-06-01", description: "Not mine",
+        recurringRuleId: rule.id,
+        splits: [
+          { accountId: theirAccount.id, amount: -100 },
+          { accountId: theirExpense.id, amount: 100 },
+        ],
+      });
+
+      const { rows, totalCount } = await selectTransactionPage(db, bookId, {
+        recurringRuleId: rule.id,
+      });
+
+      expect(rows.map((r) => r.id)).toEqual([mine.id]);
+      expect(totalCount).toBe(1);
+    });
+
+    it("throws TransactionValidationError for a recurring rule in another book", async () => {
+      const db = getDb();
+      await seedThree();
+      const other = await createBook({ name: "Other Book" });
+      const theirAccount = await createAccount({
+        bookId: other.id, name: "Theirs", type: "asset",
+      });
+      const theirExpense = await createAccount({
+        bookId: other.id, name: "Their Expense", type: "expense",
+      });
+      const theirRule = await createRecurringRule({
+        bookId: other.id, name: "Theirs", frequency: "monthly",
+        startDate: "2026-01-01", nextDate: "2026-02-01",
+        templateSplits: [
+          { accountId: theirAccount.id, amount: -100 },
+          { accountId: theirExpense.id, amount: 100 },
+        ],
+      });
+
+      // Same reasoning as payeeId: an empty page would read as "this rule has
+      // created nothing", which is a wrong answer rather than an empty one.
+      await expect(
+        selectTransactionPage(db, bookId, { recurringRuleId: theirRule.id })
+      ).rejects.toThrow(TransactionValidationError);
+      await expect(
+        selectTransactionPage(db, bookId, { recurringRuleId: theirRule.id })
+      ).rejects.toThrow("Invalid recurringRuleId");
     });
 
     it("orders a floating transaction by its effective date, not its stored date", async () => {

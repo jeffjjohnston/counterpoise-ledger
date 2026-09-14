@@ -46,7 +46,7 @@ export function WebMcpTools() {
       // as a separate change to the tool set; the Codex in-app browser allows
       // only ten such changes per page load and rejects the whole registry
       // past that. WebMCP has no bulk-registration call, so a single burst is
-      // the only way to present 59 tools as one change.
+      // the only way to present the whole filtered set as one change.
       await Promise.all(
         definitions.map((definition) =>
           modelContext.registerTool(

@@ -70,7 +70,8 @@ describe("full Moneydance import", () => {
     // Root is skipped; securities become `securities` rows, not accounts.
     expect(byName.has("Sample Book")).toBe(false);
 
-    // The investment account gets an auto-created cash sibling.
+    // The investment account gets an auto-created cash CHILD — the importer
+    // sets the investment account as its parent, not a sibling beside it.
     expect(rows.some((r) => r.isInvestmentCash)).toBe(true);
   });
 

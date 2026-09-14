@@ -86,9 +86,10 @@ const securityTypeSchema = z.enum(securityTypeValues, {
 // inputSchema (mcp/tools/securities.ts), so each .describe() call here is
 // what the MCP client shows the model for that field — see the header
 // comment on lib/schemas/transactions.ts for why the two surfaces share one
-// schema. Wording is carried over verbatim from the tool's pre-drift,
-// hand-written inputSchema (git show fc93ea8:mcp/tools/securities.ts) except
-// for fixedPriceMicros, which the hand-written version never had a field for.
+// schema. Wording is carried over verbatim from the pre-drift, hand-written
+// inputSchema this schema replaced in mcp/tools/securities.ts, so sharing one
+// definition changed no text the model reads — except for fixedPriceMicros,
+// which the hand-written version never had a field for.
 export const createSecuritySchema = z.object(
   {
     name: z
@@ -120,8 +121,9 @@ export type CreateSecurityInput = z.infer<typeof createSecuritySchema>;
 // updateSecuritySchema — PUT /api/b/[bookId]/securities/[id]
 // ---------------------------------------------------------------------------
 //
-// Unlike POST, PUT has no shared-lib write path — the route updates the row
-// directly and today validates only fetchPrices's type. That existing
+// PUT parses this schema and hands off to the shared `updateSecurity`, which
+// carries its own validation; this layer is the shape check, not the whole
+// of it. It used to validate only fetchPrices's type. That existing
 // message is "Fetch prices must be a boolean" (capital F,
 // securities/[id]/route.ts:60) — a different string from create's lowercase
 // "fetchPrices must be a boolean" above. Both are ported verbatim to their

@@ -80,7 +80,7 @@ export function StaleSyncBanner({
         className
       )}
     >
-      <span className="inline-block h-2 w-2 flex-none rounded-full bg-[var(--fg-warning)]" />
+      <span className="inline-block h-2 w-2 flex-none rounded-full bg-(--fg-warning)" />
       <div className="min-w-0 text-sm font-medium">
         {data.totalCount}{" "}
         {data.totalCount === 1 ? "transaction" : "transactions"} older than 9

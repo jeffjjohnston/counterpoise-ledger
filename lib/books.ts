@@ -68,7 +68,9 @@ export async function updateBook(
 }
 
 // ---------------------------------------------------------------------------
-// deleteBook — new. See design doc decision 3's guarded exception.
+// deleteBook — MCP reaches plenty of destructive tools (delete_account,
+// delete_transaction, delete_security and the rest). This is the one that
+// takes a name confirmation as well.
 // ---------------------------------------------------------------------------
 
 /**
@@ -81,7 +83,7 @@ export async function updateBook(
  * window.confirm naming the book — but that protection lives only in the UI,
  * and the route has none, so MCP would otherwise bypass it entirely.
  * Annotations cannot substitute: they are advisory, never an authorization
- * check. See the design doc's decision 3 exception.
+ * check.
  *
  * The comparison is exact. Do not relax it to case-insensitive or trimmed:
  * requiring the caller to reproduce the name precisely is what makes this a

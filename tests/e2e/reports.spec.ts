@@ -71,7 +71,8 @@ test.describe("reports", () => {
     // Generate the report
     await page.getByRole("button", { name: "Generate Report" }).click();
 
-    // Should show report with data (seed data covers 2023-2025)
+    // Should show report with data. seed-data.ts builds its dates relative to
+    // the current year and month, so the range moves with the clock.
     await expect(page.getByText("Total")).toBeVisible({ timeout: 10000 });
 
     // Expand to check for account data

@@ -112,7 +112,7 @@ export function registerPlaidTools(server: McpServer) {
         // success. updatePlaidToken() already treats a missing accessToken
         // as "keep the stored one", so this is the correct call shape, not
         // a workaround.
-        ...toolShape(updateTokenSchema.omit({ accessToken: true })),
+        ...toolShape(updateTokenSchema, { omit: { accessToken: true } }),
       },
       annotations: UPDATE,
     },

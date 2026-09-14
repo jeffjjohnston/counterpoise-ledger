@@ -17,6 +17,29 @@ const split = (o: Partial<ReplaySplit> & Pick<ReplaySplit, "action">): ReplaySpl
 });
 
 describe("replayLots", () => {
+  it.each([
+    { shares: 1, proceeds: 1654 },
+    { shares: 13, proceeds: 22978 },
+    { shares: 18, proceeds: 31863 },
+  ])("conserves shares, basis, and net proceeds when selling $shares shares", ({ shares, proceeds }) => {
+    // Independent ledger: 7 × $13.57 + 11 × $9.99 = $204.88 basis.
+    // Sell at $17.77 with a $1.23 fee: partial lot, cross-lot, and full close.
+    const { lots, allocations, unallocated } = replayLots([
+      split({ action: "buy", sharesMicros: 7 * M, priceMicros: 13_570_000 }),
+      split({ investmentSplitId: 2, transactionId: 2, action: "buy",
+        sharesMicros: 11 * M, priceMicros: 9_990_000, transactionDate: "2024-02-01" }),
+      split({ investmentSplitId: 3, transactionId: 3, action: "sell",
+        sharesMicros: shares * M, priceMicros: 17_770_000, feesCents: 123,
+        transactionDate: "2024-03-01" }),
+    ]);
+    expect(unallocated).toEqual([]);
+    expect(allocations.reduce((sum, allocation) => sum + allocation.sharesMicros, 0)).toBe(shares * M);
+    expect(lots.reduce((sum, lot) => sum + lot.remainingSharesMicros, 0)).toBe((18 - shares) * M);
+    expect(allocations.reduce((sum, allocation) => sum + allocation.basisCents, 0) +
+      lots.reduce((sum, lot) => sum + lot.remainingBasisCents, 0)).toBe(20488);
+    expect(allocations.reduce((sum, allocation) => sum + allocation.proceedsCents, 0)).toBe(proceeds);
+  });
+
   it("opens a lot on buy with fees capitalized into basis", () => {
     const { lots } = replayLots([
       split({ investmentSplitId: 1, transactionId: 1, action: "buy",

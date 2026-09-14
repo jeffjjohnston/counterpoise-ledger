@@ -16,12 +16,11 @@ import type { AccountWithBalance } from "@/types";
 //   - the outer container's padding/spacing ("p-3 space-y-2" vs "p-4
 //     space-y-3")
 //   - the Name and Parent Expense fields' `size` ("compact" vs the default)
-// A line-by-line diff of both original blocks (compact at TransactionForm.tsx
-// ~970-1027, desktop at ~1237-1292, as of commit 889b30e) turned up nothing
-// else — no structural, behavioural, or textual difference beyond those two,
-// aside from one code comment being word-wrapped differently across two
-// lines with identical text, which carries no observable difference either
-// way.
+// A line-by-line diff of the two blocks in TransactionForm.tsx that this
+// component replaced turned up nothing else — no structural, behavioural, or
+// textual difference beyond those two, aside from one code comment being
+// word-wrapped differently across two lines with identical text, which
+// carries no observable difference either way.
 //
 // The draft name/parent and the in-flight "creating" guard are controlled by
 // the parent (TransactionForm) rather than owned here. Both call sites live

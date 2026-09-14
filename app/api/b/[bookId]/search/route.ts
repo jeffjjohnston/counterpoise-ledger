@@ -47,13 +47,17 @@ export async function GET(
         payee: t.payee,
         splits: t.splits,
       })),
-      accounts: results.accounts.map((a) => ({
-        id: a.id,
-        name: a.name,
-        type: a.type,
-        subtype: a.subtype,
-        isFavorite: a.isFavorite,
-      })),
+      accounts: {
+        items: results.accounts.items.map((a) => ({
+          id: a.id,
+          name: a.name,
+          type: a.type,
+          subtype: a.subtype,
+          isFavorite: a.isFavorite,
+        })),
+        total: results.accounts.total,
+        truncated: results.accounts.truncated,
+      },
       payees: results.payees,
       recurringRules: results.recurringRules,
     });

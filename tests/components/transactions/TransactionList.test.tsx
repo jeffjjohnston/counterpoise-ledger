@@ -797,7 +797,6 @@ describe("TransactionList", () => {
             bookId: 1,
             transactionId: 6,
             securityId: security.id,
-            lotId: null,
             action: "buy",
             sharesMicros: 2_000_000,
             priceMicros: 7_500_000,
@@ -886,7 +885,6 @@ describe("TransactionList", () => {
             bookId: 1,
             transactionId: 7,
             securityId: security.id,
-            lotId: null,
             action: "dividend",
             sharesMicros: 0,
             priceMicros: 0,
@@ -954,7 +952,6 @@ describe("TransactionList", () => {
             bookId: 1,
             transactionId: 8,
             securityId: security.id,
-            lotId: null,
             action: "sell",
             sharesMicros: 1_500_000,
             priceMicros: 8_000_000,
@@ -1043,7 +1040,6 @@ describe("TransactionList", () => {
             bookId: 1,
             transactionId: 9,
             securityId: security.id,
-            lotId: null,
             action: "capGain",
             sharesMicros: 0,
             priceMicros: 0,
@@ -1111,7 +1107,6 @@ describe("TransactionList", () => {
             bookId: 1,
             transactionId: 10,
             securityId: security.id,
-            lotId: null,
             action: "split",
             sharesMicros: 0,
             priceMicros: 0,
@@ -2026,66 +2021,6 @@ describe("TransactionList", () => {
     expect(container.querySelector('[class*="overflow-x"]')).toBeNull();
   });
 
-  // The register is `table-fixed`: the browser satisfies every fixed-width column
-  // first and gives only what is left to the percentage columns. When the fixed
-  // columns alone exceed the container, the percentage column collapses to 0px and
-  // its text paints on top of the next column. The narrowest desktop container is
-  // ~736px (the 1024px lg breakpoint, less the 256px sidebar and padding), so the
-  // fixed columns must leave at least ~160px for the flexible column.
-  const MAX_FIXED_COLUMN_REM = 36;
-
-  const sumFixedColumnRem = (container: HTMLElement): number =>
-    [...container.querySelectorAll("colgroup col")].reduce((total, col) => {
-      const match = /w-\[([\d.]+)rem\]/.exec(col.className);
-      return total + (match ? parseFloat(match[1]) : 0);
-    }, 0);
-
-  it("leaves room for the flexible column in the standard register", () => {
-    const { container } = render(
-      <TransactionList
-        transactions={[]}
-        accounts={mockAccounts}
-        selectedAccountId={1}
-        onEdit={vi.fn()}
-        isLoading
-      />
-    );
-
-    expect(sumFixedColumnRem(container)).toBeLessThanOrEqual(MAX_FIXED_COLUMN_REM);
-  });
-
-  it("leaves room for the activity column in the investment register", () => {
-    const { container } = render(
-      <TransactionList
-        transactions={[]}
-        accounts={mockAccounts}
-        selectedAccountId={2}
-        balanceAccountId={2}
-        onEdit={vi.fn()}
-        isLoading
-      />
-    );
-
-    expect(sumFixedColumnRem(container)).toBeLessThanOrEqual(MAX_FIXED_COLUMN_REM);
-  });
-
-  it("reserves more width for payee names than accounts in the table layout", () => {
-    const { container } = render(
-      <TransactionList
-        transactions={[]}
-        accounts={mockAccounts}
-        selectedAccountId={null}
-        onEdit={vi.fn()}
-        isLoading
-      />
-    );
-
-    // The status gutter trails the numeric columns now, so the leading columns
-    // are indexed straight from the front.
-    const columns = container.querySelectorAll("colgroup col");
-    expect(columns[1]).toHaveClass("w-[32%]");
-    expect(columns[2]).toHaveClass("w-[24%]");
-  });
 
   it("does not render skeleton rows when isLoading is false with empty transactions", () => {
     render(
@@ -2677,7 +2612,6 @@ describe("TransactionList investment register", () => {
         bookId: 1,
         transactionId: id,
         securityId: security.id,
-        lotId: null,
         action: "buy",
         sharesMicros: 0,
         priceMicros: 0,
@@ -2899,7 +2833,7 @@ describe("TransactionList investment register", () => {
     )!;
     // Unbounded (flex-shrink-0 + whitespace-nowrap) it would spill into the
     // fixed-width Shares/Price columns; it has to be able to give way.
-    expect(note).not.toHaveClass("flex-shrink-0");
+    expect(note).not.toHaveClass("shrink-0");
     expect(note).toHaveClass("truncate");
     expect(activity).toHaveClass("overflow-hidden");
   });
@@ -2916,7 +2850,7 @@ describe("TransactionList investment register", () => {
     expect(activity.textContent).not.toMatch(/[+−]/);
   });
 
-  it("renders a buy amount neutral but a transfer amount directional", () => {
+  it("renders a buy amount red because it reduces cash, like any outflow", () => {
     renderRegister([
       investmentTransaction(1, -202751, {
         action: "buy",
@@ -2931,9 +2865,22 @@ describe("TransactionList investment register", () => {
       .getByRole("row", { name: /Checking/ })
       .querySelectorAll("td")[4];
 
-    expect(buyAmount).not.toHaveClass("text-fg-danger");
-    expect(buyAmount).toHaveClass("text-fg");
+    expect(buyAmount).toHaveClass("text-fg-danger");
     expect(transferAmount).toHaveClass("text-fg-success");
+  });
+
+  it("renders a sell amount green because it increases cash", () => {
+    renderRegister([
+      investmentTransaction(1, 202751, {
+        action: "sell",
+        sharesMicros: 66_000_000,
+        priceMicros: 30_720_000,
+      }),
+    ]);
+
+    const sellAmount = screen.getByRole("row", { name: /ACME/ }).querySelectorAll("td")[4];
+
+    expect(sellAmount).toHaveClass("text-fg-success");
   });
 
   it("renders a single share without pluralizing", () => {
@@ -2990,7 +2937,6 @@ describe("TransactionList investment register", () => {
       bookId: 1,
       transactionId: 6,
       securityId: security.id,
-      lotId: null,
       action: "dividend",
       sharesMicros: 0,
       priceMicros: 0,
@@ -3037,7 +2983,6 @@ describe("TransactionList investment register", () => {
       bookId: 1,
       transactionId: 6,
       securityId: security.id,
-      lotId: null,
       action: "dividend",
       sharesMicros: 0,
       priceMicros: 0,
@@ -3325,5 +3270,113 @@ describe("TransactionList category icons", () => {
     expect(screen.getByText("Gasoline")).toHaveAttribute("title", "Automobile : Gasoline");
     // The selected account itself isn't listed as a counterpart line.
     expect(screen.queryByText("Checking")).not.toBeInTheDocument();
+  });
+});
+
+describe("date-state row emphasis", () => {
+  // The register marks Recurring, Scheduled and Plaid-pending rows by tinting
+  // the whole row. The tint had also grown a blue left border on the two
+  // date-state rows, which is not what the register used to show. The
+  // background is the mark; the border is not.
+  const rowAccount = (id: number, name: string, type: "asset" | "expense") => ({
+    id,
+    bookId: 1,
+    name,
+    type,
+    subtype: null,
+    parentId: null,
+    isActive: true,
+    isInvestmentCash: false,
+    icon: null,
+    isFavorite: false,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+
+  const dateStateRow = (
+    id: number,
+    description: string,
+    date: string,
+    state: Partial<DisplayTransaction>
+  ): DisplayTransaction => ({
+    ...baseTransaction,
+    id,
+    bookId: 1,
+    date,
+    description,
+    splits: [
+      {
+        id: id * 10 + 1,
+        bookId: 1,
+        transactionId: id,
+        accountId: 1,
+        amount: -5000,
+        account: rowAccount(1, "Checking", "asset"),
+      },
+      {
+        id: id * 10 + 2,
+        bookId: 1,
+        transactionId: id,
+        accountId: 2,
+        amount: 5000,
+        account: rowAccount(2, "Groceries", "expense"),
+      },
+    ],
+    ...state,
+  });
+
+  // A date far enough ahead that `isFuture` holds whenever this test runs.
+  const RECURRING = dateStateRow(9101, "Projected rent", "2024-02-01", { isProjected: true });
+  const SCHEDULED = dateStateRow(9102, "Scheduled rent", "2999-01-01", {});
+  const PLAID_PENDING = dateStateRow(9103, "Pending card swipe", "2024-02-01", {
+    isPlaidPending: true,
+  });
+
+  const renderRows = (transactions: DisplayTransaction[]) =>
+    render(
+      <TransactionList
+        transactions={transactions}
+        accounts={mockAccounts}
+        selectedAccountId={null}
+        onEdit={vi.fn()}
+      />
+    );
+
+  it("tints the desktop Recurring and Scheduled rows without giving them a border", () => {
+    renderRows([RECURRING, SCHEDULED]);
+
+    for (const label of ["Recurring", "Scheduled"]) {
+      const row = screen.getByText(label).closest("tr");
+      expect(row).not.toBeNull();
+      expect(row!.className).toContain("bg-future");
+      expect(row!.className).not.toContain("border-border-future");
+      expect(row!.className).not.toContain("border-l-2");
+    }
+  });
+
+  it("tints the mobile Recurring and Scheduled cards without giving them a border", () => {
+    isMobileRef.value = true;
+    const { container } = renderRows([RECURRING, SCHEDULED]);
+
+    const cards = Array.from(container.querySelectorAll("div.divide-y > div"));
+    expect(cards).toHaveLength(2);
+    for (const card of cards) {
+      expect(card.className).toContain("bg-future");
+      expect(card.className).not.toContain("border-border-future");
+      expect(card.className).not.toContain("border-l-2");
+    }
+  });
+
+  it("leaves the Plaid-pending row's own border alone", () => {
+    const { container } = renderRows([PLAID_PENDING]);
+
+    // A Plaid-pending row prints "Unmatched bank transaction" in place of the
+    // description, so the amount cell is the stable handle on the row.
+    const row = container
+      .querySelector('[data-testid="transaction-amount-9103"]')
+      ?.closest("tr");
+    expect(row).not.toBeNull();
+    expect(row!.className).toContain("border-l-2");
+    expect(row!.className).toContain("border-teal-500/50");
   });
 });

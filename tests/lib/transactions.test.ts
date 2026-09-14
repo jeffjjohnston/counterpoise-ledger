@@ -21,6 +21,7 @@ import {
   transactionSplits,
 } from "@/db/schema";
 import { and, eq } from "drizzle-orm";
+import { waitForBlockedInsert } from "@/tests/helpers/locks";
 import {
   createTransaction,
   deleteTransaction,
@@ -186,9 +187,12 @@ describe("transactions shared logic", () => {
       });
 
       // ...until it has passed the lookup and is blocked on the unique index.
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      commitHolder();
-      await holder;
+      try {
+        await waitForBlockedInsert(db, "payees");
+      } finally {
+        commitHolder();
+        await holder;
+      }
 
       const result = await created;
       expect(result.payee?.name).toBe("Trader Joe's");

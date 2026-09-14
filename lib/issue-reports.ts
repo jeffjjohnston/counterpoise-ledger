@@ -71,11 +71,17 @@ export async function listIssueReports(
   const conditions = [eq(issueReports.userId, userId)];
   if (opts.status) conditions.push(eq(issueReports.status, opts.status));
 
+  // The id tiebreak is not decoration. createdAt is a JS Date at millisecond
+  // precision (db/schema.ts), so two reports filed in quick succession can
+  // share one value. With only createdAt in the ORDER BY, the order of those
+  // rows is whatever the planner returns, which for a small table is
+  // insertion order — the reverse of "newest first". id is a serial, thus a
+  // larger id is always the more recent report.
   return db
     .select()
     .from(issueReports)
     .where(and(...conditions))
-    .orderBy(desc(issueReports.createdAt));
+    .orderBy(desc(issueReports.createdAt), desc(issueReports.id));
 }
 
 // ---------------------------------------------------------------------------

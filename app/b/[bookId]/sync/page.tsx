@@ -35,9 +35,9 @@ function formatLastSynced(value: string | null) {
 const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 
 const DOT_CLASS = {
-  danger: "bg-[var(--fg-danger)]",
-  warning: "bg-[var(--fg-warning)]",
-  success: "bg-[var(--fg-success)]",
+  danger: "bg-(--fg-danger)",
+  warning: "bg-(--fg-warning)",
+  success: "bg-(--fg-success)",
 } as const;
 
 /**

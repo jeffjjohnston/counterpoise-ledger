@@ -67,7 +67,6 @@ export interface TransactionInput {
 
 export interface InvestmentSplitInput {
   securityId: number;
-  lotId?: number | null;
   action: "buy" | "sell" | "dividend" | "capGain" | "fee" | "split";
   sharesMicros: number;
   priceMicros: number;

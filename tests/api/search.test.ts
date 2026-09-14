@@ -43,10 +43,11 @@ describe("GET /api/b/[bookId]/search", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
+    const emptyBucket = { items: [], total: 0, truncated: false };
     expect(body.transactions).toEqual([]);
-    expect(body.accounts).toEqual([]);
-    expect(body.payees).toEqual([]);
-    expect(body.recurringRules).toEqual([]);
+    expect(body.accounts).toEqual(emptyBucket);
+    expect(body.payees).toEqual(emptyBucket);
+    expect(body.recurringRules).toEqual(emptyBucket);
   });
 
   it("finds a transaction by description (case-insensitive)", async () => {
@@ -128,8 +129,8 @@ describe("GET /api/b/[bookId]/search", () => {
     const res = await GET(search("main"), rp());
     const body = await res.json();
 
-    expect(body.accounts).toHaveLength(1);
-    expect(body.accounts[0].name).toBe("Main Checking");
+    expect(body.accounts.items).toHaveLength(1);
+    expect(body.accounts.items[0].name).toBe("Main Checking");
   });
 
   it("finds payees by name", async () => {
@@ -139,8 +140,8 @@ describe("GET /api/b/[bookId]/search", () => {
     const res = await GET(search("blue bottle"), rp());
     const body = await res.json();
 
-    expect(body.payees).toHaveLength(1);
-    expect(body.payees[0].id).toBe(target.id);
+    expect(body.payees.items).toHaveLength(1);
+    expect(body.payees.items[0].id).toBe(target.id);
   });
 
   it("finds recurring rules by name", async () => {
@@ -172,8 +173,8 @@ describe("GET /api/b/[bookId]/search", () => {
     const res = await GET(search("monthly rent"), rp());
     const body = await res.json();
 
-    expect(body.recurringRules).toHaveLength(1);
-    expect(body.recurringRules[0].id).toBe(rule.id);
+    expect(body.recurringRules.items).toHaveLength(1);
+    expect(body.recurringRules.items[0].id).toBe(rule.id);
   });
 
   it("finds transactions by currency amount", async () => {
@@ -250,10 +251,11 @@ describe("GET /api/b/[bookId]/search", () => {
     const res = await GET(search("xyzzy_no_match_42"), rp());
     const body = await res.json();
 
+    const emptyBucket = { items: [], total: 0, truncated: false };
     expect(body.transactions).toEqual([]);
-    expect(body.accounts).toEqual([]);
-    expect(body.payees).toEqual([]);
-    expect(body.recurringRules).toEqual([]);
+    expect(body.accounts).toEqual(emptyBucket);
+    expect(body.payees).toEqual(emptyBucket);
+    expect(body.recurringRules).toEqual(emptyBucket);
   });
 
   it("returns transactions in descending date order", async () => {

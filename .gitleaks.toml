@@ -37,8 +37,39 @@ regex = '''postgres(?:ql)?://[a-zA-Z0-9_.-]+:[^@\s'"/]+@[^\s'"/]+'''
 keywords = ["postgres://", "postgresql://"]
 
   [[rules.allowlists]]
-  description = "Published local-dev and CI defaults (documented in CLAUDE.md, not a secret)"
+  description = "Published local-dev and CI defaults (documented in guides/database-management.md, not a secret)"
   regexes = ['''counterpoise:counterpoise@''']
+
+  # A FIXTURE STRING THAT SURVIVES ONLY IN THIS FILE. It was written for a test
+  # of the database-credential loader; that test is gone. The literal is now on
+  # two lines, both below: the worked example in the next comment, and the
+  # regex itself. Grep the tree and it appears nowhere else.
+  #
+  # THE ENTRY IS NEEDED IN BOTH SCAN MODES, and they are not the same scan.
+  # `gitleaks git --log-opts=$BASE..$HEAD` reads history, and a literal that was
+  # once committed stays inside a range that ends after it — no forward-only
+  # edit clears it there. `gitleaks dir .` reads the working tree instead, and
+  # that scan finds THIS FILE: the example line below is a real match. The entry
+  # suppresses its own documentation, which is why the example can be written
+  # out in full. Run either against this repository and the entry is load-
+  # bearing in both.
+  #
+  # WHAT IS ACTUALLY PINNED: the password and the host, not the start of the
+  # username. The regex is unanchored, so a longer name ending in
+  # counterpoise_app matches too. A real credential against a real host is
+  # still caught, which a bare `counterpoise_app:` prefix would not manage.
+  # That is the whole of the safety; this file cannot establish where any
+  # particular string would authenticate.
+  [[rules.allowlists]]
+  description = "Synthetic DATABASE_URL fixture for check-db-credential.sh coverage (password is the literal word 'secret'; host is the compose service name)"
+  # Pinned to the captured SECRET, which is where a rules.allowlist regex is
+  # matched -- not the whole line. The rule stops the host at the first "/"
+  # (`@[^\s'"/]+`), so the finding is
+  #   postgresql://counterpoise_app:secret@postgres:5432
+  # with no trailing "/counterpoise". An allowlist naming the database therefore
+  # matches nothing and silently changes no verdict. Measured: with the tail it
+  # still reported 2 leaks; without it, 0.
+  regexes = ['''counterpoise_app:secret@postgres:5432''']
 
 [allowlist]
 description = "Global allowlist"
@@ -61,6 +92,13 @@ regexes = [
   '''(?i)^(test|fake|dummy|example|sample|placeholder)[-_]''',
   '''(?i)your-[a-z-]*(secret|key|token)''',
   '''originalCronSecret''',
-  # Deliberately-invalid API keys used in tests (46 hex chars, not the real 48).
-  '''cpk_(abcdef|efgh)[0-9a-f]*$''',
+  # Deliberately-invalid API keys used in tests: 46 hex characters, where a
+  # real key carries 48. THE LENGTH IS THE WHOLE EXCEPTION, so it is pinned
+  # exactly — abcdef plus 40 more. This read `[0-9a-f]*`, unbounded, which
+  # suppressed ANY length sharing the prefix, a real 48-character key
+  # included: the exception covered the case it exists to leave uncovered.
+  # Verified both ways — the 46-character fixture passes, a 48-character key
+  # on the same prefix is still reported. The old `efgh` branch went with it;
+  # g and h are not hex, so it could never match a key.
+  '''cpk_abcdef[0-9a-f]{40}$''',
 ]

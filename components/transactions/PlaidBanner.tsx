@@ -99,7 +99,7 @@ export function PlaidBanner({
         onClick={() => setExpanded(!expanded)}
       >
         <div className="flex items-center gap-2 text-sm">
-          <span className="inline-block h-2 w-2 rounded-full bg-[var(--fg-success)]" />
+          <span className="inline-block h-2 w-2 rounded-full bg-(--fg-success)" />
           <span className="font-medium">Linked to Plaid</span>
           {!expanded && (
             <span className="text-fg-secondary">

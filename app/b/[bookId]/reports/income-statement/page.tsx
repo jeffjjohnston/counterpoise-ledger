@@ -386,7 +386,7 @@ export default function IncomeStatementPage() {
             {formatCurrency(totalExpenses)}
           </p>
         </div>
-        <div className="bg-gradient-to-r from-accent to-accent-hover rounded-lg shadow-soft p-6">
+        <div className="bg-linear-to-r from-accent to-accent-hover rounded-lg shadow-soft p-6">
           <p className="text-sm font-medium text-fg-on-accent/70 mb-1">Net Income</p>
           <p className="text-2xl font-bold text-fg-on-accent tabular-nums">
             {formatCurrency(netIncome)}

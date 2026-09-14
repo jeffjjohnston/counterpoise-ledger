@@ -1,7 +1,7 @@
 "use client";
 
 import { cn } from "@/lib/utils";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 interface DateInputProps {
   label?: string;
@@ -22,6 +22,17 @@ interface DateInputProps {
 }
 
 const DAYS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+// The column headers are abbreviated to fit the cell. Assistive tech gets
+// the whole word instead.
+const FULL_DAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
 const MONTHS = [
   "January",
   "February",
@@ -99,6 +110,14 @@ function formatMDY(value: string): string {
   return `${pad(p.month + 1)}/${pad(p.day)}/${p.year}`;
 }
 
+// What a screen reader reads for a day cell. Built from MONTHS rather than
+// toLocaleDateString so the announcement does not follow the host locale.
+function fullDateLabel(ymd: string): string {
+  const p = parseYMD(ymd);
+  if (!p) return ymd;
+  return `${MONTHS[p.month]} ${p.day}, ${p.year}`;
+}
+
 export function DateInput({
   label,
   labelHidden,
@@ -124,6 +143,12 @@ export function DateInput({
   // follows can tell "the click that opened the calendar" from a later click
   // asking for a caret.
   const pointerFocusRef = useRef(false);
+  // aria-controls and aria-activedescendant need ids, and a page can hold
+  // several of these fields, so they cannot be derived from the id prop --
+  // which is optional besides.
+  const reactId = useId();
+  const gridId = `date-input-grid-${reactId}`;
+  const dayCellId = (ymd: string) => `date-input-day-${reactId}-${ymd}`;
 
   const parsed = parseYMD(value);
   const [viewYear, setViewYear] = useState(parsed?.year ?? new Date().getFullYear());
@@ -278,6 +303,14 @@ export function DateInput({
     weeks.push(week);
   }
 
+  // aria-activedescendant has to name a cell that exists. The highlight stays
+  // put when the header arrows move the view, so it can fall outside the
+  // month on screen -- and a dangling reference is worse than none.
+  const navParsed = navDate ? parseYMD(navDate) : null;
+  const highlightInView =
+    navParsed !== null && navParsed.year === viewYear && navParsed.month === viewMonth;
+  const activeDescendantId = open && navDate && highlightInView ? dayCellId(navDate) : undefined;
+
   function handleInputChange(text: string) {
     setInputText(text);
     setEditing(true);
@@ -325,6 +358,11 @@ export function DateInput({
         ref={inputRef}
         id={id}
         type="text"
+        role="combobox"
+        aria-haspopup="grid"
+        aria-expanded={open}
+        aria-controls={open ? gridId : undefined}
+        aria-activedescendant={activeDescendantId}
         value={inputText}
         placeholder="MM/DD/YYYY"
         onChange={(e) => handleInputChange(e.target.value)}
@@ -335,7 +373,7 @@ export function DateInput({
         onKeyDown={handleKeyDown}
         required={required}
         className={cn(
-          "block w-full border border-border bg-surface-inset text-fg placeholder:text-fg-tertiary focus:border-border-focus focus:outline-none focus:ring-1 focus:ring-border-focus text-sm",
+          "block w-full border border-border bg-surface-inset text-fg placeholder:text-fg-tertiary focus:border-border-focus focus:outline-hidden focus:ring-1 focus:ring-border-focus text-sm",
           isCompact ? "rounded-md px-2 py-1" : "rounded-md px-3 py-2",
           className
         )}
@@ -374,41 +412,67 @@ export function DateInput({
               </svg>
             </button>
           </div>
-          {/* Day-of-week headers */}
-          <div className="grid grid-cols-7 text-center mb-0.5">
-            {DAYS.map((d) => (
-              <div key={d} className="text-[10px] font-medium text-fg-tertiary py-0.5">
-                {d}
+          {/* Calendar grid. Each week carries its own seven-column layout so the
+              DOM can nest grid > row > gridcell without a display:contents row
+              wrapper, which browsers have historically dropped from the
+              accessibility tree. There is no row gap, so the weeks still stack
+              flush the way one tall grid did. */}
+          <div role="grid" id={gridId} aria-label={`${MONTHS[viewMonth]} ${viewYear}`}>
+            <div role="row" className="grid grid-cols-7 text-center mb-0.5">
+              {DAYS.map((d, i) => (
+                <div
+                  key={d}
+                  role="columnheader"
+                  aria-label={FULL_DAYS[i]}
+                  className="text-[10px] font-medium text-fg-tertiary py-0.5"
+                >
+                  {d}
+                </div>
+              ))}
+            </div>
+            {weeks.map((week, wi) => (
+              <div key={wi} role="row" className="grid grid-cols-7 text-center">
+                {week.map((day, di) => {
+                  // The padding either side of the month is still a cell, so
+                  // every row a screen reader walks is a full seven days wide.
+                  if (day === null) return <div key={di} role="gridcell" />;
+                  const dateStr = toYMD(viewYear, viewMonth, day);
+                  const isSelected = dateStr === value;
+                  const isHighlighted = dateStr === navDate;
+                  const isToday =
+                    dateStr ===
+                    toYMD(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
+                  return (
+                    // The cell and the control the user activates are one
+                    // element on purpose: aria-activedescendant, aria-selected
+                    // and the accessible name then describe the same node, so a
+                    // day reads the same however it is reached. tabIndex -1
+                    // keeps focus in the input, which is what names the active
+                    // day; a tab stop per day would contradict that.
+                    <button
+                      key={di}
+                      type="button"
+                      role="gridcell"
+                      id={dayCellId(dateStr)}
+                      aria-label={fullDateLabel(dateStr)}
+                      aria-selected={isSelected}
+                      tabIndex={-1}
+                      onClick={() => selectDate(dateStr)}
+                      data-highlighted={isHighlighted ? "true" : undefined}
+                      className={cn(
+                        "text-xs py-1 rounded-md hover:bg-accent-subtle",
+                        isSelected && "bg-accent text-fg-on-accent hover:bg-accent-hover",
+                        !isSelected && isToday && "font-bold text-fg-accent",
+                        !isSelected && !isToday && "text-fg",
+                        isHighlighted && "ring-2 ring-inset ring-border-focus"
+                      )}
+                    >
+                      {day}
+                    </button>
+                  );
+                })}
               </div>
             ))}
-          </div>
-          {/* Calendar grid */}
-          <div className="grid grid-cols-7 text-center">
-            {weeks.flat().map((day, i) => {
-              if (day === null) return <div key={i} />;
-              const dateStr = toYMD(viewYear, viewMonth, day);
-              const isSelected = dateStr === value;
-              const isHighlighted = dateStr === navDate;
-              const isToday =
-                dateStr === toYMD(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
-              return (
-                <button
-                  key={i}
-                  type="button"
-                  onClick={() => selectDate(dateStr)}
-                  data-highlighted={isHighlighted ? "true" : undefined}
-                  className={cn(
-                    "text-xs py-1 rounded-md hover:bg-accent-subtle",
-                    isSelected && "bg-accent text-fg-on-accent hover:bg-accent-hover",
-                    !isSelected && isToday && "font-bold text-fg-accent",
-                    !isSelected && !isToday && "text-fg",
-                    isHighlighted && "ring-2 ring-inset ring-border-focus"
-                  )}
-                >
-                  {day}
-                </button>
-              );
-            })}
           </div>
         </div>
       )}

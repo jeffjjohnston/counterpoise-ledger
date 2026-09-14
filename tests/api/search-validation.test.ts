@@ -39,14 +39,16 @@ describe("GET /api/b/[bookId]/search validation", () => {
     const res = await searchGet(new Request("http://localhost/api/b/1/search"), rp());
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body).toEqual({ transactions: [], accounts: [], payees: [], recurringRules: [] });
+    const emptyBucket = { items: [], total: 0, truncated: false };
+    expect(body).toEqual({ transactions: [], accounts: emptyBucket, payees: emptyBucket, recurringRules: emptyBucket });
   });
 
   it("returns 200 (empty buckets, not a 400) when q is an explicit empty string", async () => {
     const res = await searchGet(new Request("http://localhost/api/b/1/search?q="), rp());
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body).toEqual({ transactions: [], accounts: [], payees: [], recurringRules: [] });
+    const emptyBucket = { items: [], total: 0, truncated: false };
+    expect(body).toEqual({ transactions: [], accounts: emptyBucket, payees: emptyBucket, recurringRules: emptyBucket });
   });
 
   it("rejects a malformed startDate with the schema's message", async () => {

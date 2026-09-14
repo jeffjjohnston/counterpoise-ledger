@@ -1,6 +1,9 @@
 // @vitest-environment node
 //
-// Not jsdom (the project-wide default). jsdom installs its own TextEncoder,
+// Node, not jsdom. vitest.config.ts defines separate node, dom and database
+// projects and this file belongs to the node one; the directive is here so a
+// move into the dom project cannot silently break it. jsdom installs its own
+// TextEncoder,
 // whose output fails esbuild's `new TextEncoder().encode("") instanceof
 // Uint8Array` startup invariant, and esbuild refuses to load at all.
 import { describe, expect, it } from "vitest";
@@ -106,9 +109,15 @@ describe("bundled Node entrypoints", () => {
       // Tighter rule for the MCP server bundle alone. The paired check above
       // needs process.argv[1] AND import.meta.url, but this codebase's own
       // main-guard idiom uses argv[1] with neither — scripts/rebuild-lots.ts's
-      // `if (process.argv[1]?.includes("rebuild-lots"))`. Copied into anything
-      // mcp/server.ts imports, it would fire under `node /app/mcp-server.mjs`
-      // and the paired check would not see it.
+      // `if (process.argv[1]?.includes("rebuild-lots"))`, which the paired
+      // check would not see at all.
+      //
+      // That exact substring is false under /app/mcp-server.mjs, so it is the
+      // SHAPE that is banned rather than one spelling: any argv[1] read in
+      // this bundle is a guard whose condition depends on the entrypoint
+      // name, and the entrypoint name here is not the one it was written for.
+      // Banning the read outright is the conservative rule; deciding which
+      // spellings happen to match would be a worse test.
       //
       // Scoped to this one target on purpose: the rebuild-lots bundle contains
       // that argv[1] read by design, so asserting it for every target would

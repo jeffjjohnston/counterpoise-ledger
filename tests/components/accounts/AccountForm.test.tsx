@@ -199,7 +199,7 @@ describe("AccountForm", () => {
   it("submits icon: undefined for a non-category account type, leaving the column untouched", () => {
     // Deliberately not `null`: the PUT route only writes the column when
     // `icon !== undefined`, so a non-category's icon (settable via the API
-    // or a future MCP tool, per spec decision 5) survives an edit made
+    // or a future MCP tool, which the column permits) survives an edit made
     // through this form instead of being silently cleared.
     const onSubmit = vi.fn();
     render(<AccountForm onSubmit={onSubmit} onCancel={vi.fn()} />);

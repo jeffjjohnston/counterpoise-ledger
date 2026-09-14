@@ -15,7 +15,7 @@ export type MenuItem = {
  *
  * Deliberately not the register's menu. TransactionList's version carries
  * viewport clamping and right-click positioning because it opens from rows in
- * a scrolling virtualised table; a card header needs neither, and folding both
+ * a long scrolling table; a card header needs neither, and folding both
  * behaviours into one component with a flag would make the register's harder
  * to read without making this one better. If a third surface needs a menu,
  * that is the moment to reconcile them.

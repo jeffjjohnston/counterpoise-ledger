@@ -15,8 +15,8 @@ import { z } from "zod/v4";
 //     this interacts with shape-validation ordering.
 //   - register: "Username already taken" (409) — a DB read inside the
 //     registration transaction.
-//   - password: "Current password is incorrect" (401) — verifies a hash;
-//     the task brief's own example of a guard that must stay.
+//   - password: "Current password is incorrect" (401) — verifies a hash,
+//     so it is a business rule and stays in the route.
 //   - password/me: "User not found" / "Not authenticated" (401) — a session
 //     check or a session referencing a userId no longer in the database.
 //
@@ -38,7 +38,7 @@ import { z } from "zod/v4";
 // reaching it throws and the route would 500 instead of 400 — this schema
 // guarantees both fields are strings before the route ever gets there.
 //
-// Fields are `z.unknown()`, not `z.string()`: the two guards need two
+// Fields are `z.unknown().optional()`, not `z.string()`: the two guards need two
 // different messages depending on *why* a field is invalid — absent/falsy
 // (`!username`) vs. present-but-wrong-type (`typeof !== "string"`) — and a
 // single `z.string({ error })` can only report one message for both failure
@@ -72,8 +72,8 @@ const CREDENTIALS_STRING_MESSAGE = "Username and password must be strings"; // l
 export const loginSchema = z
   .object(
     {
-      username: z.unknown(),
-      password: z.unknown(),
+      username: z.unknown().optional(),
+      password: z.unknown().optional(),
     },
     { error: CREDENTIALS_REQUIRED_MESSAGE }
   )
@@ -136,8 +136,8 @@ const PASSWORD_LENGTH_MESSAGE = "Password must be at least 8 characters"; // reg
 export const registerSchema = z
   .object(
     {
-      username: z.unknown(),
-      password: z.unknown(),
+      username: z.unknown().optional(),
+      password: z.unknown().optional(),
     },
     { error: CREDENTIALS_REQUIRED_MESSAGE }
   )
@@ -176,8 +176,7 @@ export interface RegisterInput {
 // "New password must be different from current password" is a pure
 // comparison of two body fields — no DB or hash read — so it is shape, not
 // a business rule, and becomes part of this schema too. It is NOT the
-// "Current password is incorrect" guard the task brief calls out by name as
-// a business rule that must stay; that one verifies a hash against the
+// "Current password is incorrect" guard, which verifies a hash against the
 // database and remains in the route, at 401, untouched.
 const PASSWORD_REQUIRED_MESSAGE = "Current password and new password are required"; // password/route.ts:20
 const PASSWORD_TYPE_MESSAGE = "Invalid password payload"; // password/route.ts:27
@@ -190,8 +189,8 @@ const PASSWORD_SAME_MESSAGE = "New password must be different from current passw
 export const changePasswordSchema = z
   .object(
     {
-      currentPassword: z.unknown(),
-      newPassword: z.unknown(),
+      currentPassword: z.unknown().optional(),
+      newPassword: z.unknown().optional(),
     },
     { error: PASSWORD_REQUIRED_MESSAGE }
   )

@@ -24,11 +24,18 @@ import { eq } from "drizzle-orm";
 /**
  * Run `matcher` against a reconciliation row that a human resolves first.
  *
- * The open transaction holds the row lock while `matcher` starts on another
- * pooled connection: auto-match reads the row while it is still pending, then
- * blocks on its own UPDATE until this transaction commits — at which point its
- * guarded WHERE re-evaluates against the human's committed write and matches
- * zero rows. Deterministic, rather than dependent on scheduling luck.
+ * TIMING-DEPENDENT, NOT SYNCHRONISED. The helper starts `matcher` and sleeps
+ * 100ms; nothing here observes that the competing read happened or that the
+ * UPDATE actually blocked. Under different scheduling the interleaving it
+ * describes may not occur and the test still passes, so treat a pass as
+ * evidence the guarded WHERE works when the race does happen, not as proof
+ * that the race was reproduced.
+ *
+ * The intended shape: the open transaction holds the row lock while `matcher`
+ * runs on another pooled connection, auto-match reads the row while it is
+ * still pending, then blocks on its own UPDATE until this transaction
+ * commits — at which point its guarded WHERE re-evaluates against the human's
+ * committed write and matches zero rows.
  */
 async function raceAgainstManualMatch<T>(
   reconId: number,

@@ -1,4 +1,6 @@
 import postgres from "postgres";
+import { afterAll } from "vitest";
+import { ensureTestDatabase, leaseTestDatabase, workerDatabaseName, workerDatabaseUrl } from "./database-safety";
 import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
@@ -32,6 +34,12 @@ const db = getDb();
 export { db };
 
 let didMigrate = false;
+let releaseLease: (() => Promise<void>) | undefined;
+afterAll(async () => {
+  await releaseLease?.();
+  releaseLease = undefined;
+  didMigrate = false;
+});
 
 function createQuietSql(url: string) {
   return postgres(url, {
@@ -50,6 +58,15 @@ async function resetMetaSequences() {
 
 export const setupTestDatabase = async () => {
   if (didMigrate) return;
+
+  const url = workerDatabaseUrl();
+  const name = workerDatabaseName();
+  // This run's database does not exist until the first suite in this worker
+  // asks for it. Creating it costs about 25ms; the migrate below costs about
+  // 250ms and already ran per file under the old scheme, so nothing here is
+  // new work beyond the CREATE.
+  await ensureTestDatabase(url, name);
+  releaseLease ??= await leaseTestDatabase(url, name);
 
   // Drop and recreate schema for clean slate (including drizzle migration metadata)
   const setupSql = createQuietSql(process.env.DATABASE_URL!);
@@ -72,6 +89,8 @@ export const setupTestDatabase = async () => {
 };
 
 export const resetTestDatabase = async () => {
+  workerDatabaseUrl();
+  if (!releaseLease) throw new Error("Call setupTestDatabase before resetting test data");
   // Delete book-scoped data (FK ordering)
   await db.delete(investmentLotAllocations);
   // Must run before transactions: a lot's opened_split_id (-> investment_splits,
@@ -333,7 +352,6 @@ export const createInvestmentSplit = async (data: {
   transactionId: number;
   accountId?: number | null;
   securityId: number;
-  lotId?: number | null;
   action: "buy" | "sell" | "dividend" | "capGain" | "fee" | "split";
   sharesMicros: number;
   priceMicros: number;
@@ -349,7 +367,6 @@ export const createInvestmentSplit = async (data: {
       transactionId: data.transactionId,
       accountId: data.accountId ?? null,
       securityId: data.securityId,
-      lotId: data.lotId ?? null,
       action: data.action,
       sharesMicros: data.sharesMicros,
       priceMicros: data.priceMicros,

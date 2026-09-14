@@ -107,7 +107,7 @@ function isFocusOnActivatableElement(): boolean {
 
 function PrefixIndicator({ prefix }: { prefix: string }) {
   return (
-    <div className="fixed bottom-6 right-6 z-[70] bg-surface-elevated border border-border rounded-lg shadow-lg px-3 py-2 text-sm text-fg-secondary animate-modal-enter">
+    <div className="fixed bottom-6 right-6 z-70 bg-surface-elevated border border-border rounded-lg shadow-lg px-3 py-2 text-sm text-fg-secondary animate-modal-enter">
       <kbd className="inline-flex items-center justify-center min-w-[1.5rem] h-6 px-1.5 font-mono text-xs font-semibold bg-surface-tertiary border border-border rounded text-fg">
         {prefix}
       </kbd>
@@ -125,7 +125,9 @@ export function KeyboardShortcutProvider({
   const bookId = params.bookId as string;
   const router = useRouter();
   const routerRef = useRef(router);
-  routerRef.current = router;
+  useEffect(() => {
+    routerRef.current = router;
+  }, [router]);
 
   const [isOverlayOpen, setIsOverlayOpen] = useState(false);
   const isOverlayOpenRef = useRef(false);
@@ -135,7 +137,7 @@ export function KeyboardShortcutProvider({
   const pendingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const pageShortcutsRef = useRef<Map<string, ShortcutDef>>(new Map());
-  const [pageShortcutsVersion, setPageShortcutsVersion] = useState(0);
+  const [pageShortcuts, setPageShortcuts] = useState<ShortcutDef[]>([]);
 
   // Keep overlay ref in sync
   useEffect(() => {
@@ -162,7 +164,9 @@ export function KeyboardShortcutProvider({
     isOverlayOpenRef.current = next;
   }, []);
   const toggleOverlayRef = useRef(toggleOverlay);
-  toggleOverlayRef.current = toggleOverlay;
+  useEffect(() => {
+    toggleOverlayRef.current = toggleOverlay;
+  }, [toggleOverlay]);
 
   const prefix = `/b/${bookId}`;
 
@@ -237,29 +241,30 @@ export function KeyboardShortcutProvider({
   );
 
   const globalShortcutsRef = useRef(globalShortcuts);
-  globalShortcutsRef.current = globalShortcuts;
+  useEffect(() => {
+    globalShortcutsRef.current = globalShortcuts;
+  }, [globalShortcuts]);
 
   const registerShortcuts = useCallback((shortcuts: ShortcutDef[]) => {
     for (const s of shortcuts) {
       pageShortcutsRef.current.set(s.id, s);
     }
-    setPageShortcutsVersion((v) => v + 1);
+    setPageShortcuts(Array.from(pageShortcutsRef.current.values()));
 
     return () => {
       for (const s of shortcuts) {
         pageShortcutsRef.current.delete(s.id);
       }
-      setPageShortcutsVersion((v) => v + 1);
+      setPageShortcuts(Array.from(pageShortcutsRef.current.values()));
     };
   }, []);
 
   const allShortcuts = useMemo(
     () => [
       ...globalShortcuts,
-      ...Array.from(pageShortcutsRef.current.values()),
+      ...pageShortcuts,
     ],
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [globalShortcuts, pageShortcutsVersion]
+    [globalShortcuts, pageShortcuts]
   );
 
   // Global keydown listener

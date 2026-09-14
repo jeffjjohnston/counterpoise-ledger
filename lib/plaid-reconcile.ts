@@ -933,7 +933,31 @@ async function suggestCounterAccountId(
     return exact.accountId;
   }
 
-  return counterpartRows[0]?.accountId ?? null;
+  // No exact-amount match: every row is equally uninformative, so break the
+  // tie by which account this payee's history uses most often. Ties in
+  // frequency keep counterpartRows' own order (desc(transactionId), i.e. most
+  // recent transaction first) rather than an arbitrary secondary key.
+  return mostFrequentAccountId(counterpartRows);
+}
+
+function mostFrequentAccountId(rows: Array<{ accountId: number }>): number | null {
+  if (rows.length === 0) return null;
+
+  const counts = new Map<number, number>();
+  for (const row of rows) {
+    counts.set(row.accountId, (counts.get(row.accountId) ?? 0) + 1);
+  }
+
+  let winner = rows[0].accountId;
+  let bestCount = 0;
+  for (const row of rows) {
+    const rowCount = counts.get(row.accountId)!;
+    if (rowCount > bestCount) {
+      bestCount = rowCount;
+      winner = row.accountId;
+    }
+  }
+  return winner;
 }
 
 function toIsoString(value: string | Date | null): string {

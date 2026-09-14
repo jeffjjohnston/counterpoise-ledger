@@ -137,6 +137,71 @@ describe("lib/plaid-reconcile read path", () => {
     expect(page.items[0].candidates[0].scoreTags).toContain("exact_amount");
     expect(page.items[0].suggestedCounterAccountId).toBe(groceries.id);
   });
+
+  it("breaks the no-exact-match fallback by historical account frequency, not by whichever split query returned first", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const dining = await createAccount({ name: "Dining", type: "expense" });
+    const groceries = await createAccount({ name: "Groceries", type: "expense" });
+    const payee = await createPayee({ name: "Recurring Vendor" });
+
+    const token = await createPlaidToken({
+      financialInstitution: "Chase",
+      itemId: "item-lib-freq",
+      accessToken: "token",
+    });
+    const link = await createPlaidAccount({
+      tokenId: token.id,
+      plaidAccountId: "plaid-lib-freq",
+      name: "Plaid Checking",
+      type: "depository",
+      subtype: "checking",
+      counterpoiseAccountId: checking.id,
+    });
+
+    // Three transactions to Dining, then two to Groceries. Groceries is both
+    // more recent (higher transactionId, first in the query's own
+    // desc(transactionId) order) and would win a first-row-wins fallback,
+    // even though Dining is the account this payee uses more often overall.
+    for (const date of ["2026-01-01", "2026-01-05", "2026-01-10"]) {
+      await createTransactionWithSplits({
+        date,
+        description: "Recurring Vendor",
+        payeeId: payee.id,
+        splits: [
+          { accountId: checking.id, amount: -500 },
+          { accountId: dining.id, amount: 500 },
+        ],
+      });
+    }
+    for (const date of ["2026-01-15", "2026-01-20"]) {
+      await createTransactionWithSplits({
+        date,
+        description: "Recurring Vendor",
+        payeeId: payee.id,
+        splits: [
+          { accountId: checking.id, amount: -700 },
+          { accountId: groceries.id, amount: 700 },
+        ],
+      });
+    }
+
+    await createPlaidReconciliation({
+      plaidAccountLinkId: link.id,
+      plaidTransactionId: "txn-lib-freq",
+      date: "2026-01-21",
+      // Matches neither 500 nor 700, so the exact-amount arm never fires and
+      // the fallback is exercised.
+      amountCents: 999,
+      name: "RECURRING VENDOR",
+      merchantName: "Recurring Vendor",
+      resolutionStatus: "pending",
+    });
+
+    const resolved = await getReconcilableLink(getDb(), 1, link.id);
+    const page = await listReconciliationQueue(getDb(), 1, resolved, { limit: 25, offset: 0 });
+
+    expect(page.items[0].suggestedCounterAccountId).toBe(dining.id);
+  });
 });
 
 describe("lib/plaid-reconcile write path", () => {

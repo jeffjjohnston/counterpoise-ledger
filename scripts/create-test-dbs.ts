@@ -15,12 +15,12 @@ function isDatabaseAlreadyExistsError(error: unknown): boolean {
 async function main() {
   const sql = postgres(ADMIN_URL);
 
-  const dbNames = [
-    "counterpoise_dev",
-    // Pool IDs range from 1..maxWorkers, but we also create test_0 for safety
-    ...Array.from({ length: 9 }, (_, i) => `counterpoise_test_${i}`),
-    "counterpoise_e2e",
-  ];
+  // THE TWO FIXED NAMES, AND VITEST NEEDS NEITHER. Each vitest run mints its
+  // own database per worker and creates it as the suite starts, so there is no
+  // set of worker databases to pre-create any more — see db/test-db-name.ts.
+  // What is left is the local development database and the one Playwright
+  // uses, which carries no run dimension.
+  const dbNames = ["counterpoise_dev", "counterpoise_e2e"];
 
   for (const name of dbNames) {
     try {

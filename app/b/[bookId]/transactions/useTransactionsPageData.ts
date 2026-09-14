@@ -91,7 +91,9 @@ export function useTransactionsPageData(
   const toast = useToast();
   const router = useRouter();
   const routerRef = useRef(router);
-  routerRef.current = router;
+  useEffect(() => {
+    routerRef.current = router;
+  }, [router]);
 
   const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
   const [transactions, setTransactions] = useState<TransactionWithSplits[]>([]);

@@ -9,6 +9,7 @@ import {
   foreignKey,
   primaryKey,
   uniqueIndex,
+  unique,
   index,
   check,
   type AnyPgColumn,
@@ -131,10 +132,21 @@ export const accounts = pgTable(
       .$defaultFn(() => new Date()),
   },
   (table) => [
+    // A parent account must be in the same book as its child, and the database
+    // enforces this. parentId is nullable, and PostgreSQL MATCH SIMPLE does not
+    // check a composite key that contains a NULL, so a root account stays
+    // unconstrained. This is the intended behaviour — do not "correct" it to
+    // MATCH FULL, which would demand a NULL book_id on every root account.
     foreignKey({
-      columns: [table.parentId],
-      foreignColumns: [table.id],
+      columns: [table.bookId, table.parentId],
+      foreignColumns: [table.bookId, table.id],
+      name: "accounts_book_parent_fk",
     }),
+    // The primary key on id alone already makes this unique. State it anyway: a
+    // foreign key must point to a declared unique constraint whose column list
+    // agrees exactly, so each parent in a book-scoped composite relation needs
+    // its own (book_id, id).
+    unique("accounts_book_id_id_unique").on(table.bookId, table.id),
     uniqueIndex("accounts_name_book_unique").on(table.name, table.bookId),
   ]
 );
@@ -184,6 +196,9 @@ export const transactions = pgTable("transactions", {
   // equality predicate on it already confines the scan to one book; adding
   // bookId ahead of it would only widen the index for no gain.
   index("idx_transactions_payee_date_id").on(table.payeeId, table.date, table.id),
+  // Target for the book-scoped composite FKs on transaction_splits and
+  // investment_splits. See the note on accounts_book_id_id_unique.
+  unique("transactions_book_id_id_unique").on(table.bookId, table.id),
 ]);
 
 export const securities = pgTable("securities", {
@@ -210,14 +225,15 @@ export const securities = pgTable("securities", {
     .$defaultFn(() => new Date()),
 }, (table) => [
   uniqueIndex("securities_name_symbol_book_unique").on(table.name, table.symbol, table.bookId),
+  // Target for the book-scoped composite FKs on investment_splits and
+  // security_prices. See the note on accounts_book_id_id_unique.
+  unique("securities_book_id_id_unique").on(table.bookId, table.id),
 ]);
 
 export const securityPrices = pgTable(
   "security_prices",
   {
-    securityId: integer("security_id")
-      .notNull()
-      .references(() => securities.id, { onDelete: "cascade" }),
+    securityId: integer("security_id").notNull(),
     bookId: integer("book_id")
       .notNull()
       .references(() => books.id, { onDelete: "cascade" }),
@@ -225,7 +241,15 @@ export const securityPrices = pgTable(
     priceMicros: bigint("price_micros", { mode: "number" }).notNull(),
     source: text("source"),
   },
-  (table) => [primaryKey({ columns: [table.securityId, table.priceDate] })]
+  (table) => [
+    primaryKey({ columns: [table.securityId, table.priceDate] }),
+    // Book-scoped: a price row and its security must agree on the book.
+    foreignKey({
+      columns: [table.bookId, table.securityId],
+      foreignColumns: [securities.bookId, securities.id],
+      name: "security_prices_book_security_fk",
+    }).onDelete("cascade"),
+  ]
 );
 
 export const investmentLots = pgTable("investment_lots", {
@@ -276,14 +300,9 @@ export const investmentSplits = pgTable("investment_splits", {
   bookId: integer("book_id")
     .notNull()
     .references(() => books.id, { onDelete: "cascade" }),
-  transactionId: integer("transaction_id")
-    .notNull()
-    .references(() => transactions.id, { onDelete: "cascade" }),
-  accountId: integer("account_id").references(() => accounts.id, { onDelete: "cascade" }),
-  securityId: integer("security_id")
-    .notNull()
-    .references(() => securities.id, { onDelete: "cascade" }),
-  lotId: integer("lot_id").references(() => investmentLots.id, { onDelete: "set null" }),
+  transactionId: integer("transaction_id").notNull(),
+  accountId: integer("account_id"),
+  securityId: integer("security_id").notNull(),
   action: text("action", {
     enum: ["buy", "sell", "dividend", "capGain", "fee", "split"],
   }).notNull(),
@@ -296,6 +315,25 @@ export const investmentSplits = pgTable("investment_splits", {
   index("idx_investment_splits_txn").on(table.transactionId),
   index("idx_investment_splits_account_txn").on(table.accountId, table.transactionId),
   index("idx_investment_splits_security_txn").on(table.securityId, table.transactionId),
+  // Book-scoped composite FKs. These also pin the denormalised book_id on this
+  // row to its parents' book_id, so the copy cannot drift.
+  foreignKey({
+    columns: [table.bookId, table.transactionId],
+    foreignColumns: [transactions.bookId, transactions.id],
+    name: "investment_splits_book_transaction_fk",
+  }).onDelete("cascade"),
+  // accountId is nullable. MATCH SIMPLE skips the check when it is NULL — see
+  // the note on accounts_book_parent_fk.
+  foreignKey({
+    columns: [table.bookId, table.accountId],
+    foreignColumns: [accounts.bookId, accounts.id],
+    name: "investment_splits_book_account_fk",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [table.bookId, table.securityId],
+    foreignColumns: [securities.bookId, securities.id],
+    name: "investment_splits_book_security_fk",
+  }).onDelete("cascade"),
 ]);
 
 export const investmentLotAllocations = pgTable("investment_lot_allocations", {
@@ -326,16 +364,26 @@ export const transactionSplits = pgTable("transaction_splits", {
   bookId: integer("book_id")
     .notNull()
     .references(() => books.id, { onDelete: "cascade" }),
-  transactionId: integer("transaction_id")
-    .notNull()
-    .references(() => transactions.id, { onDelete: "cascade" }),
-  accountId: integer("account_id")
-    .notNull()
-    .references(() => accounts.id),
+  transactionId: integer("transaction_id").notNull(),
+  accountId: integer("account_id").notNull(),
   amount: integer("amount").notNull(), // positive = debit, negative = credit
 }, (table) => [
   index("idx_transaction_splits_account_txn").on(table.accountId, table.transactionId),
   index("idx_transaction_splits_txn_amount").on(table.transactionId, table.amount),
+  // Book-scoped composite FKs. These also pin the denormalised book_id on this
+  // row to its parents' book_id, so the copy cannot drift.
+  foreignKey({
+    columns: [table.bookId, table.transactionId],
+    foreignColumns: [transactions.bookId, transactions.id],
+    name: "transaction_splits_book_transaction_fk",
+  }).onDelete("cascade"),
+  // No onDelete, as before: an account that still carries splits cannot be
+  // deleted. deleteAccount refuses one for the same reason.
+  foreignKey({
+    columns: [table.bookId, table.accountId],
+    foreignColumns: [accounts.bookId, accounts.id],
+    name: "transaction_splits_book_account_fk",
+  }),
 ]);
 
 export const recurringRules = pgTable("recurring_rules", {
@@ -373,6 +421,9 @@ export const recurringRules = pgTable("recurring_rules", {
     .$defaultFn(() => new Date()),
 }, (table) => [
   index("idx_recurring_rules_active_next").on(table.isActive, table.nextDate),
+  // Target for the book-scoped composite FK on recurring_template_splits. See
+  // the note on accounts_book_id_id_unique.
+  unique("recurring_rules_book_id_id_unique").on(table.bookId, table.id),
 ]);
 
 export const recurringTemplateSplits = pgTable("recurring_template_splits", {
@@ -380,15 +431,29 @@ export const recurringTemplateSplits = pgTable("recurring_template_splits", {
   bookId: integer("book_id")
     .notNull()
     .references(() => books.id, { onDelete: "cascade" }),
-  recurringRuleId: integer("recurring_rule_id")
-    .notNull()
-    .references(() => recurringRules.id, { onDelete: "cascade" }),
-  accountId: integer("account_id")
-    .notNull()
-    .references(() => accounts.id),
+  recurringRuleId: integer("recurring_rule_id").notNull(),
+  accountId: integer("account_id").notNull(),
   amount: integer("amount").notNull(),
 }, (table) => [
   index("idx_recurring_template_splits_rule").on(table.recurringRuleId),
+  // Book-scoped: a template split and its rule must agree on the book. Note
+  // this is NOT transactions.recurring_rule_id, which is ON DELETE SET NULL and
+  // stays a simple FK — a composite SET NULL would also null book_id, which is
+  // NOT NULL.
+  foreignKey({
+    columns: [table.bookId, table.recurringRuleId],
+    foreignColumns: [recurringRules.bookId, recurringRules.id],
+    name: "recurring_template_splits_book_rule_fk",
+  }).onDelete("cascade"),
+  // The same book agreement for the account. No onDelete, as on the
+  // single-column key this replaces: you cannot delete an account that still
+  // carries template splits. deleteAccount counts transaction splits and child
+  // accounts, but not this table, so the database is the only guard here.
+  foreignKey({
+    columns: [table.bookId, table.accountId],
+    foreignColumns: [accounts.bookId, accounts.id],
+    name: "recurring_template_splits_book_account_fk",
+  }),
 ]);
 
 export const plaidTokens = pgTable(
@@ -665,10 +730,6 @@ export const investmentSplitsRelations = relations(investmentSplits, ({ one }) =
   security: one(securities, {
     fields: [investmentSplits.securityId],
     references: [securities.id],
-  }),
-  lot: one(investmentLots, {
-    fields: [investmentSplits.lotId],
-    references: [investmentLots.id],
   }),
 }));
 

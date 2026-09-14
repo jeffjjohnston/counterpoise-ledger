@@ -347,6 +347,24 @@ describe("listTransactionsQuery", () => {
     expect(r.error!.issues[0].message).toBe("Invalid accountId");
   });
 
+  it("parses recurringRuleId, the rule detail page's history filter", () => {
+    const r = listTransactionsQuery.safeParse({ recurringRuleId: "18" });
+    expect(r.success).toBe(true);
+    expect(r.data!.recurringRuleId).toBe(18);
+  });
+
+  it("rejects an empty recurringRuleId rather than coercing it to 0", () => {
+    const r = listTransactionsQuery.safeParse({ recurringRuleId: "" });
+    expect(r.success).toBe(false);
+    expect(r.error!.issues[0].message).toBe("Invalid recurringRuleId");
+  });
+
+  it("rejects a non-numeric recurringRuleId with the same shaped message", () => {
+    const r = listTransactionsQuery.safeParse({ recurringRuleId: "abc" });
+    expect(r.success).toBe(false);
+    expect(r.error!.issues[0].message).toBe("Invalid recurringRuleId");
+  });
+
   it("rejects an impossible startDate", () => {
     expect(listTransactionsQuery.safeParse({ startDate: "2026-13-45" }).success).toBe(false);
   });

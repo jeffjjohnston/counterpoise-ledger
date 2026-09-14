@@ -5,16 +5,23 @@
 # database ("Skipping initialization" in the log).
 #
 # Existing deployments therefore do not get a role from this script. Migrating
-# one is a documented manual step; see "Separating the application database
-# role" in the README.
+# one is a manual step: see "Separating the application database role" in
+# the top-level README.
 #
 # Two things are separated here, not one:
 #
-#   - The password. POSTGRES_PASSWORD belongs to the bootstrap superuser and
-#     defaults to a value this repository publishes, because the development
-#     and test databases on the same instance hardcode it in four places and
-#     are disposable. Production gets its own password instead of inheriting
-#     that one.
+#   - The password. POSTGRES_PASSWORD belongs to the bootstrap superuser. It
+#     used to default to a value this repository publishes, because the
+#     development and test databases shared this instance and hardcode that
+#     value. They have their own instance now, so production Compose carries
+#     no fallback and a deployment must supply its own.
+#
+#     NOTHING HERE CAN REFUSE THE PUBLISHED VALUE. This directory runs only
+#     AFTER initdb has already created the cluster with it, and only on a
+#     first initialization — so refusing here would stop the container while
+#     leaving that password stored, skip the role below, and never run
+#     again. A refusal has to come before initdb — an entrypoint guard on
+#     the postgres service, which runs while PGDATA is still empty.
 #
 #   - The privileges. The bootstrap role is a superuser. The application only
 #     ever runs plain DDL and DML — no CREATE EXTENSION, no role management —

@@ -54,7 +54,7 @@ export function KeyboardShortcutOverlay() {
   return (
     <div
       ref={overlayRef}
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 backdrop-blur-[2px]"
+      className="fixed inset-0 z-60 flex items-center justify-center bg-black/40 backdrop-blur-[2px]"
       onClick={(e) => {
         if (e.target === overlayRef.current) setOverlayOpen(false);
       }}

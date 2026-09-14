@@ -1,6 +1,7 @@
-import { describe, expect, it, beforeAll } from "vitest";
+import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
 import { getDb } from "@/db";
 import { seed } from "@/db/seed";
+import { ensureTestDatabase, workerDatabaseName, workerDatabaseUrl } from "../helpers/database-safety";
 import {
   accounts,
   transactions,
@@ -18,11 +19,19 @@ import {
 } from "@/db/schema";
 import { sql, eq } from "drizzle-orm";
 import { resolveAccountIcon } from "@/lib/accounting";
+import { toDateString } from "@/lib/formatters";
 
 describe("seed", () => {
   let db: ReturnType<typeof getDb>;
 
   beforeAll(async () => {
+    // This suite calls seed() instead of setupTestDatabase(), and seed() drops
+    // and rebuilds the schemas of a database it assumes is already there. It
+    // was, while every worker database was pre-created by
+    // `npm run db:create-test-dbs`; each run now names its own and creates it
+    // in setupTestDatabase, which this file never calls. Without this line the
+    // whole suite fails with `database ... does not exist`.
+    await ensureTestDatabase(workerDatabaseUrl(), workerDatabaseName());
     await seed();
     db = getDb();
   }, 120_000);
@@ -300,11 +309,67 @@ describe("seed", () => {
       // hourly recurring cron would immediately post all of them into every
       // demo book. Scheduling forward keeps a fresh book quiet and truthful.
       const rules = await db.select().from(recurringRules);
-      const today = new Date().toISOString().slice(0, 10);
+      const today = toDateString(new Date());
 
       for (const rule of rules) {
         expect(rule.nextDate > today, `${rule.name} is due ${rule.nextDate}`).toBe(true);
       }
     });
+  });
+});
+
+// The seed schedules its recurring rules from a local clock. A test that
+// checks that work must read the same clock.
+//
+// This test pins the time zone and the instant. Both are necessary:
+//
+// - The zone. In UTC, a local date and a UTC date give the same string. CI
+//   runs in UTC. Without a pinned zone, this test proves nothing there.
+// - The instant. Only a month-end evening makes a rule due tomorrow. That is
+//   the smallest margin the seed schedules, and the only case that catches a
+//   "today" that is one day ahead of the seed's.
+//
+// The zone must be behind UTC. At 20:31 in New York, UTC is already on the
+// next day. A UTC "today" then reads 2026-09-01, but the seed reads
+// 2026-08-31. In a zone ahead of UTC, the error makes the comparison less
+// strict, and the test cannot fail.
+describe("seed at a month-end evening", () => {
+  const MONTH_END_EVENING = new Date("2026-09-01T00:31:00Z");
+  let db: ReturnType<typeof getDb>;
+  let realTimeZone: string | undefined;
+
+  beforeAll(async () => {
+    realTimeZone = process.env.TZ;
+    process.env.TZ = "America/New_York";
+    // Only Date is faked. A bare useFakeTimers() also captures the timers
+    // that the postgres driver waits on, and the seed below would not finish.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(MONTH_END_EVENING);
+    await seed();
+    db = getDb();
+  }, 120_000);
+
+  afterAll(() => {
+    vi.useRealTimers();
+    if (realTimeZone === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = realTimeZone;
+    }
+  });
+
+  it("schedules every rule ahead of today", async () => {
+    const rules = await db.select().from(recurringRules);
+    const today = toDateString(new Date());
+
+    // Check the setup before the behaviour. If a pin comes loose, this test
+    // becomes quiet instead of red. That is the failure it prevents. Rent is
+    // due tomorrow only while the clock reads a month end.
+    expect(today).toBe("2026-08-31");
+    expect(rules.find((rule) => rule.name === "Rent")?.nextDate).toBe("2026-09-01");
+
+    for (const rule of rules) {
+      expect(rule.nextDate > today, `${rule.name} is due ${rule.nextDate}`).toBe(true);
+    }
   });
 });

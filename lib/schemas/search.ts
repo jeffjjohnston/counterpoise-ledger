@@ -18,9 +18,10 @@ import { z } from "zod/v4";
 // it mirrors the original literal read.
 //
 // searchBook() special-cases `q.trim() === ""` to return empty results
-// before touching the database (lib/search.ts:75-78), so an empty `q` is
-// not merely tolerated — it is the route's own documented behavior, exercised
-// by tests/api/search.test.ts's "returns empty buckets for a blank query".
+// before touching the database (its first statement after the trim), so an
+// empty `q` is not merely tolerated — it is the route's own documented
+// behavior, exercised by tests/api/search.test.ts's "returns empty buckets
+// for a blank query".
 // This schema must not turn that into a 400.
 //
 // startDate/endDate are read today as

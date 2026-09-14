@@ -486,7 +486,7 @@ export function ReconciliationModal({
                         {item.reviewReason !== null && (
                           <span
                             aria-hidden="true"
-                            className="mt-1.5 h-1.5 w-1.5 flex-none rounded-full bg-[var(--fg-warning)]"
+                            className="mt-1.5 h-1.5 w-1.5 flex-none rounded-full bg-(--fg-warning)"
                           />
                         )}
                         <div className="min-w-0 flex-1">

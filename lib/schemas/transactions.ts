@@ -229,7 +229,8 @@ const countParam = (message: string) =>
 // Key order is significant: zod reports issues in shape order and the routes
 // return only `issues[0].message`, so this mirrors the order the route's
 // hand-written guards ran in (accountId, accountIds, balanceAccountId,
-// payeeId).
+// payeeId). recurringRuleId is appended after payeeId rather than inserted
+// among them, so the existing precedence is untouched.
 export const listTransactionsQuery = z.object({
   accountId: idParam("Invalid accountId").optional(),
   // Reproduces the route's own lenient parse: split on commas, drop entries
@@ -246,6 +247,10 @@ export const listTransactionsQuery = z.object({
     .optional(),
   balanceAccountId: idParam("Invalid balanceAccountId").optional(),
   payeeId: idParam("Invalid payeeId").optional(),
+  // The rule detail page's history filter. Same idParam treatment as the ids
+  // above and for the same reason: `?recurringRuleId=` must stay a 400 rather
+  // than coerce to "filter by rule 0".
+  recurringRuleId: idParam("Invalid recurringRuleId").optional(),
   startDate: z.iso.date().optional(),
   endDate: z.iso.date().optional(),
   // Left as a bare string: the route's semantics are "true only for the

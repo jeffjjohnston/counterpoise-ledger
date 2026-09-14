@@ -170,8 +170,9 @@ export function BookNavbar() {
   // backdrop, and the hamburger itself. The scroll lock below keys off menu
   // state alone, so a menu left open would strand `overflow: hidden` on a
   // desktop-width page with nothing on screen to clear it — recoverable only
-  // by rotating back and closing the menu. useIsMobile shares MOBILE_BREAKPOINT
-  // with the `lg:` classes, so this cannot drift from the CSS that hides them.
+  // by rotating back and closing the menu. useIsMobile's MOBILE_BREAKPOINT is
+  // 1024, matching Tailwind's `lg:` by hand rather than by a shared constant —
+  // the two agree today and must be changed together.
   const isMobile = useIsMobile();
   useEffect(() => {
     if (!isMobile) {
@@ -200,7 +201,7 @@ export function BookNavbar() {
         <div className="px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-14 lg:h-16">
             <div className="flex items-center">
-              <Link href="/" className="flex items-center gap-2 flex-shrink-0">
+              <Link href="/" className="flex items-center gap-2 shrink-0">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={logoSrc} alt="" className="w-7 h-7 lg:w-8 lg:h-8" />
                 <span className="text-lg lg:text-xl font-bold text-fg hidden sm:inline" title={`Counterpoise v${process.env.NEXT_PUBLIC_APP_VERSION}`}>Counterpoise</span>
@@ -220,7 +221,7 @@ export function BookNavbar() {
                   className="flex items-center gap-1 px-2 sm:px-3 py-1.5 text-sm font-medium text-fg-secondary bg-surface-tertiary rounded-md hover:bg-surface-tertiary/80 transition-colors max-w-[8rem] sm:max-w-[10rem]"
                 >
                   <span className="truncate">{currentBook?.name || "Loading..."}</span>
-                  <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                  <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
                   </svg>
                 </button>
@@ -243,7 +244,7 @@ export function BookNavbar() {
                         >
                           <span>{book.name}</span>
                           {isCurrentBook && (
-                            <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                            <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
                             </svg>
                           )}

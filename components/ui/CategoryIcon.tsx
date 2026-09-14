@@ -32,7 +32,7 @@ export function CategoryIcon({ icon, className }: CategoryIconProps) {
     <span
       aria-hidden="true"
       className={cn(
-        "inline-block w-[1.35em] mr-1 flex-shrink-0 text-center select-none",
+        "inline-block w-[1.35em] mr-1 shrink-0 text-center select-none",
         className
       )}
     >

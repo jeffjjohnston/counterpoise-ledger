@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReconciliationModal } from "@/components/sync/ReconciliationModal";
 import { KeyboardShortcutProvider } from "@/components/KeyboardShortcutProvider";
@@ -125,6 +125,34 @@ function stubQueueFetch(
   onPost?: (body: unknown) => Promise<Response> | Response
 ) {
   return stubQueueList([item], onPost);
+}
+
+/**
+ * Drain React's pending passive effects.
+ *
+ * The single mechanism the disclosure tests and the keyboard tests both
+ * depend on, named once so the two guards below actually guard it.
+ */
+const flushEffects = () => act(async () => {});
+
+/**
+ * Resolve on the DOM mutation itself -- the same signal `findBy*` watches,
+ * without the `setTimeout(0)` grace period RTL happens to await afterwards.
+ * A MutationObserver callback is a microtask and React's passive-effect
+ * flush is a task, so this lands in the gap every time rather than once in a
+ * hundred loaded CI runs.
+ */
+function onceRendered(testId: string) {
+  return new Promise<void>((resolve) => {
+    const selector = `[data-testid="${testId}"]`;
+    if (document.querySelector(selector)) return resolve();
+    const observer = new MutationObserver(() => {
+      if (!document.querySelector(selector)) return;
+      observer.disconnect();
+      resolve();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  });
 }
 
 /** POST bodies sent to the reconcile route, in order. */
@@ -268,6 +296,7 @@ describe("ReconciliationModal", () => {
       expect(payeeInput).toHaveValue("Blue Bottle");
     });
 
+    await flushEffects();
     fireEvent.change(payeeInput, { target: { value: "Coffee Shop" } });
 
     await waitFor(() => {
@@ -331,6 +360,7 @@ describe("ReconciliationModal", () => {
     render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
 
     const matchButton = await screen.findByRole("button", { name: "Match" });
+    await flushEffects();
     fireEvent.click(matchButton);
 
     expect(
@@ -377,7 +407,15 @@ describe("ReconciliationModal", () => {
 
     render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
 
-    fireEvent.click(await screen.findByRole("button", { name: /1 other candidate/i }));
+    // Settle the fold before touching it -- see the guard test below for why
+    // clicking straight off a findBy* can be undone by an effect that has
+    // not run yet.
+    const disclosure = await screen.findByRole("button", {
+      name: /1 other candidate/i,
+    });
+    await flushEffects();
+    fireEvent.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
 
     const updateButton = await screen.findByRole("button", { name: /^Match & Update/ });
     fireEvent.click(updateButton);
@@ -435,6 +473,7 @@ describe("ReconciliationModal", () => {
     expect(updateButton).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /other candidate/i })).toBeNull();
 
+    await flushEffects();
     fireEvent.click(updateButton);
 
     await waitFor(() => {
@@ -444,6 +483,48 @@ describe("ReconciliationModal", () => {
       action: "match_update_amount",
       transactionId: 42,
     });
+  });
+
+  // The guard on flushEffects for the disclosures, the twin of the keyboard
+  // guard at the end of this file.
+  //
+  // ReconciliationModal folds both disclosures shut from an effect keyed on
+  // the selected item, and that effect first runs on the commit that paints
+  // the queue. `findBy*` resolves off a MutationObserver watching that same
+  // commit and then, by an accident of RTL's implementation, awaits a
+  // setTimeout(0). That stray tick is usually long enough for React to flush
+  // the fold. Usually. A loaded CI runner outran it on 2026-09-03 and the
+  // Match & Update test above failed with the disclosure it had just clicked
+  // open reading aria-expanded="false" -- the fold landing after the click,
+  // undoing it, with no later cause to reopen it. The findBy that followed
+  // then burned its whole 5s budget reporting a button nothing would draw.
+  //
+  // Waiting on the mutation alone removes the accident: a MutationObserver
+  // callback is a microtask and React's flush is a task, so this reaches the
+  // click before the fold every single time. Weaken flushEffects and this
+  // test fails outright, rather than the test above flaking on some CI runner
+  // a month from now.
+  it("opens the other-candidates disclosure on a queue that has only just rendered", async () => {
+    stubQueueFetch(
+      makeItem({
+        candidates: [
+          makeCandidate({ transactionId: 6 }),
+          makeCandidate({ transactionId: 7, amountDelta: 100, splitCount: 2 }),
+        ],
+      })
+    );
+
+    render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
+    await onceRendered("best-match");
+    await flushEffects();
+
+    const disclosure = screen.getByRole("button", { name: /1 other candidate/i });
+    fireEvent.click(disclosure);
+
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: /^Match & Update/ })
+    ).toBeInTheDocument();
   });
 
   describe("queue semantics: tags, reason lines, and signed amounts", () => {
@@ -567,7 +648,9 @@ describe("ReconciliationModal", () => {
 
     it("opens Create by default when there is nothing to match against", async () => {
       render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
-      fireEvent.click(await screen.findByTestId("queue-item-22"));
+      const emptyRow = await screen.findByTestId("queue-item-22");
+      await flushEffects();
+      fireEvent.click(emptyRow);
       expect(await screen.findByLabelText(/Counter account/i)).toBeInTheDocument();
     });
 
@@ -583,7 +666,9 @@ describe("ReconciliationModal", () => {
 
     it("enables Keep local and Unlink on a row the bank changed", async () => {
       render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
-      fireEvent.click(await screen.findByTestId("queue-item-23"));
+      const changedRow = await screen.findByTestId("queue-item-23");
+      await flushEffects();
+      fireEvent.click(changedRow);
 
       const footer = screen.getByTestId("resolve-footer");
       expect(within(footer).getByRole("button", { name: /Keep local/ })).toBeEnabled();
@@ -639,6 +724,7 @@ describe("ReconciliationModal", () => {
 
     render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
     await screen.findByTestId("queue-item-1");
+    await flushEffects();
     expect(queueGets).toBe(1);
 
     fireEvent.click(
@@ -664,6 +750,29 @@ describe("ReconciliationModal", () => {
       );
     }
 
+    /**
+     * Render, then wait until the modal's keys are live -- not merely drawn.
+     *
+     * `findBy*` resolves off a MutationObserver watching the commit that
+     * paints the queue. The keys arrive one step later: useRegisterShortcuts
+     * installs them from a passive effect, which React flushes in a later
+     * task. In that gap `recon-match` is still the registration from the
+     * first render, whose action closes over a null `bestMatch` and returns
+     * having done nothing -- so the provider matches Enter, calls
+     * preventDefault(), and swallows it.
+     *
+     * A keydown is one-shot, so a `waitFor` after the swallowed key has no
+     * cause left to observe and just burns its budget. Raising that timeout
+     * fixes nothing. `act` drains the pending passive effects instead, so
+     * every key below meets the shortcuts the rendered queue implies.
+     */
+    async function renderModalReady(anchorTestId: string) {
+      const utils = renderModal();
+      await screen.findByTestId(anchorTestId);
+      await flushEffects();
+      return utils;
+    }
+
     it("moves through the queue with the arrow keys", async () => {
       const items = [
         makeItem({ id: 1, candidates: [makeCandidate({ transactionId: 101 })] }),
@@ -671,8 +780,7 @@ describe("ReconciliationModal", () => {
       ];
       stubQueueList(items);
 
-      renderModal();
-      await screen.findByTestId("queue-item-1");
+      await renderModalReady("queue-item-1");
       expect(screen.getByTestId("queue-item-1")).toHaveAttribute("aria-current", "true");
 
       fireEvent.keyDown(document, { key: "ArrowDown" });
@@ -700,8 +808,7 @@ describe("ReconciliationModal", () => {
           }) as Response
       );
 
-      renderModal();
-      await screen.findByTestId("best-match");
+      await renderModalReady("best-match");
 
       fireEvent.keyDown(document, { key: "Enter" });
 
@@ -719,12 +826,18 @@ describe("ReconciliationModal", () => {
       ];
       const fetchMock = stubQueueList(items);
 
-      renderModal();
-      await screen.findByTestId("queue-item-2");
+      await renderModalReady("queue-item-2");
 
       fireEvent.keyDown(document, { key: "Enter" });
       await waitFor(() => expect(screen.getByTestId("queue-item-2")).toBeInTheDocument());
       expect(reconcilePosts(fetchMock)).toHaveLength(0);
+
+      // "No POST" is also what a key that never reached the modal looks like,
+      // so on its own the assertion above cannot fail. ArrowDown is the
+      // control: it comes from the same registration as Enter, so a selection
+      // that moves proves Enter was declined rather than dropped.
+      fireEvent.keyDown(document, { key: "ArrowDown" });
+      expect(screen.getByTestId("queue-item-2")).toHaveAttribute("aria-current", "true");
     });
 
     it("leaves Enter to the focused button instead of matching the best candidate", async () => {
@@ -741,8 +854,7 @@ describe("ReconciliationModal", () => {
           }) as Response
       );
 
-      renderModal();
-      await screen.findByTestId("best-match");
+      await renderModalReady("best-match");
 
       // A keyboard user tabs to Ignore. Enter must activate Ignore, not the
       // Enter shortcut — matching a transaction nobody chose is a
@@ -775,18 +887,62 @@ describe("ReconciliationModal", () => {
           }) as Response
       );
 
-      renderModal();
-      await screen.findByTestId("best-match");
+      await renderModalReady("best-match");
 
       // K resolves keep_local, which the pinned footer only enables for a row
       // the bank flagged (reviewReason != null) -- this item has none, so K
-      // must mirror the footer's disabled state and do nothing.
+      // must mirror the footer's disabled state and do nothing. The I below
+      // is K's control: both come from one registration, so a POST from I
+      // proves K was declined rather than dropped.
       fireEvent.keyDown(document, { key: "k" });
       expect(reconcilePosts(fetchMock)).toHaveLength(0);
 
       fireEvent.keyDown(document, { key: "i" });
       await waitFor(() => expect(reconcilePosts(fetchMock)).toHaveLength(1));
       expect(reconcilePosts(fetchMock)[0]).toMatchObject({ action: "ignore" });
+    });
+
+    // The guard on flushEffects. Every test above waits with findByTestId,
+    // which resolves off a MutationObserver and then, by an accident of RTL's
+    // implementation, awaits a setTimeout(0). That stray tick is usually long
+    // enough for React to flush the passive effect that installs the modal's
+    // keys. Usually. A loaded CI runner outran it once and the Enter test
+    // failed with "expected [] to have a length of 1".
+    //
+    // Waiting on the mutation alone removes the accident: a MutationObserver
+    // callback is a microtask, React's flush is a task, so this reaches the
+    // keydown before the current shortcuts exist every single time. Weaken
+    // flushEffects and this test fails outright, rather than one of the tests
+    // above flaking on some CI runner a month from now.
+    it("has the current shortcuts installed before a key is fired, on a queue that has only just rendered", async () => {
+      const item = makeItem({
+        id: 1,
+        candidates: [makeCandidate({ transactionId: 101 })],
+      });
+      const fetchMock = stubQueueList(
+        [item],
+        () =>
+          ({
+            ok: true,
+            json: async () => ({
+              ...item,
+              resolutionStatus: "matched",
+              matchedTransactionId: 101,
+            }),
+          }) as Response
+      );
+
+      renderModal();
+      await onceRendered("best-match");
+      await flushEffects();
+
+      fireEvent.keyDown(document, { key: "Enter" });
+
+      await waitFor(() => expect(reconcilePosts(fetchMock)).toHaveLength(1));
+      expect(reconcilePosts(fetchMock)[0]).toMatchObject({
+        action: "match",
+        transactionId: 101,
+      });
     });
   });
 });

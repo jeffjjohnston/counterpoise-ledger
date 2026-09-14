@@ -57,8 +57,8 @@ export function IconPicker({
           aria-label="Choose an icon"
           aria-expanded={isOpen}
           className={cn(
-            "w-9 h-9 flex-shrink-0 rounded-md flex items-center justify-center text-lg",
-            "focus:outline-none focus:ring-2 focus:ring-border-focus",
+            "w-9 h-9 shrink-0 rounded-md flex items-center justify-center text-lg",
+            "focus:outline-hidden focus:ring-2 focus:ring-border-focus",
             isSet
               ? "border border-border-focus bg-surface-tertiary"
               : "border border-dashed border-border opacity-60"

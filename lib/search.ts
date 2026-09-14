@@ -1,4 +1,4 @@
-import { eq, like, or, and, gte, lte, desc, sql } from "drizzle-orm";
+import { eq, like, or, and, gte, lte, desc, asc, sql } from "drizzle-orm";
 import type { AppDb } from "@/db";
 import {
   accounts,
@@ -29,6 +29,19 @@ export type SearchTransactionRow = {
 };
 
 /**
+ * One bucket of ranked results, plus enough to tell a caller the LIMIT cut
+ * some rows: `total` is the true match count and `truncated` is whether
+ * `items.length` is less than it. Without this, a model reading the MCP
+ * search tool cannot tell a complete list from a cut one, and the web route
+ * cannot render "25 of 112".
+ */
+export type SearchBucket<T> = {
+  items: T[];
+  total: number;
+  truncated: boolean;
+};
+
+/**
  * Rows here are a SUPERSET of what either surface returns. Each caller
  * projects down to its own response contract — the web route and the MCP tool
  * expose different fields, and neither should change shape just because the
@@ -36,7 +49,7 @@ export type SearchTransactionRow = {
  */
 export type SearchResults = {
   transactions: SearchTransactionRow[];
-  accounts: Array<{
+  accounts: SearchBucket<{
     id: number;
     name: string;
     type: string;
@@ -44,8 +57,8 @@ export type SearchResults = {
     isFavorite: boolean;
     isActive: boolean;
   }>;
-  payees: Array<{ id: number; name: string }>;
-  recurringRules: Array<{
+  payees: SearchBucket<{ id: number; name: string }>;
+  recurringRules: SearchBucket<{
     id: number;
     name: string;
     frequency: string;
@@ -55,6 +68,10 @@ export type SearchResults = {
     isActive: boolean;
   }>;
 };
+
+function emptyBucket<T>(): SearchBucket<T> {
+  return { items: [], total: 0, truncated: false };
+}
 
 /** "$1,234.50" -> 123450 cents; null when the query is not a number. */
 export function parseCurrencyQuery(q: string): number | null {
@@ -76,11 +93,22 @@ export async function searchBook(
 ): Promise<SearchResults> {
   const q = query.trim();
   if (q.length === 0) {
-    return { transactions: [], accounts: [], payees: [], recurringRules: [] };
+    return {
+      transactions: [],
+      accounts: emptyBucket(),
+      payees: emptyBucket(),
+      recurringRules: emptyBucket(),
+    };
   }
 
   const { startDate, endDate, limit: LIMIT = 25 } = opts;
-  const pattern = `%${q.toLowerCase()}%`;
+  const qLower = q.toLowerCase();
+  const pattern = `%${qLower}%`;
+  // Relevance banding on the same lowered value the WHERE clause already
+  // matches on: exact match first, then prefix, then substring. Without this,
+  // an exactly-matched row can sort behind 25 prefix/substring matches and
+  // become unreachable under the LIMIT.
+  const prefixPattern = `${qLower}%`;
 
   // Try parsing as currency amount (e.g., "50" or "50.00" -> 5000 cents)
   const amountCents = parseCurrencyQuery(q);
@@ -118,7 +146,13 @@ export async function searchBook(
       eq(transactionSplits.transactionId, transactions.id)
     )
     .where(txnWhereClause)
-    .orderBy(desc(effectiveDateSql))
+    // The id tiebreak decides which rows survive the LIMIT, not only their
+    // order: transactions that share an effective date are the usual case, so
+    // without it the cut through a same-date group is up to the planner and
+    // two identical searches can return different transactions. desc(id) is
+    // also the order the register uses for this same sort key — see
+    // lib/transactions-query.ts.
+    .orderBy(desc(effectiveDateSql), desc(transactions.id))
     .limit(LIMIT);
 
   const txnIds = matchingTxnIds.map((r) => r.id);
@@ -199,56 +233,107 @@ export async function searchBook(
       .filter((t): t is SearchTransactionRow => t !== undefined);
   }
 
-  // Search accounts
-  const accountResults = await db
-    .select({
-      id: accounts.id,
-      name: accounts.name,
-      type: accounts.type,
-      subtype: accounts.subtype,
-      isFavorite: accounts.isFavorite,
-      isActive: accounts.isActive,
-    })
-    .from(accounts)
-    .where(and(eq(accounts.bookId, bookId), like(sql`lower(${accounts.name})`, pattern)))
-    .limit(LIMIT);
+  // Search accounts. Relevance band on name, then alphabetical within a band.
+  // Each unique index applies to the RAW name, so two names that differ only
+  // in case share a relevance band and a lower(name); recurring rule names
+  // have no unique index at all. The id tiebreak makes the order total, so
+  // .limit() keeps the same rows on every identical search. It is the same
+  // tiebreak the transaction query above applies with desc(transactions.id).
+  const accountsWhere = and(eq(accounts.bookId, bookId), like(sql`lower(${accounts.name})`, pattern));
+  const accountRelevance = sql<number>`case
+    when lower(${accounts.name}) = ${qLower} then 0
+    when lower(${accounts.name}) like ${prefixPattern} then 1
+    else 2
+  end`;
+  const [accountRows, accountCountRows] = await Promise.all([
+    db
+      .select({
+        id: accounts.id,
+        name: accounts.name,
+        type: accounts.type,
+        subtype: accounts.subtype,
+        isFavorite: accounts.isFavorite,
+        isActive: accounts.isActive,
+      })
+      .from(accounts)
+      .where(accountsWhere)
+      .orderBy(accountRelevance, asc(sql`lower(${accounts.name})`), desc(accounts.id))
+      .limit(LIMIT),
+    db.select({ count: sql<number>`cast(count(*) as integer)` }).from(accounts).where(accountsWhere),
+  ]);
+  const accountsTotal = accountCountRows[0]?.count ?? 0;
 
-  // Search payees
-  const payeeResults = await db
-    .select({
-      id: payees.id,
-      name: payees.name,
-    })
-    .from(payees)
-    .where(and(eq(payees.bookId, bookId), like(sql`lower(${payees.name})`, pattern)))
-    .limit(LIMIT);
+  // Search payees. Same relevance band as accounts.
+  const payeesWhere = and(eq(payees.bookId, bookId), like(sql`lower(${payees.name})`, pattern));
+  const payeeRelevance = sql<number>`case
+    when lower(${payees.name}) = ${qLower} then 0
+    when lower(${payees.name}) like ${prefixPattern} then 1
+    else 2
+  end`;
+  const [payeeRows, payeeCountRows] = await Promise.all([
+    db
+      .select({
+        id: payees.id,
+        name: payees.name,
+      })
+      .from(payees)
+      .where(payeesWhere)
+      .orderBy(payeeRelevance, asc(sql`lower(${payees.name})`), desc(payees.id))
+      .limit(LIMIT),
+    db.select({ count: sql<number>`cast(count(*) as integer)` }).from(payees).where(payeesWhere),
+  ]);
+  const payeesTotal = payeeCountRows[0]?.count ?? 0;
 
-  // Search recurring rules
-  const ruleResults = await db
-    .select({
-      id: recurringRules.id,
-      name: recurringRules.name,
-      frequency: recurringRules.frequency,
-      nextDate: recurringRules.nextDate,
-      businessDaysOnly: recurringRules.businessDaysOnly,
-      isActive: recurringRules.isActive,
-    })
-    .from(recurringRules)
-    .where(
-      and(
-        eq(recurringRules.bookId, bookId),
-        or(
-          like(sql`lower(${recurringRules.name})`, pattern),
-          like(sql`lower(${recurringRules.templateDescription})`, pattern)
-        )
-      )
+  // Search recurring rules. Matches on name OR templateDescription, but the
+  // relevance band is on name alone — a row that matches only
+  // templateDescription has no name-relevance band to sit in, so it lands in
+  // the substring band (2) along with a plain name substring match.
+  const rulesWhere = and(
+    eq(recurringRules.bookId, bookId),
+    or(
+      like(sql`lower(${recurringRules.name})`, pattern),
+      like(sql`lower(${recurringRules.templateDescription})`, pattern)
     )
-    .limit(LIMIT);
+  );
+  const ruleRelevance = sql<number>`case
+    when lower(${recurringRules.name}) = ${qLower} then 0
+    when lower(${recurringRules.name}) like ${prefixPattern} then 1
+    else 2
+  end`;
+  const [ruleRows, ruleCountRows] = await Promise.all([
+    db
+      .select({
+        id: recurringRules.id,
+        name: recurringRules.name,
+        frequency: recurringRules.frequency,
+        nextDate: recurringRules.nextDate,
+        businessDaysOnly: recurringRules.businessDaysOnly,
+        isActive: recurringRules.isActive,
+      })
+      .from(recurringRules)
+      .where(rulesWhere)
+      .orderBy(ruleRelevance, asc(sql`lower(${recurringRules.name})`), desc(recurringRules.id))
+      .limit(LIMIT),
+    db.select({ count: sql<number>`cast(count(*) as integer)` }).from(recurringRules).where(rulesWhere),
+  ]);
+  const rulesTotal = ruleCountRows[0]?.count ?? 0;
 
   return {
     transactions: txnResults,
-    accounts: accountResults,
-    payees: payeeResults,
-    recurringRules: ruleResults,
+    accounts: {
+      items: accountRows,
+      total: accountsTotal,
+      truncated: accountsTotal > LIMIT,
+    },
+    payees: {
+      items: payeeRows,
+      total: payeesTotal,
+      truncated: payeesTotal > LIMIT,
+    },
+    recurringRules: {
+      items: ruleRows,
+      total: rulesTotal,
+      truncated: rulesTotal > LIMIT,
+    },
   };
 }

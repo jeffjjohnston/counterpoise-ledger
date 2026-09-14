@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import RecurringPage from "@/app/b/[bookId]/recurring/page";
 
@@ -424,6 +424,9 @@ describe("RecurringPage calendar", () => {
     fireEvent.click(screen.getByRole("button", { name: "New Rule" }));
 
     const modal = screen.getByTestId("modal");
+    // businessDaysOnly now lives behind the Advanced disclosure, closed by
+    // default so the rarely-used settings stay out of a routine edit.
+    fireEvent.click(within(modal).getByRole("button", { name: /advanced/i }));
     const checkbox = within(modal).getByLabelText("Business days only");
     expect(checkbox).not.toBeChecked();
     fireEvent.click(checkbox);
@@ -439,9 +442,44 @@ describe("RecurringPage calendar", () => {
     expect(postedBody!.businessDaysOnly).toBe(true);
   });
 
-  it("animates a rule card out before removing it when deleting a reminder", async () => {
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    let isDeleted = false;
+  it("opens the rule's detail page from the row, not the edit form", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/b/1/recurring") {
+        return { ok: true, json: async () => recurringPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/recurring/transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<RecurringPage />);
+
+    const card = await screen.findByTestId("recurring-rule-card-1");
+    expect(within(card).getByRole("link")).toHaveAttribute(
+      "href",
+      "/b/1/recurring/1"
+    );
+
+    // Edit, Delete and Process Now live on the detail page now. Only
+    // Pause/Resume stays on the row.
+    expect(within(card).queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+    expect(within(card).queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    expect(
+      within(card).queryByRole("button", { name: "Process Now" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("pauses a rule inline, without leaving the list", async () => {
+    let isActive = true;
 
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -450,26 +488,19 @@ describe("RecurringPage calendar", () => {
         return {
           ok: true,
           json: async () =>
-            isDeleted ? recurringPayload.filter((rule) => rule.id !== 1) : recurringPayload,
+            recurringPayload.map((rule) =>
+              rule.id === 1 ? { ...rule, isActive } : rule
+            ),
         } as Response;
       }
-
       if (url.startsWith("/api/b/1/accounts")) {
-        return {
-          ok: true,
-          json: async () => accountPayload,
-        } as Response;
+        return { ok: true, json: async () => accountPayload } as Response;
       }
-
       if (url.startsWith("/api/b/1/recurring/transactions")) {
-        return {
-          ok: true,
-          json: async () => [],
-        } as Response;
+        return { ok: true, json: async () => [] } as Response;
       }
-
-      if (url === "/api/b/1/recurring/1" && init?.method === "DELETE") {
-        isDeleted = true;
+      if (url === "/api/b/1/recurring/1" && init?.method === "PUT") {
+        isActive = (JSON.parse(init.body as string) as { isActive: boolean }).isActive;
         return { ok: true, json: async () => ({}) } as Response;
       }
 
@@ -480,22 +511,118 @@ describe("RecurringPage calendar", () => {
 
     render(<RecurringPage />);
 
-    await waitFor(() => {
-      expect(screen.getByText("Recurring Transactions")).toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+    const card = await screen.findByTestId("recurring-rule-card-1");
+    fireEvent.click(within(card).getByRole("button", { name: "Pause" }));
 
     await waitFor(() => {
-      expect(screen.getByTestId("recurring-rule-card-1")).toHaveClass("opacity-0");
+      expect(
+        within(screen.getByTestId("recurring-rule-card-1")).getByRole("button", {
+          name: "Resume",
+        })
+      ).toBeInTheDocument();
+    });
+  });
+});
+
+describe("RecurringPage search filter", () => {
+  const payeeRule = {
+    ...recurringPayload[1],
+    id: 4,
+    name: "Quarterly Water Bill",
+    payeeId: 7,
+    payee: { id: 7, name: "Acme Utilities" },
+    templateDescription: "Water service",
+  };
+
+  const searchPayload = [...recurringPayload, payeeRule];
+
+  const stubFetch = () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/b/1/recurring") {
+        return { ok: true, json: async () => searchPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/recurring/transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+
+      throw new Error(`Unexpected fetch url: ${url}`);
     });
 
-    act(() => {
-      vi.advanceTimersByTime(320);
-    });
+    vi.stubGlobal("fetch", fetchMock);
+  };
 
-    await waitFor(() => {
-      expect(screen.queryByTestId("recurring-rule-card-1")).not.toBeInTheDocument();
-    });
+  const search = () => screen.getByLabelText("Search recurring rules");
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-02-08T12:00:00.000Z"));
+    stubFetch();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps only the rules whose name matches, ignoring case", async () => {
+    render(<RecurringPage />);
+    await screen.findByTestId("recurring-rule-card-1");
+
+    fireEvent.change(search(), { target: { value: "friday" } });
+
+    expect(screen.getByTestId("recurring-rule-card-2")).toBeInTheDocument();
+    expect(screen.queryByTestId("recurring-rule-card-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("recurring-rule-card-3")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("recurring-rule-card-4")).not.toBeInTheDocument();
+  });
+
+  it("matches a rule by its payee name", async () => {
+    render(<RecurringPage />);
+    await screen.findByTestId("recurring-rule-card-4");
+
+    // "Acme Utilities" appears nowhere in rule 4's own name, so a match here
+    // can only come from the payee field.
+    fireEvent.change(search(), { target: { value: "acme" } });
+
+    expect(screen.getByTestId("recurring-rule-card-4")).toBeInTheDocument();
+    expect(screen.queryByTestId("recurring-rule-card-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("recurring-rule-card-2")).not.toBeInTheDocument();
+  });
+
+  it("reports an empty result without claiming the book has no rules", async () => {
+    render(<RecurringPage />);
+    await screen.findByTestId("recurring-rule-card-1");
+
+    fireEvent.change(search(), { target: { value: "no such rule" } });
+
+    expect(screen.getByText("No recurring rules match your search.")).toBeInTheDocument();
+    expect(screen.queryByText(/No recurring rules yet/)).not.toBeInTheDocument();
+  });
+
+  it("leaves the calendar and the due count showing every rule", async () => {
+    render(<RecurringPage />);
+    await screen.findByTestId("recurring-rule-card-1");
+
+    // Rules 2 and 4 are the due ones; filtering them out of the list must not
+    // change what "Process All Due" will act on.
+    expect(
+      screen.getByRole("button", { name: "Process All Due (2)" })
+    ).toBeInTheDocument();
+
+    fireEvent.change(search(), { target: { value: "Very Long" } });
+
+    expect(screen.queryByTestId("recurring-rule-card-2")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("recurring-rule-card-4")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Process All Due (2)" })
+    ).toBeInTheDocument();
+
+    const fridayCell = screen.getByTestId("calendar-day-cell-2026-02-13");
+    expect(within(fridayCell).getByText("Friday Catchup Rule")).toBeInTheDocument();
   });
 });

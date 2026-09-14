@@ -151,7 +151,7 @@ export type UpdateTokenInput = z.infer<typeof updateTokenSchema>;
 // Plaid account" (both need accounts/plaidAccounts reads). The two
 // *duplicate* checks below need no DB read at all — each is a pure function
 // of the request body — which is exactly what makes "Duplicate
-// plaidAccountId in assignments" schema-expressible per the task brief; the
+// plaidAccountId in assignments" schema-expressible; the
 // same reasoning applies unchanged to the counterpoiseAccountId duplicate
 // check, since it's the identical pattern (Set-size-vs-length over one
 // field of the same array) applied to a different field of the same body.

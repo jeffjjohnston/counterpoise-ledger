@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures";
 
 // Get today's date in MM/DD/YYYY format for the DateInput component
 const today = new Date();
@@ -9,8 +9,8 @@ function uniqueName(prefix: string) {
   return `${prefix} ${Date.now()}-${Math.round(Math.random() * 1000)}`;
 }
 
-async function getAccountIds(page: import("@playwright/test").Page) {
-  const response = await page.request.get("/api/b/1/accounts?includeInactive=true");
+async function getAccountIds(page: import("@playwright/test").Page, bookId: number) {
+  const response = await page.request.get(`/api/b/${bookId}/accounts?includeInactive=true`);
   expect(response.ok()).toBeTruthy();
   const data = await response.json();
   const flattened: Array<{ id: number; name: string }> = [];
@@ -34,14 +34,15 @@ async function getAccountIds(page: import("@playwright/test").Page) {
 
 async function createSimpleTransaction(
   page: import("@playwright/test").Page,
+  bookId: number,
   payeeName: string,
   amountCents: number
 ) {
-  const { checkingId, groceriesId } = await getAccountIds(page);
+  const { checkingId, groceriesId } = await getAccountIds(page, bookId);
   expect(checkingId).toBeTruthy();
   expect(groceriesId).toBeTruthy();
 
-  const response = await page.request.post("/api/b/1/transactions", {
+  const response = await page.request.post(`/api/b/${bookId}/transactions`, {
     data: {
       date: todayYMD,
       description: `${payeeName} description`,
@@ -58,8 +59,8 @@ async function createSimpleTransaction(
 }
 
 test.describe("transaction CRUD", () => {
-  test("creates a simple transaction", async ({ page }) => {
-    await page.goto("/b/1/transactions");
+  test("creates a simple transaction", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/transactions`);
 
     // Wait for transactions page to load
     await expect(
@@ -103,11 +104,11 @@ test.describe("transaction CRUD", () => {
     await expect(page.locator("tbody tr").filter({ hasText: "$42.50" }).first()).toBeVisible({ timeout: 10000 });
   });
 
-  test("edits an existing transaction", async ({ page }) => {
+  test("edits an existing transaction", async ({ page, bookId }) => {
     const payeeName = uniqueName("Whole Foods");
-    await createSimpleTransaction(page, payeeName, 5150);
+    const created = await createSimpleTransaction(page, bookId, payeeName, 5150);
 
-    await page.goto("/b/1/transactions");
+    await page.goto(`/b/${bookId}/transactions`);
 
     // Wait for transactions page to load
     await expect(
@@ -130,14 +131,19 @@ test.describe("transaction CRUD", () => {
     // Wait for edit modal to close
     await expect(page.getByRole("heading", { name: "Edit Transaction", level: 2 })).not.toBeVisible();
 
-    await expect(page.locator("tbody tr").filter({ hasText: payeeName }).first()).toBeVisible();
+    const saved = await page.request.get(`/api/b/${bookId}/transactions/${created.id}`);
+    expect(saved.ok()).toBe(true);
+    expect((await saved.json()).description).toBe("Updated grocery trip");
+    await page.reload();
+    await page.locator("tbody tr").filter({ hasText: payeeName }).first().click();
+    await expect(page.getByLabel("Description")).toHaveValue("Updated grocery trip");
   });
 
-  test("deletes a transaction", async ({ page }) => {
+  test("deletes a transaction", async ({ page, bookId }) => {
     const payeeName = uniqueName("Delete Target");
-    await createSimpleTransaction(page, payeeName, 4250);
+    await createSimpleTransaction(page, bookId, payeeName, 4250);
 
-    await page.goto("/b/1/transactions");
+    await page.goto(`/b/${bookId}/transactions`);
 
     // Wait for transactions page to load
     await expect(

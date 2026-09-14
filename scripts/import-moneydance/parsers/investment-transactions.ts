@@ -1,8 +1,10 @@
 /**
  * Phase 4: Investment Transactions Import
- * Two-pass approach:
- * 1. Create transactions and lots for buys
- * 2. Match sells to lots using FIFO
+ *
+ * Writes the transactions, their ledger splits, and their investment splits.
+ * It does NOT write investment_lots or investment_lot_allocations: those are
+ * derived state, rebuilt from these splits by lib/lots-db.ts's rebuildLots in
+ * Phase 6.5, which runs after stock splits are imported (see index.ts).
  */
 
 import type {
@@ -11,7 +13,6 @@ import type {
   ImportOptions,
   IdMapper,
   TransactionSplit,
-  InvestmentLot,
 } from "../types";
 import {
   convertDate,
@@ -23,18 +24,13 @@ import {
 } from "../utils/format";
 import { validateTransaction } from "../utils/validation";
 import { getDb, type AppDb } from "../../../db";
-import { eq } from "drizzle-orm";
 import {
-  accounts,
   transactions,
   transactionSplits,
   investmentSplits,
-  investmentLots,
   type NewTransaction,
   type NewTransactionSplit,
-  type InvestmentSplit,
   type NewInvestmentSplit,
-  type NewInvestmentLot,
 } from "../../../db/schema";
 
 /**
@@ -145,7 +141,7 @@ function isDividendReinvestment(action: string, secSplit: TransactionSplit): boo
 }
 
 /**
- * Pass 1: Import investment transactions and create lots for buys
+ * Import investment transactions.
  */
 export async function importInvestmentTransactions(
   mdTransactions: MoneydanceTransaction[],
@@ -161,8 +157,6 @@ export async function importInvestmentTransactions(
   buys: number;
   sells: number;
   dividends: number;
-  lots: number;
-  orphanedSells: number;
   errors: Array<{ transaction: string; error: string }>;
 }> {
   console.log("\n📈 Phase 4: Importing Investment Transactions");
@@ -176,8 +170,6 @@ export async function importInvestmentTransactions(
     buys: 0,
     sells: 0,
     dividends: 0,
-    lots: 0,
-    orphanedSells: 0,
     errors: [] as Array<{ transaction: string; error: string }>,
   };
 
@@ -194,14 +186,11 @@ export async function importInvestmentTransactions(
     return stats;
   }
 
-  // Sort by date for FIFO lot matching
+  // Sort by date so the rows are written in chronological order.
   investmentTxns.sort((a, b) => a.dt.localeCompare(b.dt));
 
-  // Track created lots for Pass 2
-  const lotsBySecurityAccount = new Map<string, InvestmentLot[]>();
-
   if (!options.dryRun) {
-    console.log("\nPass 1: Creating transactions and lots...");
+    console.log("\nCreating transactions...");
 
     let count = 0;
     const total = investmentTxns.length;
@@ -328,14 +317,10 @@ export async function importInvestmentTransactions(
           const incomeSplit = splits.find((s) => s.splitType === "inc");
           const dividendAmountCents = incomeSplit?.samt ? Math.abs(incomeSplit.samt) : pamt;
 
-          // Captured inside the transaction below, applied to the FIFO map only
-          // after the transaction commits (a rollback must not leave a lot
-          // reference for a row that no longer exists).
-          let newLotForPass2: InvestmentLot | undefined;
-          // Counted locally and applied only after the transaction commits, for
-          // the same reason as the lot reference above: an increment survives a
-          // rollback, so the summary would report rows that were never written.
-          const counted = { dividends: 0, buys: 0, lots: 0, imported: 0 };
+          // Counted locally and applied only after the transaction commits:
+          // an increment survives a rollback, so the summary would otherwise
+          // report rows that were never written.
+          const counted = { dividends: 0, buys: 0, imported: 0 };
 
           await db.transaction(async (tx) => {
             // Transaction 1: Cash dividend
@@ -357,7 +342,6 @@ export async function importInvestmentTransactions(
               transactionId: dividendTxn.id,
               accountId,
               securityId,
-              lotId: null,
               action: "dividend",
               sharesMicros: 0,
               priceMicros: 0,
@@ -420,7 +404,6 @@ export async function importInvestmentTransactions(
               transactionId: buyTxn.id,
               accountId,
               securityId,
-              lotId: null,
               action: "buy",
               sharesMicros: Math.abs(samtMicros),
               priceMicros,
@@ -428,40 +411,10 @@ export async function importInvestmentTransactions(
               splitNumerator: null,
               splitDenominator: null,
             };
-            const [insertedBuySplit] = await tx
-              .insert(investmentSplits)
-              .values(buyInvestmentSplit)
-              .returning();
+            await tx.insert(investmentSplits).values(buyInvestmentSplit);
 
-            // Create lot for the buy. Computed once and reused below for the
-            // investment account's own transaction split, so the lot's basis and
-            // the ledger amount can never drift apart. (This synthetic reinvestment
-            // buy is never a BuyXfr, so there's no transfer-amount branch to
-            // reconcile against here, unlike the normal buy path below.)
+            // Cost of the buy, recorded to both sides of the ledger below.
             const buyBasisCents = pamt + feesCents;
-            const newLot: NewInvestmentLot = {
-              bookId: bookId!,
-              accountId,
-              securityId,
-              acquiredDate: convertDate(txn.dt),
-              openedSplitId: insertedBuySplit.id,
-              openedTransactionId: buyTxn.id,
-              closedTransactionId: null,
-              originalSharesMicros: Math.abs(samtMicros),
-              originalBasisCents: buyBasisCents,
-              remainingSharesMicros: Math.abs(samtMicros),
-              remainingBasisCents: buyBasisCents,
-            };
-
-            const [lot] = await tx.insert(investmentLots).values(newLot).returning();
-
-            // Track lot for Pass 2 (applied to the map after this transaction commits)
-            newLotForPass2 = {
-              ...lot,
-              securityId,
-              accountId,
-              remainingShares: samt,
-            };
 
             // Create transaction splits for buy
             // Investment account increases
@@ -485,21 +438,12 @@ export async function importInvestmentTransactions(
             }
 
             counted.buys++;
-            counted.lots++;
             counted.imported += 2; // Two transactions created
           });
 
           stats.dividends += counted.dividends;
           stats.buys += counted.buys;
-          stats.lots += counted.lots;
           stats.imported += counted.imported;
-
-          // Track lot for Pass 2 now that the transaction has committed
-          const key = `${securityId}-${accountId}`;
-          if (!lotsBySecurityAccount.has(key)) {
-            lotsBySecurityAccount.set(key, []);
-          }
-          lotsBySecurityAccount.get(key)!.push(newLotForPass2!);
 
           if (options.verbose) {
             console.log(
@@ -537,14 +481,10 @@ export async function importInvestmentTransactions(
         const feeSplit = splits.find((s) => s.splitType === "fee");
         const feesCents = feeSplit?.pamt ? Math.abs(feeSplit.pamt) : 0;
 
-        // Captured inside the transaction below, applied to the FIFO map only
-        // after the transaction commits (a rollback must not leave a lot
-        // reference for a row that no longer exists).
-        let newLotForPass2: InvestmentLot | undefined;
-        // Counted locally and applied only after the transaction commits, for
-        // the same reason as the lot reference above: an increment survives a
-        // rollback, so the summary would report rows that were never written.
-        const counted = { lots: 0, buys: 0, sells: 0, dividends: 0 };
+        // Counted locally and applied only after the transaction commits: an
+        // increment survives a rollback, so the summary would otherwise report
+        // rows that were never written.
+        const counted = { buys: 0, sells: 0, dividends: 0 };
 
         await db.transaction(async (tx) => {
           const [insertedTxn] = await tx.insert(transactions).values(newTransaction).returning();
@@ -555,7 +495,6 @@ export async function importInvestmentTransactions(
             transactionId: insertedTxn.id,
             accountId, // Investment account ID
             securityId,
-            lotId: null, // Will be set in Pass 2 for sells
             action,
             sharesMicros: Math.abs(samtMicros),
             priceMicros,
@@ -564,10 +503,7 @@ export async function importInvestmentTransactions(
             splitDenominator: null,
           };
 
-          const [insertedInvestmentSplit] = await tx
-            .insert(investmentSplits)
-            .values(newInvestmentSplit)
-            .returning();
+          await tx.insert(investmentSplits).values(newInvestmentSplit);
 
           // Create transaction splits for cash movements
           // In Moneydance: pamt = from parent's perspective, samt = from split account's perspective
@@ -581,9 +517,11 @@ export async function importInvestmentTransactions(
           }
 
           // Calculate investment account value change (for buy/sell/dividend actions).
-          // This is the offsetting split needed for double-entry accounting, and — for
-          // buys — it is also the lot's cost basis below, computed once and reused so
-          // the two can never drift apart.
+          // This is the offsetting split needed for double-entry accounting, and
+          // that is ALL it is. The lot rebuild never reads it: lib/lots.ts derives
+          // basis from the investment split's shares, price and fees. The two are
+          // computed independently and can disagree — the transfer branch below
+          // excludes feesCents from this amount, while the basis includes them.
 
           // Check if this is a transfer transaction (BuyXfr/SellXfr)
           const xfrSplit = splits.find((s) => s.splitType === "xfr");
@@ -612,38 +550,7 @@ export async function importInvestmentTransactions(
           }
           // For cash dividends (no shares), the offset is just the income account (handled below with "inc" splits)
 
-          // For buys, create investment lot. Basis is investmentAccountAmount — the
-          // same figure recorded a few lines below to the investment account's own
-          // transaction split — not a separately recomputed pamt + feesCents, so the
-          // lot and the ledger can never disagree (this matters for BuyXfr, where the
-          // transfer amount excludes fees; see the branch above).
           if (action === "buy" && samt > 0) {
-            const buyBasisCents = investmentAccountAmount;
-            const newLot: NewInvestmentLot = {
-              bookId: bookId!,
-              accountId,
-              securityId,
-              acquiredDate: convertDate(txn.dt),
-              openedSplitId: insertedInvestmentSplit.id,
-              openedTransactionId: insertedTxn.id,
-              closedTransactionId: null,
-              originalSharesMicros: samt,
-              originalBasisCents: buyBasisCents,
-              remainingSharesMicros: samt,
-              remainingBasisCents: buyBasisCents,
-            };
-
-            const [lot] = await tx.insert(investmentLots).values(newLot).returning();
-
-            // Track lot for Pass 2 (applied to the map after this transaction commits)
-            newLotForPass2 = {
-              ...lot,
-              securityId,
-              accountId,
-              remainingShares: samt, // Already converted to micros
-            };
-
-            counted.lots++;
             counted.buys++;
           } else if (action === "sell") {
             counted.sells++;
@@ -725,7 +632,6 @@ export async function importInvestmentTransactions(
               transactionId: insertedTxn.id,
               accountId, // Investment account ID
               securityId,
-              lotId: null,
               action: "dividend",
               sharesMicros: 0,
               priceMicros: 0,
@@ -738,19 +644,9 @@ export async function importInvestmentTransactions(
           }
         });
 
-        stats.lots += counted.lots;
         stats.buys += counted.buys;
         stats.sells += counted.sells;
         stats.dividends += counted.dividends;
-
-        // Track lot for Pass 2 now that the transaction has committed
-        if (newLotForPass2) {
-          const key = `${securityId}-${accountId}`;
-          if (!lotsBySecurityAccount.has(key)) {
-            lotsBySecurityAccount.set(key, []);
-          }
-          lotsBySecurityAccount.get(key)!.push(newLotForPass2);
-        }
 
         stats.imported++;
 
@@ -774,100 +670,16 @@ export async function importInvestmentTransactions(
       }
     }
 
-    // Pass 2: Match sells to lots using FIFO
-    console.log("\nPass 2: Matching sells to lots (FIFO)...");
+    // This phase deliberately writes no investment_lots or
+    // investment_lot_allocations rows. Lots are derived state: index.ts
+    // rebuilds every (account, security) pair through the real FIFO replay
+    // engine (lib/lots-db.ts) in Phase 6.5, from the investment splits written
+    // above. That rebuild must run AFTER stock splits are imported — this
+    // phase runs before them, so it cannot do the rebuild itself; replaying
+    // here would match every sell against pre-split share counts and corrupt
+    // cost basis, realized gains and holding term for any book with a split.
+    // tests/import/lot-rebuild-ordering.test.ts pins that ordering.
 
-    // Get all sell transactions with their account info from transaction_splits
-    const sellTransactionsQuery = await db
-      .select({
-        sellSplit: investmentSplits,
-        txnSplit: transactionSplits,
-        account: accounts,
-      })
-      .from(investmentSplits)
-      .where(eq(investmentSplits.action, "sell"))
-      .innerJoin(transactions, eq(transactions.id, investmentSplits.transactionId))
-      .innerJoin(transactionSplits, eq(transactionSplits.transactionId, transactions.id))
-      .innerJoin(accounts, eq(accounts.id, transactionSplits.accountId));
-
-    // Group by transaction to handle multiple splits per transaction
-    const sellsByTransaction = new Map<number, { sellSplit: InvestmentSplit; accountId: number }>();
-
-    for (const { sellSplit, account } of sellTransactionsQuery) {
-      // Get the parent investment account (cash account's parent)
-      const investmentAccountId = account.parentId || account.id;
-
-      if (!sellsByTransaction.has(sellSplit.transactionId)) {
-        sellsByTransaction.set(sellSplit.transactionId, {
-          sellSplit,
-          accountId: investmentAccountId,
-        });
-      }
-    }
-
-    for (const { sellSplit, accountId } of sellsByTransaction.values()) {
-      const key = `${sellSplit.securityId}-${accountId}`;
-      const lots = lotsBySecurityAccount.get(key);
-
-      if (!lots || lots.length === 0) {
-        stats.orphanedSells++;
-        if (options.verbose) {
-          console.log(`  ⚠ Orphaned sell: No lots available for security ${sellSplit.securityId}`);
-        }
-        continue;
-      }
-
-      let remainingShares = Math.abs(sellSplit.sharesMicros);
-
-      // Match to lots in FIFO order
-      for (const lot of lots) {
-        if (remainingShares === 0) break;
-        if (lot.remainingShares === 0) continue;
-
-        const sharesToClose = Math.min(lot.remainingShares, remainingShares);
-
-        // Update investment split with lot reference
-        await db
-          .update(investmentSplits)
-          .set({ lotId: lot.id })
-          .where(eq(investmentSplits.id, sellSplit.id));
-
-        // Update lot
-        lot.remainingShares -= sharesToClose;
-        remainingShares -= sharesToClose;
-
-        if (lot.remainingShares === 0) {
-          // Lot fully closed
-          await db
-            .update(investmentLots)
-            .set({ closedTransactionId: sellSplit.transactionId })
-            .where(eq(investmentLots.id, lot.id));
-        }
-      }
-
-      if (remainingShares > 0) {
-        stats.orphanedSells++;
-        if (options.verbose) {
-          console.log(
-            `  ⚠ Partial match: ${remainingShares} shares could not be matched to lots`
-          );
-        }
-      }
-    }
-
-    // Pass 1's hand-written lot inserts (above) and Pass 2's hand-written FIFO
-    // matching (above) are both superseded later in the import run: after
-    // stock splits are imported, index.ts rebuilds every (account, security)
-    // pair touched by this import via the real FIFO replay engine
-    // (lib/lots-db.ts), from the investment splits just written, so the final
-    // lot/allocation state is engine-derived regardless of what Pass 1/2
-    // produced. That rebuild must run after stock splits are imported — this
-    // phase runs before them, so it cannot do the rebuild itself; running it
-    // here would replay every sell against pre-split share counts and corrupt
-    // every downstream number for a book with any stock split. Pass 1 and
-    // Pass 2 are slated for deletion, along with investmentSplits.lotId, in a
-    // later release — left in place for now since this importer has no test
-    // coverage and a full refactor is out of scope here.
   } else {
     console.log("  [DRY RUN] Would import investment transactions:");
     const sample = investmentTxns.slice(0, 5);
@@ -880,7 +692,6 @@ export async function importInvestmentTransactions(
       // Update stats for dry run
       if (action === "buy" && secSplit?.samt && secSplit.samt > 0) {
         stats.buys++;
-        stats.lots++;
       } else if (action === "sell") {
         stats.sells++;
       } else if (action === "dividend") {
@@ -897,7 +708,6 @@ export async function importInvestmentTransactions(
 
       if (action === "buy" && secSplit?.samt && secSplit.samt > 0) {
         stats.buys++;
-        stats.lots++;
       } else if (action === "sell") {
         stats.sells++;
       } else if (action === "dividend") {
@@ -917,8 +727,6 @@ export async function importInvestmentTransactions(
   console.log(`  Buys: ${stats.buys}`);
   console.log(`  Sells: ${stats.sells}`);
   console.log(`  Dividends: ${stats.dividends}`);
-  console.log(`  Lots created: ${stats.lots}`);
-  console.log(`  Orphaned sells: ${stats.orphanedSells}`);
   console.log(`  Skipped: ${stats.skipped}`);
   console.log(`  Errors: ${stats.errors.length}`);
 

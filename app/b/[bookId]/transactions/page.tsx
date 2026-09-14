@@ -113,7 +113,9 @@ function TransactionsPageInner() {
   const router = useRouter();
   const routerRef = useRef(router);
   const navIndexRef = useRef(-1);
-  routerRef.current = router;
+  useEffect(() => {
+    routerRef.current = router;
+  }, [router]);
 
   const bookId = useBookId();
   const toast = useToast();
@@ -665,12 +667,7 @@ function TransactionsPageInner() {
       const params = new URLSearchParams();
       params.set("accountId", accountId.toString());
       params.set("highlight", transactionId.toString());
-      const targetUrl = `/b/${bookId}/transactions?${params.toString()}`;
-      if (process.env.NODE_ENV !== "test" && typeof window !== "undefined") {
-        window.location.assign(targetUrl);
-        return;
-      }
-      router.push(targetUrl);
+      router.push(`/b/${bookId}/transactions?${params.toString()}`);
     },
     [bookId, router, scrollTransactionsToTop]
   );
@@ -924,7 +921,7 @@ function TransactionsPageInner() {
                 <button
                   type="button"
                   onClick={() => setMobileSidebarOpen(true)}
-                  className="lg:hidden mr-2 p-1.5 text-fg-secondary hover:text-fg rounded-md hover:bg-surface-tertiary transition-colors flex-shrink-0"
+                  className="lg:hidden mr-2 p-1.5 text-fg-secondary hover:text-fg rounded-md hover:bg-surface-tertiary transition-colors shrink-0"
                   aria-label="Open accounts"
                 >
                   <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -946,7 +943,7 @@ function TransactionsPageInner() {
                         ? "Remove from favorites"
                         : "Add to favorites"
                     }
-                    className="ml-1 lg:ml-2 inline-flex h-8 w-8 items-center justify-center rounded-md text-yellow-500 transition-colors hover:bg-yellow-50 disabled:cursor-not-allowed disabled:opacity-50 flex-shrink-0"
+                    className="ml-1 lg:ml-2 inline-flex h-8 w-8 items-center justify-center rounded-md text-yellow-500 transition-colors hover:bg-yellow-50 disabled:cursor-not-allowed disabled:opacity-50 shrink-0"
                   >
                     <svg
                       className="h-5 w-5"
@@ -1049,7 +1046,7 @@ function TransactionsPageInner() {
             startingBalance={startingBalance}
             onEdit={setEditingTransaction}
             onProjectedClick={(ruleId) =>
-              router.push(`/b/${bookId}/recurring?highlightRule=${ruleId}`)
+              router.push(`/b/${bookId}/recurring/${ruleId}`)
             }
             onPlaidPendingClick={() => router.push(`/b/${bookId}/sync`)}
             onToggleReconciled={handleToggleReconciled}

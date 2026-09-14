@@ -64,7 +64,6 @@ const config: Config = {
           focus: "var(--border-focus)",
           danger: "var(--border-danger)",
           warning: "var(--border-warning)",
-          future: "var(--border-future)",
         },
       },
       boxShadow: {

@@ -766,13 +766,13 @@ export async function updateTransaction(
  *      auto-match claims the row after step 2 runs but before this delete
  *      commits, the delete blocks on the FK until auto-match commits. ON
  *      DELETE SET NULL then clears the id but leaves resolutionStatus at
- *      "matched". No test covers this step: reproducing the race needs two
- *      concurrent sessions, and a single-process test cannot create that
- *      interleaving. Mutation testing confirmed the gap:
- *      removing step 2 or step 3 alone still leaves the row "pending" in
- *      every single-threaded test, because each step masks the other's
- *      absence. A maintainer who deletes this step would see a fully green
- *      suite.
+ *      "matched". THE SWEEP ITSELF IS COVERED — tests/api/transactions-id
+ *      seeds a row at matched/null-id and asserts the delete returns it to
+ *      pending. What no test reproduces is the RACE that strands it, which
+ *      needs the delete and auto-match interleaved on two sessions.
+ *      Historical mutation testing found that removing step 2 or step 3
+ *      alone left the row "pending" in every test then present, each step
+ *      masking the other's absence.
  *   4. Rebuild lots for the collected pairs. rebuildLots takes
  *      pg_advisory_xact_lock as its first statement, and that lock releases
  *      at commit. It MUST run on `tx`, not on the pooled db.

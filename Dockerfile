@@ -1,5 +1,5 @@
 # --- Stage 1: Install dependencies ---
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 # .npmrc carries strict-allow-scripts=true, which makes package.json's
 # allowScripts map enforcing. Without it here, npm ci would run unapproved
@@ -8,7 +8,7 @@ COPY package.json package-lock.json .npmrc ./
 RUN npm ci
 
 # --- Stage 2: Build the application ---
-FROM node:24-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -37,10 +37,10 @@ RUN node -e "const n=['drizzle-orm','postgres','@modelcontextprotocol/sdk','post
  && cat /app/runtime-deps.txt
 
 # --- Stage 3: Production runner ---
-FROM node:24-alpine AS runner
+FROM node:26-alpine AS runner
 WORKDIR /app
 
-# node (uid 1000) ships in node:24-alpine. Chown the directory itself so the
+# node (uid 1000) ships in node:26-alpine. Chown the directory itself so the
 # npm install below can write into it as that user.
 RUN chown node:node /app
 

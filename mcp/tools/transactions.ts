@@ -218,7 +218,7 @@ export function registerTransactionTools(server: McpServer) {
     {
       title: "Search",
       description:
-        "Search across transactions (description, notes, payee, amount), accounts (name), and payees (name). Returns up to 25 results per entity type. Use this for free-text discovery.",
+        "Search across transactions (description, notes, payee, amount), accounts (name), and payees (name). Returns up to 25 results per entity type; the accounts, payees, and recurringRules buckets each carry total and truncated so a cut list is never mistaken for a complete one. Use this for free-text discovery.",
       inputSchema: {
         bookId: z.number().int().positive().describe("The book ID to query"),
         query: z.string().min(1).describe("Search query"),
@@ -247,14 +247,18 @@ export function registerTransactionTools(server: McpServer) {
       // capability gain — check numbers, splits, recurring rules — is purely
       // additive on top of what was already here.
       const result = {
-        accounts: results.accounts.map((a) => ({
-          id: a.id,
-          name: a.name,
-          type: a.type,
-          subtype: a.subtype,
-          isActive: a.isActive,
-          isFavorite: a.isFavorite,
-        })),
+        accounts: {
+          items: results.accounts.items.map((a) => ({
+            id: a.id,
+            name: a.name,
+            type: a.type,
+            subtype: a.subtype,
+            isActive: a.isActive,
+            isFavorite: a.isFavorite,
+          })),
+          total: results.accounts.total,
+          truncated: results.accounts.truncated,
+        },
         payees: results.payees,
         transactions: results.transactions.map((t) => ({
           id: t.id,

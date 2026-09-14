@@ -19,8 +19,9 @@ const accountSubtypeSchema = z.enum(accountSubtypeValues, {
 });
 
 // One grapheme cluster, not one code unit: "👨‍👩‍👧‍👦" is eleven UTF-16 units and
-// four code points but reads as a single character, and a length check on
-// any of those would reject it. Intl.Segmenter is the only correct counter,
+// seven code points — four pictographs joined by three zero-width joiners —
+// but reads as a single character, and a length check on either count would
+// reject it. Intl.Segmenter is the only correct counter,
 // and it is present in Node 18+ and every browser Next.js 16 targets.
 const graphemeSegmenter = new Intl.Segmenter("en", { granularity: "grapheme" });
 

@@ -46,9 +46,9 @@ const REFRESH_MS = 5 * 60_000;
 
 /**
  * Derived from `lastOk` at render time rather than from the server's `ageMs`,
- * which is a snapshot taken when the request was served. This page never
- * refetches, so a tab left open all afternoon would otherwise keep insisting
- * the backup ran "14 min ago".
+ * which is a snapshot taken when the request was served. The page refetches
+ * every REFRESH_MS and when it becomes visible again, but between those a tab
+ * left open would otherwise keep insisting the backup ran "14 min ago".
  */
 function lastSuccess(lastOk: string | null): string {
   if (!lastOk) return "—";

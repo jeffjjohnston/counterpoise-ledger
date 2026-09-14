@@ -1,8 +1,8 @@
 /**
- * The fixture this guards replaced a real Moneydance export that carried a card
- * number, bank account numbers, an OFX username, and an AlphaVantage API key.
- * These assertions keep the replacement honest on every CI run rather than only
- * at review time.
+ * A Moneydance export is exactly the kind of file that carries account numbers,
+ * usernames and API keys, so the fixture standing in for one must not. These
+ * assertions check that on every run rather than at review time, which is the
+ * only point at which a fixture quietly reacquiring real data would be noticed.
  */
 import { describe, it, expect, beforeAll } from "vitest";
 import { readFile } from "node:fs/promises";

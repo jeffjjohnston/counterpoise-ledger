@@ -306,7 +306,7 @@ describe("syncToken - concurrency", () => {
     return token;
   };
 
-  // The hourly cron and a manual "Sync" click can overlap. Staging is
+  // The scheduled sync and a manual "Sync" click can overlap. Staging is
   // idempotent so the books survive it, but both runs pay for the same Plaid
   // page fetches.
   it("refuses a second sync while one is already running for the token", async () => {

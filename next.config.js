@@ -21,6 +21,9 @@ const nextConfig = {
   output: "standalone",
   // Don't advertise the framework in an X-Powered-By response header.
   poweredByHeader: false,
+  // Do not let `next dev` write its agent-rules block into AGENTS.md.
+  // The block comes back at each start and makes the git tree dirty.
+  agentRules: false,
   env: {
     NEXT_PUBLIC_APP_VERSION: version,
   },

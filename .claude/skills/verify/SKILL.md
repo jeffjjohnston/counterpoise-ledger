@@ -16,7 +16,7 @@ When the **production Docker container** (`counterpoise-app-1`) is running local
 PORT=3001 npm run dev   # background it; ready when /login returns 200
 ```
 
-The dev server uses the `counterpoise_dev` PostgreSQL database (Docker Compose must be up: `docker compose up -d`).
+The dev server uses the `counterpoise_dev` PostgreSQL database (start the dedicated dev database with `docker compose -f docker-compose.dev.yml up -d --wait`; no production environment file is needed).
 
 ## Login
 

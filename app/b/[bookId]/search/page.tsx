@@ -50,12 +50,25 @@ type SearchRecurringRule = {
   isActive: boolean;
 };
 
+type SearchBucket<T> = {
+  items: T[];
+  total: number;
+  truncated: boolean;
+};
+
 type SearchResults = {
   transactions: SearchTransaction[];
-  accounts: SearchAccount[];
-  payees: SearchPayee[];
-  recurringRules: SearchRecurringRule[];
+  accounts: SearchBucket<SearchAccount>;
+  payees: SearchBucket<SearchPayee>;
+  recurringRules: SearchBucket<SearchRecurringRule>;
 };
+
+/** "Accounts (5)", or "Accounts (25 of 112)" when the LIMIT cut the list. */
+function bucketHeading(label: string, bucket: SearchBucket<unknown>): string {
+  return bucket.truncated
+    ? `${label} (${bucket.items.length} of ${bucket.total})`
+    : `${label} (${bucket.items.length})`;
+}
 
 function pickBestAccount(splits: SearchSplit[]): number | null {
   if (splits.length === 0) return null;
@@ -172,9 +185,9 @@ function SearchPageInner() {
 
   const totalResults = results
     ? results.transactions.length +
-      results.accounts.length +
-      results.payees.length +
-      results.recurringRules.length
+      results.accounts.items.length +
+      results.payees.items.length +
+      results.recurringRules.items.length
     : 0;
 
   return (
@@ -204,7 +217,7 @@ function SearchPageInner() {
             placeholder="Search transactions, accounts, payees, recurring rules..."
             spellCheck={false}
             autoComplete="off"
-            className="block w-full rounded-lg border border-border bg-surface-inset text-fg pl-10 pr-4 py-2.5 text-sm focus:border-border-focus focus:outline-none focus:ring-1 focus:ring-border-focus"
+            className="block w-full rounded-lg border border-border bg-surface-inset text-fg pl-10 pr-4 py-2.5 text-sm focus:border-border-focus focus:outline-hidden focus:ring-1 focus:ring-border-focus"
           />
         </div>
         <DateRangeFilter
@@ -309,10 +322,10 @@ function SearchPageInner() {
           )}
 
           {/* Accounts */}
-          {results.accounts.length > 0 && (
+          {results.accounts.items.length > 0 && (
             <section>
               <h2 className="text-sm font-semibold text-fg-tertiary uppercase tracking-wide mb-3">
-                Accounts ({results.accounts.length})
+                {bucketHeading("Accounts", results.accounts)}
               </h2>
               <div className="bg-surface rounded-lg border border-border shadow-soft overflow-hidden">
                 <table className="min-w-full divide-y divide-border">
@@ -327,7 +340,7 @@ function SearchPageInner() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border-secondary">
-                    {results.accounts.map((acct) => (
+                    {results.accounts.items.map((acct) => (
                       <tr key={acct.id} className="hover:bg-surface-tertiary">
                         <td className="px-4 py-2.5 text-sm text-fg">
                           <Link
@@ -350,10 +363,10 @@ function SearchPageInner() {
           )}
 
           {/* Payees */}
-          {results.payees.length > 0 && (
+          {results.payees.items.length > 0 && (
             <section>
               <h2 className="text-sm font-semibold text-fg-tertiary uppercase tracking-wide mb-3">
-                Payees ({results.payees.length})
+                {bucketHeading("Payees", results.payees)}
               </h2>
               <div className="bg-surface rounded-lg border border-border shadow-soft overflow-hidden">
                 <table className="min-w-full divide-y divide-border">
@@ -365,7 +378,7 @@ function SearchPageInner() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border-secondary">
-                    {results.payees.map((payee) => (
+                    {results.payees.items.map((payee) => (
                       <tr key={payee.id} className="hover:bg-surface-tertiary">
                         <td className="px-4 py-2.5 text-sm text-fg">
                           <Link
@@ -384,10 +397,10 @@ function SearchPageInner() {
           )}
 
           {/* Recurring Rules */}
-          {results.recurringRules.length > 0 && (
+          {results.recurringRules.items.length > 0 && (
             <section>
               <h2 className="text-sm font-semibold text-fg-tertiary uppercase tracking-wide mb-3">
-                Recurring Rules ({results.recurringRules.length})
+                {bucketHeading("Recurring Rules", results.recurringRules)}
               </h2>
               <div className="bg-surface rounded-lg border border-border shadow-soft overflow-hidden">
                 <table className="min-w-full divide-y divide-border">
@@ -408,11 +421,11 @@ function SearchPageInner() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border-secondary">
-                    {results.recurringRules.map((rule) => (
+                    {results.recurringRules.items.map((rule) => (
                       <tr key={rule.id} className="hover:bg-surface-tertiary">
                         <td className="px-4 py-2.5 text-sm text-fg">
                           <Link
-                            href={`${prefix}/recurring?highlightRule=${rule.id}`}
+                            href={`${prefix}/recurring/${rule.id}`}
                             className="hover:text-fg-accent"
                           >
                             {rule.name}

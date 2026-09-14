@@ -201,8 +201,9 @@ export const createRuleSchema = z.object(
       .optional()
       .describe(
         "How many frequency units between occurrences, as a positive integer — 1 means " +
-          "every period. Applied to daily and monthly rules; weekly rules use weekOfMonth " +
-          "instead and yearly rules ignore it. Defaults to 1."
+          "every period. Applied to daily, weekly and monthly rules — weekly with interval 4 " +
+          "is every 4 weeks. A weekly rule uses it only while weekOfMonth is unset or 'every'; " +
+          "an nth-week-of-month pattern ignores it, as do yearly rules. Defaults to 1."
       ),
     daysOfWeek: z
       .any()
@@ -313,8 +314,9 @@ export const updateRuleSchema = z.object({
     .optional()
     .describe(
       "How many frequency units between occurrences, as a positive integer — 1 means " +
-        "every period. Applied to daily and monthly rules; weekly rules use weekOfMonth " +
-        "instead and yearly rules ignore it. Defaults to 1."
+        "every period. Applied to daily, weekly and monthly rules — weekly with interval 4 " +
+        "is every 4 weeks. A weekly rule uses it only while weekOfMonth is unset or 'every'; " +
+        "an nth-week-of-month pattern ignores it, as do yearly rules. Defaults to 1."
     ),
   daysOfWeek: z
     .any()

@@ -1,6 +1,12 @@
 // lib/transactions-query.ts
 import { type AppDb } from "@/db";
-import { accounts, payees, transactions, transactionSplits } from "@/db/schema";
+import {
+  accounts,
+  payees,
+  recurringRules,
+  transactions,
+  transactionSplits,
+} from "@/db/schema";
 import { and, desc, eq, gte, inArray, lte, or, sql, type SQL } from "drizzle-orm";
 import { effectiveDateSql } from "@/lib/accounting";
 import { TransactionValidationError } from "@/lib/transactions";
@@ -9,6 +15,8 @@ import { TransactionValidationError } from "@/lib/transactions";
 export interface TransactionFilters {
   accountIds?: number[] | null;
   payeeId?: number | null;
+  /** Only the transactions this recurring rule created. */
+  recurringRuleId?: number | null;
   startDate?: string | null;
   endDate?: string | null;
 }
@@ -84,6 +92,13 @@ function buildTransactionFilters(
   if (filters.payeeId !== undefined && filters.payeeId !== null) {
     conditions.push(eq(transactions.payeeId, filters.payeeId));
   }
+  // Paired with the bookId condition above, never on its own. recurringRuleId
+  // is nullable and carries no (bookId, recurringRuleId) composite constraint,
+  // so a rule id alone does not confine the answer to one book — see
+  // assertRecurringRuleInBook.
+  if (filters.recurringRuleId !== undefined && filters.recurringRuleId !== null) {
+    conditions.push(eq(transactions.recurringRuleId, filters.recurringRuleId));
+  }
 
   return { conditions, joinsSplits: accountIds !== null };
 }
@@ -105,6 +120,36 @@ async function assertPayeeInBook(
 
   if (!payee) {
     throw new TransactionValidationError("Invalid payeeId");
+  }
+}
+
+/**
+ * A recurring rule id that is an integer is not thereby yours. Filtering by
+ * another book's rule returns nothing, which reads as "this rule has created
+ * no transactions" — a wrong answer rather than an empty one.
+ *
+ * It also does the ownership work the WHERE clause cannot. `payeeId` is at
+ * least a book-scoped column with a real FK, but `transactions.recurringRuleId`
+ * has no (bookId, recurringRuleId) composite constraint, so another book's row
+ * can legally point at this rule. The bookId predicate in
+ * buildTransactionFilters keeps such a row out of the answer; this check is
+ * what turns the reverse case — asking about a rule you do not own — into an
+ * error instead of an empty page.
+ */
+async function assertRecurringRuleInBook(
+  db: AppDb,
+  bookId: number,
+  recurringRuleId: number,
+): Promise<void> {
+  const [rule] = await db
+    .select({ id: recurringRules.id })
+    .from(recurringRules)
+    .where(
+      and(eq(recurringRules.id, recurringRuleId), eq(recurringRules.bookId, bookId)),
+    );
+
+  if (!rule) {
+    throw new TransactionValidationError("Invalid recurringRuleId");
   }
 }
 
@@ -160,6 +205,9 @@ export async function selectTransactionPage(
 
   if (filters.payeeId !== undefined && filters.payeeId !== null) {
     await assertPayeeInBook(db, bookId, filters.payeeId);
+  }
+  if (filters.recurringRuleId !== undefined && filters.recurringRuleId !== null) {
+    await assertRecurringRuleInBook(db, bookId, filters.recurringRuleId);
   }
   if (filters.accountIds !== undefined && filters.accountIds !== null && filters.accountIds.length > 0) {
     await assertAccountsInBook(db, bookId, filters.accountIds);

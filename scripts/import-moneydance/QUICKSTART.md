@@ -48,7 +48,7 @@ npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existi
 | Option | Description | When to Use |
 |--------|-------------|-------------|
 | `--book-id <id>` | Target book ID (required) | Always - specifies which book to import into |
-| `--dry-run` | Validate without writing | Always run first! |
+| `--dry-run` | Preview without writing — it does not validate; see the README | Always run first! |
 | `--overwrite` | Clear existing data in the target book before importing | Clean re-import into an existing book |
 | `--no-inactive` | Skip inactive accounts | Clean import, only current accounts |
 | `--no-hidden` | Skip hidden accounts | Exclude archived data |
@@ -71,7 +71,7 @@ in under a second. A full ledger of many years takes one to two minutes.
 
 **Phase 3 - Standard Transactions**: All non-investment transactions, with their splits, reconciliation status, and payee linkage.
 
-**Phase 4 - Investment Transactions**: Buy/sell/dividend transactions with FIFO lot tracking.
+**Phase 4 - Investment Transactions**: Buy/sell/dividend transactions. Lots are built later, in phase 6.5, after stock splits are imported.
 
 **Phase 5 - Security Prices**: All historical price points found in the export.
 
@@ -98,9 +98,10 @@ After importing, check:
 # Check you're in project root
 pwd  # Should show .../counterpoise
 
-# Ensure PostgreSQL is running (create volume first if needed)
-docker volume create counterpoise_pgdata
-docker compose up -d
+# Ensure the DEVELOPMENT PostgreSQL is running. docker-compose.yml is
+# production-only and publishes no host port; the dev file is the one that
+# serves a local import.
+docker compose -f docker-compose.dev.yml up -d --wait
 
 # Dry-run your export first
 npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existing-book-id> --dry-run

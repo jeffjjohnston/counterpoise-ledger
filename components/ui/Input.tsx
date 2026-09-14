@@ -6,6 +6,12 @@ import { InputHTMLAttributes, forwardRef } from "react";
 interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "size"> {
   label?: string;
   /**
+   * A lighter phrase appended to the label, for a field whose name alone does
+   * not say what it is for. Costs no vertical space, and unlike a placeholder
+   * it survives the field being filled.
+   */
+  labelSuffix?: string;
+  /**
    * Render the label as screen-reader-only text. For a field sitting under a
    * column header that already names it -- the register's quick-entry row --
    * where repeating the name on screen is noise but the accessible name is
@@ -20,7 +26,7 @@ interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "size">
 }
 
 export const Input = forwardRef<HTMLInputElement, InputProps>(
-  ({ className, label, labelHidden, error, id, size = "default", selectOnFocus, onFocus, ...props }, ref) => {
+  ({ className, label, labelSuffix, labelHidden, error, id, size = "default", selectOnFocus, onFocus, ...props }, ref) => {
     const isCompact = size === "compact";
     return (
       <div className="w-full">
@@ -39,6 +45,12 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
             }
           >
             {label}
+            {labelSuffix && (
+              <span className="font-normal text-fg-tertiary">
+                {" \u2014 "}
+                {labelSuffix}
+              </span>
+            )}
           </label>
         )}
         <input
@@ -49,7 +61,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
             onFocus?.(e);
           }}
           className={cn(
-            "block w-full border border-border bg-surface-inset text-fg placeholder:text-fg-tertiary focus:border-border-focus focus:outline-none focus:ring-1 focus:ring-border-focus text-sm",
+            "block w-full border border-border bg-surface-inset text-fg placeholder:text-fg-tertiary focus:border-border-focus focus:outline-hidden focus:ring-1 focus:ring-border-focus text-sm",
             isCompact ? "rounded-md px-2 py-1" : "rounded-md px-3 py-2",
             error && "border-border-danger focus:border-border-danger focus:ring-border-danger",
             className

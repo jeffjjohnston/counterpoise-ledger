@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import { setupTestDatabase, resetTestDatabase, createUser } from "@/tests/helpers/db-utils";
 import { getDb } from "@/db";
+import { issueReports } from "@/db/schema";
 import {
   createIssueReport,
   listIssueReports,
@@ -59,6 +60,26 @@ describe("issue reports shared logic", () => {
       const reports = await listIssueReports(getDb(), userId);
       expect(reports[0].description).toBe("Second");
       expect(reports[1].description).toBe("First");
+    });
+
+    it("returns newest first when two reports share a created_at", async () => {
+      // createdAt is a JS Date at millisecond precision (db/schema.ts), so two
+      // back-to-back inserts frequently get the same value. This test makes
+      // that tie on purpose. It does not wait for one to occur.
+      const sharedCreatedAt = new Date("2026-08-29T12:00:00.000Z");
+      const insert = (description: string) =>
+        getDb()
+          .insert(issueReports)
+          .values({ userId, description, type: "bug", page: "/b/1", createdAt: sharedCreatedAt })
+          .returning();
+
+      const [older] = await insert("First");
+      const [newer] = await insert("Second");
+      // id is a serial, thus the newer report always has the larger id.
+      expect(newer.id).toBeGreaterThan(older.id);
+
+      const reports = await listIssueReports(getDb(), userId);
+      expect(reports.map((r) => r.description)).toEqual(["Second", "First"]);
     });
 
     it("filters by status when given", async () => {

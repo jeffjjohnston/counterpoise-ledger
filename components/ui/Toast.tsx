@@ -39,7 +39,7 @@ export function Toast({
     >
       <div
         className={cn(
-          "text-sm px-4 py-2 rounded-lg shadow-lg max-w-md break-words whitespace-pre-line",
+          "text-sm px-4 py-2 rounded-lg shadow-lg max-w-md wrap-break-word whitespace-pre-line",
           // bg-danger + text-fg-on-accent is this codebase's established pairing
           // for a solid danger surface — see app/page.tsx:505.
           variant === "error"

@@ -1,30 +1,29 @@
 "use client";
 
-import { useEffect, useState, Suspense, useCallback, useRef } from "react";
+import { useEffect, useState, Suspense, useCallback } from "react";
+import Link from "next/link";
 import { Button } from "@/components/ui/Button";
-import { Modal } from "@/components/ui/Modal";
 import { Input } from "@/components/ui/Input";
-import { Select } from "@/components/ui/Select";
-import { SplitEditor } from "@/components/transactions/SplitEditor";
-import { PayeeAutocomplete } from "@/components/ui/PayeeAutocomplete";
+import { Modal } from "@/components/ui/Modal";
+import {
+  RecurringForm,
+  type PrefillData,
+} from "@/components/recurring/RecurringForm";
 import { formatCurrency, formatDate, toDateString, getAccountShortName } from "@/lib/formatters";
 import {
   describeRecurrence,
-  validateSplits,
   flattenAccounts,
   getNextDate,
-  type RecurrenceConfig,
 } from "@/lib/accounting";
 import {
+  buildRuleRecurrenceConfig,
   getOccurrenceDate,
   isRecurringRuleDue,
-  MAX_AUTO_CREATE_DAYS_BEFORE,
-  MAX_DAILY_INTERVAL_DAYS,
 } from "@/lib/recurring";
 import { useSearchParams, useRouter } from "next/navigation";
-import { cn, selectInputContents } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
-import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
+import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type {
   AccountWithBalance,
@@ -58,7 +57,6 @@ const CALENDAR_DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const CALENDAR_WEEKS = 4;
 const DAYS_PER_WEEK = 7;
 const MAX_OCCURRENCE_ITERATIONS = 366;
-const DELETE_EXIT_ANIMATION_MS = 320;
 
 function parseDateString(dateString: string): Date {
   return new Date(`${dateString}T00:00:00`);
@@ -82,26 +80,6 @@ function describeProcessResult(data: ProcessResult): string {
 
   const reasons = data.skipped.map((s) => `rule ${s.ruleId}: ${s.reason}`).join("\n");
   return `${created}\n\nSkipped ${data.skipped.length} rule(s) — these stay due until fixed:\n${reasons}`;
-}
-
-function buildRuleRecurrenceConfig(rule: RecurringRuleWithSplits): RecurrenceConfig {
-  const parseDays = (value: string | null): number[] | undefined => {
-    if (!value) return undefined;
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-
-  return {
-    frequency: rule.frequency as RecurrenceConfig["frequency"],
-    interval: Math.max(1, rule.interval ?? 1),
-    daysOfWeek: parseDays(rule.daysOfWeek),
-    weekOfMonth: rule.weekOfMonth || undefined,
-    daysOfMonth: parseDays(rule.daysOfMonth),
-  };
 }
 
 function getRuleOccurrencesInRange(
@@ -150,20 +128,13 @@ function RecurringPageInner() {
   const [rules, setRules] = useState<RecurringRuleWithSplits[]>([]);
   const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
   const [completedTxns, setCompletedTxns] = useState<RecurringTransaction[]>([]);
-  const [deletingRuleIds, setDeletingRuleIds] = useState<number[]>([]);
-  const [exitingRuleIds, setExitingRuleIds] = useState<number[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
-  const [editingRule, setEditingRule] = useState<RecurringRuleWithSplits | null>(
-    null
-  );
+  const [searchTerm, setSearchTerm] = useState("");
   const [prefillData, setPrefillData] = useState<PrefillData | undefined>(undefined);
-  const [highlightRuleId, setHighlightRuleId] = useState<number | null>(null);
   const searchParams = useSearchParams();
   const router = useRouter();
-  const highlightedRef = useRef<HTMLDivElement>(null);
-  const removeRuleTimeouts = useRef<ReturnType<typeof setTimeout>[]>([]);
 
   const fetchData = useCallback(async (showLoading: boolean) => {
     // Compute calendar date range for the recurring transactions query
@@ -221,31 +192,6 @@ function RecurringPageInner() {
   }, [fetchData]);
 
   useEffect(() => {
-    const highlightParam = searchParams.get("highlightRule");
-    if (!highlightParam) return;
-    const ruleId = parseInt(highlightParam, 10);
-    if (!Number.isFinite(ruleId)) return;
-
-    setHighlightRuleId(ruleId);
-
-    // Scroll to the highlighted rule once data is loaded
-    const timer = setTimeout(() => {
-      highlightedRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-    }, 100);
-
-    // Clear highlight after animation
-    const clearTimer = setTimeout(() => {
-      setHighlightRuleId(null);
-      window.history.replaceState(null, "", `/b/${bookId}/recurring`);
-    }, 2000);
-
-    return () => {
-      clearTimeout(timer);
-      clearTimeout(clearTimer);
-    };
-  }, [searchParams, router, bookId]);
-
-  useEffect(() => {
     const fromTransaction = searchParams.get("fromTransaction");
     if (!fromTransaction) return;
     const transactionId = parseInt(fromTransaction, 10);
@@ -286,15 +232,6 @@ function RecurringPageInner() {
     return () => { cancelled = true; };
   }, [bookId, searchParams]);
 
-  useEffect(() => {
-    return () => {
-      for (const timeoutId of removeRuleTimeouts.current) {
-        clearTimeout(timeoutId);
-      }
-      removeRuleTimeouts.current = [];
-    };
-  }, []);
-
   const closeNewRuleModal = useCallback(() => {
     setShowModal(false);
     setPrefillData(undefined);
@@ -302,23 +239,6 @@ function RecurringPageInner() {
       router.replace(`/b/${bookId}/recurring`);
     }
   }, [router, searchParams, bookId]);
-
-  const handleProcessRule = async (ruleId: number) => {
-    try {
-      const data = await apiPost<ProcessResult>(`/api/b/${bookId}/recurring/process`, {
-        ruleId,
-      });
-      void fetchData(false);
-      const message = describeProcessResult(data);
-      if (data.skipped?.length) {
-        toast.error(message);
-      } else {
-        toast.success(message);
-      }
-    } catch (e) {
-      toast.error(toMessage(e, "Failed to process the rule"));
-    }
-  };
 
   const handleProcessAll = async () => {
     try {
@@ -334,40 +254,6 @@ function RecurringPageInner() {
       }
     } catch (e) {
       toast.error(toMessage(e, "Failed to process rules"));
-    }
-  };
-
-  const handleDelete = async (id: number) => {
-    if (deletingRuleIds.includes(id) || exitingRuleIds.includes(id)) return;
-    if (!confirm("Are you sure you want to delete this recurring rule?")) return;
-
-    setDeletingRuleIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
-
-    try {
-      await apiDelete(`/api/b/${bookId}/recurring/${id}`);
-
-      setExitingRuleIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
-
-      const timeoutId = setTimeout(() => {
-        setRules((prev) => prev.filter((rule) => rule.id !== id));
-        setCompletedTxns((prev) =>
-          prev.filter((transaction) => transaction.recurringRuleId !== id)
-        );
-        setDeletingRuleIds((prev) => prev.filter((ruleId) => ruleId !== id));
-        setExitingRuleIds((prev) => prev.filter((ruleId) => ruleId !== id));
-        void fetchData(false);
-        removeRuleTimeouts.current = removeRuleTimeouts.current.filter(
-          (activeTimeoutId) => activeTimeoutId !== timeoutId
-        );
-      }, DELETE_EXIT_ANIMATION_MS);
-
-      removeRuleTimeouts.current.push(timeoutId);
-    } catch (e) {
-      // The rule stays visible because the exit animation never started; tell
-      // the user why it is still here.
-      toast.error(toMessage(e, "Failed to delete recurring rule"));
-    } finally {
-      setDeletingRuleIds((prev) => prev.filter((ruleId) => ruleId !== id));
     }
   };
 
@@ -475,6 +361,16 @@ function RecurringPageInner() {
     calendarDays.slice(index * DAYS_PER_WEEK, (index + 1) * DAYS_PER_WEEK)
   );
 
+  // The search narrows the list below it and nothing else. The calendar keeps
+  // every upcoming occurrence, and `dueRules` keeps every due rule, so the
+  // count on "Process All Due" still says what that button will act on.
+  const normalizedSearchTerm = searchTerm.trim().toLowerCase();
+  const filteredRules = rules.filter(
+    (rule) =>
+      rule.name.toLowerCase().includes(normalizedSearchTerm) ||
+      (rule.payee?.name.toLowerCase().includes(normalizedSearchTerm) ?? false)
+  );
+
   return (
     <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       <div className="flex items-center justify-between mb-6">
@@ -573,8 +469,23 @@ function RecurringPageInner() {
         </div>
       </section>
 
+      <div className="mb-4">
+        <Input
+          id="recurring-search"
+          label="Search recurring rules"
+          type="text"
+          value={searchTerm}
+          onChange={(event) => setSearchTerm(event.target.value)}
+          placeholder="Filter by name or payee..."
+          autoCorrect="off"
+          autoCapitalize="off"
+          autoComplete="off"
+          spellCheck={false}
+        />
+      </div>
+
       <div className="space-y-4">
-        {rules.map((rule) => {
+        {filteredRules.map((rule) => {
           const isDue =
             rule.isActive &&
             isRecurringRuleDue(
@@ -596,93 +507,64 @@ function RecurringPageInner() {
             daysOfMonth: rule.daysOfMonth ? JSON.parse(rule.daysOfMonth) : null,
           });
 
-          const isHighlighted = rule.id === highlightRuleId;
-          const isDeleting = deletingRuleIds.includes(rule.id);
-          const isExiting = exitingRuleIds.includes(rule.id);
-
           return (
             <div
               key={rule.id}
               data-testid={`recurring-rule-card-${rule.id}`}
-              ref={isHighlighted ? highlightedRef : undefined}
               className={cn(
-                "bg-surface rounded-lg border shadow-soft overflow-hidden transition-all duration-300",
-                "transition-[opacity,transform,filter] ease-out",
+                "bg-surface rounded-lg border shadow-soft overflow-hidden",
                 isDue ? "border-border-warning" : "border-border",
-                !rule.isActive && "opacity-60",
-                isHighlighted && "ring-2 ring-purple-400 border-purple-400 bg-purple-50/30",
-                isExiting && "opacity-0 translate-x-4 scale-[0.98] blur-[1px] pointer-events-none"
+                !rule.isActive && "opacity-60"
               )}
             >
-              <div className="px-6 py-4 flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <h3 className="font-semibold text-fg">
-                        {rule.name}
-                      </h3>
-                      {isDue && (
-                        <span className="text-xs px-2 py-0.5 bg-warning-subtle text-fg-warning rounded-full">
-                          Due
-                        </span>
-                      )}
-                      {!rule.isActive && (
-                        <span className="text-xs px-2 py-0.5 bg-surface-tertiary text-fg-tertiary rounded-full">
-                          Inactive
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-sm text-fg-tertiary mt-1">
-                      {rule.payee && (
-                        <span className="text-fg-secondary">{rule.payee.name} &middot; </span>
-                      )}
-                      {ruleDesc}
-                      {rule.businessDaysOnly && " (business days only)"} | Next:{" "}
-                      {formatDate(
-                        getOccurrenceDate(rule.nextDate, rule.businessDaysOnly)
-                      )}
-                    </p>
+              <div className="flex items-stretch justify-between">
+                {/* One link per row, and it does not wrap the Pause control:
+                    an interactive element inside an anchor is invalid, and a
+                    click on it would follow the link as well as fire. */}
+                <Link
+                  href={`/b/${bookId}/recurring/${rule.id}`}
+                  className="min-w-0 flex-1 px-6 py-4 transition-colors hover:bg-surface-tertiary"
+                >
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-semibold text-fg">
+                      {rule.name}
+                    </h3>
+                    {isDue && (
+                      <span className="text-xs px-2 py-0.5 bg-warning-subtle text-fg-warning rounded-full">
+                        Due
+                      </span>
+                    )}
+                    {!rule.isActive && (
+                      <span className="text-xs px-2 py-0.5 bg-surface-tertiary text-fg-tertiary rounded-full">
+                        Inactive
+                      </span>
+                    )}
                   </div>
-                </div>
-                <div className="flex items-center gap-4">
+                  <p className="text-sm text-fg-tertiary mt-1">
+                    {rule.payee && (
+                      <span className="text-fg-secondary">{rule.payee.name} &middot; </span>
+                    )}
+                    {ruleDesc}
+                    {rule.businessDaysOnly && " (business days only)"} | Next:{" "}
+                    {formatDate(
+                      getOccurrenceDate(rule.nextDate, rule.businessDaysOnly)
+                    )}
+                  </p>
+                </Link>
+                <div className="flex items-center gap-4 px-6 py-4">
                   <span className="text-lg font-semibold text-fg tabular-nums">
                     {formatCurrency(amount)}
                   </span>
-                  <div className="flex items-center gap-2">
-                    {isDue && (
-                      <Button
-                        size="sm"
-                        onClick={() => handleProcessRule(rule.id)}
-                      >
-                        Process Now
-                      </Button>
-                    )}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setEditingRule(rule)}
-                      disabled={isDeleting}
-                    >
-                      Edit
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleToggleActive(rule)}
-                      disabled={isDeleting}
-                    >
-                      {rule.isActive ? "Pause" : "Resume"}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleDelete(rule.id)}
-                      disabled={isDeleting}
-                      className="text-fg-danger hover:text-fg-danger"
-                    >
-                      {isDeleting ? "Deleting..." : "Delete"}
-                    </Button>
-                  </div>
+                  {/* Pause/Resume is the one row action that stays. Edit,
+                      Delete and Process Now live on the detail page, where the
+                      rule's history is in view to decide against. */}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => handleToggleActive(rule)}
+                  >
+                    {rule.isActive ? "Pause" : "Resume"}
+                  </Button>
                 </div>
               </div>
               <div className="px-6 py-3 bg-surface-secondary border-t border-border-secondary">
@@ -706,6 +588,12 @@ function RecurringPageInner() {
             >
               Create your first recurring transaction
             </button>
+          </div>
+        )}
+
+        {rules.length > 0 && filteredRules.length === 0 && (
+          <div className="text-center py-12 text-fg-tertiary">
+            No recurring rules match your search.
           </div>
         )}
       </div>
@@ -732,454 +620,7 @@ function RecurringPageInner() {
           onCancel={closeNewRuleModal}
         />
       </Modal>
-
-      <Modal
-        isOpen={!!editingRule}
-        onClose={() => setEditingRule(null)}
-        title="Edit Recurring Transaction"
-        size="lg"
-      >
-        {editingRule && (
-          <RecurringForm
-            rule={editingRule}
-            accounts={accounts}
-            bookId={bookId}
-            onSubmit={async (data) => {
-              try {
-                await apiPut(`/api/b/${bookId}/recurring/${editingRule.id}`, data);
-                setEditingRule(null);
-                void fetchData(false);
-              } catch (e) {
-                toast.error(toMessage(e, "Failed to update recurring rule"));
-              }
-            }}
-            onCancel={() => setEditingRule(null)}
-          />
-        )}
-      </Modal>
     </div>
-  );
-}
-
-type Frequency = "daily" | "weekly" | "monthly" | "yearly";
-
-type RecurringFormData = {
-  name: string;
-  frequency: Frequency;
-  interval: number;
-  daysOfWeek: number[] | null;
-  weekOfMonth: string | null;
-  daysOfMonth: number[] | null;
-  startDate: string;
-  endDate: string | null;
-  autoCreateDaysBefore: number;
-  businessDaysOnly: boolean;
-  templateDescription: string;
-  templateSplits: SplitInput[];
-  payeeId: number | null;
-  payeeName?: string;
-};
-
-const FREQUENCY_OPTIONS = [
-  { value: "daily", label: "Daily" },
-  { value: "weekly", label: "Weekly" },
-  { value: "monthly", label: "Monthly" },
-  { value: "yearly", label: "Yearly" },
-];
-
-const WEEKLY_SCOPE_OPTIONS = [
-  { value: "every", label: "Every week" },
-  { value: "2", label: "Every 2nd week" },
-  { value: "3", label: "Every 3rd week" },
-  { value: "4", label: "Every 4th week" },
-  { value: "5", label: "Every 5th week" },
-  { value: "last", label: "Last week of the month" },
-];
-
-const MONTHLY_INTERVAL_OPTIONS = [
-  { value: "1", label: "Every month" },
-  { value: "2", label: "Every other month" },
-  { value: "3", label: "Every 3rd month" },
-  { value: "4", label: "Every 4th month" },
-  { value: "5", label: "Every 5th month" },
-  { value: "6", label: "Every 6th month" },
-];
-
-const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
-
-type PrefillData = {
-  name: string;
-  templateDescription: string;
-  templateSplits: SplitInput[];
-  payeeId?: number | null;
-  payeeName?: string;
-};
-
-function RecurringForm({
-  rule,
-  prefill,
-  accounts,
-  bookId,
-  onSubmit,
-  onCancel,
-}: {
-  rule?: RecurringRuleWithSplits;
-  prefill?: PrefillData;
-  accounts: AccountWithBalance[];
-  bookId: string;
-  onSubmit: (data: RecurringFormData) => void;
-  onCancel: () => void;
-}) {
-  const toast = useToast();
-  const [name, setName] = useState(rule?.name || prefill?.name || "");
-  const [payeeName, setPayeeName] = useState(
-    rule?.payee?.name || prefill?.payeeName || ""
-  );
-  const [payeeId, setPayeeId] = useState<number | null>(
-    rule?.payeeId ?? prefill?.payeeId ?? null
-  );
-  const [payeeSuggestions, setPayeeSuggestions] = useState<
-    Array<{ id: number; name: string }>
-  >([]);
-  const [frequency, setFrequency] = useState<Frequency>(
-    (rule?.frequency as Frequency) || "monthly"
-  );
-  const [intervalVal, setIntervalVal] = useState(rule?.interval ?? 1);
-  const [daysOfWeek, setDaysOfWeek] = useState<number[]>(
-    rule?.daysOfWeek ? JSON.parse(rule.daysOfWeek) : []
-  );
-  const [weekOfMonth, setWeekOfMonth] = useState(rule?.weekOfMonth || "every");
-  const [daysOfMonth, setDaysOfMonth] = useState<number[]>(
-    rule?.daysOfMonth ? JSON.parse(rule.daysOfMonth) : []
-  );
-  const [startDate, setStartDate] = useState(
-    rule?.startDate || toDateString(new Date())
-  );
-  const [endDate, setEndDate] = useState(rule?.endDate || "");
-  const [autoCreateDaysBefore, setAutoCreateDaysBefore] = useState(
-    rule?.autoCreateDaysBefore ?? 0
-  );
-  const [businessDaysOnly, setBusinessDaysOnly] = useState(
-    rule?.businessDaysOnly ?? false
-  );
-  const [description, setDescription] = useState(rule?.templateDescription || prefill?.templateDescription || "");
-  const [splits, setSplits] = useState<SplitInput[]>(
-    rule?.templateSplits.map((s) => ({
-      accountId: s.accountId,
-      amount: s.amount,
-    })) || prefill?.templateSplits || [
-      { accountId: accounts[0]?.id || 0, amount: 0 },
-      { accountId: accounts[1]?.id || 0, amount: 0 },
-    ]
-  );
-
-  const toggleDayOfWeek = (day: number) => {
-    setDaysOfWeek((prev) =>
-      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day].sort((a, b) => a - b)
-    );
-  };
-
-  const toggleDayOfMonth = (day: number) => {
-    setDaysOfMonth((prev) =>
-      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day].sort((a, b) => {
-        if (a === -1) return 1;
-        if (b === -1) return -1;
-        return a - b;
-      })
-    );
-  };
-
-  useEffect(() => {
-    const query = payeeName.trim();
-    if (!query) {
-      setPayeeSuggestions([]);
-      setPayeeId(null);
-      return;
-    }
-
-    const controller = new AbortController();
-
-    const fetchSuggestions = async () => {
-      try {
-        const data = await apiGet<Array<{ id: number; name: string }>>(
-          `/api/b/${bookId}/payees?search=${encodeURIComponent(query)}&limit=8`,
-          { signal: controller.signal }
-        );
-        const suggestions = Array.isArray(data) ? data : [];
-        setPayeeSuggestions(suggestions);
-        const match = suggestions.find(
-          (p: { name: string }) => p.name.toLowerCase() === query.toLowerCase()
-        );
-        setPayeeId(match ? match.id : null);
-      } catch (error) {
-        // The controller's own signal is the authoritative answer to "was this
-        // cancelled?". Name matching alone misses a Firefox abort and a body
-        // truncated mid-stream, both of which reject with TypeError.
-        if (controller.signal.aborted) return;
-        if (error instanceof DOMException && error.name === "AbortError") return;
-      }
-    };
-
-    // setTimeout requires a void-returning callback; fetchSuggestions
-    // already catches its own errors (including abort), so this is a
-    // safe fire-and-forget.
-    const timeout = setTimeout(() => {
-      void fetchSuggestions();
-    }, 150);
-
-    return () => {
-      clearTimeout(timeout);
-      controller.abort();
-    };
-  }, [payeeName, bookId]);
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-
-    if (!validateSplits(splits)) {
-      toast.error("Splits must be balanced (debits = credits)");
-      return;
-    }
-
-    const normalizedPayeeName = payeeName.trim();
-
-    onSubmit({
-      name,
-      frequency,
-      interval: frequency === "daily" ? intervalVal : frequency === "monthly" ? intervalVal : 1,
-      daysOfWeek: frequency === "weekly" && daysOfWeek.length > 0 ? daysOfWeek : null,
-      weekOfMonth: frequency === "weekly" ? weekOfMonth : null,
-      daysOfMonth: frequency === "monthly" && daysOfMonth.length > 0 ? daysOfMonth : null,
-      startDate,
-      endDate: endDate || null,
-      autoCreateDaysBefore,
-      businessDaysOnly,
-      templateDescription: description,
-      templateSplits: splits,
-      payeeId: normalizedPayeeName ? payeeId : null,
-      payeeName: normalizedPayeeName || undefined,
-    });
-  };
-
-  return (
-    <form onSubmit={handleSubmit} className="space-y-4">
-      <Input
-        label="Rule Name"
-        id="name"
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        placeholder="e.g., Monthly Rent"
-        required
-      />
-
-      <PayeeAutocomplete
-        label="Payee"
-        payees={payeeSuggestions}
-        textValue={payeeName}
-        onTextChange={setPayeeName}
-        placeholder="e.g., Landlord"
-      />
-
-      <div className="grid grid-cols-2 gap-4">
-        <Select
-          label="Frequency"
-          id="frequency"
-          value={frequency}
-          onChange={(e) => {
-            const f = e.target.value as Frequency;
-            setFrequency(f);
-            setIntervalVal(1);
-            setDaysOfWeek([]);
-            setWeekOfMonth("every");
-            setDaysOfMonth([]);
-          }}
-          options={FREQUENCY_OPTIONS}
-        />
-        <Input
-          type="date"
-          label="Start Date"
-          id="startDate"
-          value={startDate}
-          onChange={(e) => setStartDate(e.target.value)}
-          required
-        />
-      </div>
-
-      {/* Daily: interval input */}
-      {frequency === "daily" && (
-        <div className="flex items-center gap-2">
-          <span className="text-sm text-fg-secondary">Repeat every</span>
-          <input
-            type="number"
-            min={1}
-            max={MAX_DAILY_INTERVAL_DAYS}
-            value={intervalVal}
-            onFocus={(e) => selectInputContents(e.currentTarget)}
-            onChange={(e) =>
-              setIntervalVal(
-                Math.min(
-                  MAX_DAILY_INTERVAL_DAYS,
-                  Math.max(1, parseInt(e.target.value) || 1)
-                )
-              )
-            }
-            className="w-16 rounded-lg border border-border px-2 py-1.5 text-sm text-center focus:border-border-focus focus:outline-none focus:ring-1 focus:ring-border-focus"
-          />
-          <span className="text-sm text-fg-secondary">day(s)</span>
-        </div>
-      )}
-
-      {/* Weekly: scope dropdown + day-of-week toggles */}
-      {frequency === "weekly" && (
-        <div className="space-y-3">
-          <Select
-            label="Week Pattern"
-            id="weekOfMonth"
-            value={weekOfMonth}
-            onChange={(e) => setWeekOfMonth(e.target.value)}
-            options={WEEKLY_SCOPE_OPTIONS}
-          />
-          <div>
-            <label className="block text-sm font-medium text-fg-secondary mb-1.5">
-              Days of Week
-            </label>
-            <div className="flex gap-1.5">
-              {DAY_LABELS.map((label, i) => (
-                <button
-                  key={i}
-                  type="button"
-                  onClick={() => toggleDayOfWeek(i)}
-                  className={cn(
-                    "w-9 h-9 rounded-lg text-sm font-medium transition-colors",
-                    daysOfWeek.includes(i)
-                      ? "bg-accent text-fg-on-accent"
-                      : "bg-surface-tertiary text-fg-secondary hover:bg-surface-tertiary"
-                  )}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Monthly: interval dropdown + day-of-month grid */}
-      {frequency === "monthly" && (
-        <div className="space-y-3">
-          <Select
-            label="Month Pattern"
-            id="monthInterval"
-            value={String(intervalVal)}
-            onChange={(e) => setIntervalVal(parseInt(e.target.value))}
-            options={MONTHLY_INTERVAL_OPTIONS}
-          />
-          <div>
-            <label className="block text-sm font-medium text-fg-secondary mb-1.5">
-              Days of Month
-            </label>
-            <div className="grid grid-cols-7 gap-1.5">
-              {/* Stops at 30: day 31 clamps to the last day of every month, so a
-                  "31" button would be an exact duplicate of "Last" below. */}
-              {Array.from({ length: 30 }, (_, i) => i + 1).map((day) => (
-                <button
-                  key={day}
-                  type="button"
-                  onClick={() => toggleDayOfMonth(day)}
-                  className={cn(
-                    "h-8 rounded text-sm font-medium transition-colors",
-                    daysOfMonth.includes(day)
-                      ? "bg-accent text-fg-on-accent"
-                      : "bg-surface-tertiary text-fg-secondary hover:bg-surface-tertiary"
-                  )}
-                >
-                  {day}
-                </button>
-              ))}
-              <button
-                type="button"
-                onClick={() => toggleDayOfMonth(-1)}
-                className={cn(
-                  "h-8 rounded text-xs font-medium transition-colors col-span-2",
-                  daysOfMonth.includes(-1)
-                    ? "bg-accent text-fg-on-accent"
-                    : "bg-surface-tertiary text-fg-secondary hover:bg-surface-tertiary"
-                )}
-              >
-                Last
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <Input
-        type="date"
-        label="End Date (optional)"
-        id="endDate"
-        value={endDate}
-        onChange={(e) => setEndDate(e.target.value)}
-      />
-
-      <Input
-        type="number"
-        min={0}
-        max={MAX_AUTO_CREATE_DAYS_BEFORE}
-        label="Auto-create days before scheduled date"
-        id="autoCreateDaysBefore"
-        value={autoCreateDaysBefore}
-        onChange={(e) => {
-          const parsed = parseInt(e.target.value, 10);
-          const nextValue = Number.isNaN(parsed) ? 0 : parsed;
-          setAutoCreateDaysBefore(
-            Math.min(MAX_AUTO_CREATE_DAYS_BEFORE, Math.max(0, nextValue))
-          );
-        }}
-      />
-
-      <div className="space-y-1">
-        <label className="flex items-center gap-2 text-sm text-fg">
-          <input
-            type="checkbox"
-            id="businessDaysOnly"
-            checked={businessDaysOnly}
-            onChange={(e) => setBusinessDaysOnly(e.target.checked)}
-            className="h-4 w-4 text-fg-accent focus:ring-fg-accent border-border rounded"
-          />
-          <span>Business days only</span>
-        </label>
-        <p className="pl-6 text-xs text-fg-tertiary">
-          An occurrence that falls on a weekend is created on the next business
-          day instead. The schedule itself does not move.
-        </p>
-      </div>
-
-      <Input
-        label="Description"
-        id="description"
-        value={description}
-        onChange={(e) => setDescription(e.target.value)}
-        placeholder="e.g., Rent payment to landlord"
-      />
-
-      <div>
-        <label className="block text-sm font-medium text-fg-secondary mb-2">
-          Transaction Splits
-        </label>
-        <SplitEditor
-          splits={splits}
-          onChange={setSplits}
-          accounts={accounts.filter((a) => a.isActive)}
-        />
-      </div>
-
-      <div className="flex justify-end gap-3 pt-4">
-        <Button type="button" variant="secondary" onClick={onCancel}>
-          Cancel
-        </Button>
-        <Button type="submit">{rule ? "Save Changes" : "Create Rule"}</Button>
-      </div>
-    </form>
   );
 }
 

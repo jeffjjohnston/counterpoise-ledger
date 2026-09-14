@@ -6,6 +6,7 @@ node_modules
 *.md
 docs/
 tests/
+playwright.config.ts
 test-results/
 screenshots/
 moneydance_exports/
@@ -17,3 +18,17 @@ pgdata/
 data/
 backups/
 coverage/
+
+# EVERY PATTERN ABOVE IS TOP-LEVEL-ONLY, and that is not a style choice: Docker
+# matches these against the path relative to the context root, so `tests/`
+# excludes the top-level tests directory and nothing nested below it. A stale
+# nested checkout here therefore had its test files type-checked by a release
+# build, which failed after the version tag was already published.
+#
+# scripts/deploy.sh no longer builds from this directory — it builds from a
+# separate permanent checkout holding the tracked tree at the deployed commit
+# and nothing else — so no pattern in this file is what keeps that class out of
+# a released image any more. The entry below is for the other caller: a
+# `docker compose build` run by hand in this directory, where these patterns
+# are still the only thing between the working tree and the image.
+worktrees/

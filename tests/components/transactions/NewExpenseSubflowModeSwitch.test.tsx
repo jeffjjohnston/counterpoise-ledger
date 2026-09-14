@@ -1,4 +1,4 @@
-// Regression test for PR #115: NewExpenseSubflow was extracted out of
+// Regression test: NewExpenseSubflow was extracted out of
 // TransactionForm with its draft name/parent/isCreating state owned locally
 // in the child. Both call sites in TransactionForm sit under mode
 // conditionals (the full-layout site is inside a `mode === "simple" ? ... :`

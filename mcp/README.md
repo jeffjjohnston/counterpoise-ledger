@@ -13,7 +13,10 @@ All tools require a valid API key. Users create keys in the Counterpoise UI at t
 ### WebMCP / site tools
 
 When an authenticated book is open in a browser that supports WebMCP, the web
-application also publishes this same tool registry as site tools. No API key is
+application also publishes site tools — a FILTERED subset of the registry
+above, not all of it. `WEB_EXCLUDED_TOOLS` in `mcp/webmcp.ts` withholds the
+tools that make no sense or are unsafe from a page, and they are refused on
+invocation as well as hidden from the listing. No API key is
 needed in that case: calls are proxied through the Counterpoise application and
 use the signed-in user's session and the currently open book. Book-scoped tools
 have `bookId` filled in by the server rather than accepting it from the agent.
@@ -89,7 +92,8 @@ WebMCP support continue to use the application normally.
 
 ## Setup for Claude Code
 
-Add to your project-level `.claude/settings.local.json`:
+Register the server with `claude mcp add`, or declare it in the project's
+`.mcp.json` (settings files configure Claude Code itself, not MCP servers):
 
 ```json
 {
@@ -110,7 +114,8 @@ Add to your project-level `.claude/settings.local.json`:
 
 If Counterpoise is running via Docker Compose, configure the MCP server to use `docker exec` with the API key passed via `-e`:
 
-Add to your project-level `.claude/settings.local.json`:
+Register the server with `claude mcp add`, or declare it in the project's
+`.mcp.json` (settings files configure Claude Code itself, not MCP servers):
 
 ```json
 {
@@ -159,7 +164,11 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 **Prerequisites:**
 - Generate an API key at `/account` in the web UI
-- The `app` container must be running (`docker compose up -d`)
+- The `app` container must be running. Start it with
+  `docker compose --env-file .env.production.local up -d`: the service-level
+  `env_file` populates the containers but does NOT feed the `${VAR}`
+  interpolation the compose file itself performs — see "Deployment" in the
+  top-level README
 
 ## Environment Variables
 

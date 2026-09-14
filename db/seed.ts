@@ -697,7 +697,7 @@ export async function seedBook(db: AppDb, bookId: number) {
     // Investment split
     await db.insert(schema.investmentSplits).values({
       bookId, transactionId: txnId, accountId: investmentAccountId, securityId,
-      lotId: null, action: "buy", sharesMicros, priceMicros, feesCents: 0,
+      action: "buy", sharesMicros, priceMicros, feesCents: 0,
       splitNumerator: null, splitDenominator: null,
     });
 
@@ -731,7 +731,7 @@ export async function seedBook(db: AppDb, bookId: number) {
 
     await db.insert(schema.investmentSplits).values({
       bookId, transactionId: txnId, accountId: investmentAccountId, securityId,
-      lotId: null, action: "sell", sharesMicros, priceMicros, feesCents: 0,
+      action: "sell", sharesMicros, priceMicros, feesCents: 0,
       splitNumerator: null, splitDenominator: null,
     });
 
@@ -756,7 +756,7 @@ export async function seedBook(db: AppDb, bookId: number) {
     // Investment split for dividend (0 shares, 0 price like the import does)
     await db.insert(schema.investmentSplits).values({
       bookId, transactionId: txnId, accountId: investmentAccountId, securityId,
-      lotId: null, action: "dividend", sharesMicros: 0, priceMicros: 0, feesCents: 0,
+      action: "dividend", sharesMicros: 0, priceMicros: 0, feesCents: 0,
       splitNumerator: null, splitDenominator: null,
     });
 

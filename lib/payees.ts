@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { AppDb } from "@/db";
 import { payees, transactions, transactionSplits, type Payee } from "@/db/schema";
 import { effectiveDateSql } from "@/lib/accounting";
@@ -148,9 +148,16 @@ export async function getPayee(
  * The account on the largest debit split of a payee's most recent
  * transaction, or null when the payee has no transactions.
  *
- * The split query is scoped by transaction id alone. It does not need its own
- * bookId filter: the transaction it names was already selected within this
- * book, and a split can only belong to one transaction.
+ * "Last", not "most used": the most recent transaction and its largest debit
+ * split stay the primary rule. Historical frequency enters only to break a
+ * tie the primary rule cannot — two debit splits of THAT transaction carrying
+ * the same amount, on different accounts.
+ *
+ * The debit-split query is scoped by transaction id alone. It does not need
+ * its own bookId filter: the transaction it names was already selected within
+ * this book, and a split can only belong to one transaction. The frequency
+ * query below is a different shape — it spans the payee's history — so it
+ * does carry bookId.
  */
 export async function getPayeeLastAccountId(
   db: AppDb,
@@ -166,14 +173,52 @@ export async function getPayeeLastAccountId(
 
   if (!lastTxn) return null;
 
-  const [debitSplit] = await db
-    .select({ accountId: transactionSplits.accountId })
+  const debitSplits = await db
+    .select({ accountId: transactionSplits.accountId, amount: transactionSplits.amount })
     .from(transactionSplits)
     .where(and(eq(transactionSplits.transactionId, lastTxn.id), gt(transactionSplits.amount, 0)))
-    .orderBy(desc(transactionSplits.amount))
-    .limit(1);
+    .orderBy(desc(transactionSplits.amount), asc(transactionSplits.accountId));
 
-  return debitSplit?.accountId ?? null;
+  if (debitSplits.length === 0) return null;
+
+  const maxAmount = debitSplits[0].amount;
+  const tied = debitSplits.filter((split) => split.amount === maxAmount);
+  if (tied.length === 1) return tied[0].accountId;
+
+  const tiedAccountIds = [...new Set(tied.map((split) => split.accountId))];
+  if (tiedAccountIds.length === 1) return tiedAccountIds[0];
+
+  // Two debit splits of the SAME transaction carry equal amounts. The
+  // "largest debit split" rule cannot break that tie, so fall back to
+  // whichever of the tied accounts this payee has used most often historically.
+  const frequencyRows = await db
+    .select({
+      accountId: transactionSplits.accountId,
+      frequency: sql<number>`cast(count(*) as integer)`,
+    })
+    .from(transactionSplits)
+    .innerJoin(transactions, eq(transactionSplits.transactionId, transactions.id))
+    .where(
+      and(
+        eq(transactions.bookId, bookId),
+        eq(transactions.payeeId, payeeId),
+        gt(transactionSplits.amount, 0),
+        inArray(transactionSplits.accountId, tiedAccountIds)
+      )
+    )
+    .groupBy(transactionSplits.accountId);
+  const frequencyByAccount = new Map(frequencyRows.map((row) => [row.accountId, row.frequency]));
+
+  let winner = tied[0].accountId;
+  let bestFrequency = frequencyByAccount.get(winner) ?? 0;
+  for (const split of tied) {
+    const frequency = frequencyByAccount.get(split.accountId) ?? 0;
+    if (frequency > bestFrequency) {
+      bestFrequency = frequency;
+      winner = split.accountId;
+    }
+  }
+  return winner;
 }
 
 /**

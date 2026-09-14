@@ -2,16 +2,16 @@
  * Persistence for the FIFO lot engine.
  *
  * `rebuildLots` is the only code that INSERTS rows into investment_lots or
- * investment_lot_allocations at runtime. Everything that can change a pair's
- * split history calls it, inside the same DB transaction as the write. It is
- * not the only thing that ever writes those tables, in two other ways:
+ * investment_lot_allocations. Application writes call it inside the same DB
+ * transaction as the write, so a pair's splits and its lots move together.
  *
- * - The Moneydance importer's superseded Pass 1/2 (scripts/import-moneydance/
- *   parsers/investment-transactions.ts) still insert investment_lots directly
- *   while building the initial import — never investment_lot_allocations —
- *   and those direct writes are overwritten by a `rebuildLots` pass run later
- *   in the same import, after stock splits are imported (see
- *   scripts/import-moneydance/index.ts).
+ * THE IMPORTER DOES NOT. It writes investment splits in one phase and rebuilds
+ * every pair in a later one, each rebuild in its own transaction, after stock
+ * splits are imported (scripts/import-moneydance/index.ts). A rebuild that
+ * fails there does not roll back the splits already imported.
+ *
+ * It is still not the only thing that ever writes those tables:
+ *
  * - Rows disappear via FK cascade wherever a transaction, investment split,
  *   or lot is deleted, without going through this file at all: deleting a
  *   transaction cascades to its investment splits and their lot allocations

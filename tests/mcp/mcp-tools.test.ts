@@ -772,8 +772,8 @@ describe("MCP Tools", () => {
       const { data, isError } = await callTool("search", { bookId: 1, query: "Account" });
 
       expect(isError).toBe(false);
-      expect(data.accounts).toHaveLength(2);
-      const names = data.accounts.map((a: { name: string }) => a.name);
+      expect(data.accounts.items).toHaveLength(2);
+      const names = data.accounts.items.map((a: { name: string }) => a.name);
       expect(names).toContain("Checking Account");
       expect(names).toContain("Savings Account");
     });
@@ -785,8 +785,8 @@ describe("MCP Tools", () => {
       const { data, isError } = await callTool("search", { bookId: 1, query: "Foods" });
 
       expect(isError).toBe(false);
-      expect(data.payees).toHaveLength(1);
-      expect(data.payees[0].name).toBe("Whole Foods Market");
+      expect(data.payees.items).toHaveLength(1);
+      expect(data.payees.items[0].name).toBe("Whole Foods Market");
     });
 
     it("finds transactions by description", async () => {
@@ -841,10 +841,10 @@ describe("MCP Tools", () => {
       expect(data.transactions).toHaveLength(1);
 
       const accountHit = await callTool("search", { bookId: 1, query: "cHeCKing" });
-      expect(accountHit.data.accounts).toHaveLength(1);
+      expect(accountHit.data.accounts.items).toHaveLength(1);
 
       const payeeHit = await callTool("search", { bookId: 1, query: "whole foods" });
-      expect(payeeHit.data.payees).toHaveLength(1);
+      expect(payeeHit.data.payees.items).toHaveLength(1);
     });
 
     // MCP search now shares the web route's implementation (lib/search.ts), so
@@ -878,8 +878,8 @@ describe("MCP Tools", () => {
       const { data, isError } = await callTool("search", { bookId: 1, query: "roof" });
       expect(isError).toBe(false);
 
-      expect(data.recurringRules).toHaveLength(1);
-      expect(data.recurringRules[0].name).toBe("Roofing Maintenance Plan");
+      expect(data.recurringRules.items).toHaveLength(1);
+      expect(data.recurringRules.items[0].name).toBe("Roofing Maintenance Plan");
 
       expect(data.transactions).toHaveLength(1);
       expect(data.transactions[0].splits.length).toBe(2);
@@ -909,7 +909,7 @@ describe("MCP Tools", () => {
       });
 
       const byAccount = await callTool("search", { bookId: 1, query: "Checking" });
-      expect(byAccount.data.accounts[0]).toHaveProperty("isActive", true);
+      expect(byAccount.data.accounts.items[0]).toHaveProperty("isActive", true);
 
       const byTxn = await callTool("search", { bookId: 1, query: "Shopping trip" });
       expect(byTxn.data.transactions[0].payeeName).toBe("Whole Foods Market");

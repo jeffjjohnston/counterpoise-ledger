@@ -54,14 +54,33 @@ describe("getLatestPrices", () => {
     expect(await getLatestPrices(db, 1)).toEqual([]);
   });
 
+  /**
+   * This test used to give the book-1 security a second price row stamped
+   * bookId: 2, to show that the scoping comes from the predicate on
+   * security_prices.book_id rather than from the security's own ownership.
+   * That row is no longer possible to write: security_prices_book_security_fk
+   * ties (book_id, security_id) to securities (book_id, id), so a price row and
+   * its security always agree on the book. The misattributed case is gone from
+   * the database, not merely untested.
+   *
+   * What is still reachable, and still worth asserting, is a second book with
+   * its own security and its own prices.
+   */
   it("does not leak prices from another book", async () => {
     await createBook({ name: "Other Book" });
     const mine = await createSecurity({ name: "Mine", symbol: "MINE", securityType: "etf" });
     await createSecurityPrice({ securityId: mine.id, priceDate: "2026-03-01", priceMicros: 50_000_000 });
-    // Same security, a row misattributed to another book: book scoping has to
-    // come from the predicate, not from the security's ownership.
+
+    const theirs = await createSecurity({
+      name: "Theirs",
+      symbol: "THEIRS",
+      securityType: "etf",
+      bookId: 2,
+    });
+    // Newer than book 1's price, so a query missing its book filter would
+    // return this row rather than silently agreeing with the expectation.
     await createSecurityPrice({
-      securityId: mine.id,
+      securityId: theirs.id,
       priceDate: "2026-03-02",
       priceMicros: 99_000_000,
       bookId: 2,

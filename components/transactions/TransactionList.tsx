@@ -327,7 +327,7 @@ export function TransactionList({
   }, [highlightTransactionId]);
 
   const renderCheckNumberPill = (checkNumber: string) => (
-    <span className="inline-flex flex-shrink-0 items-center rounded-full bg-warning-subtle px-2 py-0.5 text-xs font-medium text-fg-warning">
+    <span className="inline-flex shrink-0 items-center rounded-full bg-warning-subtle px-2 py-0.5 text-xs font-medium text-fg-warning">
       CHK #{checkNumber}
     </span>
   );
@@ -350,7 +350,7 @@ export function TransactionList({
   const renderFloatPill = () => (
     <span
       title="Floating — date advances to today until reconciled"
-      className="inline-flex flex-shrink-0 items-center rounded-full bg-future px-2 py-0.5 text-xs font-medium text-fg-accent"
+      className="inline-flex shrink-0 items-center rounded-full bg-future px-2 py-0.5 text-xs font-medium text-fg-accent"
     >
       Float
     </span>
@@ -359,7 +359,7 @@ export function TransactionList({
   // Teal to match Plaid's identity and stay distinct from the blue
   // Recurring/Scheduled pills
   const renderPlaidPill = () => (
-    <span className="inline-flex flex-shrink-0 items-center rounded-full bg-teal-500/15 px-2 py-0.5 text-xs font-medium text-teal-700 dark:text-teal-400">
+    <span className="inline-flex shrink-0 items-center rounded-full bg-teal-500/15 px-2 py-0.5 text-xs font-medium text-teal-700 dark:text-teal-400">
       Plaid
     </span>
   );
@@ -493,7 +493,7 @@ export function TransactionList({
           return (
             <li key={split.id} className="flex items-center gap-1.5">
               <span className={cn(
-                "text-xs font-medium w-3 text-right flex-shrink-0",
+                "text-xs font-medium w-3 text-right shrink-0",
                 isPositive ? "text-fg-success" : "text-fg-danger"
               )}>
                 {isPositive ? "+" : "\u2212"}
@@ -504,7 +504,7 @@ export function TransactionList({
         })}
         {remainingCount > 0 && (
           <li className="flex items-center gap-1.5 text-sm text-fg-tertiary">
-            <span className="w-3 flex-shrink-0" aria-hidden="true" />
+            <span className="w-3 shrink-0" aria-hidden="true" />
             + {remainingCount} more {remainingCount === 1 ? "account" : "accounts"}
           </li>
         )}
@@ -622,7 +622,7 @@ export function TransactionList({
     <span
       className={cn(
         ACTIVITY_TAG_WIDTH,
-        "flex-shrink-0 text-[10px] font-semibold uppercase tracking-wider",
+        "shrink-0 text-[10px] font-semibold uppercase tracking-wider",
         tone === "positive" ? "text-fg-success" : "text-fg-tertiary"
       )}
     >
@@ -715,7 +715,7 @@ export function TransactionList({
           {line.tag ? (
             renderActivityTag(line.tag, line.tone)
           ) : (
-            <span className={cn(ACTIVITY_TAG_WIDTH, "flex-shrink-0")} aria-hidden="true" />
+            <span className={cn(ACTIVITY_TAG_WIDTH, "shrink-0")} aria-hidden="true" />
           )}
           <span
             className={cn(
@@ -895,7 +895,7 @@ export function TransactionList({
             )}
             {!showAccountName && (
               <span className={cn(
-                "text-xs font-medium w-3 text-right flex-shrink-0",
+                "text-xs font-medium w-3 text-right shrink-0",
                 row.sign === "neutral"
                   ? "text-fg-tertiary"
                   : row.sign === "+"
@@ -1167,7 +1167,7 @@ export function TransactionList({
     // silently becomes what decides the row height (49px rows instead of 44px,
     // measured). Block-level means no inline formatting context, no strut, and
     // exactly 20px. In the mobile card it is a flex item either way.
-    const base = "flex h-5 w-5 items-center justify-center flex-shrink-0";
+    const base = "flex h-5 w-5 items-center justify-center shrink-0";
     const dot = "block h-3.5 w-3.5 rounded-full";
     if (isPlaceholder) {
       return (
@@ -1266,7 +1266,7 @@ export function TransactionList({
           >
             <span
               className={cn(
-                "inline-block h-2.5 w-2.5 rounded-full flex-shrink-0",
+                "inline-block h-2.5 w-2.5 rounded-full shrink-0",
                 contextMenu.transaction.isReconciled
                   ? "border border-border bg-surface"
                   : "bg-fg-success"
@@ -1308,16 +1308,6 @@ export function TransactionList({
     const balance = runningBalances.get(transaction.id) || 0;
     const isFuture = transaction.date > today;
     const isHighlightTarget = transaction.id === highlightTransactionId;
-    // A pure trade converts cash into an asset (or back) and is neither a gain
-    // nor a loss, so it is not tinted. Anything that genuinely moves money in or
-    // out — transfers, dividends, cap gains, fees — keeps directional colour. A
-    // reinvestment (buy + dividend) counts as income and stays directional.
-    const isTradeOnly =
-      isInvestmentRegister &&
-      transaction.investmentSplits.length > 0 &&
-      transaction.investmentSplits.every(
-        (split) => split.action === "buy" || split.action === "sell"
-      );
 
     return {
       isProjected,
@@ -1327,7 +1317,6 @@ export function TransactionList({
       balance,
       isFuture,
       isHighlightTarget,
-      isTradeOnly,
     };
   };
 
@@ -1351,11 +1340,11 @@ export function TransactionList({
                 className={cn(
                   "px-3 py-3 cursor-pointer transition-colors",
                   isProjected
-                    ? "border-l-2 border-dashed border-border-future bg-future"
+                    ? "bg-future"
                     : isPlaidPending
                       ? "border-l-2 border-dashed border-teal-500/50 bg-teal-500/5"
                       : isFuture
-                        ? "border-l-2 border-border-future bg-future"
+                        ? "bg-future"
                         : "active:bg-surface-tertiary",
                   transaction.id === newTransactionId && "animate-new-row",
                   isHighlightTarget && "animate-highlight-row"
@@ -1390,7 +1379,7 @@ export function TransactionList({
                       {formatDate(getEffectiveDate(transaction))}
                     </div>
                   </div>
-                  <div className="flex items-start gap-1 flex-shrink-0">
+                  <div className="flex items-start gap-1 shrink-0">
                     <div className="text-right">
                       <div className={cn(
                         "flex items-center justify-end gap-1.5 text-sm font-medium tabular-nums whitespace-nowrap",
@@ -1493,7 +1482,7 @@ export function TransactionList({
         </thead>
         <tbody className="divide-y divide-border-secondary">
           {displayTransactions.map((transaction, index) => {
-            const { isProjected, isPlaidPending, amount, isPositive, balance, isFuture, isHighlightTarget, isTradeOnly } =
+            const { isProjected, isPlaidPending, amount, isPositive, balance, isFuture, isHighlightTarget } =
               renderTransactionRow(transaction);
             const dateCell = dateCellFor(
               getEffectiveDate(transaction),
@@ -1516,12 +1505,12 @@ export function TransactionList({
                   // hover without colliding with any other group in the tree.
                   "group/row transition-colors",
                   isProjected
-                    ? "cursor-pointer border-l-2 border-dashed border-border-future bg-future hover:bg-future-hover"
+                    ? "cursor-pointer bg-future hover:bg-future-hover"
                     : isPlaidPending
                       ? "cursor-pointer border-l-2 border-dashed border-teal-500/50 bg-teal-500/5 hover:bg-teal-500/10"
                       : "cursor-pointer",
                   !isProjected && !isPlaidPending && isFuture
-                    ? "border-l-2 border-border-future bg-future hover:bg-future-hover"
+                    ? "bg-future hover:bg-future-hover"
                     : !isProjected && !isPlaidPending && "hover:bg-surface-tertiary",
                   transaction.id === newTransactionId && "animate-new-row",
                   isHighlightTarget && "animate-highlight-row"
@@ -1593,20 +1582,16 @@ export function TransactionList({
                   className={cn(
                     "px-4 py-3 text-sm font-medium text-right tabular-nums whitespace-nowrap",
                     isProjected
-                      ? isTradeOnly
-                        ? "text-fg-tertiary italic"
-                        : selectedAccountId && isPositive
-                          ? "text-fg-success-muted italic"
-                          : selectedAccountId && !isPositive
-                            ? "text-fg-danger-muted italic"
-                            : "text-fg-tertiary italic"
-                      : isTradeOnly
-                        ? "text-fg"
-                        : selectedAccountId && isPositive
-                          ? "text-fg-success"
-                          : selectedAccountId && !isPositive
-                            ? "text-fg-danger"
-                            : "text-fg"
+                      ? selectedAccountId && isPositive
+                        ? "text-fg-success-muted italic"
+                        : selectedAccountId && !isPositive
+                          ? "text-fg-danger-muted italic"
+                          : "text-fg-tertiary italic"
+                      : selectedAccountId && isPositive
+                        ? "text-fg-success"
+                        : selectedAccountId && !isPositive
+                          ? "text-fg-danger"
+                          : "text-fg"
                   )}
                 >
                   {selectedAccountId && isPositive && "+"}

@@ -1062,12 +1062,14 @@ export function buildAccountHierarchyName(
 }
 
 // `parentId` is a self-referencing foreign key with no cycle constraint, so a
-// corrupt row could otherwise loop forever in a direct `resolveAccountIcon` /
-// `resolveAccountIconSource` call. It does not protect `buildCategoryLabelMap`:
-// that function calls `buildAccountHierarchyName` first, on the same account,
-// and that recursion has no depth limit of its own — a cycle stack-overflows
-// there before this cap ever gets to run. The account tree is two levels deep
-// in practice; 32 is far above any real hierarchy.
+// corrupt row could otherwise loop forever walking it. Both walkers are
+// bounded, but by SEPARATE constants that happen to hold the same value: this
+// one bounds `resolveAccountIcon` / `resolveAccountIconSource`, while
+// `buildAccountHierarchyName` checks its own `MAX_HIERARCHY_DEPTH` before
+// recursing and increments depth on the way. A cycle therefore truncates
+// rather than overflowing the stack, whichever entry point reaches it first.
+// Changing one cap does not change the other. The account tree is two levels
+// deep in practice; 32 is far above any real hierarchy.
 const MAX_ICON_DEPTH = 32;
 
 type IconResolvable = { icon: string | null; parentId: number | null };

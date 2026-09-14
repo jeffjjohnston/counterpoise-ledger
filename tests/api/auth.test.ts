@@ -56,10 +56,11 @@ beforeEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe("POST /auth/register", () => {
-  // These exercise the register route's own validation, which sits behind the
-  // registration gate. Any case that runs with users already present would
-  // otherwise get a 403 before reaching what it means to test, so they opt in
-  // explicitly rather than the gate being loosened to accommodate them.
+  // These exercise the register route's own validation, which runs BEFORE the
+  // registration gate: the route parses the body first and checks whether
+  // registration is open afterwards. Enabling registration here keeps the
+  // cases that get past parsing from stopping at the gate instead of reaching
+  // the behaviour under test.
   beforeEach(() => {
     process.env.REGISTRATION_ENABLED = "true";
     __resetRateLimits();

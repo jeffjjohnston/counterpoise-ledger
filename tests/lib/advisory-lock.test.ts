@@ -54,18 +54,22 @@ describe("withAdvisoryLock", () => {
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
+    let acquired!: () => void;
+    const ready = new Promise<void>((resolve) => { acquired = resolve; });
 
     const holder = withAdvisoryLock(TEST_NAMESPACE, 7_001, async () => {
+      acquired();
       await held;
       return "first";
     });
 
-    // Give the holder time to take the lock before the second attempt.
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const contender = await withAdvisoryLock(TEST_NAMESPACE, 7_001, async () => "second");
-    expect(contender.acquired).toBe(false);
-
-    release();
+    await ready;
+    try {
+      const contender = await withAdvisoryLock(TEST_NAMESPACE, 7_001, async () => "second");
+      expect(contender.acquired).toBe(false);
+    } finally {
+      release();
+    }
     expect(await holder).toEqual({ acquired: true, value: "first" });
   });
 

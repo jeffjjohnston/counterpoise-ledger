@@ -30,9 +30,9 @@ describe("SearchPage", () => {
       new Response(
         JSON.stringify({
           transactions: [],
-          accounts: [],
-          payees: [],
-          recurringRules: [],
+          accounts: { items: [], total: 0, truncated: false },
+          payees: { items: [], total: 0, truncated: false },
+          recurringRules: { items: [], total: 0, truncated: false },
         })
       )
     );
@@ -83,9 +83,9 @@ describe("SearchPage", () => {
               ],
             },
           ],
-          accounts: [],
-          payees: [],
-          recurringRules: [],
+          accounts: { items: [], total: 0, truncated: false },
+          payees: { items: [], total: 0, truncated: false },
+          recurringRules: { items: [], total: 0, truncated: false },
         })
       )
     );
@@ -109,18 +109,22 @@ describe("SearchPage", () => {
       new Response(
         JSON.stringify({
           transactions: [],
-          accounts: [],
-          payees: [],
-          recurringRules: [
-            {
-              id: 7,
-              name: "Vacation Fund Transfer",
-              frequency: "monthly",
-              nextDate: "2026-08-15",
-              businessDaysOnly: true,
-              isActive: true,
-            },
-          ],
+          accounts: { items: [], total: 0, truncated: false },
+          payees: { items: [], total: 0, truncated: false },
+          recurringRules: {
+            items: [
+              {
+                id: 7,
+                name: "Vacation Fund Transfer",
+                frequency: "monthly",
+                nextDate: "2026-08-15",
+                businessDaysOnly: true,
+                isActive: true,
+              },
+            ],
+            total: 1,
+            truncated: false,
+          },
         })
       )
     );
@@ -145,18 +149,22 @@ describe("SearchPage", () => {
       new Response(
         JSON.stringify({
           transactions: [],
-          accounts: [],
-          payees: [],
-          recurringRules: [
-            {
-              id: 8,
-              name: "Vacation Fund Transfer",
-              frequency: "monthly",
-              nextDate: "2026-08-15",
-              businessDaysOnly: false,
-              isActive: true,
-            },
-          ],
+          accounts: { items: [], total: 0, truncated: false },
+          payees: { items: [], total: 0, truncated: false },
+          recurringRules: {
+            items: [
+              {
+                id: 8,
+                name: "Vacation Fund Transfer",
+                frequency: "monthly",
+                nextDate: "2026-08-15",
+                businessDaysOnly: false,
+                isActive: true,
+              },
+            ],
+            total: 1,
+            truncated: false,
+          },
         })
       )
     );
@@ -173,6 +181,75 @@ describe("SearchPage", () => {
       { timeout: 2000 }
     );
     expect(screen.getByText("Aug 15, 2026")).toBeInTheDocument();
+  });
+
+  // Decision 2 exists so a reader can see the 25-row cut. A heading that still
+  // reads "Payees (25)" when 112 matched hides exactly what the total and
+  // truncated fields were added to expose, so assert the rendered text, not
+  // just that the fields arrived.
+  it("reports the true total in a bucket heading when the LIMIT truncated it", async () => {
+    vi.mocked(global.fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          transactions: [],
+          accounts: { items: [], total: 0, truncated: false },
+          payees: {
+            items: [
+              { id: 1, name: "Zebra Supply" },
+              { id: 2, name: "Zebra Foods" },
+            ],
+            total: 112,
+            truncated: true,
+          },
+          recurringRules: { items: [], total: 0, truncated: false },
+        })
+      )
+    );
+
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
+      target: { value: "zebra" },
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("Payees (2 of 112)")).toBeInTheDocument();
+      },
+      { timeout: 2000 }
+    );
+    expect(screen.queryByText("Payees (2)")).not.toBeInTheDocument();
+  });
+
+  it("omits the total from a bucket heading when nothing was truncated", async () => {
+    vi.mocked(global.fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          transactions: [],
+          accounts: { items: [], total: 0, truncated: false },
+          payees: {
+            items: [
+              { id: 1, name: "Zebra Supply" },
+              { id: 2, name: "Zebra Foods" },
+            ],
+            total: 2,
+            truncated: false,
+          },
+          recurringRules: { items: [], total: 0, truncated: false },
+        })
+      )
+    );
+
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
+      target: { value: "zebra" },
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("Payees (2)")).toBeInTheDocument();
+      },
+      { timeout: 2000 }
+    );
   });
 
   it("does not call fetch when query is empty", async () => {

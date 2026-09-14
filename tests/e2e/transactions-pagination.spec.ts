@@ -1,7 +1,8 @@
-import { test, expect } from "@playwright/test";
+import { buildSeedData } from "./seed-data";
+import { test, expect } from "./fixtures";
 
-test("paginates transactions for a selected account", async ({ page }) => {
-  await page.goto("/b/1/transactions");
+test("paginates transactions for a selected account", async ({ page, bookId }) => {
+  await page.goto(`/b/${bookId}/transactions`);
 
   await page.getByRole("link", { name: "Checking" }).first().click();
   await expect(page.getByRole("columnheader", { name: "Balance" })).toBeVisible();
@@ -14,11 +15,6 @@ test("paginates transactions for a selected account", async ({ page }) => {
   await expect(scrollForMore).toBeVisible();
   await scrollForMore.scrollIntoViewIfNeeded();
 
-  // After scrolling, more rows should load beyond the initial page of 50.
-  // We don't assert an exact count because other e2e tests running in
-  // parallel may create transactions that touch this account.
-  await expect(async () => {
-    const count = await rows.count();
-    expect(count).toBeGreaterThan(50);
-  }).toPass({ timeout: 10000 });
+  await expect(rows).toHaveCount(buildSeedData().checkingTransactionCount);
+  await expect(scrollForMore).not.toBeVisible();
 });

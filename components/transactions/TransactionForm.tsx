@@ -252,7 +252,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
         className="mt-2 flex items-center gap-1.5 rounded-md bg-warning-subtle px-2 py-1 text-xs text-fg-warning"
       >
         <svg
-          className="h-3.5 w-3.5 flex-shrink-0"
+          className="h-3.5 w-3.5 shrink-0"
           fill="none"
           stroke="currentColor"
           viewBox="0 0 24 24"
@@ -755,7 +755,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               Add spans status plus balance plus actions. The two account fields
               share the Accounts column, as the register shares it between the
               accounts a transaction touches. */}
-          <div className="grid grid-cols-[9rem_calc(32%_-_3.5rem)_24%_10rem_1fr] items-end pt-2 -mx-4">
+          <div className="grid grid-cols-[9rem_calc(32%-3.5rem)_24%_10rem_1fr] items-end pt-2 -mx-4">
           <div className={`pl-4 pr-2 ${isFloating ? "pointer-events-none" : ""}`} aria-disabled={isFloating || undefined} inert={isFloating || undefined}>
             <DateInput
               label="Date"
@@ -800,7 +800,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
                 setFromAccountId(toAccountId);
                 setToAccountId(fromAccountId);
               }}
-              className="mb-0.5 p-1 rounded-md text-fg-tertiary hover:text-fg-secondary hover:bg-surface-tertiary transition-colors flex-shrink-0"
+              className="mb-0.5 p-1 rounded-md text-fg-tertiary hover:text-fg-secondary hover:bg-surface-tertiary transition-colors shrink-0"
               title="Swap accounts"
               aria-label="Swap From and To accounts"
             >

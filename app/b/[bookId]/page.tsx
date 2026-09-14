@@ -269,7 +269,7 @@ export default function HomePage() {
                   className="px-3 md:px-6 py-3 md:py-4 flex items-center justify-between hover:bg-surface-tertiary transition-colors gap-3"
                 >
                   <div className="flex items-center gap-3 md:gap-4 min-w-0">
-                    <div className="hidden sm:block text-sm text-fg-tertiary w-20 tabular-nums flex-shrink-0">
+                    <div className="hidden sm:block text-sm text-fg-tertiary w-20 tabular-nums shrink-0">
                       {formatDate(transaction.date)}
                     </div>
                     <div className="min-w-0">
@@ -287,7 +287,7 @@ export default function HomePage() {
                       </p>
                     </div>
                   </div>
-                  <div className="text-sm font-medium text-fg tabular-nums flex-shrink-0">
+                  <div className="text-sm font-medium text-fg tabular-nums shrink-0">
                     {formatCurrency(amount)}
                   </div>
                 </Link>

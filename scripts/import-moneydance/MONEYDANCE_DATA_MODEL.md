@@ -121,12 +121,21 @@ for (const split of splits) {
 
 ### Sign Conventions
 
-| Account Type | Debit (Increase) | Credit (Decrease) |
-|--------------|------------------|-------------------|
-| Asset (checking) | Positive | Negative |
-| Liability (credit card) | Negative | Positive |
-| Expense | Positive | Negative |
-| Income | Negative | Positive |
+A split's stored amount carries one sign convention throughout: **debits are
+positive and credits are negative, for every account type.** What changes by
+type is whether a debit *increases* the account, which is its normal balance.
+
+| Account Type | Normal balance | A positive (debit) amount | A negative (credit) amount |
+|--------------|----------------|---------------------------|----------------------------|
+| Asset (checking) | Debit | Increases the balance | Decreases it |
+| Expense | Debit | Increases the balance | Decreases it |
+| Liability (credit card) | Credit | Decreases what is owed | Increases what is owed |
+| Equity | Credit | Decreases it | Increases it |
+| Income | Credit | Decreases it | Increases it |
+
+So a credit-card purchase stores a negative amount on the card account and a
+positive one on the expense account: the card's balance owed goes up, and the
+two sum to zero.
 
 **Example: Deposit to checking**
 ```
@@ -143,7 +152,10 @@ Split (expense): +100 (debit, increase expense)
 ### Investment Transactions
 
 Investment transactions (with `xfer_type` field) use a different model:
-- `samt` = share quantity (in micros)
+- `samt` = share quantity, in the SECURITY'S OWN decimal precision — the `dec`
+  field of its currency record, defaulting to 5 when absent. It is not micros:
+  the parser reads that precision per security and converts with
+  `10^(6 - dec)` to reach Counterpoise's millionths
 - `pamt` = cash amount
 - These require separate handling (Phase 4)
 

@@ -434,7 +434,8 @@ async function getQueueSummary(db: AppDb, linkIds: number[]) {
  * Sync a single Plaid token: fetch new transactions from Plaid and stage them
  * in the reconciliation table for review.
  *
- * Serialised per token, so the hourly cron and a manual "Sync" click cannot pay
+ * Serialised per token, so the scheduled sync (every six hours in the shipped
+ * crontab) and a manual "Sync" click cannot pay
  * for the same Plaid pages twice. A caller that finds a sync already running
  * gets `SyncTokenError` 409 rather than waiting for it: by the time the running
  * sync commits its cursor there is nothing left for the second one to fetch.

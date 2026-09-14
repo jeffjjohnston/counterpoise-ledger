@@ -26,10 +26,15 @@ beforeEach(async () => {
  * Run `processor` against a rule whose nextDate is being advanced by a competing
  * processor that commits first — the cron-vs-manual-click race.
  *
- * The open transaction holds the rule's row lock while `processor` starts on
- * another pooled connection: the processor reads the still-committed nextDate,
- * then blocks on its own write until this transaction commits. That makes the
- * interleaving deterministic instead of depending on scheduling luck.
+ * TIMING-DEPENDENT, NOT SYNCHRONISED. The helper starts `processor` and
+ * sleeps; nothing observes that the competing read or the blocked write
+ * actually happened, so a pass is evidence the guard works when the race
+ * occurs rather than proof it occurred.
+ *
+ * The intended shape: the open transaction holds the rule's row lock while
+ * `processor` runs on another pooled connection, the processor reads the
+ * still-committed nextDate, then blocks on its own write until this
+ * transaction commits.
  */
 async function raceAgainstRuleAdvance<T>(
   ruleId: number,

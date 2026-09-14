@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures";
 import { formatDate, toDateString } from "../../lib/formatters";
 import { getOccurrenceDate } from "../../lib/recurring";
 
@@ -14,8 +14,8 @@ function uniqueName(prefix: string) {
   return `${prefix} ${Date.now()}-${Math.round(Math.random() * 1000)}`;
 }
 
-async function getAccountIds(page: import("@playwright/test").Page) {
-  const response = await page.request.get("/api/b/1/accounts?includeInactive=true");
+async function getAccountIds(page: import("@playwright/test").Page, bookId: number) {
+  const response = await page.request.get(`/api/b/${bookId}/accounts?includeInactive=true`);
   expect(response.ok()).toBeTruthy();
   const data = await response.json();
   const flattened: Array<{ id: number; name: string }> = [];
@@ -39,13 +39,14 @@ async function getAccountIds(page: import("@playwright/test").Page) {
 
 async function createRecurringRule(
   page: import("@playwright/test").Page,
+  bookId: number,
   name: string
 ) {
-  const { checkingId, rentId } = await getAccountIds(page);
+  const { checkingId, rentId } = await getAccountIds(page, bookId);
   expect(checkingId).toBeTruthy();
   expect(rentId).toBeTruthy();
 
-  const response = await page.request.post("/api/b/1/recurring", {
+  const response = await page.request.post(`/api/b/${bookId}/recurring`, {
     data: {
       name,
       frequency: "daily",
@@ -64,8 +65,8 @@ async function createRecurringRule(
 }
 
 test.describe("recurring transactions", () => {
-  test("displays recurring rules list", async ({ page }) => {
-    await page.goto("/b/1/recurring");
+  test("displays recurring rules list", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/recurring`);
     await expect(
       page.getByRole("heading", { name: "Recurring Transactions" })
     ).toBeVisible();
@@ -74,30 +75,42 @@ test.describe("recurring transactions", () => {
     await expect(page.getByRole("heading", { name: "Monthly Rent" })).toBeVisible();
   });
 
-  test("displays the upcoming calendar", async ({ page }) => {
-    await page.goto("/b/1/recurring");
+  test("displays the upcoming calendar", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/recurring`);
     await expect(
       page.getByRole("heading", { name: /Upcoming Calendar/ })
     ).toBeVisible();
     await expect(page.getByTestId("recurring-calendar")).toBeVisible();
   });
 
-  test("edits an existing recurring rule", async ({ page }) => {
+  test("opens a rule's detail page from the list, edits it, and comes back", async ({ page, bookId }) => {
     const originalName = uniqueName("Recurring Edit");
     const updatedName = uniqueName("Recurring Edit Updated");
-    const rule = await createRecurringRule(page, originalName);
+    const rule = await createRecurringRule(page, bookId, originalName);
 
-    await page.goto("/b/1/recurring");
+    await page.goto(`/b/${bookId}/recurring`);
 
+    // The row opens the detail page, not the edit form.
     const ruleCard = page.getByTestId(`recurring-rule-card-${rule.id}`);
     await expect(ruleCard).toBeVisible();
-    await ruleCard.getByRole("button", { name: "Edit" }).click();
+    await ruleCard.getByRole("link").click();
+    await expect(page).toHaveURL(new RegExp(`/b/${bookId}/recurring/${rule.id}$`));
+    await expect(page.getByRole("heading", { name: originalName })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Schedule" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Template" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "History" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Edit" }).click();
     await expect(page.getByText("Edit Recurring Transaction")).toBeVisible();
 
     await page.getByLabel("Rule Name").clear();
     await page.getByLabel("Rule Name").fill(updatedName);
     await page.getByRole("button", { name: "Save Changes" }).click();
 
+    await expect(page.getByRole("heading", { name: updatedName })).toBeVisible();
+
+    await page.getByRole("link", { name: /Back to Recurring/ }).click();
+    await expect(page).toHaveURL(new RegExp(`/b/${bookId}/recurring$`));
     await expect(
       page.getByTestId(`recurring-rule-card-${rule.id}`).getByRole("heading", {
         name: updatedName,
@@ -105,8 +118,8 @@ test.describe("recurring transactions", () => {
     ).toBeVisible();
   });
 
-  test("pauses and resumes a recurring rule", async ({ page }) => {
-    await page.goto("/b/1/recurring");
+  test("pauses and resumes a recurring rule", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/recurring`);
 
     // Pause the rule
     await page.getByRole("button", { name: "Pause" }).first().click();
@@ -117,10 +130,10 @@ test.describe("recurring transactions", () => {
     await expect(page.getByRole("button", { name: "Pause" }).first()).toBeVisible();
   });
 
-  test("creates a new recurring rule via UI", async ({ page }) => {
+  test("creates a new recurring rule via UI", async ({ page, bookId }) => {
     const ruleName = uniqueName("Weekly Groceries");
 
-    await page.goto("/b/1/recurring");
+    await page.goto(`/b/${bookId}/recurring`);
     await expect(
       page.getByRole("heading", { name: "Recurring Transactions" })
     ).toBeVisible();
@@ -166,13 +179,13 @@ test.describe("recurring transactions", () => {
     await expect(page.getByRole("heading", { name: ruleName })).toBeVisible();
   });
 
-  test("shows a business-days-only rule on the next business day", async ({ page }) => {
+  test("shows a business-days-only rule on the next business day", async ({ page, bookId }) => {
     const ruleName = uniqueName("Saturday Rule");
-    const { checkingId, rentId } = await getAccountIds(page);
+    const { checkingId, rentId } = await getAccountIds(page, bookId);
 
     // Weekly on Saturday, so the next occurrence always lands on a weekend
     // whatever day this test runs.
-    const response = await page.request.post("/api/b/1/recurring", {
+    const response = await page.request.post(`/api/b/${bookId}/recurring`, {
       data: {
         name: ruleName,
         frequency: "weekly",
@@ -191,7 +204,7 @@ test.describe("recurring transactions", () => {
     const rule = await response.json();
     expect(rule.businessDaysOnly).toBe(true);
 
-    await page.goto("/b/1/recurring");
+    await page.goto(`/b/${bookId}/recurring`);
     const ruleCard = page.getByTestId(`recurring-rule-card-${rule.id}`);
     await expect(ruleCard).toBeVisible();
 
@@ -203,33 +216,42 @@ test.describe("recurring transactions", () => {
     );
     await expect(ruleCard).not.toContainText(formatDate(rule.nextDate));
 
-    // The saved value round-trips into the edit form.
-    await ruleCard.getByRole("button", { name: "Edit" }).click();
+    // The detail page states the same fact in words, and the saved value
+    // round-trips into the edit form there. Business days only sits behind the
+    // Advanced disclosure, which opens closed on every edit, so the checkbox is
+    // not in the DOM until that button is clicked.
+    await page.goto(`/b/${bookId}/recurring/${rule.id}`);
+    await expect(page.getByTestId("rule-schedule")).toContainText(
+      "moves to the next business day"
+    );
+    await page.getByRole("button", { name: "Edit" }).click();
+    await page.getByRole("button", { name: /advanced/i }).click();
     await expect(page.getByLabel("Business days only")).toBeChecked();
   });
 
-  test("deletes a recurring rule", async ({ page }) => {
+  test("deletes a recurring rule from its detail page and returns to the list", async ({ page, bookId }) => {
     const ruleName = uniqueName("Recurring Delete");
-    const rule = await createRecurringRule(page, ruleName);
+    const rule = await createRecurringRule(page, bookId, ruleName);
 
-    await page.goto("/b/1/recurring");
+    await page.goto(`/b/${bookId}/recurring/${rule.id}`);
+    await expect(page.getByRole("heading", { name: ruleName })).toBeVisible();
 
     page.on("dialog", (dialog) => dialog.accept());
-    const ruleCard = page.getByTestId(`recurring-rule-card-${rule.id}`);
-    await expect(ruleCard).toBeVisible();
-    await ruleCard.getByRole("button", { name: "Delete" }).click();
+    await page.getByRole("button", { name: "Delete" }).click();
 
+    // The rule no longer exists, so the page it was on must not stay open.
+    await expect(page).toHaveURL(new RegExp(`/b/${bookId}/recurring$`));
     await expect(page.getByTestId(`recurring-rule-card-${rule.id}`)).toHaveCount(0);
   });
 
-  test("processes a due recurring rule and creates a transaction", async ({ page }) => {
-    const { checkingId, rentId } = await getAccountIds(page);
+  test("processes a due recurring rule and creates a transaction", async ({ page, bookId }) => {
+    const { checkingId, rentId } = await getAccountIds(page, bookId);
     expect(checkingId).toBeTruthy();
     expect(rentId).toBeTruthy();
 
     // Create a rule with nextDate = today (already due)
     const ruleName = uniqueName("Due Rule");
-    const response = await page.request.post("/api/b/1/recurring", {
+    const response = await page.request.post(`/api/b/${bookId}/recurring`, {
       data: {
         name: ruleName,
         frequency: "monthly",
@@ -244,20 +266,20 @@ test.describe("recurring transactions", () => {
     });
     expect(response.ok()).toBeTruthy();
 
-    await page.goto("/b/1/recurring");
+    await page.goto(`/b/${bookId}/recurring`);
     await expect(page.getByRole("heading", { name: ruleName })).toBeVisible();
 
     // The "Process All Due" button should be visible since our rule is due today
     const processButton = page.getByRole("button", { name: /Process All Due/ });
     await expect(processButton).toBeVisible({ timeout: 5000 });
 
+    const processed = page.waitForResponse((response) =>
+      response.url().includes(`/api/b/${bookId}/recurring/process`) && response.request().method() === "POST");
     await processButton.click();
-
-    // Wait a moment for processing to complete
-    await page.waitForTimeout(1000);
+    expect((await processed).ok()).toBe(true);
 
     // After processing, verify a transaction was created via the API
-    const transactionsResponse = await page.request.get("/api/b/1/transactions?limit=20");
+    const transactionsResponse = await page.request.get(`/api/b/${bookId}/transactions?limit=20`);
     expect(transactionsResponse.ok()).toBeTruthy();
     const transactionsData = await transactionsResponse.json();
     const allTransactions = Array.isArray(transactionsData) ? transactionsData : (transactionsData.transactions ?? []);

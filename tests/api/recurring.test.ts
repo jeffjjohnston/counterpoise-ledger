@@ -864,13 +864,13 @@ describe("Recurring rule API", () => {
     const checking = await createAccount({ name: "Checking", type: "asset" });
     const rent = await createAccount({ name: "Rent", type: "expense" });
 
-    // Both accounts exist and belong to this book, so the route's pre-insert
-    // account validation passes. The amount is balanced (sums to zero) and a
-    // finite number, so app-level validation passes too — but it exceeds the
-    // range of the `recurring_template_splits.amount` `integer` (int4) column,
-    // so the split INSERT itself fails at the database. This forces the real
-    // failure mode under test: the second statement fails *after* the first
-    // (the rule insert) has already succeeded.
+    // An amount outside int4. THIS DOES NOT REACH THE DATABASE: validateSplits
+    // in lib/accounting.ts range-checks against INT4_MIN/INT4_MAX before
+    // lib/recurring-rules.ts opens a transaction, precisely so the caller gets
+    // a 400 rather than an opaque 500 from PostgreSQL.
+    //
+    // So this asserts the REFUSAL and that nothing was written — not rollback
+    // after a partial write, which the range check makes unreachable here.
     const response = await POSTRecurring(
       new Request("http://localhost/api/b/1/recurring", {
         method: "POST",

@@ -142,7 +142,8 @@ export function AccountForm({
       // touches the column when `icon !== undefined`, so an icon set on a
       // bank account through the API (or a future MCP tool) survives an
       // edit made here instead of being silently cleared. The column
-      // accepts any account type by design — see spec decision 5.
+      // accepts any account type by design: the form only offers an icon for
+      // categories, but nothing in the schema restricts it to them.
       icon: isCategory ? icon : undefined,
     });
   };

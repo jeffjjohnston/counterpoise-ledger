@@ -88,7 +88,6 @@ export async function importStockSplits(
             transactionId: txn.id,
             accountId: null, // Stock splits apply to all accounts holding the security
             securityId,
-            lotId: null, // Splits don't apply to specific lots
             action: "split",
             sharesMicros: 0, // No shares traded in a split
             priceMicros: 0, // No price for splits

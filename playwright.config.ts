@@ -1,7 +1,8 @@
 import { defineConfig } from "@playwright/test";
 import { resolve } from "path";
+import { e2eDatabaseUrl } from "./tests/e2e/database";
 
-const e2eDbUrl = process.env.E2E_DATABASE_URL || "postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_e2e";
+const e2eDbUrl = e2eDatabaseUrl();
 const e2eStorageStatePath = resolve("./test-results/e2e-storage-state.json");
 
 export default defineConfig({
@@ -13,12 +14,14 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:3001",
     headless: true,
     storageState: e2eStorageStatePath,
+    trace: "retain-on-failure",
+    screenshot: "only-on-failure",
   },
   webServer: {
     command:
       "npx next build --webpack && cp -R .next/static .next/standalone/.next/static && PORT=3001 HOSTNAME=127.0.0.1 node .next/standalone/server.js",
     url: "http://127.0.0.1:3001",
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 120000,
     env: {
       DATABASE_URL: e2eDbUrl,

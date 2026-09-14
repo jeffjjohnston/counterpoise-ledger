@@ -106,7 +106,7 @@ describe("BookNavbar", () => {
 
   it("keeps the brand from shrinking when the navbar is tight", async () => {
     // The brand shares a flex row with the book switcher and every nav link. At the
-    // default flex-shrink it is the first thing to give up width, and the wordmark
+    // default shrink it is the first thing to give up width, and the wordmark
     // renders clipped as "Counterpois".
     const fetchMock = vi.fn(async () => ({
       ok: true,
@@ -118,7 +118,7 @@ describe("BookNavbar", () => {
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     const brand = screen.getByRole("link", { name: "Counterpoise" });
-    expect(brand).toHaveClass("flex-shrink-0");
+    expect(brand).toHaveClass("shrink-0");
   });
 
   it("switches between mobile and desktop chrome at the lg breakpoint", async () => {

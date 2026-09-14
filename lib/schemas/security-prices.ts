@@ -46,8 +46,7 @@ import { z } from "zod/v4";
 // required". That's a slightly imprecise message for the calendar-invalid
 // case, but it preserves the exact ported text for the missing/blank case
 // (verified in tests/lib/schemas/security-prices.test.ts) while still
-// rejecting (400) the data-corrupting input instead of writing it — the
-// same trade-off the task brief's own suggested fix makes.
+// rejecting (400) the data-corrupting input instead of writing it.
 const PRICE_DATE_REQUIRED_MESSAGE = "priceDate is required";
 const INVALID_PRICE_MICROS_MESSAGE = "Invalid priceMicros";
 
@@ -100,10 +99,10 @@ export type UpdateSecurityPriceInput = z.infer<typeof updateSecurityPriceSchema>
 // listTransactionsQuery.accountIds uses in lib/schemas/transactions.ts for
 // its own lenient comma-split parse.
 //
-// priceDate uses z.iso.date() here, unlike updateSecurityPriceSchema above:
-// the original guard already ran a literal /^\d{4}-\d{2}-\d{2}$/ regex
-// (bulk/route.ts:35), so swapping it for z.iso.date() is the direct,
-// task-mandated replacement (real calendar validation, not new scope) —
+// priceDate uses z.iso.date(), as updateSecurityPriceSchema above does: both
+// feed a write, and the settled rule is that write paths get calendar
+// validation. The original guard here ran a literal /^\d{4}-\d{2}-\d{2}$/
+// regex, which accepts 2026-02-31; z.iso.date() does not —
 // not new validation being introduced where none existed. One behavior
 // changes as a result: an item with a calendar-invalid but regex-matching
 // date (e.g. "2026-02-30") was previously accepted and written to the

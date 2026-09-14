@@ -50,7 +50,8 @@ function isCrossOriginWrite(request: NextRequest): boolean {
   // Requirement on self-hosters: the reverse proxy in front of this app must
   // preserve the original Host header. Tailscale Serve does this by default.
   // nginx does NOT — its default `proxy_set_header Host $proxy_host` replaces
-  // it with the upstream address, which would make every write 403 with an
+  // it with the upstream address. That 403s any write that reaches this
+  // comparison, i.e. one carrying an Origin but no Sec-Fetch-Site, with an
   // opaque "Cross-origin request rejected". See the README's "Security notes
   // for self-hosting" section.
   const host = request.headers.get("host") ?? request.nextUrl.host;

@@ -42,6 +42,7 @@ export async function GET(
       accountIds: searchParams.get("accountIds") ?? undefined,
       balanceAccountId: searchParams.get("balanceAccountId") ?? undefined,
       payeeId: searchParams.get("payeeId") ?? undefined,
+      recurringRuleId: searchParams.get("recurringRuleId") ?? undefined,
       startDate: searchParams.get("startDate") || undefined,
       endDate: searchParams.get("endDate") || undefined,
       includeMeta: searchParams.get("includeMeta") ?? undefined,
@@ -61,6 +62,7 @@ export async function GET(
       accountIds: accountIdsQuery,
       balanceAccountId: balanceAccountIdQuery,
       payeeId: payeeIdQuery,
+      recurringRuleId: recurringRuleIdQuery,
       startDate,
       endDate,
     } = parsedQuery.data;
@@ -68,6 +70,7 @@ export async function GET(
     const accountIds = accountIdsQuery ?? null;
     const balanceAccountIdNumber = balanceAccountIdQuery ?? null;
     const payeeIdNumber = payeeIdQuery ?? null;
+    const recurringRuleIdNumber = recurringRuleIdQuery ?? null;
     const includeMeta = parsedQuery.data.includeMeta === "true";
     let limit = parsedQuery.data.limit ?? 100;
     const offset = parsedQuery.data.offset ?? 0;
@@ -104,6 +107,7 @@ export async function GET(
     const filters: TransactionFilters = {
       accountIds: filteredAccountIds,
       payeeId: payeeIdNumber,
+      recurringRuleId: recurringRuleIdNumber,
       startDate: startDate ?? null,
       endDate: endDate ?? null,
     };

@@ -22,7 +22,7 @@ export function NoteIndicator({ notes }: NoteIndicatorProps) {
         xmlns="http://www.w3.org/2000/svg"
         viewBox="0 0 20 20"
         fill="currentColor"
-        className="w-4 h-4 text-fg-tertiary hover:text-fg-secondary transition-colors flex-shrink-0"
+        className="w-4 h-4 text-fg-tertiary hover:text-fg-secondary transition-colors shrink-0"
         aria-label="Has notes"
       >
         <path

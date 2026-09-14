@@ -231,7 +231,7 @@ export function PriceEntryPill({
                     // try/finally; it cannot reject.
                     if (e.key === "Enter") void handleSave();
                   }}
-                  className="w-24 rounded-md border border-border bg-surface px-2 py-1 text-right text-sm tabular-nums text-fg focus:border-accent focus:outline-none"
+                  className="w-24 rounded-md border border-border bg-surface px-2 py-1 text-right text-sm tabular-nums text-fg focus:border-accent focus:outline-hidden"
                   aria-label={`Price for ${s.name}`}
                 />
               </label>

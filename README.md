@@ -72,7 +72,7 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 ### AI Integration (MCP)
 - **MCP Server** - Read/write access to accounting data for AI assistants (see [mcp/README.md](mcp/README.md))
 - **API Keys** - Per-user `cpk_` keys managed on the Account page, scrypt-hashed at rest
-- **Usage Analytics** - Optional PostHog integration for usage events (no financial data captured)
+- **Usage Analytics** - Optional PostHog integration for usage events. Custom events carry no financial values, but `$pageview` sends the full URL including its query string, and the search page puts the typed query in `?q=` — see [guides/posthog-analytics.md](guides/posthog-analytics.md)
 
 ### User Experience
 - **Clean Modern UI** - Built with Tailwind CSS for a polished interface
@@ -95,7 +95,7 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 
 ## Prerequisites
 
-- Node.js 24+
+- Node.js 26+
 - npm
 - Docker (for PostgreSQL)
 
@@ -112,21 +112,33 @@ cd counterpoise-ledger
 npm install
 ```
 
-3. Create the PostgreSQL data volume and start the database:
+3. Start the dedicated development database (Compose creates its volume):
 ```bash
-docker volume create counterpoise_pgdata
-docker compose up -d postgres
+docker compose -f docker-compose.dev.yml up -d --wait
 ```
 
-Local development only needs the database. For a full Docker deployment, copy
-the example environment file and point `DATABASE_URL` at the `postgres` service
-— inside the app container, `localhost` is the container itself:
+This uses project `counterpoise-dev`, volume `counterpoise_dev_pgdata`, and
+`127.0.0.1:5432`. It needs no production environment file and shares no data with
+production. Stop it with `docker compose -f docker-compose.dev.yml down`;
+the data volume survives. Keep port 5432 available for this database.
+
+The development checkout is separate from production. For a full Docker
+deployment, use the production clone (`~/prod/counterpoise` by default, branch `main`).
+In that clone, create the production volume, copy the example environment file,
+and point `DATABASE_URL` at the `postgres` service — inside the app container,
+`localhost` is the container itself:
 
 ```bash
+docker volume create counterpoise_pgdata
 cp .env.example .env.production.local
 
-# Then edit .env.production.local. Set an application-role password, and put
-# that same password into DATABASE_URL — nothing derives one from the other:
+# Then edit .env.production.local. Set the bootstrap superuser password —
+# production Compose has no fallback, and the published development value must
+# not be reused here:
+#   POSTGRES_PASSWORD=$(openssl rand -hex 32)
+#
+# Set an application-role password too, and put that same password into
+# DATABASE_URL — nothing derives one from the other:
 #   APP_DB_PASSWORD=$(openssl rand -hex 32)
 #   DATABASE_URL=postgresql://counterpoise_app:<that password>@postgres:5432/counterpoise
 
@@ -136,15 +148,19 @@ docker compose --env-file .env.production.local up -d --build
 `--env-file` is required, not optional: Compose reads `${VAR}` substitutions in
 `docker-compose.yml` from the shell, a `.env` file, or `--env-file` — a
 service-level `env_file:` populates the container but does **not** feed those
-substitutions. Without it, `TZ` and `POSTGRES_PASSWORD` silently keep their
-defaults.
+substitutions. Without it, `TZ` keeps its default and `POSTGRES_PASSWORD`
+arrives empty, which the postgres image refuses to initialize a volume with.
 
-4. Create the local dev database (and per-worker test databases):
+Run tests only against the separate dev database. Its test databases can be
+reclaimed manually with `scripts/scheduler/sweep-test-databases.sh`; see
+[testing.md](guides/testing.md). Production does not schedule dev cleanup.
+
+4. In the development checkout, create the local dev database (and the E2E database):
 ```bash
 npm run db:create-test-dbs
 ```
 
-Docker only creates the `counterpoise` database; local development uses `counterpoise_dev`, which this script creates (along with the databases used by the test suite).
+Docker only creates the `counterpoise` database; local development uses `counterpoise_dev`, which this script creates along with `counterpoise_e2e`. The Vitest suite needs neither: each run creates its own databases as it starts, and the dev cleanup script can reclaim them.
 
 5. Seed with sample data (optional):
 ```bash
@@ -237,6 +253,17 @@ which is in this repository and known to every reader of it.
 
 ### Starting
 
+> **Run production `docker compose` commands from the production checkout root**
+> (`~/prod/counterpoise` by default, branch `main`). Dev uses `-f docker-compose.dev.yml`. The project
+> name is pinned in `docker-compose.yml`, so Compose addresses the same
+> containers from any directory, while `--env-file` is resolved against the
+> directory the command runs in. A command run one directory away therefore
+> recreates production's containers reading `TZ`, `POSTGRES_PASSWORD` and
+> `COUNTERPOISE_BACKUPS_DIR` from the wrong file. An env file that is missing
+> outright is refused — Compose exits 1 — so the hazard is one that exists and
+> disagrees. `./scripts/check-compose-cwd.sh` answers "am I in
+> the right directory?" and `scripts/deploy.sh` runs it first.
+
 ```bash
 # Create the persistent data volume (first time only)
 docker volume create counterpoise_pgdata
@@ -244,8 +271,8 @@ docker volume create counterpoise_pgdata
 # Build and start all services
 docker compose --env-file .env.production.local up -d --build
 
-# Or start just the database (for local dev)
-docker compose up -d postgres
+# Or start only the production database
+docker compose --env-file .env.production.local up -d postgres
 ```
 
 The app will be available at http://localhost:3000. Migrations run automatically on container startup via `docker-entrypoint.sh`.
@@ -342,9 +369,12 @@ books.example.com {
 ```
 
 nginx needs two headers set explicitly. Its defaults break Counterpoise in two
-separate ways — `Host` becomes the upstream address, which makes every write
-fail the cross-origin check, and without `X-Forwarded-Proto` the app cannot tell
-that the original request was HTTPS:
+separate ways — `Host` becomes the upstream address, which fails the
+cross-origin check for any WRITE to `/api/` that the browser did not label with
+`Sec-Fetch-Site` (safe methods and page requests never reach the comparison,
+that header is checked first wherever it is present, and a request carrying no
+`Origin` is allowed through), and without `X-Forwarded-Proto` the app cannot
+tell that the original request was HTTPS:
 
 ```nginx
 location / {
@@ -383,8 +413,11 @@ exposing it to anything wider, understand these defaults:
   HTTP, silently breaks login. See "Getting HTTPS" above.
 - **`npm run db:seed` creates an `admin` / `password` account.** Delete or change
   it before the instance is reachable by anyone else.
-- **Postgres binds to `127.0.0.1` by default** and its bootstrap superuser uses
-  the password from `POSTGRES_PASSWORD`. Change it before altering that binding.
+- **The bootstrap superuser password comes from `POSTGRES_PASSWORD`**, and
+  production Compose has no fallback for it: a fresh deployment must supply
+  one, and must not reuse the published development value. Nothing enforces
+  that yet — the postgres image reads the password before any script of ours
+  runs.
 - **The application connects as its own non-superuser role.** A fresh install
   creates `counterpoise_app` from `APP_DB_PASSWORD`, and the app container
   refuses to start if `DATABASE_URL` still carries the published default.
@@ -404,6 +437,36 @@ exposing it to anything wider, understand these defaults:
   seconds — it is the longest the app makes, and the only one a short read
   timeout will cut. The seed keeps running server-side when it does, so the
   symptom is a failed request plus a complete demo book the page never showed.
+
+### Separating the application database role
+
+`scripts/postgres-init/01-app-role.sh` creates `counterpoise_app` on the FIRST
+initialization of the postgres volume. An instance that already holds a database
+skips that directory entirely, so an existing deployment has to be migrated by
+hand.
+
+```sql
+-- As the bootstrap superuser, against the application database.
+CREATE ROLE counterpoise_app LOGIN PASSWORD 'the value of APP_DB_PASSWORD';
+ALTER DATABASE counterpoise OWNER TO counterpoise_app;
+
+-- Then, connected to that database, hand over what it contains:
+REASSIGN OWNED BY counterpoise TO counterpoise_app;
+```
+
+**`REASSIGN OWNED BY` reaches past the database you run it in.** It moves every
+object inside the current database *and* every shared object the old role owns
+— databases and tablespaces — whichever database the connection is using.
+Connecting to the right database confines the first half only, so running it
+once per database does not stop the second. On an instance where the bootstrap
+role also owns development or test databases, those databases change owner too.
+Run it only where the old role owns nothing you mean to leave alone — a
+production instance holding one database — and otherwise move ownership by
+hand, with `ALTER DATABASE` and an `ALTER ... OWNER TO` per object inside.
+
+Afterwards point `DATABASE_URL` at the new role and restart. The app container
+refuses to start while `DATABASE_URL` still carries the published bootstrap
+credential, so a missed step fails loudly rather than running as a superuser.
 
 ## Backups
 
@@ -456,13 +519,19 @@ state one-for-one will faithfully replicate a corruption or an encryption event
 to your only other copy. Thirty days of retention turns that from a disaster
 into an inconvenience.
 
-You do not need to verify the dumps yourself — the scheduler already does, on
-every one (see Monitoring below). What it cannot do is put them somewhere else.
+The scheduler checks every dump, but check what that check is: `pg_restore
+--list` reads the archive's header and table of contents and stops there. It
+catches a file whose header or contents list is unreadable, and a `pg_dump`
+that failed outright is caught separately by its own exit status. It never
+reaches the data blocks, so a dump truncated or corrupted past the contents
+list lists cleanly. Nothing here restores a dump or reads a row, so nothing
+here can tell you the data inside is complete — only a restore into a scratch
+database does that, and none is performed. See Monitoring below.
 
 ### Monitoring
 
-Counterpoise verifies each dump with `pg_restore --list` and records the outcome
-of every scheduled job to `backups/status/`. The app surfaces stale or
+Counterpoise reads each dump's table of contents with `pg_restore --list` and
+records the outcome of every scheduled job to `backups/status/`. The app surfaces stale or
 unverified jobs in the navbar — silently, until something needs attention.
 
 That design assumes **you use the app**. It detects a broken backup job while
@@ -658,7 +727,7 @@ npm run test:coverage # Generate coverage report
 npm run test:e2e     # Run Playwright E2E tests
 npm run db:generate  # Generate a migration from /db/schema.ts into /db/migrations
 npm run db:migrate   # Apply pending migrations
-npm run db:create-test-dbs  # Create dev + per-worker test databases (one-time setup)
+npm run db:create-test-dbs  # Create dev + E2E databases (one-time setup)
 npm run db:list-books  # List books and their IDs
 npm run db:seed -- --book-id 2  # Full reset + seed sample data for a specific book
 npm run mcp:dev      # Start the MCP server (stdio)
@@ -723,9 +792,9 @@ requests, feature requests, or bug reports**. That is not unfriendliness — it 
 the point of publishing it.
 
 Fork it and make it yours. The repository is built for exactly that: `CLAUDE.md`
-is a complete machine-readable contract for the codebase, so your own AI agents
-can pick it up and build on it without a human explaining the architecture
-first. The `.claude/skills/` directory ships the maintainer's own workflows as
+and the `guides/` directory it indexes are a complete machine-readable contract
+for the codebase, so your own AI agents can pick it up and build on it without a
+human explaining the architecture first. The `.claude/skills/` directory ships the maintainer's own workflows as
 worked examples.
 
 If you want to track upstream changes, add this repository as a second remote

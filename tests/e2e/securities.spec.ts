@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures";
 import { readFile } from "node:fs/promises";
 
 // Helper: find the inactive security row that contains the given security name
@@ -14,10 +14,11 @@ function uniqueName(prefix: string) {
 
 async function createSecurity(
   page: import("@playwright/test").Page,
+  bookId: number,
   name: string,
   symbol: string
 ) {
-  const response = await page.request.post("/api/b/1/securities", {
+  const response = await page.request.post(`/api/b/${bookId}/securities`, {
     data: {
       name,
       symbol,
@@ -30,22 +31,23 @@ async function createSecurity(
 }
 
 test.describe("securities", () => {
-  test("displays securities list", async ({ page }) => {
-    await page.goto("/b/1/securities");
+  test("displays securities list", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/securities`);
     await expect(
       page.getByRole("heading", { name: "Securities", exact: true })
     ).toBeVisible();
 
-    // Seed security (VTI has no positions, so it's in Inactive Securities)
+    // The seeded security. seed-book.ts buys 4 shares of it, so it holds a
+    // position — this spec asserts that positions table further down.
     await expect(page.getByText("Vanguard Total Stock Market")).toBeVisible();
     await expect(page.getByText("VTI")).toBeVisible();
   });
 
-  test("creates a new security", async ({ page }) => {
+  test("creates a new security", async ({ page, bookId }) => {
     const securityName = uniqueName("Vanguard Bond Fund");
     const symbol = `B${Date.now().toString().slice(-4)}`;
 
-    await page.goto("/b/1/securities");
+    await page.goto(`/b/${bookId}/securities`);
 
     await page.getByRole("button", { name: "Add Security" }).click();
     await expect(
@@ -63,13 +65,13 @@ test.describe("securities", () => {
     await expect(page.getByText(securityName)).toBeVisible();
   });
 
-  test("edits a security", async ({ page }) => {
+  test("edits a security", async ({ page, bookId }) => {
     const originalName = uniqueName("Vanguard Bond Fund");
     const updatedName = uniqueName("Vanguard Total Bond");
     const symbol = `B${Date.now().toString().slice(-4)}`;
-    await createSecurity(page, originalName, symbol);
+    await createSecurity(page, bookId, originalName, symbol);
 
-    await page.goto("/b/1/securities");
+    await page.goto(`/b/${bookId}/securities`);
 
     const row = securityRow(page, originalName);
     await expect(row).toBeVisible();
@@ -88,12 +90,12 @@ test.describe("securities", () => {
     await expect(page.getByText(updatedName)).toBeVisible();
   });
 
-  test("deletes a security with no transactions", async ({ page }) => {
+  test("deletes a security with no transactions", async ({ page, bookId }) => {
     const securityName = uniqueName("Disposable Security");
     const symbol = `D${Date.now().toString().slice(-4)}`;
-    await createSecurity(page, securityName, symbol);
+    await createSecurity(page, bookId, securityName, symbol);
 
-    await page.goto("/b/1/securities");
+    await page.goto(`/b/${bookId}/securities`);
 
     page.on("dialog", (dialog) => dialog.accept());
 
@@ -104,20 +106,20 @@ test.describe("securities", () => {
     await expect(page.getByText(securityName)).toHaveCount(0);
   });
 
-  test("navigates to security detail page", async ({ page }) => {
-    await page.goto("/b/1/securities");
+  test("navigates to security detail page", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/securities`);
 
     await page
       .getByRole("link", { name: "Vanguard Total Stock Market" })
       .click();
-    await expect(page).toHaveURL(/\/b\/1\/securities\/\d+/);
+    await expect(page).toHaveURL(new RegExp(`/b/${bookId}/securities/\\d+`));
     await expect(page.getByText("VTI")).toBeVisible();
   });
 
-  test("security detail page shows position data", async ({ page }) => {
-    await page.goto("/b/1/securities");
+  test("security detail page shows position data", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/securities`);
     await page.getByRole("link", { name: "Vanguard Total Stock Market" }).click();
-    await expect(page).toHaveURL(/\/b\/1\/securities\/\d+/);
+    await expect(page).toHaveURL(new RegExp(`/b/${bookId}/securities/\\d+`));
 
     // Header info
     await expect(page.getByRole("heading", { name: "Vanguard Total Stock Market" })).toBeVisible();
@@ -134,10 +136,10 @@ test.describe("securities", () => {
     await expect(page.getByText("Brokerage")).toBeVisible();
   });
 
-  test("security detail page shows price history tab", async ({ page }) => {
-    await page.goto("/b/1/securities");
+  test("security detail page shows price history tab", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/securities`);
     await page.getByRole("link", { name: "Vanguard Total Stock Market" }).click();
-    await expect(page).toHaveURL(/\/b\/1\/securities\/\d+/);
+    await expect(page).toHaveURL(new RegExp(`/b/${bookId}/securities/\\d+`));
 
     // Price History tab is active by default (rendered as a button)
     await expect(page.getByRole("button", { name: "Price History" })).toBeVisible();
@@ -146,8 +148,8 @@ test.describe("securities", () => {
     await expect(page.getByRole("cell", { name: "$250.00" })).toBeVisible();
   });
 
-  test("downloads active securities as CSV", async ({ page }) => {
-    await page.goto("/b/1/securities");
+  test("downloads active securities as CSV", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/securities`);
 
     // The seed has an active VTI position, so the Download CSV button is shown.
     const downloadButton = page.getByRole("button", { name: "Download CSV" });
@@ -171,10 +173,10 @@ test.describe("securities", () => {
     expect(vtiRow).toBeDefined();
   });
 
-  test("security detail page shows transactions tab", async ({ page }) => {
-    await page.goto("/b/1/securities");
+  test("security detail page shows transactions tab", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}/securities`);
     await page.getByRole("link", { name: "Vanguard Total Stock Market" }).click();
-    await expect(page).toHaveURL(/\/b\/1\/securities\/\d+/);
+    await expect(page).toHaveURL(new RegExp(`/b/${bookId}/securities/\\d+`));
 
     // Switch to Transactions tab (rendered as a button)
     await page.getByRole("button", { name: "Transactions" }).click();

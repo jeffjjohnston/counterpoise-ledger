@@ -352,7 +352,7 @@ export default function SyncTokensPage() {
                         <span
                           className={cn(
                             "h-2 w-2 flex-none rounded-full",
-                            needsAttention ? "bg-[var(--fg-warning)]" : "bg-[var(--fg-success)]"
+                            needsAttention ? "bg-(--fg-warning)" : "bg-(--fg-success)"
                           )}
                           role="status"
                           aria-label={

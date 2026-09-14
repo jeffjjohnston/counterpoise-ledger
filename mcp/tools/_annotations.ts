@@ -75,17 +75,25 @@ export const DESTRUCTIVE: ToolAnnotations = {
  * Removes data AND lands in a different state when repeated — unlike
  * DESTRUCTIVE, whose idempotentHint promises a retry is safe.
  * reconcile_plaid_transaction's 'create' action is the case that motivated
- * this preset: loadReconciliationRow() in lib/plaid-reconcile.ts matches on
- * id, link and book, but not on resolutionStatus, so a second 'create' call
- * on the same reconciliationId does not detect that the row was already
- * resolved. It runs the whole branch again — inserts a second transaction
- * and overwrites matchedTransactionId to point at the new one. The first
- * transaction stays in the ledger, marked reconciled, linked to nothing, and
- * invisible to getStaleUnmatched() (which only flags isReconciled = false).
- * A client that trusts idempotentHint and retries a timed-out call would
- * create exactly that duplicate-plus-orphan pair in someone's real financial
- * records. Use this preset for any tool with the same shape: destructive,
- * and not safe to retry blindly.
+ * this preset. HISTORICALLY it ran the whole branch again on a repeat call:
+ * loadReconciliationRow() matches on id, link and book but not on
+ * resolutionStatus, so a second 'create' inserted a second transaction and
+ * repointed matchedTransactionId at it, leaving the first in the ledger marked
+ * reconciled, linked to nothing, and invisible to getStaleUnmatched() (which
+ * only flags isReconciled = false).
+ *
+ * lib/plaid-reconcile.ts now refuses a row that already carries a
+ * matchedTransactionId, for 'match', 'match_update_amount' and 'create' alike,
+ * so that exact duplicate-plus-orphan pair is closed. The exception is a row
+ * flagged with a reviewReason, which is deliberately still re-resolvable.
+ *
+ * The preset stays, and stays on this tool, because that exception is enough
+ * to make the hint false. idempotentHint promises that repeating a call has no
+ * ADDITIONAL effect, and on a flagged row a second 'create' still inserts a
+ * second transaction and repoints the link. A client that trusts the hint and
+ * retries a timed-out call would build that duplicate-plus-orphan pair on
+ * exactly the rows Plaid has already told us it changed. Use this preset for
+ * any tool with that shape — destructive, and not safe to retry blindly.
  */
 export const DESTRUCTIVE_NONIDEMPOTENT: ToolAnnotations = {
   readOnlyHint: false,

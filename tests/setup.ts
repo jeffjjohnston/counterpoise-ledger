@@ -1,12 +1,9 @@
-import "@testing-library/jest-dom/vitest";
 import { afterEach, beforeEach, vi } from "vitest";
+import { workerDatabaseUrl } from "./helpers/database-safety";
 
-const workerId =
-  process.env.VITEST_POOL_ID || process.env.VITEST_WORKER_ID || "0";
+// DOM-specific configuration lives in setup-dom.ts.
 
-if (!process.env.DATABASE_URL) {
-  process.env.DATABASE_URL = `postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_test_${workerId}`;
-}
+process.env.DATABASE_URL = workerDatabaseUrl();
 
 beforeEach(() => {
   vi.spyOn(console, "log").mockImplementation(() => {});

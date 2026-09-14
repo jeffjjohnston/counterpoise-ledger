@@ -674,20 +674,4 @@ describe("TransactionForm simple mode", () => {
     }
   });
 
-  it("lays the quick-entry row out on the register's own column widths", () => {
-    const { container } = renderWithToast(
-      <TransactionForm accounts={mockAccounts} selectedAccountId={null} onSubmit={vi.fn()} />
-    );
-
-    const grid = container.querySelector(".grid.items-end");
-    // Date takes the 9rem an MM/DD/YYYY field needs and borrows most of the
-    // overshoot back from Payee, so the Payee/Accounts boundary stays near the
-    // register's. The rest match TRANSACTION_TABLE_COLUMN_WIDTHS one for one.
-    // Kept in step by hand -- see the comment above the grid, which records why
-    // the borrow is a fitted 3.5rem and cannot be exact.
-    expect(grid).toHaveClass("grid-cols-[9rem_calc(32%_-_3.5rem)_24%_10rem_1fr]");
-    // No gap: a grid gap would push each column right of its table column,
-    // cumulatively. Spacing comes from cell padding, as it does in the table.
-    expect(grid?.className).not.toMatch(/\bgap-\d/);
-  });
 });

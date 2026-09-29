@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import { Link } from "@/lib/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -8,9 +8,10 @@ import { Modal } from "@/components/ui/Modal";
 import { SecurityForm } from "@/components/securities/SecurityForm";
 import { UpdatePricesModal } from "@/components/securities/UpdatePricesModal";
 import { cn } from "@/lib/utils";
-import { formatCurrency } from "@/lib/formatters";
+import { formatCurrency } from "@/lib/wasm-client";
 import { csvEscape, datedCsvFilename, triggerDownload } from "@/lib/csv";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookRole } from "@/components/BookRoleProvider";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { Security } from "@/db/schema";
@@ -34,6 +35,7 @@ const MICROS_PER_SHARE = 1_000_000;
 
 export default function SecuritiesPage() {
   const bookId = useBookId();
+  const { canWrite } = useBookRole();
   const toast = useToast();
   const [securities, setSecurities] = useState<SecurityWithPosition[]>([]);
   const [loading, setLoading] = useState(true);
@@ -214,12 +216,14 @@ export default function SecuritiesPage() {
               <Button variant="secondary" onClick={handleDownloadCsv}>
                 Download CSV
               </Button>
-              <Button variant="secondary" onClick={() => setShowUpdatePricesModal(true)}>
-                Update Prices
-              </Button>
+              {canWrite && (
+                <Button variant="secondary" onClick={() => setShowUpdatePricesModal(true)}>
+                  Update Prices
+                </Button>
+              )}
             </>
           )}
-          <Button onClick={() => setShowModal(true)}>Add Security</Button>
+          {canWrite && <Button onClick={() => setShowModal(true)}>Add Security</Button>}
         </div>
       </div>
 
@@ -354,21 +358,25 @@ export default function SecuritiesPage() {
                     {securityTypeLabels[security.securityType]}
                   </div>
                   <div className="col-span-2 flex items-center justify-end gap-2">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setEditingSecurity(security)}
-                    >
-                      Edit
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleDelete(security.id)}
-                      className="text-fg-danger hover:text-fg-danger"
-                    >
-                      Delete
-                    </Button>
+                    {canWrite && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setEditingSecurity(security)}
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleDelete(security.id)}
+                          className="text-fg-danger hover:text-fg-danger"
+                        >
+                          Delete
+                        </Button>
+                      </>
+                    )}
                   </div>
                 </div>
               ))}
@@ -428,7 +436,7 @@ export default function SecuritiesPage() {
       </Modal>
 
       <UpdatePricesModal
-        isOpen={showUpdatePricesModal}
+        isOpen={showUpdatePricesModal && canWrite}
         onClose={() => setShowUpdatePricesModal(false)}
         securities={activeSecurities}
         onUpdate={() => void fetchSecurities(false)}

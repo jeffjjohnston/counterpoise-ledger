@@ -3,6 +3,29 @@
 name: counterpoise-dev
 
 services:
+  rust-api:
+    profiles: ["rust-spike"]
+    build:
+      context: .
+    # The server only. The production entrypoint refuses the published
+    # development credential, and development migrates with
+    # `npm run db:migrate`.
+    entrypoint: ["counterpoise-rust-api"]
+    environment:
+      DATABASE_URL: postgresql://counterpoise:counterpoise@postgres:5432/counterpoise_dev
+      RUST_BIND: 0.0.0.0:4000
+      TZ: ${TZ:-America/New_York}
+    ports:
+      - "127.0.0.1:4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   postgres:
     image: postgres:16-alpine
     ports:

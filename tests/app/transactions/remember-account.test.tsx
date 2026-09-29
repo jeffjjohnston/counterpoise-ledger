@@ -39,11 +39,13 @@ const pushMock = vi.fn();
 /* Module-level mocks (hoisted by Vitest)                             */
 /* ------------------------------------------------------------------ */
 
-vi.mock("next/navigation", () => ({
-  useSearchParams: () => searchParamsValue,
-  useRouter: () => ({ push: pushMock, replace: replaceMock }),
-  useParams: () => ({ bookId: "1" }),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useSearchParams: () => searchParamsValue,
+    useRouter: () => ({ push: pushMock, replace: replaceMock }),
+    useParams: () => ({ bookId: "1" }),
+  })
+);
 
 vi.mock("@/components/accounts/AccountList", () => ({
   AccountList: () => <div data-testid="account-list" />,

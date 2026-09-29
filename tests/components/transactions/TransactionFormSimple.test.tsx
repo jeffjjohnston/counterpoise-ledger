@@ -14,11 +14,13 @@ const renderWithToast = (ui: React.ReactElement) =>
 const getWarningStatus = () =>
   screen.getAllByRole("status").find((el) => /won't appear in/i.test(el.textContent ?? ""));
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/b/1/transactions",
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    usePathname: () => "/b/1/transactions",
+  })
+);
 
 const mockAccounts: AccountWithBalance[] = [
   {
@@ -348,6 +350,8 @@ describe("TransactionForm simple mode", () => {
           isReconciled: false,
           isFloating: false,
           recurringRuleId: null,
+          createdBy: null,
+          updatedBy: null,
           createdAt: new Date(),
           updatedAt: new Date(),
           payee: null,
@@ -654,8 +658,84 @@ describe("TransactionForm simple mode", () => {
     expect(submit).toHaveAttribute("type", "submit");
     // Visible text, not a "+" explained only by an aria-label.
     expect(submit.textContent).toBe("Add");
-    // size="md" rather than "sm": this is the primary action of the row.
-    expect(submit).toHaveClass("px-4", "py-2");
+    // jsdom has no layout. tests/e2e/register-layout.spec.ts measures the
+    // button against the fields in its row.
+  });
+
+  it("moves focus from Amount to Add on Tab", () => {
+    renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={null} onSubmit={vi.fn()} />
+    );
+
+    const amount = screen.getByLabelText("Amount");
+    amount.focus();
+
+    // fireEvent does not run the browser's own tab navigation, so focus moves
+    // here only if the form moves it. That is the point: on macOS, Safari and
+    // Firefox keep buttons out of the tab order unless Full Keyboard Access is
+    // on, so DOM order alone does not put Add one Tab away from Amount.
+    const notPrevented = fireEvent.keyDown(amount, { key: "Tab" });
+
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Add Transaction" })
+    );
+    // Prevented, so the browser does not then hop a second time and overshoot.
+    expect(notPrevented).toBe(false);
+  });
+
+  // Journal mode: Tab from the last Credit landed on "+ Add Line", so Enter
+  // added a split row instead of committing the transaction.
+  describe("journal mode", () => {
+    const credits = () =>
+      screen
+        .getAllByPlaceholderText("0.00")
+        .filter((el) => !(el as HTMLInputElement).id);
+
+    it("moves focus from the last Credit to Add Transaction on Tab", () => {
+      renderWithToast(
+        <TransactionForm accounts={mockAccounts} selectedAccountId={null} onSubmit={vi.fn()} />
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Journal" }));
+
+      const amounts = credits();
+      const lastCredit = amounts[amounts.length - 1];
+      lastCredit.focus();
+      const notPrevented = fireEvent.keyDown(lastCredit, { key: "Tab" });
+
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: /Add Transaction/ })
+      );
+      expect(notPrevented).toBe(false);
+    });
+
+    it("leaves Tab from an earlier split row to the browser", () => {
+      renderWithToast(
+        <TransactionForm accounts={mockAccounts} selectedAccountId={null} onSubmit={vi.fn()} />
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Journal" }));
+
+      // Two rows of Debit and Credit: index 1 is the first row's Credit.
+      const firstCredit = credits()[1];
+      firstCredit.focus();
+      const notPrevented = fireEvent.keyDown(firstCredit, { key: "Tab" });
+
+      expect(document.activeElement).toBe(firstCredit);
+      expect(notPrevented).toBe(true);
+    });
+  });
+
+  it("leaves Shift+Tab out of Amount to the browser", () => {
+    renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={null} onSubmit={vi.fn()} />
+    );
+
+    const amount = screen.getByLabelText("Amount");
+    amount.focus();
+
+    const notPrevented = fireEvent.keyDown(amount, { key: "Tab", shiftKey: true });
+
+    expect(document.activeElement).toBe(amount);
+    expect(notPrevented).toBe(true);
   });
 
   it("keeps every quick-entry field named, but hides the labels on screen", () => {

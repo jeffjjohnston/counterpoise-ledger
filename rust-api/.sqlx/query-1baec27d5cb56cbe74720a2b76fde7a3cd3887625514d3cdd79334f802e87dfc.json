@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT user_id FROM sessions WHERE token_hash = $1 AND expires_at > (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1baec27d5cb56cbe74720a2b76fde7a3cd3887625514d3cdd79334f802e87dfc"
+}

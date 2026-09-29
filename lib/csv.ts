@@ -2,7 +2,7 @@
  * Shared helpers for building and downloading CSV files client-side.
  */
 
-import { toDateString } from "@/lib/formatters";
+import { toDateString } from "@/lib/wasm-client";
 
 /**
  * Builds a dated CSV filename, e.g. `active-securities-2026-08-09.csv`.

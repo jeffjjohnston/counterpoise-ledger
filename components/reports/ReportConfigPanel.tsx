@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { Select } from "@/components/ui/Select";
 import { Input } from "@/components/ui/Input";
 import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
-import { ACCOUNT_TYPE_LABELS } from "@/lib/accounting";
+import { ACCOUNT_TYPE_LABELS } from "@/lib/wasm-client";
 import type { AccountWithBalance } from "@/types";
 import type { GroupDimension } from "@/lib/reports";
 

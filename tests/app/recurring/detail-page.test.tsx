@@ -4,17 +4,22 @@ import RecurringRuleDetailPage from "@/app/b/[bookId]/recurring/[id]/page";
 import type { TransactionWithSplits } from "@/types";
 
 const mockPush = vi.fn();
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1", id: "7" }),
-  useRouter: () => ({ push: mockPush, replace: vi.fn() }),
-  useSearchParams: () => new URLSearchParams(),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1", id: "7" }),
+    useRouter: () => ({ push: mockPush, replace: vi.fn() }),
+    useSearchParams: () => new URLSearchParams(),
+  })
+);
 
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
-    <a href={href}>{children}</a>
-  ),
+let bookRoleValue: { canWrite: boolean; isOwner: boolean; role: string } = {
+  canWrite: true,
+  isOwner: true,
+  role: "owner",
+};
+
+vi.mock("@/components/BookRoleProvider", () => ({
+  useBookRole: () => bookRoleValue,
 }));
 
 // Stands in for the register table so a history assertion is about how many
@@ -202,6 +207,24 @@ describe("RecurringRuleDetailPage", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    bookRoleValue = { canWrite: true, isOwner: true, role: "owner" };
+  });
+
+  it("hides Process Now, Edit and Delete from a viewer", async () => {
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+    await renderPage();
+
+    expect(screen.queryByRole("button", { name: "Process Now" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+  });
+
+  it("shows Process Now, Edit and Delete for an owner", async () => {
+    await renderPage();
+
+    expect(screen.getByRole("button", { name: "Process Now" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
   });
 
   it("names the rule, its state, its payee and its template description", async () => {
@@ -338,6 +361,40 @@ describe("RecurringRuleDetailPage", () => {
 
     const modal = within(await screen.findByTestId("modal"));
     expect(modal.getByRole("button", { name: "Save Changes" })).toBeInTheDocument();
+  });
+
+  it("closes the rule edit form when the role drops to viewer", async () => {
+    // The role can change while the form is open: the role loads after the
+    // page, and an owner can demote a member at any time. A viewer must not
+    // keep an editable form. The server refuses the save.
+    vi.stubGlobal("fetch", mockFetch());
+    const { rerender } = render(<RecurringRuleDetailPage />);
+    await screen.findByRole("heading", { name: "Monthly Rent" });
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(
+      await screen.findByRole("heading", { name: "Edit Recurring Transaction" })
+    ).toBeInTheDocument();
+
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+    rerender(<RecurringRuleDetailPage />);
+
+    expect(
+      screen.queryByRole("heading", { name: "Edit Recurring Transaction" })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save Changes" })).not.toBeInTheDocument();
+  });
+
+  it("titles a viewer's transaction modal without Edit", async () => {
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+    await renderPage({ history: { 0: [buildTransaction(101)] }, totalCount: 1 });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("1");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open transaction editor" }));
+
+    expect(await screen.findByRole("heading", { name: "Transaction" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Edit Transaction" })).not.toBeInTheDocument();
   });
 
   it("returns to the list after deleting the rule", async () => {

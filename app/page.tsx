@@ -1,12 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import Link from "next/link";
+import { Link, useRouter } from "@/lib/navigation";
 import { Modal } from "@/components/ui/Modal";
 import { Input } from "@/components/ui/Input";
 import { JobStatusTable } from "@/components/system/JobStatusTable";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
+import type { BookRole } from "@/lib/book-roles";
 import { useToast } from "@/components/ui/ToastProvider";
 
 interface Book {
@@ -14,6 +14,7 @@ interface Book {
   name: string;
   createdAt: string;
   updatedAt: string;
+  role?: BookRole;
 }
 
 interface IssueReport {
@@ -319,6 +320,11 @@ export default function BookSelectorPage() {
                   <Link href={`/b/${book.id}`} className="block flex-1 min-w-0">
                     <h2 className="text-lg font-semibold text-fg mb-2 truncate">
                       {book.name}
+                      {book.role && book.role !== "owner" && (
+                        <span className="ml-2 rounded-full bg-surface-tertiary px-2 py-0.5 text-xs text-fg-secondary capitalize">
+                          {book.role}
+                        </span>
+                      )}
                     </h2>
                     <p className="text-xs text-fg-tertiary">
                       Created{" "}
@@ -329,14 +335,16 @@ export default function BookSelectorPage() {
                       })}
                     </p>
                   </Link>
-                  <button
-                    type="button"
-                    onClick={() => openEditModal(book)}
-                    className="shrink-0 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-fg-secondary hover:bg-surface-tertiary transition-colors"
-                    aria-label={`Edit ${book.name}`}
-                  >
-                    Edit
-                  </button>
+                  {(book.role === undefined || book.role === "owner") && (
+                    <button
+                      type="button"
+                      onClick={() => openEditModal(book)}
+                      className="shrink-0 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-fg-secondary hover:bg-surface-tertiary transition-colors"
+                      aria-label={`Edit ${book.name}`}
+                    >
+                      Edit
+                    </button>
+                  )}
                 </div>
               </div>
             );

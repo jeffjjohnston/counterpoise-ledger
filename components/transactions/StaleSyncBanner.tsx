@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
+import { Link } from "@/lib/navigation";
 import { cn } from "@/lib/utils";
-import { formatDateShort } from "@/lib/formatters";
+import { formatDateShort } from "@/lib/wasm-client";
 import { apiGet } from "@/lib/api-client";
 
 type StaleAccount = {

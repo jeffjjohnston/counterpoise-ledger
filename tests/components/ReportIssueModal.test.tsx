@@ -2,9 +2,11 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ReportIssueModal } from "@/components/ReportIssueModal";
 
-vi.mock("next/navigation", () => ({
-  usePathname: () => "/b/1/transactions",
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    usePathname: () => "/b/1/transactions",
+  })
+);
 
 describe("ReportIssueModal", () => {
   beforeEach(() => {

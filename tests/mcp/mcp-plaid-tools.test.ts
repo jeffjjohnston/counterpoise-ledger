@@ -1,7 +1,6 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { plaidAccounts, plaidTokens, transactions } from "@/db/schema";
@@ -16,26 +15,38 @@ import {
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
+import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 
-// Mock MCP auth to return an authenticated user, same pattern as
-// mcp-account-tools.test.ts.
-vi.mock("@/mcp/auth", () => ({
-  getMcpAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  verifyBookAccess: vi.fn().mockResolvedValue(true),
-  requireAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  requireBookAuth: vi.fn().mockResolvedValue({ userId: 1, keyId: 1 }),
-}));
-
-vi.mock("@/db", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/db")>();
-  return { ...actual };
-});
-
-let client: Client;
-let server: McpServer;
+let mcp: McpTestClient;
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
-  callMcpTool(client, name, args);
+  callMcpTool(mcp.client, name, args);
+
+// A fake Plaid API that records each request. A stubbed global fetch does not
+// reach the Rust process, and the Rust server reads its Plaid settings when
+// it starts, so the server gets this URL in its environment. Every
+// /transactions/sync call gets an empty page.
+const plaidRequests: string[] = [];
+let plaid: Server;
+
+async function startPlaid() {
+  plaid = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      plaidRequests.push(request.url ?? "");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          added: [], modified: [], removed: [], has_more: false,
+          next_cursor: "cursor-next", request_id: "r",
+        })
+      );
+    });
+  });
+  await new Promise<void>((resolve) => plaid.listen(0, "127.0.0.1", resolve));
+  return `http://127.0.0.1:${(plaid.address() as AddressInfo).port}`;
+}
 
 describe("MCP Plaid Tools", () => {
   const bookId = 1;
@@ -43,23 +54,27 @@ describe("MCP Plaid Tools", () => {
   beforeAll(async () => {
     await setupTestDatabase();
 
-    server = new McpServer({ name: "test", version: "0.0.1" });
-    const { registerPlaidTools } = await import("@/mcp/tools/plaid");
-    registerPlaidTools(server);
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(clientTransport);
-  });
+    const env = {
+      PLAID_CLIENT_ID: "client-id",
+      PLAID_SECRET: "plaid-secret",
+      PLAID_ENV: "sandbox",
+      PLAID_API_URL: await startPlaid(),
+    };
+    Object.assign(process.env, env);
+    mcp = await connectMcpTestClient({ env });
+  }, 120_000);
 
   beforeEach(async () => {
     await resetTestDatabase();
+    plaidRequests.length = 0;
   });
 
   afterAll(async () => {
-    await client.close();
-    await server.close();
+    await mcp.close();
+    await new Promise<void>((resolve) => plaid.close(() => resolve()));
+    for (const name of ["PLAID_CLIENT_ID", "PLAID_SECRET", "PLAID_ENV", "PLAID_API_URL"]) {
+      delete process.env[name];
+    }
   });
 
   describe("get_plaid_status", () => {
@@ -93,13 +108,13 @@ describe("MCP Plaid Tools", () => {
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toContain("not found");
+      expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
     });
 
     // Proof for item 1: refresh must not exist on this tool's published
     // input schema, and a caller that sends it anyway must not reach Plaid.
     it("does not publish a refresh input, and never contacts Plaid even if one is sent anyway", async () => {
-      const tools = (await client.listTools()).tools;
+      const tools = (await mcp.client.listTools()).tools;
       const tool = tools.find((t) => t.name === "list_plaid_token_accounts");
       const properties = tool?.inputSchema.properties as Record<string, unknown> | undefined;
       expect(properties).not.toHaveProperty("refresh");
@@ -109,18 +124,13 @@ describe("MCP Plaid Tools", () => {
         accessToken: "access-sandbox-refresh-ignored",
       });
 
-      const fetchMock = vi.fn();
-      vi.stubGlobal("fetch", fetchMock);
-
       const { data, isError } = await callTool("list_plaid_token_accounts", {
         bookId, tokenId: token.id, refresh: true,
       });
 
       expect(isError).toBe(false);
       expect(data).toEqual([]);
-      expect(fetchMock).not.toHaveBeenCalled();
-
-      vi.unstubAllGlobals();
+      expect(plaidRequests).toEqual([]);
     });
   });
 
@@ -137,7 +147,7 @@ describe("MCP Plaid Tools", () => {
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toContain("not found");
+      expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
 
       const db = getDb();
       const [row] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, theirs.id));
@@ -148,7 +158,7 @@ describe("MCP Plaid Tools", () => {
     // input schema, and a caller that sends one anyway must not change the
     // stored credential.
     it("does not publish an accessToken input, and never overwrites the stored credential even if one is sent anyway", async () => {
-      const tools = (await client.listTools()).tools;
+      const tools = (await mcp.client.listTools()).tools;
       const tool = tools.find((t) => t.name === "update_plaid_token");
       const properties = tool?.inputSchema.properties as Record<string, unknown> | undefined;
       expect(properties).not.toHaveProperty("accessToken");
@@ -196,7 +206,7 @@ describe("MCP Plaid Tools", () => {
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toContain("not found");
+      expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
 
       const db = getDb();
       const [row] = await db
@@ -204,6 +214,88 @@ describe("MCP Plaid Tools", () => {
         .from(plaidAccounts)
         .where(eq(plaidAccounts.id, theirLink.id));
       expect(row.counterpoiseAccountId).toBeNull();
+    });
+  });
+
+  describe("zod rules the JSON Schema cannot hold", () => {
+    // zod trims before min(1) and refuses repeats; the published JSON Schema
+    // holds neither, so the Rust server checks them before its schema check.
+    // Each refusal is the SDK's plain-text input error.
+    async function inputError(name: string, args: Record<string, unknown>) {
+      const result = await mcp.client.callTool({ name, arguments: args });
+      expect(result.isError).toBe(true);
+      return (result.content as Array<{ type: string; text: string }>)[0].text;
+    }
+
+    it("refuses a token field of only whitespace", async () => {
+      const text = await inputError("update_plaid_token", {
+        bookId, tokenId: 1, financialInstitution: "  ", itemId: "item",
+      });
+      expect(text).toMatch(/^MCP error -32602: Input validation error: .*financialInstitution and itemId are required/s);
+    });
+
+    it("refuses a repeated plaidAccountId, as trimmed, and a repeated counterpoiseAccountId", async () => {
+      const repeatedPlaid = await inputError("set_plaid_token_accounts", {
+        bookId, tokenId: 1,
+        assignments: [
+          { plaidAccountId: "acct", counterpoiseAccountId: 1 },
+          { plaidAccountId: " acct ", counterpoiseAccountId: 2 },
+        ],
+      });
+      expect(repeatedPlaid).toMatch(/^MCP error -32602: Input validation error: .*Duplicate plaidAccountId in assignments/s);
+
+      const repeatedLocal = await inputError("set_plaid_token_accounts", {
+        bookId, tokenId: 1,
+        assignments: [
+          { plaidAccountId: "a", counterpoiseAccountId: 1 },
+          { plaidAccountId: "b", counterpoiseAccountId: 1 },
+          { plaidAccountId: "c", counterpoiseAccountId: null },
+          { plaidAccountId: "d", counterpoiseAccountId: null },
+        ],
+      });
+      expect(repeatedLocal).toMatch(
+        /^MCP error -32602: Input validation error: .*A Counterpoise account cannot be assigned to more than one Plaid account/s
+      );
+
+      const blank = await inputError("set_plaid_token_accounts", {
+        bookId, tokenId: 1, assignments: [{ plaidAccountId: " ", counterpoiseAccountId: 1 }],
+      });
+      expect(blank).toMatch(/^MCP error -32602: Input validation error: .*Each assignment must include plaidAccountId/s);
+
+      // A null item, and an item with no counterpoiseAccountId: the failure
+      // is the item's field, not the array.
+      const nullItem = await inputError("set_plaid_token_accounts", {
+        bookId, tokenId: 1, assignments: [null],
+      });
+      expect(nullItem).toMatch(/^MCP error -32602: Input validation error: .*Each assignment must include plaidAccountId/s);
+      expect(nullItem).not.toMatch(/assignments must be an array/);
+
+      const missingLocal = await inputError("set_plaid_token_accounts", {
+        bookId, tokenId: 1, assignments: [{ plaidAccountId: "a" }],
+      });
+      expect(missingLocal).toMatch(
+        /^MCP error -32602: Input validation error: .*counterpoiseAccountId must be a positive integer or null/s
+      );
+
+      // zod checks every item before it looks for repeats, so a malformed
+      // item wins over a repeated counterpoiseAccountId.
+      const malformedAndRepeated = await inputError("set_plaid_token_accounts", {
+        bookId, tokenId: 1,
+        assignments: [
+          { plaidAccountId: "a", counterpoiseAccountId: 1 },
+          { plaidAccountId: "b", counterpoiseAccountId: 1 },
+          { counterpoiseAccountId: 2 },
+        ],
+      });
+      expect(malformedAndRepeated).toMatch(/Each assignment must include plaidAccountId/);
+      expect(malformedAndRepeated).not.toMatch(/more than one Plaid account/);
+
+      const badLocal = await inputError("set_plaid_token_accounts", {
+        bookId, tokenId: 1, assignments: [{ plaidAccountId: "a", counterpoiseAccountId: 0 }],
+      });
+      expect(badLocal).toMatch(
+        /^MCP error -32602: Input validation error: .*counterpoiseAccountId must be a positive integer or null/s
+      );
     });
   });
 
@@ -220,7 +312,7 @@ describe("MCP Plaid Tools", () => {
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toContain("not found");
+      expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
 
       const db = getDb();
       const rows = await db.select().from(plaidTokens).where(eq(plaidTokens.id, theirs.id));
@@ -229,26 +321,53 @@ describe("MCP Plaid Tools", () => {
   });
 
   describe("sync_plaid_token", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
     it("sync_plaid_token refuses a demo connection with a clear message", async () => {
       const token = await createPlaidToken({
         bookId, financialInstitution: "Demo Bank", itemId: "item-demo",
         accessToken: "access-sandbox-demo-000000", isDemo: true,
       });
-      const fetchSpy = vi.fn();
-      vi.stubGlobal("fetch", fetchSpy);
-
       const { data, isError } = await callTool("sync_plaid_token", {
         bookId, tokenId: token.id,
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toContain("demo connection");
+      expect(data.error).toBe("This is a demo connection and cannot sync with Plaid");
       // The guard sits above the try block precisely so no request is made.
-      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(plaidRequests).toEqual([]);
+    });
+
+    it("syncs a linked connection through Plaid and reports the counts", async () => {
+      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
+      const token = await createPlaidToken({
+        bookId, financialInstitution: "Test Bank", itemId: "item-sync", accessToken: "access-sandbox-sync",
+      });
+      await createPlaidAccount({
+        tokenId: token.id, plaidAccountId: "plaid-checking", name: "Checking", type: "depository",
+        counterpoiseAccountId: checking.id,
+      });
+
+      const { data, isError } = await callTool("sync_plaid_token", { bookId, tokenId: token.id });
+
+      expect(isError).toBe(false);
+      expect(data).toMatchObject({
+        synced: { added: 0, modified: 0, removed: 0 },
+        autoMatched: 0,
+        pendingCount: 0,
+        reviewCount: 0,
+      });
+      expect(Object.keys(data)).toEqual(["synced", "autoMatched", "lastSyncedAt", "pendingCount", "reviewCount"]);
+      expect(plaidRequests).toContain("/transactions/sync");
+    });
+
+    it("refuses a connection with no linked account", async () => {
+      const token = await createPlaidToken({
+        bookId, financialInstitution: "Bare Bank", itemId: "item-bare", accessToken: "access-sandbox-bare",
+      });
+
+      const { data, isError } = await callTool("sync_plaid_token", { bookId, tokenId: token.id });
+
+      expect(isError).toBe(true);
+      expect(data.error).toBe("No linked accounts found for this token");
     });
   });
 
@@ -265,7 +384,7 @@ describe("MCP Plaid Tools", () => {
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toContain("not found");
+      expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
 
       const db = getDb();
       const [row] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, theirs.id));
@@ -315,6 +434,27 @@ describe("MCP Plaid Tools", () => {
       expect(isError).toBe(false);
       expect(data).toHaveLength(1);
       expect(data[0].description).toBe("Coffee Shop");
+
+      // accountId is z.coerce.number(): a numeric string filters as the
+      // number does, and the JSON Schema alone would refuse it.
+      const asString = await callTool("list_pending_plaid_transactions", {
+        bookId, accountId: String(account.id),
+      });
+      expect(asString.isError).toBe(false);
+      expect(asString.data).toEqual(data);
+      const otherAccount = await callTool("list_pending_plaid_transactions", {
+        bookId, accountId: String(account.id + 1000),
+      });
+      expect(otherAccount.data).toEqual([]);
+
+      const bad = await mcp.client.callTool({
+        name: "list_pending_plaid_transactions",
+        arguments: { bookId, accountId: "abc" },
+      });
+      expect(bad.isError).toBe(true);
+      expect((bad.content as Array<{ text: string }>)[0].text).toMatch(
+        /^MCP error -32602: Input validation error: .*Invalid accountId/s
+      );
     });
   });
 

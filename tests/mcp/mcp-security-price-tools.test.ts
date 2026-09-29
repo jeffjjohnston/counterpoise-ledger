@@ -1,32 +1,41 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { setupTestDatabase, resetTestDatabase, createSecurity } from "@/tests/helpers/db-utils";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { setupTestDatabase, resetTestDatabase, createBook, createSecurity } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
+import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 import { getDb } from "@/db";
 import { securityPrices } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
-// Mock MCP auth to return an authenticated user, same pattern as
-// mcp-payee-tools.test.ts.
-vi.mock("@/mcp/auth", () => ({
-  getMcpAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  verifyBookAccess: vi.fn().mockResolvedValue(true),
-  requireAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  requireBookAuth: vi.fn().mockResolvedValue({ userId: 1, keyId: 1 }),
-}));
-
-vi.mock("@/db", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/db")>();
-  return { ...actual };
-});
-
-let client: Client;
-let server: McpServer;
+let mcp: McpTestClient;
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
-  callMcpTool(client, name, args);
+  callMcpTool(mcp.client, name, args);
+
+// A fake Tiingo daily-prices API. A stubbed global fetch does not reach the
+// Rust process, and the Rust server reads its Tiingo settings when it
+// starts, so the server gets this URL and key in its environment.
+const TIINGO_KEY = "test-key";
+let tiingo: Server;
+let tiingoUrl: string;
+const tiingoRequests: string[] = [];
+
+async function startTiingo() {
+  tiingo = createServer((request, response) => {
+    tiingoRequests.push(request.url ?? "");
+    const url = new URL(request.url ?? "/", "http://fake");
+    const ok = url.pathname === "/tiingo/daily/VTI/prices" && url.searchParams.get("token") === TIINGO_KEY;
+    response.writeHead(ok ? 200 : 404, { "content-type": "application/json" });
+    response.end(
+      ok
+        ? JSON.stringify([{ date: "2026-03-10T00:00:00.000Z", adjClose: 250.5 }])
+        : JSON.stringify({ detail: "Not found." })
+    );
+  });
+  await new Promise<void>((resolve) => tiingo.listen(0, "127.0.0.1", resolve));
+  tiingoUrl = `http://127.0.0.1:${(tiingo.address() as AddressInfo).port}`;
+}
 
 describe("MCP Security Price Tools", () => {
   const bookId = 1;
@@ -34,23 +43,19 @@ describe("MCP Security Price Tools", () => {
   beforeAll(async () => {
     await setupTestDatabase();
 
-    server = new McpServer({ name: "test", version: "0.0.1" });
-    const { registerSecurityPriceTools } = await import("@/mcp/tools/security-prices");
-    registerSecurityPriceTools(server);
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(clientTransport);
-  });
+    await startTiingo();
+    mcp = await connectMcpTestClient({
+      env: { TIINGO_API_KEY: TIINGO_KEY, TIINGO_API_URL: tiingoUrl },
+    });
+  }, 120_000);
 
   beforeEach(async () => {
     await resetTestDatabase();
   });
 
   afterAll(async () => {
-    await client.close();
-    await server.close();
+    await mcp.close();
+    await new Promise<void>((resolve) => tiingo.close(() => resolve()));
   });
 
   describe("set_security_prices", () => {
@@ -67,12 +72,60 @@ describe("MCP Security Price Tools", () => {
 
       expect(isError).toBe(false);
       expect(data.count).toBe(1);
-      expect(data.discarded).toHaveLength(1);
-      expect(data.discarded[0].index).toBe(1);
+      // The reason is zod's first issue for the item.
+      expect(data.discarded).toEqual([{ index: 1, reason: "Too small: expected number to be >0" }]);
+      expect(data.written).toEqual([
+        { securityId: sec.id, priceMicros: 1_000_000, priceDate: "2026-01-15" },
+      ]);
 
       const rows = await getDb().select().from(securityPrices);
       expect(rows).toHaveLength(1);
     });
+  });
+
+  it("reports zod's first issue for each malformed entry", async () => {
+    const sec = await createSecurity({ bookId, name: "A", symbol: "AAA", securityType: "etf" });
+
+    const { data } = await callTool("set_security_prices", {
+      bookId,
+      priceUpdates: [
+        "x",
+        {},
+        { securityId: 1.5 },
+        { securityId: sec.id, priceMicros: 2 ** 60, priceDate: "2026-01-15" },
+        { securityId: sec.id, priceMicros: 1, priceDate: "2025-02-30" },
+        { securityId: sec.id, priceMicros: 1, priceDate: null },
+        { securityId: sec.id, priceMicros: 1, priceDate: "2026-01-15" },
+      ],
+    });
+
+    expect(data.discarded).toEqual([
+      { index: 0, reason: "Invalid input: expected object, received string" },
+      { index: 1, reason: "Invalid input: expected number, received undefined" },
+      { index: 2, reason: "Invalid input: expected int, received number" },
+      { index: 3, reason: "Too big: expected int to be <=9007199254740991" },
+      { index: 4, reason: "Invalid ISO date" },
+      { index: 5, reason: "Invalid input: expected string, received null" },
+    ]);
+    expect(data.count).toBe(1);
+  });
+
+  it("refuses a batch with a security from another book, and writes nothing", async () => {
+    const other = await createBook({ name: "Other" });
+    const mine = await createSecurity({ bookId, name: "A", symbol: "AAA", securityType: "etf" });
+    const theirs = await createSecurity({ bookId: other.id, name: "B", symbol: "BBB", securityType: "etf" });
+
+    const { data, isError } = await callTool("set_security_prices", {
+      bookId,
+      priceUpdates: [
+        { securityId: mine.id, priceMicros: 1, priceDate: "2026-01-15" },
+        { securityId: theirs.id, priceMicros: 1, priceDate: "2026-01-15" },
+      ],
+    });
+
+    expect(isError).toBe(true);
+    expect(data.error).toBe("One or more securities do not belong to this book");
+    expect(await getDb().select().from(securityPrices)).toHaveLength(0);
   });
 
   describe("update_security_price", () => {
@@ -103,11 +156,13 @@ describe("MCP Security Price Tools", () => {
         priceUpdates: [{ securityId: sec.id, priceMicros: 1_000_000, priceDate: "2026-01-15" }],
       });
 
-      const { isError } = await callTool("delete_security_price", {
+      const { data, isError } = await callTool("delete_security_price", {
         bookId, securityId: sec.id, priceDate: "2026-01-20",
       });
 
       expect(isError).toBe(true);
+      // The library names the date; the HTTP route does not.
+      expect(data.error).toBe("Price entry for 2026-01-20 not found");
       const rows = await getDb().select().from(securityPrices).where(eq(securityPrices.securityId, sec.id));
       expect(rows).toHaveLength(1);
     });
@@ -126,7 +181,7 @@ describe("MCP Security Price Tools", () => {
         securityType: "etf",
       });
 
-      const result = await client.callTool({
+      const result = await mcp.client.callTool({
         name: "delete_security_price",
         arguments: { bookId, securityId: security.id, priceDate: "Feb 8" },
       });
@@ -150,51 +205,42 @@ describe("MCP Security Price Tools", () => {
   });
 
   describe("fetch_tiingo_prices", () => {
-    const originalApiKey = process.env.TIINGO_API_KEY;
-
-    afterEach(() => {
-      vi.unstubAllGlobals();
-      if (originalApiKey === undefined) {
-        delete process.env.TIINGO_API_KEY;
-      } else {
-        process.env.TIINGO_API_KEY = originalApiKey;
-      }
+    beforeEach(() => {
+      tiingoRequests.length = 0;
     });
 
-    it("returns the prices the Tiingo client resolves", async () => {
-      process.env.TIINGO_API_KEY = "test-key";
-      vi.stubGlobal(
-        "fetch",
-        vi.fn().mockResolvedValue({
-          ok: true,
-          json: async () => [{ date: "2026-03-10T00:00:00.000Z", close: 250.5 }],
-        })
-      );
-
+    it("returns the prices Tiingo gives, and the symbols that failed", async () => {
       const { data, isError } = await callTool("fetch_tiingo_prices", {
         bookId,
-        symbols: ["VTI"],
+        symbols: ["VTI", "NOPE"],
       });
 
       expect(isError).toBe(false);
-      expect(data).toHaveProperty("prices");
-      expect(data).toHaveProperty("errors");
+      expect(data.prices).toEqual([{ symbol: "VTI", price: 250.5, date: "2026-03-10" }]);
+      expect(data.errors).toEqual([
+        { symbol: "NOPE", error: "Failed to fetch price for NOPE: Not Found" },
+      ]);
     });
 
     it("fails with a clear message when TIINGO_API_KEY is not configured", async () => {
-      delete process.env.TIINGO_API_KEY;
-      const fetchSpy = vi.fn();
-      vi.stubGlobal("fetch", fetchSpy);
-
-      const { data, isError } = await callTool("fetch_tiingo_prices", {
-        bookId,
-        symbols: ["VTI"],
+      // The Rust server reads the key when it starts, so this case needs a
+      // server started without one.
+      const unconfigured = await connectMcpTestClient({
+        env: { TIINGO_API_KEY: "", TIINGO_API_URL: tiingoUrl },
       });
+      try {
+        const { data, isError } = await callMcpTool(unconfigured.client, "fetch_tiingo_prices", {
+          bookId,
+          symbols: ["VTI"],
+        });
 
-      expect(isError).toBe(true);
-      expect(data.error).toContain("TIINGO_API_KEY");
-      // The guard must run before any request is attempted.
-      expect(fetchSpy).not.toHaveBeenCalled();
+        expect(isError).toBe(true);
+        expect(data.error).toBe("TIINGO_API_KEY environment variable not configured");
+        // The guard must run before any request is attempted.
+        expect(tiingoRequests).toEqual([]);
+      } finally {
+        await unconfigured.close();
+      }
     });
   });
 });

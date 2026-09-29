@@ -24,11 +24,13 @@ import type { AccountWithBalance } from "@/types";
 const renderWithToast = (ui: React.ReactElement) =>
   render(<ToastProvider>{ui}</ToastProvider>);
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/b/1/transactions",
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    usePathname: () => "/b/1/transactions",
+  })
+);
 
 const mockAccounts: AccountWithBalance[] = [
   {

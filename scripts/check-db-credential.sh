@@ -3,9 +3,9 @@
 # credential this repository publishes as its local-development default.
 #
 # WHERE IT RUNS. In both containers that carry DATABASE_URL: the app, from
-# docker-entrypoint.sh, which the image holds; and the scheduler, which runs
-# the stock postgres image and therefore reads the script through a bind mount
-# declared in docker-compose.yml.
+# docker-entrypoint.sh, which the image holds, before the migrations and the
+# server; and the scheduler, which runs the stock postgres image and therefore
+# reads the script through a bind mount declared in docker-compose.yml.
 #
 # That credential is not a secret and is not meant to be one. It appears in
 # .env.example, in the README, and hardcoded in four development and test
@@ -15,7 +15,7 @@
 #
 # WHY HERE AND NOT IN docker-compose.yml
 #
-# A `${APP_DB_PASSWORD:?...}` guard on the app service does fail closed, but
+# A `${APP_DB_PASSWORD:?...}` guard on a service does fail closed, but
 # Compose interpolates the whole file before it selects services. Measured:
 # the guard also blocks `docker compose up -d postgres`, `ps`, `logs` and
 # `down`, so local development and routine operations all break with it. An
@@ -33,7 +33,7 @@ set -e
 # fails later with a connection error, which is already clear." That premise
 # was wrong, and this refusal replaces it.
 #
-# With no DATABASE_URL the app connects to 127.0.0.1:5432 INSIDE ITS OWN
+# With no DATABASE_URL a container connects to 127.0.0.1:5432 INSIDE ITS OWN
 # CONTAINER and crash-loops. No message names the missing file, so the cause
 # is invisible. The connection error is not clear; it points at a host nobody
 # configured.

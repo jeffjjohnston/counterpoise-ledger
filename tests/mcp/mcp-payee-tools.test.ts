@@ -1,7 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import {
   setupTestDatabase,
   resetTestDatabase,
@@ -10,29 +7,15 @@ import {
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
+import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 import { getDb } from "@/db";
 import { payees } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
-// Mock MCP auth to return an authenticated user, same pattern as
-// mcp-account-tools.test.ts.
-vi.mock("@/mcp/auth", () => ({
-  getMcpAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  verifyBookAccess: vi.fn().mockResolvedValue(true),
-  requireAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  requireBookAuth: vi.fn().mockResolvedValue({ userId: 1, keyId: 1 }),
-}));
-
-vi.mock("@/db", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/db")>();
-  return { ...actual };
-});
-
-let client: Client;
-let server: McpServer;
+let mcp: McpTestClient;
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
-  callMcpTool(client, name, args);
+  callMcpTool(mcp.client, name, args);
 
 describe("MCP Payee Tools", () => {
   const bookId = 1;
@@ -40,23 +23,15 @@ describe("MCP Payee Tools", () => {
   beforeAll(async () => {
     await setupTestDatabase();
 
-    server = new McpServer({ name: "test", version: "0.0.1" });
-    const { registerPayeeTools } = await import("@/mcp/tools/payees");
-    registerPayeeTools(server);
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(clientTransport);
-  });
+    mcp = await connectMcpTestClient();
+  }, 120_000);
 
   beforeEach(async () => {
     await resetTestDatabase();
   });
 
   afterAll(async () => {
-    await client.close();
-    await server.close();
+    await mcp.close();
   });
 
   describe("list_payees", () => {
@@ -201,6 +176,29 @@ describe("MCP Payee Tools", () => {
       expect(upper.isError).toBe(false);
       expect(mixed.isError).toBe(false);
       expect(upper.data.id).not.toBe(mixed.data.id);
+    });
+
+    it("refuses a name of only whitespace at the schema boundary, before the book gate", async () => {
+      // The zod schema trims before min(1), so the SDK refuses this before the
+      // handler runs, and so before requireBookAuth. The JSON Schema that Rust
+      // validates has no trim, so the Rust handler must refuse it the same
+      // way, and before its own book gate. Book 999 does not exist: a gate
+      // that runs first gives an access error instead of the input error. The
+      // error is the SDK's plain text, not fail()'s JSON, so this calls
+      // client.callTool directly.
+      for (const target of [bookId, 999]) {
+        const result = await mcp.client.callTool({
+          name: "create_payee",
+          arguments: { bookId: target, name: "   " },
+        });
+
+        expect(result.isError).toBe(true);
+        const [content] = result.content as Array<{ type: string; text: string }>;
+        expect(content.text).toMatch(/^MCP error -32602: Input validation error: .*Name is required/s);
+      }
+
+      const rows = await getDb().select().from(payees).where(eq(payees.bookId, bookId));
+      expect(rows).toHaveLength(0);
     });
 
     it("refuses an exact repeat rather than silently returning the existing row", async () => {

@@ -10,13 +10,19 @@ description: Build/launch/drive recipe for verifying Counterpoise UI changes end
 
 ## Launch
 
-When the **production Docker container** (`counterpoise-app-1`) is running locally, it holds port 3000 and serves deployed code — not your working tree. Always run the dev server on another port so the two can't be confused:
+When the **production Docker container** (`counterpoise-rust-api-1`) is running locally, it holds host port 3000 and serves deployed code — not your working tree. Always run the dev servers on other ports so the two can't be confused. Run two processes, both in the background:
 
 ```bash
-PORT=3001 npm run dev   # background it; ready when /login returns 200
+# 1. The Rust API server, on its own port
+DATABASE_URL=postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev \
+  RUST_BIND=127.0.0.1:4100 \
+  cargo run --manifest-path rust-api/Cargo.toml -p counterpoise-rust-api   # ready when /health returns 200
+
+# 2. The Vite dev server, which proxies /api to that Rust server
+RUST_API_URL=http://127.0.0.1:4100 npm run dev -- --port 3001   # ready when /login returns 200
 ```
 
-The dev server uses the `counterpoise_dev` PostgreSQL database (start the dedicated dev database with `docker compose -f docker-compose.dev.yml up -d --wait`; no production environment file is needed).
+The Vite port is strict: if 3001 is in use, Vite stops with an error. Pick another port. The Rust server uses the `counterpoise_dev` PostgreSQL database (start the dedicated dev database with `docker compose -f docker-compose.dev.yml up -d --wait`; no production environment file is needed). Rust code changes need a restart of the Rust server; client changes reload in the browser.
 
 ## Login
 
@@ -41,4 +47,4 @@ Dev data is disposable seed data, but restore any rows you mutate (UPDATE back t
 
 ## Cleanup
 
-Kill the dev server (`pkill -f "next dev"`), delete `.playwright-mcp/` and stray screenshots from the repo root before committing.
+Stop the two dev servers that you started (the `vite` process and the `counterpoise-rust-api` process; stop them by PID, not by a broad `pkill`, so that you do not stop another task's servers), delete `.playwright-mcp/` and stray screenshots from the repo root before committing.

@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
+import { Link } from "@/lib/navigation";
 import { Input } from "@/components/ui/Input";
-import { formatDate } from "@/lib/formatters";
+import { formatDate } from "@/lib/wasm-client";
 import { useBookId } from "@/hooks/useBookId";
 import { apiGet } from "@/lib/api-client";
 

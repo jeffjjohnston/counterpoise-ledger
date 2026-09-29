@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useId, forwardRef } from "react";
 import { cn } from "@/lib/utils";
+import { comparePayeeMatches } from "@/lib/payee-match";
 
 interface PayeeAutocompleteBaseProps {
   payees: Array<{ id: number; name: string }>;
@@ -78,9 +79,12 @@ export const PayeeAutocomplete = forwardRef<HTMLInputElement, PayeeAutocompleteP
 
     // --- Filtering ---
     const filterTerm = isTextMode ? props.textValue : searchTerm;
-    const filteredPayees = payees.filter((payee) =>
-      payee.name.toLowerCase().includes(filterTerm.toLowerCase())
-    );
+    // The server already ranks the rows it sends the text-mode forms. The
+    // ID-mode filters get the whole payee list, so the ranking must also
+    // happen here. `sort` is stable, so equal ranks keep the server order.
+    const filteredPayees = payees
+      .filter((payee) => payee.name.toLowerCase().includes(filterTerm.toLowerCase()))
+      .sort((a, b) => comparePayeeMatches(a.name, b.name, filterTerm));
 
     // --- Input display value ---
     const inputValue = isTextMode

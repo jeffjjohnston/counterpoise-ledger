@@ -1,36 +1,20 @@
 // tests/components/layout/Navbar.test.tsx
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
-import type { ReactNode } from "react";
 
-vi.mock("next/navigation", () => ({
-  usePathname: vi.fn(() => "/"),
-  useParams: () => ({}),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
-}));
-
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({
-    children,
-    href,
-    className,
-  }: {
-    children: ReactNode;
-    href: string;
-    className?: string;
-  }) => (
-    <a href={href} className={className}>
-      {children}
-    </a>
-  ),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    usePathname: vi.fn(() => "/"),
+    useParams: () => ({}),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+  })
+);
 
 vi.mock("@/components/ui/ThemeToggle", () => ({
   ThemeToggle: () => <button>Theme</button>,
 }));
 
-import { usePathname } from "next/navigation";
+import { usePathname } from "@/lib/navigation";
 import { Navbar } from "@/components/layout/Navbar";
 
 describe("Navbar", () => {

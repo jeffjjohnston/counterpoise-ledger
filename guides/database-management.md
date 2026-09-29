@@ -12,8 +12,12 @@ it carries the rules that apply everywhere and says when to come here.
 3. Run `npm run db:migrate` to apply the migration
 4. Commit **all** generated files: the SQL migration (`db/migrations/NNNN_*.sql`), the snapshot (`db/migrations/meta/NNNN_snapshot.json`), and the updated journal (`db/migrations/meta/_journal.json`). Drizzle needs the snapshot to compute future diffs correctly.
 5. Update TypeScript types (Drizzle auto-generates)
+6. Update the Rust SQL that reads or writes the changed columns, and refresh
+   the SQLx query metadata in `rust-api/.sqlx/` with `cargo sqlx prepare` (see
+   [testing.md](testing.md)). The Rust server never applies DDL: Drizzle is the
+   only migrator.
 
-Migrations are NOT auto-applied by `getDb()`. Use `npm run db:migrate` (or `runMigrations()` in scripts). Test helpers handle migrations for tests.
+Migrations are NOT auto-applied by `getDb()` or by the Rust server. Use `npm run db:migrate` (or `runMigrations()` in scripts). In production, the entrypoint of the `rust-api` container (`docker-entrypoint.sh`) runs them: it checks the credential, runs `migrate.js` (Drizzle) and `ledger-cli rebuild-lots`, then starts the server. A failed migration stops the container before the server starts, and `docker compose up --wait` exits 1, so a new server never runs against the old schema. Test helpers handle migrations for tests.
 
 ## ⚠️ Never Manually Alter the Production Database
 Do not use `ALTER TABLE`, `CREATE INDEX`, or other DDL statements directly against the production database. Drizzle tracks applied migrations by hash in its `__drizzle_migrations` table — manual changes desync the schema from the migration history, causing future migrations to fail (e.g., `column already exists`). Always make schema changes through `db/schema.ts` → `npm run db:generate` → deploy.
@@ -47,8 +51,9 @@ Test database cleanup runs against the dev container only; see [testing.md](test
   `initdb` reads and nothing else — editing it on a populated volume is
   silently ignored, and the role's password changes only via `ALTER ROLE`.
 - `scripts/check-db-credential.sh` runs from `docker-entrypoint.sh` before
-  migrations and aborts startup when `DATABASE_URL` carries the published
-  default. It is **not** a `${APP_DB_PASSWORD:?}` guard in `docker-compose.yml`:
+  migrations, and from the scheduler before it installs its crontab. It stops
+  the container before the server starts when `DATABASE_URL`
+  carries the published default. It is **not** a `${APP_DB_PASSWORD:?}` guard in `docker-compose.yml`:
   Compose interpolates the whole file before selecting services, so a required
   variable there also blocks `docker compose up -d postgres`, `ps`, `logs` and
   `down` (measured). Checking the connection string also catches the operator

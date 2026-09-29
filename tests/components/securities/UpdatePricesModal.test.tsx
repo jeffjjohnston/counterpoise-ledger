@@ -3,11 +3,13 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { UpdatePricesModal } from "@/components/securities/UpdatePricesModal";
 import { ToastProvider } from "@/components/ui/ToastProvider";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/b/1/securities",
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    usePathname: () => "/b/1/securities",
+  })
+);
 
 const renderWithToast = (ui: React.ReactElement) =>
   render(<ToastProvider>{ui}</ToastProvider>);

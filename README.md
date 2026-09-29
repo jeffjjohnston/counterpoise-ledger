@@ -70,7 +70,7 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 - **CSV Export** - Download report and security data as CSV
 
 ### AI Integration (MCP)
-- **MCP Server** - Read/write access to accounting data for AI assistants (see [mcp/README.md](mcp/README.md))
+- **MCP Server** - Read/write access to accounting data for AI assistants, over stdio or HTTP (see [guides/mcp-server.md](guides/mcp-server.md))
 - **API Keys** - Per-user `cpk_` keys managed on the Account page, scrypt-hashed at rest
 - **Usage Analytics** - Optional PostHog integration for usage events. Custom events carry no financial values, but `$pageview` sends the full URL including its query string, and the search page puts the typed query in `?q=` — see [guides/posthog-analytics.md](guides/posthog-analytics.md)
 
@@ -85,19 +85,21 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 
 ## Tech Stack
 
-- **Framework**: Next.js 16 (App Router)
-- **Language**: TypeScript
+- **Web client**: React with React Router, built by Vite into static files
+- **API server**: Rust (Axum and SQLx). It serves the API, the MCP server and the client build
+- **Language**: TypeScript in the browser, Rust on the server. The browser runs the shared Rust domain code as WASM
 - **Styling**: Tailwind CSS
-- **Database**: PostgreSQL with postgres.js driver
-- **ORM**: Drizzle ORM
-- **Testing**: Vitest (unit), Playwright (E2E)
-- **Runtime**: Node.js
+- **Database**: PostgreSQL
+- **Schema and migrations**: Drizzle ORM
+- **Testing**: Vitest (unit), `cargo test`, Playwright (E2E)
 
 ## Prerequisites
 
 - Node.js 26+
 - npm
 - Docker (for PostgreSQL)
+- Rust with `cargo` and the `wasm32-unknown-unknown` target. `npm run dev`
+  builds the core crate to WASM, and `npm run db:seed` runs the Rust CLI
 
 ## Installation
 
@@ -125,7 +127,7 @@ the data volume survives. Keep port 5432 available for this database.
 The development checkout is separate from production. For a full Docker
 deployment, use the production clone (`~/prod/counterpoise` by default, branch `main`).
 In that clone, create the production volume, copy the example environment file,
-and point `DATABASE_URL` at the `postgres` service — inside the app container,
+and point `DATABASE_URL` at the `postgres` service — inside a container,
 `localhost` is the container itself:
 
 ```bash
@@ -167,12 +169,16 @@ Docker only creates the `counterpoise` database; local development uses `counter
 npm run db:seed
 ```
 
-This resets the local database, creates a sample `admin` user with password `password`, creates a sample book, and seeds it with data. If you want to seed an existing book instead, first create the book, then run `npm run db:list-books` to find its ID and `npm run db:seed -- --book-id <id>`.
+This resets the local database, creates a sample `admin` user with password `password`, creates a sample book, and seeds it with data. If you want to seed an existing book instead, first create the book, then run `npm run db:list-books` to find its ID and `npm run db:seed -- --book-id <id>`. The seed runs `ledger-cli seed` through `cargo run`, so the first run also builds the Rust CLI.
 
 If you skip seeding, run `npm run db:migrate` instead to apply the schema — migrations are not applied automatically in local dev.
 
-6. Start the development server:
+6. Start the API server and the Vite development server, in two terminals.
+   Vite serves the client on port 3000. It sends every `/api` request to the
+   API server on `127.0.0.1:4000` (set `RUST_API_URL` to use a different address):
 ```bash
+DATABASE_URL=postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev \
+  cargo run --manifest-path rust-api/Cargo.toml -p counterpoise-rust-api
 npm run dev
 ```
 
@@ -185,7 +191,8 @@ on the books page. It creates a book named "Demo Book" and fills it with the
 same sample dataset the seed uses. Unlike `npm run db:seed`, which resets the
 entire database, this only ever writes to the book it just created — so it is
 safe to run on an instance that already holds real data, and you can add several.
-It writes thousands of rows one at a time, so give it a few seconds.
+It writes thousands of rows in one transaction, so give it a few seconds. If it
+fails, no demo book remains.
 
 ## Database Architecture
 
@@ -210,12 +217,12 @@ The full stack runs as three Docker Compose services:
 | Service     | Description                                                              |
 |-------------|--------------------------------------------------------------------------|
 | `postgres`  | PostgreSQL 16 database with persistent volume                            |
-| `app`       | Next.js standalone server (runs migrations on startup)                   |
+| `rust-api`  | The app: the UI (the Vite client build), the API and MCP, on host port 3000. Before the server starts, it checks the database credential, applies the Drizzle migrations and rebuilds the investment lots |
 | `scheduler` | PostgreSQL Alpine sidecar — recurring transactions, Plaid sync, backups, pruning, reindex |
 
 ### Configuration
 
-The `app` and `scheduler` services read secrets from `.env.production.local` via `env_file`. Configure these variables:
+The `rust-api` and `scheduler` services read secrets from `.env.production.local` via `env_file`. Configure these variables:
 
 ```bash
 # .env.production.local
@@ -224,6 +231,11 @@ CRON_SECRET=your-cron-secret-here
 # Optional — signup control. Leave unset and registration is open only until the
 # first account exists, then closes itself.
 REGISTRATION_ENABLED=true|false
+
+# Optional — the client address for the rate limits. Leave unset: the server
+# then uses X-Forwarded-For only when APP_BIND is loopback. See "Client
+# addresses and rate limits" below.
+TRUST_PROXY=true|false
 
 # Optional — Plaid bank sync (see "Connecting a Bank (Plaid)" below)
 PLAID_CLIENT_ID=...
@@ -234,7 +246,8 @@ PLAID_ENV=sandbox|production
 TIINGO_API_KEY=...
 
 # Optional — PostHog analytics
-# NEXT_PUBLIC_* values are Docker build args (inlined into the JS bundle at image build)
+# NEXT_PUBLIC_* values are Docker build args. The client build puts them into
+# the JS bundle when the image is built, so a change needs a rebuild.
 NEXT_PUBLIC_POSTHOG_KEY=...
 NEXT_PUBLIC_POSTHOG_HOST=...
 POSTHOG_PERSONAL_API_KEY=...  # runtime; used for querying the PostHog API
@@ -247,7 +260,7 @@ role is created from `APP_DB_PASSWORD` by
 `scripts/postgres-init/01-app-role.sh`, which runs on **first initialization
 only**: the postgres image skips `/docker-entrypoint-initdb.d` once the volume
 holds a database. Set `APP_DB_PASSWORD` before the first `docker compose up` —
-setting it later does nothing. The app container refuses to start while
+setting it later does nothing. The app refuses to start while
 `DATABASE_URL` still carries the published `counterpoise:counterpoise` default,
 which is in this repository and known to every reader of it.
 
@@ -275,22 +288,32 @@ docker compose --env-file .env.production.local up -d --build
 docker compose --env-file .env.production.local up -d postgres
 ```
 
-The app will be available at http://localhost:3000. Migrations run automatically on container startup via `docker-entrypoint.sh`.
+The app will be available at http://localhost:3000. The `rust-api` entrypoint
+(`docker-entrypoint.sh`) applies the migrations before the server starts. If a
+migration fails, the server does not start.
 
 ### Rebuilding
 
-Rebuild the app image after code changes:
+Rebuild the image after code changes. The new migrations run before the new
+server starts:
 
 ```bash
-docker compose --env-file .env.production.local up -d --build app
+docker compose --env-file .env.production.local up -d --build rust-api
 ```
+
+### Upgrading to SQLite
+
+v1.48.0 is the last release that uses PostgreSQL. The next release moves the
+data to SQLite, and an existing install must convert its data one time. Read
+[guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md) before you upgrade
+past v1.48.0.
 
 ### Updating Environment Variables
 
 Docker Compose reads `env_file` only when **creating** a container. After editing `.env.production.local`, force-recreate to pick up changes:
 
 ```bash
-docker compose --env-file .env.production.local up -d --force-recreate app scheduler
+docker compose --env-file .env.production.local up -d --force-recreate rust-api scheduler
 ```
 
 > **Note:** `docker compose restart` will **not** re-read the env file — it only stops and starts the existing container with the old environment.
@@ -302,7 +325,7 @@ docker compose --env-file .env.production.local up -d --force-recreate app sched
 docker compose logs -f
 
 # Specific service
-docker compose logs -f app
+docker compose logs -f rust-api
 ```
 
 ### Stopping
@@ -318,13 +341,18 @@ docker volume rm counterpoise_pgdata
 
 ### Build Architecture
 
-The Dockerfile uses a multi-stage build:
+The root `Dockerfile` builds one image in stages:
 
-1. **deps** — installs `node_modules` via `npm ci`
-2. **builder** — builds the Next.js standalone output
-3. **runner** — minimal production image with the standalone server, static assets, and migration runner
+1. **wasm-builder** — compiles the core crate to WASM for the browser
+2. **client** — runs `npm ci` and `npm run build` (Vite) to make the client in `build/`
+3. **builder** — compiles the Rust server and `ledger-cli`
+4. **runtime** — a small Node image with the two binaries, the client in
+   `/srv/client` (`COUNTERPOISE_STATIC_DIR`), the migrations and `migrate.js`
 
-The entrypoint runs Drizzle migrations before starting the Next.js server, so schema changes are applied automatically on deploy.
+Its entrypoint (`docker-entrypoint.sh`) checks the database credential,
+applies the Drizzle migrations, rebuilds the lots with `ledger-cli
+rebuild-lots`, and then starts the server. Node runs only for `migrate.js`. A
+new server never runs against the old schema.
 
 ## Getting HTTPS
 
@@ -345,7 +373,7 @@ origin. So the same build behaves differently depending on how you reach it:
 The middle row has no error message, so it looks like a rejected password. It is
 what you get by setting `APP_BIND=0.0.0.0` and pointing a phone at the LAN
 address. Counterpoise logs a warning when it happens — check `docker compose
-logs app` if login is bouncing.
+logs rust-api` if login is bouncing.
 
 Any of these fixes it:
 
@@ -355,7 +383,7 @@ Any of these fixes it:
 | **Tailscale Serve** | A tailnet | `tailscale serve --bg 3000` publishes it at `https://<machine>.<tailnet>.ts.net`. No open ports, no domain, no certificate management, and it preserves `Host`. Easiest option for reaching your own instance from other devices. |
 | **Caddy** | A domain, ports 80/443 | Automatic Let's Encrypt certificates from a two-line Caddyfile. Sets `Host` and `X-Forwarded-Proto` correctly by default. |
 | **Cloudflare Tunnel** | A domain on Cloudflare | `cloudflared` dials out, so nothing needs to be opened inbound. |
-| **nginx + certbot** | A domain, ports 80/443 | Works, but needs both proxy headers set by hand — see below. |
+| **nginx + certbot** | A domain, ports 80/443 | Works, but needs three proxy headers set by hand — see below. |
 
 Leave `APP_BIND` at its `127.0.0.1` default when the proxy runs on the same
 host; the proxy reaches the app over loopback and nothing else can.
@@ -368,24 +396,74 @@ books.example.com {
 }
 ```
 
-nginx needs two headers set explicitly. Its defaults break Counterpoise in two
+nginx needs three headers set explicitly. Its defaults break Counterpoise in three
 separate ways — `Host` becomes the upstream address, which fails the
 cross-origin check for any WRITE to `/api/` that the browser did not label with
 `Sec-Fetch-Site` (safe methods and page requests never reach the comparison,
 that header is checked first wherever it is present, and a request carrying no
 `Origin` is allowed through), and without `X-Forwarded-Proto` the app cannot
-tell that the original request was HTTPS:
+tell that the original request was HTTPS, and without
+`X-Forwarded-For` the rate limits see one address for all clients and pass on a
+value that the client wrote:
 
 ```nginx
+# Deliver live book updates immediately instead of buffering the stream.
+location ~ ^/api/b/[0-9]+/events$ {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off;
+    proxy_read_timeout 60s;
+}
+
 location / {
     proxy_pass http://127.0.0.1:3000;
     proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 ```
 
 Once TLS is working, set `ENABLE_HSTS=true` to add a `Strict-Transport-Security`
 header.
+
+### Client addresses and rate limits
+
+The auth rate limits count failures per client address. The server finds that
+address in one of two ways:
+
+- **`X-Forwarded-For`**, the rightmost entry. A reverse proxy adds its own
+  client's address at the end, so that entry is correct when every request
+  comes through the proxy.
+- **The TCP peer address**, which the client cannot change. The server ignores
+  `X-Forwarded-For`, because a client that connects directly can write any
+  value in it and get a new rate-limit bucket for each attempt.
+
+`TRUST_PROXY` selects the method:
+
+| `TRUST_PROXY` | Client address |
+| --- | --- |
+| unset (the default) | `X-Forwarded-For` when `APP_BIND` is loopback, else the peer |
+| `true` | `X-Forwarded-For`. The peer when the header is missing |
+| `false` | The peer. `X-Forwarded-For` has no effect |
+
+With the default `APP_BIND=127.0.0.1`, only a process on the same host can
+connect, and that is your proxy. Tailscale Serve, Caddy and Cloudflare Tunnel
+set `X-Forwarded-For` by default; nginx needs the line in the example above.
+Thus the default needs no configuration. The server logs its choice when it
+starts (`docker compose logs rust-api`).
+
+Set `TRUST_PROXY=true` when a proxy on a different host is the only way in and
+`APP_BIND` is therefore not loopback. Do not set it when clients can also reach
+port 3000 directly.
+
+With `APP_BIND=0.0.0.0` and no proxy, the server uses the peer address. On
+Linux with the default Docker network, that is the real client address. Docker
+Desktop (macOS and Windows) and rootless Docker can show the same internal
+address for all clients. Then all clients share one bucket of twenty failures,
+and one client's failures can lock out the others for a time. The per-username
+limit is not changed. Put a proxy in front if this is a problem.
 
 ## Security notes for self-hosting
 
@@ -407,6 +485,8 @@ exposing it to anything wider, understand these defaults:
 - **Auth endpoints are rate limited.** Five failed attempts per username and
   twenty per client IP in fifteen minutes, with lockouts escalating from one
   minute to fifteen. State is in-process and resets when the container restarts.
+  The server takes the client IP from `X-Forwarded-For` only when the port is
+  on loopback or `TRUST_PROXY=true`. See "Client addresses and rate limits".
 - **The app binds to `127.0.0.1` by default**, so a reverse proxy is the only
   way in. `APP_BIND=0.0.0.0` publishes it on your LAN instead — which bypasses
   whatever authentication that proxy provides, and, if you reach it over plain
@@ -419,13 +499,15 @@ exposing it to anything wider, understand these defaults:
   that yet — the postgres image reads the password before any script of ours
   runs.
 - **The application connects as its own non-superuser role.** A fresh install
-  creates `counterpoise_app` from `APP_DB_PASSWORD`, and the app container
-  refuses to start if `DATABASE_URL` still carries the published default.
+  creates `counterpoise_app` from `APP_DB_PASSWORD`, and the app refuses to
+  start if `DATABASE_URL` still carries the published default.
 - **Cron endpoints fail closed.** `/api/cron/*` returns 401 unless `CRON_SECRET`
   is set and presented as a bearer token.
 - **A reverse proxy in front of Counterpoise must preserve the original `Host`
-  header.** The cross-origin write check in `proxy.ts` compares the request's
-  `Origin` against its `Host` header. Tailscale Serve preserves `Host` by
+  header.** The cross-origin write check compares the request's `Origin`
+  against its `Host` header (or `X-Forwarded-Host` when the proxy sets it).
+  The Rust server does this check in `rust-api/server/src/security.rs`.
+  Tailscale Serve preserves `Host` by
   default, so this works out of the box behind it. nginx does **not** — its
   default `proxy_set_header Host $proxy_host` replaces `Host` with the
   upstream address — and a proxy on that default will 403 every write with an
@@ -464,9 +546,32 @@ Run it only where the old role owns nothing you mean to leave alone — a
 production instance holding one database — and otherwise move ownership by
 hand, with `ALTER DATABASE` and an `ALTER ... OWNER TO` per object inside.
 
-Afterwards point `DATABASE_URL` at the new role and restart. The app container
-refuses to start while `DATABASE_URL` still carries the published bootstrap
+Afterwards point `DATABASE_URL` at the new role and restart. The app refuses to
+start while `DATABASE_URL` still carries the published bootstrap
 credential, so a missed step fails loudly rather than running as a superuser.
+
+#### The bootstrap password
+
+`POSTGRES_PASSWORD` is the superuser's, and it has no default: set your own in
+`.env.production.local` before the first start. `scripts/postgres-entrypoint-guard.sh`
+runs as the postgres entrypoint and refuses the password this repository
+publishes, ahead of `initdb` — the only moment refusing costs nothing, because
+no cluster exists yet. Change the variable and start again.
+
+On a deployment ALREADY initialized with that password the guard warns on every
+start and lets postgres run, because refusing there would take a working
+deployment down without fixing anything. Changing the variable does not help
+either: the password lives in the cluster once it is created. Rotate it in
+place instead.
+
+```sql
+-- As the bootstrap superuser.
+ALTER ROLE counterpoise WITH PASSWORD 'a value of your own';
+```
+
+Then set that same value as `POSTGRES_PASSWORD` in `.env.production.local`, so
+a future re-initialization matches. Backups authenticate as `counterpoise_app`
+and are unaffected.
 
 ## Backups
 
@@ -482,9 +587,9 @@ docker exec counterpoise-scheduler-1 sh -c \
 pg_restore --list backups/<file>.dump
 
 # Full restore (drops and recreates all objects) — stop the app first
-docker compose stop app
+docker compose stop rust-api
 pg_restore --clean --if-exists -d "$DATABASE_URL" backups/<file>.dump
-docker compose start app
+docker compose start rust-api
 ```
 
 ### Get the dumps off the machine
@@ -640,15 +745,15 @@ Import data from Moneydance JSON exports:
 
 ```bash
 # Dry run (recommended first)
-npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existing-book-id> --dry-run
+npm run import:moneydance -- path/to/export.json --book-id <existing-book-id> --dry-run
 
 # Full import
-npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existing-book-id> --verbose
+npm run import:moneydance -- path/to/export.json --book-id <existing-book-id> --verbose
 ```
 
 Create the destination book first in the UI, or use `npm run db:seed` for a sample seeded book. Use `npm run db:list-books` to find the book ID before importing.
 
-Imports accounts, payees, transactions, investment transactions, security prices, stock splits, and recurring reminders. See `scripts/import-moneydance/README.md` for details.
+Imports accounts, payees, transactions, investment transactions, security prices, stock splits, and recurring reminders. The script runs `ledger-cli import-moneydance` through `cargo run`, so the first run also builds the Rust CLI. One database transaction holds the import, so a failed import leaves the book as it was. See `guides/moneydance-import.md` for details.
 
 ## Usage Examples
 
@@ -717,7 +822,7 @@ The system will automatically show when it's due and allow one-click processing.
 ### Available Scripts
 
 ```bash
-npm run dev          # Start development server
+npm run dev          # Start the web server (the API server runs with cargo; see step 6 above)
 npm run build        # Build for production
 npm run start        # Start production server
 npm run lint         # Run ESLint
@@ -730,7 +835,7 @@ npm run db:migrate   # Apply pending migrations
 npm run db:create-test-dbs  # Create dev + E2E databases (one-time setup)
 npm run db:list-books  # List books and their IDs
 npm run db:seed -- --book-id 2  # Full reset + seed sample data for a specific book
-npm run mcp:dev      # Start the MCP server (stdio)
+npm run mcp:dev      # Start the MCP server over stdio (Rust; needs DATABASE_URL and COUNTERPOISE_API_KEY)
 npm run plaid:link   # Mint a Plaid access token for one bank (sandbox)
 npx drizzle-kit studio  # Open Drizzle Studio (database GUI)
 ```
@@ -777,8 +882,8 @@ Migrations are NOT auto-applied by `getDb()`. Use `runMigrations()` explicitly i
   /reports.ts                     # Financial report logic
 /hooks
   /useBookId.ts                   # Client hooks (also useIsMobile, useRegisterShortcuts)
-/mcp
-  /server.ts                      # MCP server (AI access to accounting data)
+/rust-api
+  /server/src/mcp                 # MCP server (AI access to accounting data)
 ```
 
 ## License

@@ -1,36 +1,21 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import {
   setupTestDatabase,
   resetTestDatabase,
   createAccount,
   createTransactionWithSplits,
+  createUser,
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
+import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 import { getDb } from "@/db";
 import { transactions } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
-// Mock MCP auth to return authenticated user
-vi.mock("@/mcp/auth", () => ({
-  getMcpAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  verifyBookAccess: vi.fn().mockResolvedValue(true),
-  requireAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  requireBookAuth: vi.fn().mockResolvedValue({ userId: 1, keyId: 1 }),
-}));
-
-vi.mock("@/db", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/db")>();
-  return { ...actual };
-});
-
-let client: Client;
-let server: McpServer;
+let mcp: McpTestClient;
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
-  callMcpTool(client, name, args);
+  callMcpTool(mcp.client, name, args);
 
 describe("MCP Write Transaction Tools", () => {
   const bookId = 1;
@@ -38,27 +23,15 @@ describe("MCP Write Transaction Tools", () => {
   beforeAll(async () => {
     await setupTestDatabase();
 
-    server = new McpServer({ name: "test", version: "0.0.1" });
-    const { registerWriteTransactionTools } = await import(
-      "@/mcp/tools/write-transactions"
-    );
-    const { registerSecurityTools } = await import("@/mcp/tools/securities");
-    registerWriteTransactionTools(server);
-    registerSecurityTools(server);
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(clientTransport);
-  });
+    mcp = await connectMcpTestClient();
+  }, 120_000);
 
   beforeEach(async () => {
     await resetTestDatabase();
   });
 
   afterAll(async () => {
-    await client.close();
-    await server.close();
+    await mcp.close();
   });
 
   describe("create_transaction", () => {
@@ -161,34 +134,10 @@ describe("MCP Write Transaction Tools", () => {
       expect(data.payee.name).toBe("Whole Foods");
     });
 
-    it("returns auth error when not authenticated", async () => {
-      const { requireBookAuth } = await import("@/mcp/auth");
-      vi.mocked(requireBookAuth).mockResolvedValueOnce({
-        content: [{ type: "text" as const, text: JSON.stringify({ error: "A valid COUNTERPOISE_API_KEY is required" }) }],
-        isError: true,
-      });
-
-      const { data, isError } = await callTool("create_transaction", {
-        bookId,
-        date: "2025-01-15",
-        splits: [
-          { accountId: 1, amount: 5000 },
-          { accountId: 2, amount: -5000 },
-        ],
-      });
-
-      expect(isError).toBe(true);
-      expect(data.error).toContain("COUNTERPOISE_API_KEY");
-    });
-
+    // The key check itself is in rust-transport.test.ts and rust-stdio.test.ts.
     it("returns book access error when not authorized", async () => {
-      const { requireBookAuth } = await import("@/mcp/auth");
-      vi.mocked(requireBookAuth).mockResolvedValueOnce({
-        content: [{ type: "text" as const, text: JSON.stringify({ error: "You do not have access to this book" }) }],
-        isError: true,
-      });
-
-      const { data, isError } = await callTool("create_transaction", {
+      const stranger = await createUser({ username: "stranger" });
+      const { data, isError } = await mcp.callAs(stranger.id, "create_transaction", {
         bookId,
         date: "2025-01-15",
         splits: [
@@ -198,7 +147,7 @@ describe("MCP Write Transaction Tools", () => {
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toContain("access");
+      expect(data).toEqual({ error: "You do not have access to this book" });
     });
   });
 
@@ -287,22 +236,25 @@ describe("MCP Write Transaction Tools", () => {
         .where(eq(transactions.id, created.id));
       expect(row.isReconciled).toBe(true);
     });
+  });
 
-    it("returns auth error when not authenticated", async () => {
-      const { requireBookAuth } = await import("@/mcp/auth");
-      vi.mocked(requireBookAuth).mockResolvedValueOnce({
-        content: [{ type: "text" as const, text: JSON.stringify({ error: "A valid COUNTERPOISE_API_KEY is required" }) }],
-        isError: true,
+  describe("update_transaction conflict check", () => {
+    it("fails with the conflict message for a stale expectedUpdatedAt", async () => {
+      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
+      const groceries = await createAccount({ name: "Groceries", type: "expense", subtype: "other", bookId });
+
+      const created = await callTool("create_transaction", {
+        bookId, date: "2026-01-01", description: "A",
+        splits: [{ accountId: groceries.id, amount: 100 }, { accountId: checking.id, amount: -100 }],
       });
-
+      const stale = created.data.updatedAt;
+      await new Promise((r) => setTimeout(r, 5));
+      await callTool("update_transaction", { bookId, transactionId: created.data.id, description: "B" });
       const { data, isError } = await callTool("update_transaction", {
-        bookId,
-        transactionId: 1,
-        description: "Updated",
+        bookId, transactionId: created.data.id, description: "C", expectedUpdatedAt: stale,
       });
-
       expect(isError).toBe(true);
-      expect(data.error).toContain("COUNTERPOISE_API_KEY");
+      expect(data).toEqual({ error: "Another user changed this transaction. Showing the latest version." });
     });
   });
 
@@ -352,7 +304,103 @@ describe("MCP Write Transaction Tools", () => {
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toMatch(/not found/i);
+      // Without expectedUpdatedAt, the library's delete names the
+      // transaction and the book; the HTTP route does not.
+      expect(data.error).toBe(`Transaction 999999 not found in book ${bookId}`);
+    });
+
+    // expectedUpdatedAt makes the delete conditional. These tests use the
+    // tools to create and change the row, so updatedAt comes from the tool
+    // output as a client sees it.
+    async function createThroughTool() {
+      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
+      const groceries = await createAccount({ name: "Groceries", type: "expense", subtype: "other", bookId });
+      const created = await callTool("create_transaction", {
+        bookId, date: "2026-01-01", description: "A",
+        splits: [{ accountId: groceries.id, amount: 100 }, { accountId: checking.id, amount: -100 }],
+      });
+      expect(created.isError).toBe(false);
+      return created.data as { id: number; updatedAt: string };
+    }
+
+    async function rowExists(id: number) {
+      const rows = await getDb().select().from(transactions).where(eq(transactions.id, id));
+      return rows.length === 1;
+    }
+
+    it("deletes when expectedUpdatedAt matches the row", async () => {
+      const created = await createThroughTool();
+      const { data, isError } = await callTool("delete_transaction", {
+        bookId, transactionId: created.id, expectedUpdatedAt: created.updatedAt,
+      });
+      expect(isError).toBe(false);
+      expect(data).toEqual({ success: true, transactionId: created.id });
+      expect(await rowExists(created.id)).toBe(false);
+    });
+
+    it("fails with the conflict message for a stale expectedUpdatedAt, and keeps the row", async () => {
+      const created = await createThroughTool();
+      await new Promise((r) => setTimeout(r, 5));
+      const changed = await callTool("update_transaction", {
+        bookId, transactionId: created.id, description: "B",
+      });
+      expect(changed.isError).toBe(false);
+      expect(changed.data.updatedAt).not.toBe(created.updatedAt);
+
+      const { data, isError } = await callTool("delete_transaction", {
+        bookId, transactionId: created.id, expectedUpdatedAt: created.updatedAt,
+      });
+      expect(isError).toBe(true);
+      expect(data).toEqual({ error: "Another user changed this transaction. Showing the latest version." });
+      expect(await rowExists(created.id)).toBe(true);
+    });
+
+    // The HTTP route parses the same value with expectedUpdatedAtQuerySchema
+    // and answers 400 with this message. The tool must refuse the same input
+    // with the same message. The SDK refuses it before the handler runs, so
+    // the body is plain text, not the JSON envelope from fail().
+    it("refuses a malformed expectedUpdatedAt with the HTTP route's message, and keeps the row", async () => {
+      const created = await createThroughTool();
+      const result = await mcp.client.callTool({
+        name: "delete_transaction",
+        arguments: { bookId, transactionId: created.id, expectedUpdatedAt: "yesterday" },
+      });
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+      expect(text).toContain("expectedUpdatedAt must be an ISO timestamp");
+      expect(await rowExists(created.id)).toBe(true);
+    });
+  });
+
+  describe("expectedUpdatedAt", () => {
+    it("says a missing transaction is not found, as the lock check says it", async () => {
+      const { data, isError } = await callTool("delete_transaction", {
+        bookId,
+        transactionId: 999999,
+        expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      expect(isError).toBe(true);
+      expect(data.error).toBe("Transaction not found");
+    });
+
+    it("refuses an offset and a non-string with zod's message", async () => {
+      // z.iso.datetime() refuses an offset, which the JSON Schema date-time
+      // format accepts, and gives its custom message for any failure.
+      for (const [name, extra] of [
+        ["delete_transaction", {}],
+        ["update_transaction", { description: "B" }],
+      ] as const) {
+        for (const expectedUpdatedAt of ["2026-01-01T00:00:00+02:00", 5]) {
+          const result = await mcp.client.callTool({
+            name,
+            arguments: { bookId, transactionId: 1, expectedUpdatedAt, ...extra },
+          });
+          expect(result.isError).toBe(true);
+          const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+          expect(text).toMatch(/^MCP error -32602: Input validation error: .*expectedUpdatedAt must be an ISO timestamp/s);
+        }
+      }
     });
   });
 
@@ -429,7 +477,7 @@ describe("MCP Write Transaction Tools", () => {
       // envelope. That is the one error body callMcpTool() refuses to
       // decode, so inspect the result directly — the same way the
       // schema-boundary tests in mcp-tools.test.ts do.
-      const result = await client.callTool({
+      const result = await mcp.client.callTool({
         name: "create_security",
         arguments: {
           bookId,

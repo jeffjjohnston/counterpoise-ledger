@@ -1,4 +1,4 @@
-import { formatCurrency, formatDate, toDateString } from "@/lib/formatters";
+import { formatCurrency, formatDate, toDateString } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 
 const MICROS_PER_SHARE = 1_000_000;
@@ -30,16 +30,16 @@ const TERM_BADGE_CLASS: Record<"short" | "long", string> = {
 
 /**
  * True when the holding period exceeds one year (IRS long-term threshold),
- * measured from acquisition to today. Mirrors `isLongTerm` in
- * lib/realized-gains.ts (calendar-year comparison, not a 365-day
- * approximation) so an open lot's term here agrees with how it will be
- * classified once sold.
+ * measured from acquisition to today. Mirrors `is_long_term` in
+ * rust-api/server/src/routes/realized_gains.rs (calendar-year comparison, not
+ * a 365-day approximation) so an open lot's term here agrees with how it will
+ * be classified once sold.
  *
  * Both sides of the comparison must be date-only (midnight UTC), not a live
  * timestamp — `Date.now()` carries a time of day, so comparing it directly
  * against midnight UTC on the anniversary date would flip the lot to "Long"
- * partway through the anniversary day itself, one day before
- * lib/realized-gains.ts (which compares two date-only values) agrees. That
+ * partway through the anniversary day itself, one day before the realized
+ * gains report (which compares two date-only values) agrees. That
  * mismatch would show "Long" here and "Short" on the realized gains report
  * for the same lot on the same day.
  */

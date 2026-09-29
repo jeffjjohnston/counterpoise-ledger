@@ -13,63 +13,39 @@ import { newTestRunId } from "./db/test-db-name";
 const testRunId = newTestRunId();
 process.env.COUNTERPOISE_TEST_RUN_ID = testRunId;
 
-// New persistence suites belong in this list or tests/api/. Pure calculations
+// The MCP suites run against the Rust server over the transport that
+// COUNTERPOISE_MCP_TRANSPORT names (npm run test:mcp:http or test:mcp:stdio).
+// They need its binary, so a plain `npm test` leaves them out, as it leaves
+// out tests/http.
+const rustMcpTests = [
+  "tests/mcp/manifest.test.ts",
+  "tests/mcp/mcp-*.test.ts",
+  "tests/mcp/rust-stdio.test.ts",
+  "tests/mcp/rust-transport.test.ts",
+];
+
+// New persistence suites belong in this list. Pure calculations
 // and schemas stay runnable without PostgreSQL.
 const databaseTests = [
+  "tests/db/book-change-notifications.test.ts",
+  "tests/db/book-members.test.ts",
+  "tests/db/reset-test-database.test.ts",
   "tests/db/session-hash-migration.test.ts",
   "tests/db/database-lease.test.ts",
   "tests/db/concurrent-runs.test.ts",
-  "tests/api/**/*.test.ts",
   "tests/db/backfill-dividend-account-ids.test.ts",
   "tests/db/book-scoped-composite-fks.test.ts",
   "tests/db/list-books-script.test.ts",
   "tests/db/lot-schema.test.ts",
   "tests/db/timezone.test.ts",
-  "tests/import/account-import-integration.test.ts",
-  "tests/import/full-import.test.ts",
-  "tests/import/lot-rebuild-ordering.test.ts",
-  "tests/import/overwrite.test.ts",
-  "tests/import/reminders.test.ts",
-  "tests/import/transactions.test.ts",
-  "tests/lib/accounts.test.ts",
-  "tests/lib/advisory-lock.test.ts",
-  "tests/lib/books.test.ts",
-  "tests/lib/floating-transactions.test.ts",
   "tests/lib/investments-latest-prices.test.ts",
   "tests/lib/investments-ordering.test.ts",
-  "tests/lib/issue-reports.test.ts",
   "tests/lib/lots-backfill.test.ts",
   "tests/lib/lots-db.test.ts",
   "tests/lib/payees.test.ts",
-  "tests/lib/plaid-auto-match.test.ts",
-  "tests/lib/plaid-reconcile.test.ts",
-  "tests/lib/plaid-sync.test.ts",
-  "tests/lib/plaid-tokens.test.ts",
-  "tests/lib/plaid-transactions.test.ts",
-  "tests/lib/positions-lots.test.ts",
-  "tests/lib/realized-gains.test.ts",
-  "tests/lib/recurring-processing.test.ts",
-  "tests/lib/recurring-rules.test.ts",
-  "tests/lib/registration.test.ts",
-  "tests/lib/reports-queries.test.ts",
-  "tests/lib/search.test.ts",
-  "tests/lib/securities.test.ts",
-  "tests/lib/security-prices.test.ts",
-  "tests/lib/session.test.ts",
-  "tests/lib/transactions-lots.test.ts",
-  "tests/lib/transactions-query.test.ts",
-  "tests/lib/transactions.test.ts",
-  "tests/mcp/mcp-account-tools.test.ts",
-  "tests/mcp/mcp-book-tools.test.ts",
-  "tests/mcp/mcp-issue-report-tools.test.ts",
-  "tests/mcp/mcp-payee-tools.test.ts",
-  "tests/mcp/mcp-plaid-reconcile-tools.test.ts",
-  "tests/mcp/mcp-plaid-tools.test.ts",
-  "tests/mcp/mcp-recurring-tools.test.ts",
-  "tests/mcp/mcp-security-price-tools.test.ts",
-  "tests/mcp/mcp-tools.test.ts",
-  "tests/mcp/mcp-write-tools.test.ts",
   "tests/scripts/sweep-test-databases.test.ts",
+  ...(process.env.COUNTERPOISE_HTTP_SERVER ? ["tests/http/**/*.test.ts"] : []),
+  ...(process.env.COUNTERPOISE_MCP_TRANSPORT ? rustMcpTests : []),
 ];
 const domTests = ["tests/**/*.test.tsx", "tests/lib/utils.test.ts", "tests/lib/posthog-client.test.ts"];
 
@@ -97,7 +73,7 @@ export default defineConfig({
       { extends: true, test: {
         name: "node", environment: "node",
         include: ["tests/**/*.test.ts"],
-        exclude: [...configDefaults.exclude, ...databaseTests, ...domTests],
+        exclude: [...configDefaults.exclude, ...databaseTests, ...domTests, "tests/http/**/*.test.ts", ...rustMcpTests],
       } },
       { extends: true, test: {
         name: "database", environment: "node", include: databaseTests,
@@ -115,7 +91,6 @@ export default defineConfig({
         "components/**/*.{ts,tsx}",
         "db/**/*.ts",
         "lib/**/*.ts",
-        "mcp/**/*.ts",
         "scripts/**/*.ts",
       ],
       exclude: [

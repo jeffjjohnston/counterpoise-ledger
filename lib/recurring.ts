@@ -22,9 +22,8 @@ export const MAX_YEARLY_INTERVAL_YEARS = 20;
 /**
  * The stored columns of a rule row as a RecurrenceConfig.
  *
- * Deliberately not lib/recurring-processing.ts's `buildConfig`, which is
- * reachable only from server code and lets a malformed daysOfWeek/daysOfMonth
- * throw. This one is rendered by client pages against whatever the database
+ * Deliberately not the server's recurrence parser, which lets a malformed
+ * daysOfWeek/daysOfMonth fail the request. This one is rendered by client pages against whatever the database
  * holds, so a bad JSON string degrades to "no day list" instead of blanking
  * the page.
  */

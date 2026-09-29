@@ -3,11 +3,13 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import ReportsPage from "@/app/b/[bookId]/reports/page";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/b/1/reports",
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    usePathname: () => "/b/1/reports",
+  })
+);
 
 vi.mock("@/components/reports/ReportConfigPanel", () => ({
   ReportConfigPanel: ({

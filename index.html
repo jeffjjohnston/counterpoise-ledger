@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+    <title>Counterpoise - Personal Finance</title>
+    <meta name="description" content="Double-entry accounting for personal finance" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <link rel="icon" href="/favicon.ico" type="image/x-icon" sizes="16x16" />
+    <link rel="icon" href="/favicon-16x16.png" sizes="16x16" type="image/png" media="(prefers-color-scheme: light)" />
+    <link rel="icon" href="/favicon-32x32.png" sizes="32x32" type="image/png" media="(prefers-color-scheme: light)" />
+    <link rel="icon" href="/favicon-48x48.png" sizes="48x48" type="image/png" media="(prefers-color-scheme: light)" />
+    <link rel="icon" href="/favicon-64x64.png" sizes="64x64" type="image/png" media="(prefers-color-scheme: light)" />
+    <link rel="icon" href="/favicon-dark-16x16.png" sizes="16x16" type="image/png" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon-dark-32x32.png" sizes="32x32" type="image/png" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon-dark-48x48.png" sizes="48x48" type="image/png" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon-dark-64x64.png" sizes="64x64" type="image/png" media="(prefers-color-scheme: dark)" />
+    <link rel="apple-touch-icon" href="/apple-icon.png" sizes="180x180" type="image/png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon-dark.png" media="(prefers-color-scheme: dark)" />
+    <!-- Set the theme before the first paint, so that a dark page does not flash light. -->
+    <script>
+      (function(){try{var t=localStorage.getItem('theme');var d=t==='dark'||(t!=='light'&&matchMedia('(prefers-color-scheme:dark)').matches);if(d)document.documentElement.classList.add('dark')}catch(e){}})()
+    </script>
+  </head>
+  <body class="min-h-screen bg-surface-secondary">
+    <div id="root"></div>
+    <script type="module" src="/client/main.tsx"></script>
+  </body>
+</html>

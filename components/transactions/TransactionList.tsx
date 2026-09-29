@@ -1,8 +1,8 @@
 "use client";
 
 import { useMemo, useState, useEffect, useCallback, useRef } from "react";
-import { buildAccountHierarchyName, buildCategoryLabelMap, getEffectiveDate } from "@/lib/accounting";
-import { formatCurrency, formatDate, formatDateShort, toDateString } from "@/lib/formatters";
+import { accountHierarchyNames, buildAccountHierarchyName, buildCategoryLabelMap, getEffectiveDate } from "@/lib/wasm-client";
+import { formatCurrency, formatDate, formatDateShort, toDateString } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import type { TransactionWithSplits, DisplayTransaction, AccountWithBalance } from "@/types";
@@ -192,6 +192,20 @@ export function TransactionList({
   // sub-account, so it doubles as "this is an investment register" and selects
   // the Activity / Shares / Price column set below.
   const isInvestmentRegister = balanceAccountId != null;
+  const hierarchyNames = useMemo(() => accountHierarchyNames(accounts), [accounts]);
+  const accountRowsById = useMemo(() => new Map(accounts.map((account) => [account.id, account])), [accounts]);
+  const hierarchyName = useCallback(
+    (account: { id: number; name: string; parentId: number | null; isInvestmentCash?: boolean }) => {
+      const row = accountRowsById.get(account.id);
+      if (row?.name === account.name && row.parentId === account.parentId &&
+          row.isInvestmentCash === account.isInvestmentCash) {
+        const name = hierarchyNames.get(account.id);
+        if (name !== undefined) return name;
+      }
+      return buildAccountHierarchyName(account, accounts);
+    },
+    [hierarchyNames, accountRowsById, accounts]
+  );
 
   const getGoToAccounts = useCallback(
     (transaction: DisplayTransaction) => {
@@ -209,7 +223,7 @@ export function TransactionList({
         }
         goToAccounts.set(split.accountId, {
           accountId: split.accountId,
-          accountName: buildAccountHierarchyName(split.account, accounts),
+          accountName: hierarchyName(split.account),
         });
       };
 
@@ -235,7 +249,7 @@ export function TransactionList({
 
       return Array.from(goToAccounts.values());
     },
-    [accounts, balanceAccountId, selectedAccountId]
+    [hierarchyName, balanceAccountId, selectedAccountId]
   );
 
   // Whether the row menu would show anything for this transaction — mirrors the
@@ -420,7 +434,7 @@ export function TransactionList({
     const label = categoryLabels.get(account.id);
 
     if (!label) {
-      return <span>{buildAccountHierarchyName(account, accounts)}</span>;
+      return <span>{hierarchyName(account)}</span>;
     }
 
     return (
@@ -443,7 +457,7 @@ export function TransactionList({
       return renderMultiSplitTransaction(transaction);
     }
 
-    const assetLibName = buildAccountHierarchyName(assetLibSplit.account, accounts);
+    const assetLibName = hierarchyName(assetLibSplit.account);
 
     // Keep account/category names neutral and the arrow a quiet connector — the
     // colored, signed amount carries direction. Avoids the ledger turning into a
@@ -464,8 +478,8 @@ export function TransactionList({
     const [fromSplit, toSplit] =
       split1.amount < 0 ? [split1, split2] : [split2, split1];
 
-    const fromName = buildAccountHierarchyName(fromSplit.account, accounts);
-    const toName = buildAccountHierarchyName(toSplit.account, accounts);
+    const fromName = hierarchyName(fromSplit.account);
+    const toName = hierarchyName(toSplit.account);
 
     return (
       <div className="flex items-center gap-2">
@@ -687,7 +701,7 @@ export function TransactionList({
     return relatedSplits.map((split, index) => ({
       key: `split-${split.id}`,
       tag: index === 0 && isTransfer ? "XFER" : null,
-      subject: buildAccountHierarchyName(split.account, accounts),
+      subject: hierarchyName(split.account),
       tone: "neutral" as const,
       isUncertain: false,
     }));
@@ -811,7 +825,7 @@ export function TransactionList({
       .map((split) => {
         const symbol = split.security?.symbol ?? null;
         const accountName = split.account
-          ? buildAccountHierarchyName(split.account, accounts)
+          ? hierarchyName(split.account)
           : null;
         const hasUnknownSymbol = !symbol;
 
@@ -976,10 +990,15 @@ export function TransactionList({
     const targetAccountId = balanceAccountId ?? selectedAccountId;
     if (!targetAccountId) return new Map<number, number>();
 
-    // Sort transactions by date (oldest first), then by id for same-date ordering
+    // The exact inverse of displayTransactions below: oldest first, floating
+    // rows LAST within a date, then id ascending. The balance has to
+    // accumulate in the reverse of the order the rows are printed in, or the
+    // column reads as though the register ran the day backwards.
     const sorted = [...transactions].sort((a, b) => {
       const dateCompare = getEffectiveDate(a).localeCompare(getEffectiveDate(b));
       if (dateCompare !== 0) return dateCompare;
+      const floatCompare = Number(!!a.isFloating) - Number(!!b.isFloating);
+      if (floatCompare !== 0) return floatCompare;
       return a.id - b.id;
     });
 
@@ -1000,10 +1019,18 @@ export function TransactionList({
     return balances;
   }, [transactions, selectedAccountId, balanceAccountId, startingBalance]);
   const displayTransactions = useMemo(() => {
+    // Effective date descending, floating rows at the top of their date,
+    // projected rows at the bottom of it, then newest id first. The floating
+    // leg matches the register's ORDER BY in
+    // rust-api/server/src/routes/transactions.rs: a floating
+    // row's effective date is always today, so without it the day's later
+    // entries sort on top of it.
     const sorted = [...transactions];
     sorted.sort((a, b) => {
       const dateCmp = getEffectiveDate(b).localeCompare(getEffectiveDate(a));
       if (dateCmp !== 0) return dateCmp;
+      const floatCmp = Number(!!b.isFloating) - Number(!!a.isFloating);
+      if (floatCmp !== 0) return floatCmp;
       const aProj = a.isProjected ? 1 : 0;
       const bProj = b.isProjected ? 1 : 0;
       if (aProj !== bProj) return aProj - bProj;

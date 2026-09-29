@@ -3,155 +3,311 @@
 One of the guides [CLAUDE.md](../CLAUDE.md) points to. Read that file first;
 it carries the rules that apply everywhere and says when to come here.
 
-## Key Business Logic Files
+Read this before you write a helper. The helper is probably already there.
+The Rust server serves every API route, so server logic is in `rust-api/`.
+`lib/` holds the browser code and the few modules that the remaining Node
+scripts run.
 
-### `/lib/accounting.ts`
-Core accounting functions:
-- `validateSplits(splits)` - Ensures debits = credits
-- `getNormalBalanceSign(type)` - Returns 1 or -1 based on account type
-- `getDisplayBalance(balance, type)` - Converts to display format
-- `buildAccountTree()` - Creates hierarchical account structure
-- `buildAccountHierarchyName()` - Creates display names (e.g., "Parent -> Child")
-- `getNextDate()`, `getInitialNextDate()`, `describeRecurrence()` - Recurring transaction helpers
-- `buildBuySplits()`, `buildSellSplits()`, `buildDividendSplits()`, `buildCapGainSplits()` - Investment split builders
-- `mapInvestmentActionToSplits()`, `validateInvestmentAction()` - Investment action helpers
-- `groupAccountsByType()` - Group accounts by type for display
-- `resolveAccountIcon()` - Walks `parentId` upward and returns the first icon found; an account's own icon wins, `null` means no ancestor has one either
-- `resolveAccountIconSource()` - Same walk, also returns the short name of the ancestor the icon came from (for "Inherits 🚗 from Automobile")
-- `buildCategoryLabelMap()` - Precomputes icon/text/title per category account, memoized once per account list; holds entries only for `income`/`expense` accounts — a lookup miss is the deliberate fallback to today's full-path display, which is what keeps every renderer free of an `account.type` check
+## Where a helper goes
 
-### `/lib/investments.ts`
-Investment calculations:
-- `aggregatePositions(splits, securities, prices)` - Calculates current positions (shares and market value only)
-- `getPositions(db, bookId, accountId?)` - Full position query with market values; cost basis is summed from `investmentLots.remainingBasisCents`, not recomputed from splits (see Lot Tracking in [guides/investments.md](investments.md))
-- `getMarketValuesByAccount(db, bookId, asOfDate?)` - Aggregate market value by account
+- Domain logic that the server and the browser share goes in
+  `rust-api/core`. The server links the crate. The browser loads it as WASM
+  through `lib/wasm-client.ts`. Do not write a second copy in TypeScript.
+- Logic that only a route needs goes in its route module under
+  `rust-api/server/src/routes/`, or in a module of `rust-api/server/src/`
+  when more than one route uses it.
+- Database logic that the server and `ledger-cli` both run goes in
+  `rust-api/db`.
+- Browser-only helpers (API calls, events, presentation) go in `lib/`.
 
-### `/lib/formatters.ts`
-Display formatting:
-- `formatCurrency(cents)` - Converts cents to USD string
-- `formatDate(dateString)` - Formats YYYY-MM-DD for display
-- `formatDateShort(dateString)` - Short date format
-- `toDateString(date)` - Convert Date to YYYY-MM-DD
-- `parseCurrency(string)` - Parses user input to cents
-- `getAccountShortName(name)` - Extract short name from full path
+## Browser helpers (`lib/`)
 
-### `/lib/api-auth.ts`
-Authentication and book access:
-- `authenticateRequest()` - Basic auth for non-book routes
-- `authenticateBookRequest(bookId)` - Book-scoped auth, returns `{ db, bookId, userId, book }`
-- `isError()` - Type guard for auth error checking. On failure the result carries the
-  response as `auth.error` (the type is `{ error: NextResponse }`) — **not** `auth.response`
+### `/lib/wasm-client.ts`
+The synchronous browser adapter for `ledger-core`. Components import the
+shared helpers from here, not from `lib/accounting.ts`. It exports:
+- Accounting: `validateSplits()`, `getInvestmentGrossAmountCents()`,
+  `buildBuySplits()`, `buildSellSplits()`, `buildDividendSplits()`,
+  `buildCapGainSplits()`, `getDisplayBalance()`, `getEffectiveDate()`,
+  `getNextBusinessDay()`
+- Account trees: `buildAccountTree()`, `flattenAccounts()`,
+  `flattenAccountTreeWithDepth()`, `isDescendantOf()`,
+  `buildAccountHierarchyName()`, `descendantAccountIds()`,
+  `accountHierarchyNames()`, `resolveAccountIconSource()`,
+  `buildCategoryLabelMap()`, and the label and order constants
+  (`ACCOUNT_TYPE_LABELS`, `ACCOUNT_SUBTYPE_LABELS`, `ACCOUNT_TYPE_ORDER`,
+  `BALANCE_SHEET_TYPES`)
+  - `resolveAccountIconSource()` walks `parentId` upward. An account's own
+    icon wins, and the result also names the ancestor that the icon came
+    from (for "Inherits 🚗 from Automobile")
+  - `buildCategoryLabelMap()` holds entries only for `income`/`expense`
+    accounts. A lookup miss is the deliberate fallback to the full-path
+    display, which keeps every renderer free of an `account.type` check
+- Recurrence: `getNextDate()`, `describeRecurrence()`,
+  `buildRuleRecurrenceConfig()`, `getOccurrenceDate()`,
+  `isRecurringRuleDue()`, `maxIntervalFor()`, `scheduleKey()`,
+  `previewOccurrences()`, `MAX_AUTO_CREATE_DAYS_BEFORE`
+- Formatting: `formatCurrency()`, `formatDate()`, `formatDateShort()`,
+  `toDateString()`, `isValidDateString()`, `parseStrictCurrency()`,
+  `resolveAmountOnBlur()`, `getAccountShortName()`, `formatRelativeAge()`,
+  `formatPriceMicrosInput()`, `evaluateExpression()`
 
-### `/lib/api-keys.ts`
-API key management:
-- `generateApiKey()` - Creates `cpk_` + 48 hex char key
-- `getKeyPrefix(key)` - Extracts first 8 chars for DB lookup
-- `hashApiKey(key)` - Scrypt hash for storage
-- `verifyApiKey(key, hash)` - Timing-safe scrypt verification
+The TypeScript modules `accounting`, `recurring`, `formatters` and
+`expression` give its types.
+`lib/investment-arithmetic.ts` and `lib/formatters.ts` give the fallbacks for
+input that JSON cannot carry to the WASM module, such as a fractional value
+while the user types.
 
-### `/lib/auth.ts` & `/lib/session.ts`
-User authentication:
-- `hashPassword()`, `verifyPassword()` - Scrypt-based password handling
-- `createSession()`, `getSession()`, `destroySession()` - 30-day session management with HTTP-only cookies
+### `/lib/api-client.ts`
+Every browser request to the API goes through this module:
+- `apiFetch()`, `apiGet()`, `apiPost()`, `apiPut()`, `apiDelete()`
+- `ApiError` - carries the status and the server's `error` message
+- `toMessage(error)` - the text to show for any thrown value
 
-### `/lib/transactions.ts`
-Shared transaction logic (used by both API routes and MCP tools):
-- `createTransaction(db, bookId, input)` - Creates a transaction with splits and optional investment splits
-- `updateTransaction(db, bookId, transactionId, input)` - Updates fields and/or replaces splits
-- `deleteTransaction(db, bookId, transactionId)` - Deletes a transaction, its splits, and its investment splits
-- `TransactionValidationError` - Invalid input (splits don't balance, etc.)
-- `TransactionNotFoundError` - Transaction ID doesn't exist in the book
+### `/lib/navigation.tsx`
+Every router use in the client goes through this module: `Link`,
+`useRouter()` (`push` and `replace`, with the `scroll` option),
+`usePathname()`, `useParams()` and `useSearchParams()` (read only). It wraps
+React Router. ESLint refuses a `react-router` import in any other file,
+except `client/**` (the entry and the route table) and the two layout routes
+(`app/layout.tsx` and `app/b/[bookId]/layout.tsx`).
+`tests/lib/navigation.test.tsx` tests it against a memory router.
 
-### `/lib/accounts.ts`
-Shared account logic (used by both API routes and MCP tools):
-- `getAccountsWithBalances(db, bookId, opts?)` - Accounts with computed balances
-- `createAccount(db, bookId, input)` - Creates an account; an `investment` subtype also gets its paired cash sub-account
-- `updateAccount(db, bookId, accountId, input)` - Updates an account's fields
-- `deleteAccount(db, bookId, accountId)` - Deletes an account; refuses when it still has transactions or children
-- `ensureInvestmentCashAccount()`, `isInvestmentAccount()` - Investment cash pairing helpers
-- `AccountValidationError`, `AccountNotFoundError` - Error classes both surfaces map to their own status codes
+### `/lib/book-roles.ts`
+Roles and access levels for shared books. It has no server imports. The
+browser uses it only to show or hide controls. The Rust server enforces every
+level in `rust-api/server/src/book_auth.rs`:
+- `BOOK_ROLES` - `["owner", "editor", "viewer"]`; `BookRole` is its element type
+- `AccessLevel` - `"read" | "write" | "owner"`
+- `roleSatisfies(role, level)` - `read` accepts every role; `write` accepts
+  owner and editor; `owner` accepts owner only
+- `accessDeniedMessage(level)` - "Only an owner can do this" for `owner`,
+  otherwise "You have read-only access to this book"
 
-### `/lib/books.ts`
-Shared book logic (used by both API routes and MCP tools):
-- `createBook(db, userId, input)`, `updateBook(db, userId, bookId, input)` — note `name` is required on update; resend the current name to change only `upcomingDays`
-- `deleteBook(db, userId, bookId, confirmBookName)` - Deletes a book and, by FK cascade, its whole ledger. `confirmBookName` must match the stored name **exactly** — this guard is the only thing standing between MCP and an entire book. A tool call is cheap to issue and a book is not recoverable, so the caller has to name what it is destroying. Do not relax the comparison
-- `createDemoBook(db, userId)` - Creates a book and fills it with the `db/seed.ts` sample dataset. The only caller allowed to reach `seedBook`, and it always passes the id of the book it just created — `seedBook` deletes the target book's rows first, so a caller-supplied id would be a data-loss bug
-- `BookValidationError`, `BookNotFoundError` - Error classes
+### `/lib/transaction-requests.ts`
+Browser helpers for the edit-conflict check. Each call sends the
+`updatedAt` that the client loaded, so the server can refuse a stale edit
+with 409:
+- `putTransaction(bookId, transaction, body)` - PUT with `expectedUpdatedAt`
+  added to the body
+- `deleteTransactionRequest(bookId, transaction)` - DELETE with
+  `expectedUpdatedAt` added to the query string
+- `isTransactionConflict(error)` - true for a 409 `ApiError`
+- `TRANSACTION_CONFLICT_MESSAGE` - "Another user changed this transaction.
+  Showing the latest version." The Rust route sends the same text
+  (`CONFLICT` in `rust-api/server/src/routes/transactions.rs`)
 
-### `/lib/issue-reports.ts`
-Shared issue-report logic (used by both API routes and MCP tools). These are scoped to `userId`, not `bookId`:
-- `createIssueReport()`, `listIssueReports()`, `updateIssueReport()`, `deleteIssueReport()`
-- `IssueReportValidationError`, `IssueReportNotFoundError` - Error classes
+### `components/BookRoleProvider.tsx`
+Client provider, mounted in `app/b/[bookId]/layout.tsx` above `BookNavbar`.
+Loads `/api/books` and `/api/books/[bookId]/members` once and refreshes on a
+`books`/`book_members` change from `useBookChanges`. `useBookRole()` returns
+`{ books, currentBook, currentUserId, role, canWrite, isOwner, members,
+refresh }`. Outside the provider (isolated component tests, non-book pages)
+it answers owner access with no members — a display default only; the server
+enforces every level regardless of what the client shows
 
-### Other lib files
-- `/lib/payees.ts` - Payee reads and writes shared by API routes and MCP tools:
-  - `normalizePayeeName()` for deduplication (trims, collapses whitespace runs, straightens curly quotes; does **not** lowercase)
-  - `listPayees(db, bookId, {search, limit})`, `getPayee()`, `getPayeeLastAccountId()`, `getPayeeDetail()` — the reads behind `GET /payees`, `GET /payees/[id]`, `GET /payees/[id]/last-account` and the `list_payees`/`get_payee` tools. `getPayeeDetail()` is `getPayee` + `getPayeeLastAccountId`, which is why MCP folds the last-account route into `get_payee`
-  - `createPayee()`, `deletePayee()` — writes; `deletePayee` refuses a payee that still has transactions
-  - `PayeeValidationError`, `PayeeNotFoundError` - Error classes
-- `/lib/pricing.ts` - Security price data handling
-- `/lib/securities.ts` - Security reads and writes shared by API and MCP: `listSecurities()`, `createSecurity()`, `updateSecurity()`, `deleteSecurity()`. `deleteSecurity` refuses a security that still has investment splits — splits, lots, and prices all cascade from `securities`, so deleting one would erase its whole investment history while leaving the double-entry transactions in place. Errors: `SecurityValidationError`, `SecurityDuplicateError`, `SecurityNotFoundError`
-- `/lib/security-prices.ts` - Price writes and the price-entry queue shared by API and MCP: `setSecurityPrices()` (atomic batch upsert; takes the **raw** array so it can report which entries it discarded — `bulkPricesSchema` filters malformed items inside a `.transform()`, so a caller that parses first cannot say what it lost), `updateSecurityPrice()`, `deleteSecurityPrice()`, `listPricesDue()`. `updateSecurityPrice` treats a date change as a move, and refuses one onto an occupied date with `PriceEntryConflictError`. It checks for an occupant *before* opening the transaction so the delete never runs, then maps a duplicate-key violation from inside it to the same error — the pre-check reads committed rows only, so a concurrent move onto that date slips past it and collides at the unique index. Errors: `PriceEntryNotFoundError`, `PriceEntryConflictError`
-- `/lib/expression.ts` - `evaluateExpression()` parser for amount inputs (supports `+`, `-`, `*`, `/`, parens — e.g., user can type `12.50 + 3` in an amount field)
-- `/lib/csv.ts` - CSV export helpers (`csvEscape()`, `triggerDownload()`) used by the securities and income statement pages
-- `/lib/transactions-query.ts` - The single transaction filter, shared by the register route and `list_transactions`: `selectTransactionPage()` (which rows, in what order, and optionally how many) and `countTransactionsBefore()` (how many sort ahead of a given row — the register's scroll-to-transaction affordance). It returns rows carrying the **effective** date, not bare ids, because the route anchors its running-balance sum on the oldest row of the page. The two surfaces previously built this filter twice and differently — MCP with a subquery on `transaction_splits`, the route with an inner join and `GROUP BY`. They agreed; nothing held them in agreement
-  - Presentation stays with each surface: the route keeps `ensureId`'s page widening, `balanceAccountId`/`startingBalance`, the `includeMeta` envelope and its relational hydration; `list_transactions` keeps its own row shaping. Only "which rows, in what order" is shared. `balanceAccountId` and `includeMeta` are deliberately absent from MCP — the first never filters which transactions come back (it only picks which account's splits seed the route's own `startingBalance` sum, and `get_account_balance_history` answers the equivalent question for MCP); the second is an envelope switch and the tool always returns `totalCount`
-- `/lib/merge-transactions.ts` - `mergeTransactionsForDisplay()` interleaves projected (recurring) and actual transactions in date order for the transaction list
-- `/lib/plaid.ts` - Plaid API client (link tokens, access tokens, transaction sync fetch)
-- `/lib/plaid-tokens.ts` - Plaid connection reads and writes shared by API routes and MCP tools: `getPlaidStatus()` (the Sync page's four polls in one call), `listTokenAccounts()` (an optional `refresh` re-pulls the account list from Plaid — the only reason this read is not folded into `getPlaidStatus`; the MCP tool does not expose this option, only the HTTP route does — see `mcp/tools/plaid.ts`), `updatePlaidToken()`, `deletePlaidToken()`, `setTokenAccounts()`, `clearSyncData()`. `maskAccessToken()` and `toTokenListItem()` (exported so the token-creation route can mask its own inserted row the same way) live here too. `getTokenOr404()` is not exported: it returns the unmasked row, including the raw `accessToken`, so nothing outside this file can reach it — every caller-facing read goes through `toTokenListItem()` or `toPlaidAccountPayload()` instead. Its parameter order is `(db, bookId, tokenId, …)`, matching every other exported function here, on purpose: a transposed `(tokenId, bookId)` pair type-checks silently and would query the wrong row. Errors: `PlaidTokenNotFoundError`, `PlaidTokenValidationError`, `PlaidRefreshError` (a refresh's Plaid call, or the write reconciling its response, failed — kept distinct from a plain database failure so callers can tell them apart)
-- `/lib/plaid-transactions.ts` - Staged Plaid rows and transaction links shared by API routes and MCP tools: `listPendingPlaidTransactions()`, `getTransactionPlaidLink()`, `unlinkPlaidTransaction()`. Error: `PlaidLinkNotFoundError`
-- `/lib/plaid-sync.ts` - `syncToken()` — fetches Plaid transactions, stages in reconciliation table, runs auto-match
-- `/lib/plaid-auto-match.ts` - `autoMatchPendingTransactions()` — learned payee-based auto-matching
-- `/lib/recurring.ts`, `/lib/recurring-processing.ts`, `/lib/recurring-rules.ts` - Recurring transaction logic
-- `/lib/reports.ts` - Financial report logic (`groupSplits()`, `computeGrandTotal()`, `buildTopParentMap()`)
-- `/lib/utils.ts` - `cn()` utility for Tailwind class merging
+### Other browser files
+- `/lib/book-change-hub.ts` - `createBookChangeHub()`: one event stream per
+  book, shared by every `useBookChanges` subscriber (`BookChange` is the
+  message type). `components/BookChangesProvider.tsx` mounts it
+- `/lib/events.ts` - window event names: `PRICES_SAVED_EVENT`,
+  `SYNC_QUEUE_CHANGED_EVENT`, `BOOK_SESSION_ENDED_EVENT`
+- `/lib/formatters.ts` - the TypeScript formatters. Components use the WASM
+  copies in `lib/wasm-client.ts`; this module gives the types and the
+  fallback for input that JSON cannot carry
+- `/lib/expression.ts` - `evaluateExpression()`, the parser for amount inputs
+  (`+`, `-`, `*`, `/`, parentheses; a user can type `12.50 + 3`)
+- `/lib/recurring.ts` - the recurrence limits and helpers
+  (`MAX_*_INTERVAL_*`, `isValidAutoCreateDaysBefore()`,
+  `parseAutoCreateDaysBefore()`, `addDaysToDateString()`) and the types for
+  the WASM recurrence functions
+- `/lib/reports.ts` - report grouping for the report page: `groupSplits()`,
+  `computeGrandTotal()`, `buildTopParentMap()`
+- `/lib/csv.ts` - CSV export: `csvEscape()`, `datedCsvFilename()`,
+  `triggerDownload()`
+- `/lib/merge-transactions.ts` - `mergeTransactionsForDisplay()` interleaves
+  projected (recurring) and actual transactions in date order
+- `/lib/payee-match.ts` - `rankPayeeMatch()` and `comparePayeeMatches()`: the
+  three match tiers that the payee autocomplete ranks by (the name starts
+  with the term, a word starts with it, any other substring). The Rust
+  payee list applies the same tiers in SQL before its LIMIT, because the
+  forms ask for 8 rows and an alphabetical cut dropped "United" for "uni"
+- `/lib/pricing.ts` - `formatPriceMicros()`, `parsePriceMicros()` for the
+  price entry pill
+- `/lib/job-health.ts` - the job names, their schedules (`JOB_SCHEDULES`),
+  and `evaluateJobHealth()`. The status page uses it for its empty state; the
+  server evaluates in `rust-api/server/src/routes/system.rs`
+- `/lib/posthog-client.ts` - `identifyUser()`, `resetUser()`
+- `/lib/posthog-url.ts` - `redactedCaptureUrl()`
+- `/lib/typesafe/events.ts`, `/lib/typesafe/types.ts` - the TypeSafe
+  settings event and the suggestion types that the sync page shows
+- `/lib/api-contract.ts` - `API_CONTRACT`, the number a native client
+  compares. The Rust server reads it at build time
+- `/lib/utils.ts` - `cn()` for Tailwind class merging, and
+  `selectInputContents()`
+
+## Modules the Node scripts run (`lib/`)
+
+These run outside the web server. Do not import them from a component.
+- `/lib/accounting.ts` - the TypeScript accounting helpers, and
+  `effectiveDateSql`, the effective-date SQL expression that the lot rebuild
+  and the payee queries below use
+- `/lib/lots.ts` - `replayLots()`, the pure FIFO replay engine (no database)
+- `/lib/lots-db.ts` - `rebuildLots()`, `rebuildLotsForPairs()`,
+  `findAllLotPairs()`, `collectAffectedPairs()`. `scripts/rebuild-lots.ts`
+  runs them for `npm run db:migrate`. The Rust copy in
+  `rust-api/db/src/lots.rs` must write the same lots:
+  `tests/http/rebuild-lots.test.ts` compares the two
+- `/lib/investments.ts` - `aggregatePositions()`, `getPositions()`,
+  `getMarketValuesByAccount()`, `fixedPriceRow()`, and the position types
+  that the pages import as types
+- `/lib/payees.ts` - payee queries and `normalizePayeeName()`, for the
+  TypeSafe report
+- `/lib/typesafe/client.ts`, `/lib/typesafe/questions.ts`,
+  `/lib/typesafe/report.ts`, `/lib/typesafe/settings.ts` - the TypeSafe
+  client and the report of `npm run typesafe:report`. The server's copies are
+  `rust-api/server/src/typesafe_client.rs`, `typesafe_questions.rs` and
+  `typesafe.rs`
+- `/lib/plaid.ts` - the Plaid client of `npm run plaid:link`. The server's
+  copy is `rust-api/server/src/plaid.rs`. `PLAID_API_URL` replaces the Plaid
+  origin for a test mock
+- `/lib/posthog-query.ts` - HogQL queries for `scripts/posthog-export.ts`.
+  The server's copy is `rust-api/server/src/posthog_query.rs`
+
+## Server code (`rust-api/`)
+
+### `rust-api/core` (`ledger-core`)
+Pure domain code. The server links it, and the browser loads it as WASM
+(`core/src/wasm.rs`). Its tests check the corpus in
+`rust-api/core/fixtures/core.json`:
+- `accounting.rs` - `validate_splits()`, `gross_amount_cents()`, the
+  investment split builders, `map_investment_action_to_splits()`,
+  `validate_investment_action()`, `normal_balance_sign()`,
+  `display_balance()`
+- `accounts.rs` - the account tree, hierarchy names, and icon resolution
+- `recurring.rs` - recurrence: `next_date()`, `initial_next_date()`,
+  `is_recurring_rule_due()`, `schedule_key()`, `preview_occurrences()`,
+  business-day shifts, and `effective_date()`
+- `investments.rs` - `aggregate_positions()`, `fixed_price_row()`,
+  `aggregate_market_values_by_account()`
+- `lots.rs` - `replay_lots()`, the FIFO replay engine
+- `formatters.rs`, `expression.rs` - formatting, currency parsing, and the
+  amount expression parser
+
+### `rust-api/db` (`ledger-db`)
+Database code that the server and `ledger-cli` both run:
+- `lots.rs` - `rebuild_lots()`, `rebuild_lots_for_pairs()`,
+  `collect_affected_pairs()`, `find_all_lot_pairs()`, `backfill_lots()`.
+  Lots and allocations are derived state. The transaction routes call
+  `collect_affected_pairs()` and `rebuild_lots_for_pairs()` inside the same
+  transaction as the write
+- `seed.rs` - `seed_book()`, the sample dataset of `npm run db:seed` and of
+  `POST /api/books/demo`
+
+### `rust-api/server/src`
+Shared server modules:
+- `auth.rs` - `principal()` resolves the session cookie or a bearer key to a
+  user, with the API-key lockout. `session_user()` gives the route's 401.
+  `bearer_token()`, `cookie_token()`
+- `routes/auth.rs` - `cookie_session()`, the cookie-only session. The
+  password change and the API-key routes use only this, so a device that
+  holds one key cannot mint another. A repository test holds that rule
+- `book_auth.rs` - `authenticate_book(state, headers, raw_book_id, level,
+  failure_message)` and `authenticate_book_membership()`. Not a member: 404
+  "Book not found", never 403, so a stranger cannot learn that the book
+  exists. A member below the level: 403 with the text of
+  `accessDeniedMessage()`. Give the level explicitly: `AccessLevel::Read` for
+  a read. The default of `AccessLevel` is `Write`. See Access Levels in
+  [guides/api-route-patterns.md](api-route-patterns.md)
+- `error.rs` - `ApiError`, `error()`, `error_owned()`, `internal_error()`.
+  An error answers `{ "error": message }`
+- `validation.rs` - the parsers that keep the input rules of the former
+  TypeScript routes: `parse_json_body()`, `first_query_values()`,
+  `query_date_param()`, `parse_int_prefix()`, `database_integer()`,
+  `js_number_string()`, `js_stringify()`, and the account and payee
+  validators
+- `transaction_input.rs`, `recurring_input.rs` - the transaction and
+  recurring-rule input rules, including `expected_updated_at()`
+- `db_scope.rs` - `with_advisory_lock()` holds a session lock on one reserved
+  connection and hands the callback that connection. Run the callback's
+  transaction and queries on it (`with_transaction()`), never on the pool
+- `rate_limit.rs` - the login, registration, password, API-key and
+  member-add limits. `client_ip()` reads the forwarded address
+- `book_changes.rs` - the change notifications behind the event stream
+- `analytics.rs` - `capture_event()`. A route that runs for an MCP tool
+  records nothing
+- `plaid.rs`, `tiingo.rs` - the Plaid and Tiingo clients
+- `typesafe.rs`, `typesafe_client.rs`, `typesafe_questions.rs` - the
+  TypeSafe experiment
+- `openapi/` - the OpenAPI document. See [guides/api-contract.md](api-contract.md)
+- `mcp/` - the MCP server. See [guides/mcp-server.md](mcp-server.md)
+
+### `rust-api/server/src/routes/`
+One module per route area. `routes/mod.rs` registers each entry of
+`rust-api/routes.json`. Functions that more than one caller uses:
+- `accounts.rs` - `accounts_with_balances()`
+- `transactions.rs` - the register, and the create, update and delete paths.
+  A write that sends `expectedUpdatedAt` and finds a newer row answers 409
+  and changes nothing. A floating row sorts above the settled rows of its
+  effective date (`REGISTER_ORDER`)
+- `payees.rs` - `normalize_name()`: trims, collapses whitespace runs and
+  straightens quotes. It does **not** lowercase: "IKEA" and "Ikea" are two
+  payees. `create_exact()` creates a payee with the exact name
+- `members.rs` - member changes. An unknown username and an existing member
+  both fail with "Cannot add that user", so the answer does not disclose
+  which usernames exist. Only an unknown username counts against the
+  `book-member-add` limit. Each change locks every member row of the book
+  (`lock_members()`), then checks the actor's role again, so a concurrent
+  change cannot leave the book without an owner ("A book must keep at least
+  one owner")
+- `books.rs` - book CRUD and `create_demo_book()`, which writes the book and
+  the seed in one transaction
+- `securities.rs` - `delete_security()` refuses a security that still has
+  investment splits: splits, lots and prices all cascade from `securities`
+- `security_prices.rs` - `set_prices()`, the atomic batch upsert that reports
+  the items it skipped. A price move onto an occupied date answers 409
+- `reports.rs`, `realized_gains.rs`, `search.rs` - `report_splits()`,
+  `income_rows()`, `report()` and `search_book()`
+- `sync.rs`, `plaid_sync.rs`, `reconcile.rs` - Plaid connections (access
+  tokens are masked before they leave the server), `sync_token()`, and the
+  reconciliation queue and `resolve()`
+- `recurring.rs` - recurring rules and `process_rules()`
+- `system.rs` - version, health, and job status
+- `cron.rs`, `typesafe.rs`, `typesafe_suggestion.rs`, `events.rs`,
+  `issue_reports.rs`
 
 ## Critical Files Reference
 
 | File | Purpose |
 |------|---------|
-| `/db/schema.ts` | All table definitions and relations (meta + book-scoped) |
-| `/db/index.ts` | Database connection (`getDb()`) with postgres.js driver, `runMigrations()` for explicit migration |
-| `/db/create-book.ts` | Migration folder path constant |
-| `/lib/accounting.ts` | Core accounting logic and validation |
-| `/lib/investments.ts` | Position and market value calculation (cost basis now comes from lots, not this file); `fixedPriceRow()` for fixed-price securities |
-| `/lib/lots.ts` | Pure FIFO replay engine (no DB) |
-| `/lib/lots-db.ts` | `rebuildLots()` — the only inserter of lots and allocations at runtime (rows also disappear via FK cascade on deletes) |
-| `/lib/realized-gains.ts` | Realized gain/loss query shared by the report route and MCP |
-| `/lib/transactions-query.ts` | Shared transaction filter, page select, and position count |
-| `/lib/security-prices.ts` | Manual price writes, atomic batch upsert, and the price-entry queue |
-| `/scripts/rebuild-lots.ts` | Guarded backfill, run by the container entrypoint |
-| `/scripts/check-db-credential.sh` | Aborts container startup when `DATABASE_URL` uses the published default credential |
+| `/db/schema.ts` | All table definitions and relations (meta + book-scoped). Drizzle is the only migrator |
+| `/db/index.ts` | Database connection (`getDb()`) with the postgres.js driver, and `runMigrations()` for explicit migration |
+| `/db/create-book.ts` | The migration folder path constant |
+| `/db/reset.ts` | `resetDatabase()`: drops the `public` and `drizzle` schemas and runs the migrations again. **Declarations only — no top-level side effects** |
+| `/db/seed-cli.ts` | CLI entry for `npm run db:seed`. For a full reset it runs `resetDatabase()`, then runs `ledger-cli seed` through `cargo run`. Holds the main-module guard. Keep the guard out of any module that another file imports: inlined into a bundle, it matches the bundle's own path and drops the database schemas when the bundle starts |
+| `/rust-api/routes.json` | The routes that `routes/mod.rs` registers from its handler table |
+| `/rust-api/server/src/routes/mod.rs` | The Axum router, and the routes that it registers by name (`/health`, `/api/health`, `/api/mcp`, WebMCP) |
+| `/rust-api/server/src/book_auth.rs` | Book access at a level |
+| `/rust-api/db/src/lots.rs` | The lot rebuild. Lots and allocations are derived state |
+| `/rust-api/cli/src/main.rs` | `ledger-cli`: `rebuild-lots [--force]`, `seed [--book-id N]`, `import-moneydance` |
+| `/rust-api/cli/src/import_moneydance/mod.rs` | Moneydance import orchestration, run by `ledger-cli import-moneydance` and `npm run import:moneydance` |
+| `/rust-api/server/src/mcp/` | The MCP server: the tool registry, the stdio and HTTP transports, WebMCP, and one handler module per tool group. See [mcp-server.md](mcp-server.md) |
+| `/rust-api/server/mcp-tools.json` | The source of each MCP tool's name, title, description, annotations and input schema |
+| `/rust-api/server/src/openapi/` | The source of `openapi/openapi.json` |
+| `/rust-api/server/src/security.rs` | The only copy of the session gate, the cross-origin write check and the security headers: `protect()` adds the headers (HSTS when `ENABLE_HSTS=true`), the cross-origin write check, the API gate (401 for an `/api/` request without credentials, before the router), and the gate for unmatched paths (404 for `/api/`, a redirect to `/login` for a page without a session) |
+| `/rust-api/server/src/compression.rs` | The gzip and br layer that `serve()` puts around every response. It never compresses an event stream, an image, a WOFF font or a tiny body |
+| `/rust-api/server/src/static_pages.rs` | The page service behind the page gate. It serves the client build that `COUNTERPOISE_STATIC_DIR` names: `index.html` for each page path, 404 for a missing file under `/assets/`, a one-year immutable cache for `/assets/` and `no-cache` for the rest. The server refuses to start when the folder has no `index.html` |
+| `/vite.config.ts` | The client build (to `build/`) and the development server on port 3000. It proxies `/api` to `RUST_API_URL` and puts the `NEXT_PUBLIC_*` values into the bundle at build time |
+| `/client/routes.tsx` | The route table of the client. Each page and the book layout load on demand |
+| `/lib/wasm-client.ts` | The browser adapter for `ledger-core` |
+| `/lib/api-client.ts` | Every browser API request |
+| `/scripts/rebuild-lots.ts` | Guarded lot backfill, run by `npm run db:migrate`. `ledger-cli rebuild-lots [--force]` is the Rust copy, with the same guard and messages; the Docker entrypoint runs it |
+| `/scripts/check-db-credential.sh` | Stops the app container (before the migrations) and the scheduler when `DATABASE_URL` uses the published default credential |
 | `/scripts/postgres-init/01-app-role.sh` | Creates the `counterpoise_app` role on first postgres initialization |
-| `/lib/reports.ts` | Financial report logic |
-| `/lib/api-auth.ts` | API authentication and book access |
-| `/lib/api-keys.ts` | API key generation, hashing, and verification |
-| `/lib/auth.ts` | Password hashing and verification |
-| `/lib/session.ts` | Session management |
-| `/lib/transactions.ts` | Shared create/update transaction logic (used by API routes and MCP) |
-| `/lib/recurring-rules.ts` | Shared recurring-rule reads and writes (used by API routes and MCP) |
-| `/lib/advisory-lock.ts` | `withAdvisoryLock()` — session-scoped lock on a reserved connection; its callback's `db` is not the pooled one |
-| `/lib/plaid-tokens.ts` | Plaid connection reads and writes; owns access-token masking |
-| `/lib/plaid-transactions.ts` | Staged Plaid rows and transaction links |
-| `/lib/plaid-reconcile.ts` | Reconciliation queue read and the six-action resolver, shared by the route and MCP |
-| `/lib/plaid-sync.ts` | Plaid transaction sync — fetches, stages, and auto-matches |
-| `/lib/plaid-auto-match.ts` | Learned payee-based auto-matching for Plaid transactions |
-| `/app/api/cron/plaid-sync/route.ts` | Cron endpoint for periodic Plaid sync (every 6 hours) |
-| `/lib/tiingo.ts` | Shared Tiingo price fetching (`fetchLatestTiingoPrices()`, `isTiingoConfigured()`) |
-| `/app/api/cron/price-sync/route.ts` | Cron endpoint for automatic security price updates (Tue–Sat 6am ET) |
-| `/lib/posthog-server.ts` | Server-side PostHog singleton and `captureEvent()` |
-| `/lib/posthog-client.ts` | Client-side PostHog helpers (`identifyUser`, `resetUser`) |
-| `/hooks/useBookId.ts` | Client hook for current book ID |
-| `/app/api/b/[bookId]/transactions/route.ts` | Main transaction API |
 | `/scripts/release.sh` | Version bump, release branch, push, and PR creation. Creates no tag |
 | `/scripts/deploy.sh` | Publishes the version tag at one named commit, then builds and restarts. Rebases nothing |
-| `/scripts/import-moneydance/index.ts` | Import orchestration |
 | `/scripts/posthog-export.ts` | CLI tool for exporting PostHog events |
-| `/mcp/auth.ts` | MCP API key authentication and book access verification |
-| `/mcp/server.ts` | MCP server entry point (connects the transport, registers no tools itself) |
-| `/mcp/register-all.ts` | `registerAllTools()` — the single place every `register*Tools` module is wired in |
-| `/scripts/bundle-node-entrypoints.mjs` | Bundles the MCP server and lot rebuild script into `dist/` for the Docker image |
-| `/scripts/bundle-config.mjs` | The esbuild options both the bundler and `tests/mcp/bundle-safety.test.ts` build with — shared so the test cannot check a different artifact than Docker ships |
-| `/db/seed.ts` | Sample dataset builders. **Declarations only — no top-level side effects.** Application code imports it (`lib/books.ts` → demo route + `create_demo_book`), so anything running at import time gets bundled into `/app/mcp-server.mjs` and runs on MCP startup |
-| `/db/seed-cli.ts` | CLI entry for `npm run db:seed`. Holds the main-module guard that used to live in `db/seed.ts`, where — once bundled — it matched `node /app/mcp-server.mjs` and would have dropped the database schemas on every MCP server start |
-| `/mcp/tools/usage.ts` | MCP tool for querying PostHog analytics |
+| `/hooks/useBookId.ts` | Client hook for the current book ID |
+| `/hooks/useRegistrationOpen.ts` | Client hook for the registration gate of the login and register pages. `null` until the Rust server answers, `false` when the request fails or does not answer in five seconds |
+| `/tests/helpers/navigation.tsx` | `mockNavigation(overrides)`: a full mock of `@/lib/navigation` for component tests. It supplies each export, so a test gives only the hooks that it cares about |
+| `/tests/helpers/contract.ts` | `contract(name)`: a strict validator of a response body against a component of `openapi/openapi.json` |
+| `/tests/helpers/api-keys.ts`, `/tests/helpers/password.ts` | Test helpers that mint API keys and hash passwords in the formats that the Rust server checks |

@@ -9,7 +9,7 @@ import {
   useCallback,
   useMemo,
 } from "react";
-import { useRouter, useParams } from "next/navigation";
+import { useParams, useRouter } from "@/lib/navigation";
 
 /**
  * Every category a shortcut may be registered under, in the order the `?`

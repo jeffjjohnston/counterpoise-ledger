@@ -15,6 +15,7 @@ import {
   createPayee,
   deletePayee,
   getPayeeLastAccountId,
+  listPayees,
   PayeeNotFoundError,
   PayeeValidationError,
 } from "@/lib/payees";
@@ -62,6 +63,70 @@ describe("payees shared logic", () => {
     const db = getDb();
     const [book] = await db.select().from(books).limit(1);
     bookId = book.id;
+  });
+
+  describe("listPayees", () => {
+    // The forms ask for `limit: 8`. Ranked alphabetically, "United" sat
+    // below "American Civil Liberties Union" for the term "uni" and could
+    // fall outside the eight rows entirely.
+    it("ranks prefix matches, then word-start matches, then other substrings", async () => {
+      const db = getDb();
+      await seedPayee({ name: "Reunion Hall", bookId });
+      await seedPayee({ name: "American Civil Liberties Union", bookId });
+      await seedPayee({ name: "United Airlines", bookId });
+      await seedPayee({ name: "Union Square Cafe", bookId });
+
+      const rows = await listPayees(db, bookId, { search: "uni" });
+
+      expect(rows.map((r) => r.name)).toEqual([
+        "Union Square Cafe",
+        "United Airlines",
+        "American Civil Liberties Union",
+        "Reunion Hall",
+      ]);
+    });
+
+    it("applies the limit after the ranking", async () => {
+      const db = getDb();
+      await seedPayee({ name: "American Civil Liberties Union", bookId });
+      await seedPayee({ name: "Communion Bakery", bookId });
+      await seedPayee({ name: "United Airlines", bookId });
+
+      const rows = await listPayees(db, bookId, { search: "uni", limit: 2 });
+
+      expect(rows.map((r) => r.name)).toEqual([
+        "United Airlines",
+        "American Civil Liberties Union",
+      ]);
+    });
+
+    // The client filters with `includes()`, which is literal. If the SQL
+    // treated `%` and `_` as LIKE wildcards, "un_" would rank "United"
+    // and "Unity" as prefix matches, fill the limit, and starve the one
+    // literal match the client would keep.
+    it("matches % and _ in the search term literally", async () => {
+      const db = getDb();
+      await seedPayee({ name: "United Airlines", bookId });
+      await seedPayee({ name: "Unity Bank", bookId });
+      await seedPayee({ name: "A un_ Store", bookId });
+      await seedPayee({ name: "50% Off Outlet", bookId });
+
+      const underscore = await listPayees(db, bookId, { search: "un_", limit: 2 });
+      expect(underscore.map((r) => r.name)).toEqual(["A un_ Store"]);
+
+      const percent = await listPayees(db, bookId, { search: "50%" });
+      expect(percent.map((r) => r.name)).toEqual(["50% Off Outlet"]);
+    });
+
+    it("keeps the alphabetical order when there is no search", async () => {
+      const db = getDb();
+      await seedPayee({ name: "Whole Foods", bookId });
+      await seedPayee({ name: "Blue Bottle", bookId });
+
+      const rows = await listPayees(db, bookId);
+
+      expect(rows.map((r) => r.name)).toEqual(["Blue Bottle", "Whole Foods"]);
+    });
   });
 
   describe("deletePayee", () => {

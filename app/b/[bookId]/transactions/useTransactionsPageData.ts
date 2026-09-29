@@ -9,10 +9,11 @@ import {
   type RefObject,
   type SetStateAction,
 } from "react";
-import { useRouter } from "next/navigation";
+import { useBookChanges } from "@/components/BookChangesProvider";
+import { useRouter } from "@/lib/navigation";
 import { useToast } from "@/components/ui/ToastProvider";
-import { flattenAccounts } from "@/lib/accounting";
-import { toDateString } from "@/lib/formatters";
+import { flattenAccounts } from "@/lib/wasm-client";
+import { toDateString } from "@/lib/wasm-client";
 import { apiGet } from "@/lib/api-client";
 import type { AccountMarketValue } from "@/lib/investments";
 import type {
@@ -22,6 +23,8 @@ import type {
 } from "@/types";
 
 const PAGE_SIZE = 50;
+// Covers the usual 250 ms server + 100 ms browser notification windows.
+const REFRESH_COALESCE_MS = 400;
 
 export interface UseTransactionsPageDataArgs {
   bookId: string;
@@ -32,6 +35,7 @@ export interface UseTransactionsPageDataArgs {
   showUpcoming: boolean;
   scrollTransactionsToTop: () => void;
   ensureIdRef: RefObject<number | null>;
+  deferBackgroundRefresh?: boolean;
 }
 
 export interface UseTransactionsPageDataResult {
@@ -49,11 +53,6 @@ export interface UseTransactionsPageDataResult {
   transactionsLoading: boolean;
   loadMoreFailed: boolean;
 
-  fetchAccounts: () => Promise<AccountWithBalance[]>;
-  fetchPayees: () => Promise<void>;
-  fetchMarketValues: () => Promise<void>;
-  fetchProjectedTransactions: () => Promise<void>;
-  fetchPlaidPendingTransactions: () => Promise<void>;
   fetchTransactionsPage: (
     pageOffset: number,
     append: boolean,
@@ -74,374 +73,235 @@ export interface UseTransactionsPageDataResult {
   setLoadMoreFailed: Dispatch<SetStateAction<boolean>>;
 }
 
-export function useTransactionsPageData(
-  args: UseTransactionsPageDataArgs
-): UseTransactionsPageDataResult {
-  const {
-    bookId,
-    accountId: selectedAccountId,
-    startDate,
-    endDate,
-    selectedPayeeId,
-    showUpcoming,
-    scrollTransactionsToTop,
-    ensureIdRef,
-  } = args;
+type PageContext = Parameters<UseTransactionsPageDataResult["fetchTransactionsPage"]>[2];
+type PageResponse = { transactions?: TransactionWithSplits[]; startingBalance?: number; totalCount?: number };
+type RefreshRequest = { showLoading: boolean; ensureId?: number | null; background: boolean; immediate?: boolean };
 
+function pageParams(offset: number, limit: number, context: PageContext) {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset), includeMeta: "true" });
+  if (context.ensureId) params.set("ensureId", String(context.ensureId));
+  if (context.selectedAccountId) {
+    if (context.isInvestmentAccount && context.investmentCashAccountId) {
+      params.set("accountIds", `${context.selectedAccountId},${context.investmentCashAccountId}`);
+      params.set("balanceAccountId", String(context.investmentCashAccountId));
+    } else params.set("accountId", String(context.selectedAccountId));
+  }
+  if (context.startDate) params.set("startDate", context.startDate);
+  if (context.endDate) params.set("endDate", context.endDate);
+  if (context.selectedPayeeId !== null) params.set("payeeId", String(context.selectedPayeeId));
+  return params;
+}
+
+export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseTransactionsPageDataResult {
+  const { bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming,
+    scrollTransactionsToTop, ensureIdRef, deferBackgroundRefresh = false } = args;
   const toast = useToast();
   const router = useRouter();
+  // Refs hold the callbacks, because a caller can pass a new identity on each
+  // render. If drain depended on them, each new identity would start a new
+  // scope, and the new scope's fetch would render again, without end.
   const routerRef = useRef(router);
+  const toastRef = useRef(toast);
+  const scrollRef = useRef(scrollTransactionsToTop);
   useEffect(() => {
     routerRef.current = router;
-  }, [router]);
-
+    toastRef.current = toast;
+    scrollRef.current = scrollTransactionsToTop;
+  }, [router, toast, scrollTransactionsToTop]);
   const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
+  const [payees, setPayees] = useState<Array<{ id: number; name: string }>>([]);
   const [transactions, setTransactions] = useState<TransactionWithSplits[]>([]);
+  const [projectedTransactions, setProjectedTransactions] = useState<DisplayTransaction[]>([]);
+  const [plaidPendingTransactions, setPlaidPendingTransactions] = useState<DisplayTransaction[]>([]);
+  const [marketValues, setMarketValues] = useState<AccountMarketValue[]>([]);
   const [startingBalance, setStartingBalance] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
-  const [marketValues, setMarketValues] = useState<AccountMarketValue[]>([]);
-  const [projectedTransactions, setProjectedTransactions] = useState<
-    DisplayTransaction[]
-  >([]);
-  const [plaidPendingTransactions, setPlaidPendingTransactions] = useState<
-    DisplayTransaction[]
-  >([]);
+  const [positionsVersion, setPositionsVersion] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [transactionsLoading, setTransactionsLoading] = useState(false);
-  // Set when a "load more" fetch fails; stops the IntersectionObserver
-  // effect from immediately re-triggering (see handleLoadMore) so a failure
-  // doesn't become an unbounded retry loop. Cleared on the next successful
-  // page-0 refresh (refreshData) and at the start of the next attempt.
   const [loadMoreFailed, setLoadMoreFailed] = useState(false);
-  const [payees, setPayees] = useState<Array<{ id: number; name: string }>>([]);
-  const [positionsVersion, setPositionsVersion] = useState(0);
+  const initialLoad = useRef(true);
+  const autoSelectDone = useRef(false);
 
-  const autoSelectDoneRef = useRef(false);
-  const initialLoadRef = useRef(true);
+  // A fresh scope fences every response to the book/filter that requested it.
+  // No old response can publish after cleanup, even if fetch ignores abort.
+  const contextKey = JSON.stringify([bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming]);
+  const scopeRef = useRef<{
+    key: string; active: boolean; paused: boolean; running: boolean; loadingPage: boolean;
+    loadedCount: number; pending: RefreshRequest | null; controller: AbortController;
+    promise: Promise<void>; frame?: number;
+    wait?: { timer: ReturnType<typeof setTimeout>; resume: () => void };
+  } | null>(null);
 
-  // Track previous account ID to detect changes and clear stale data
-  const prevAccountIdRef = useRef<number | null | undefined>(undefined);
-  useEffect(() => {
-    if (prevAccountIdRef.current === undefined) {
-      // Initial render — just record it
-      prevAccountIdRef.current = selectedAccountId;
-      return;
-    }
-    if (prevAccountIdRef.current !== selectedAccountId) {
-      prevAccountIdRef.current = selectedAccountId;
-      // Immediately clear stale transactions and show loading
-      setTransactions([]);
-      setProjectedTransactions([]);
-      setStartingBalance(0);
-      setTotalCount(0);
-      setTransactionsLoading(true);
-    }
-  }, [selectedAccountId]);
-
-  const fetchAccounts = useCallback(async () => {
-    const today = toDateString(new Date());
-    // apiGet throws on a non-ok response, so refreshData's catch runs
-    // instead of writing a parsed error body into state — see the comment
-    // above fetchTransactionsPage's matching call below.
-    const accountsData = await apiGet<AccountWithBalance[]>(
-      `/api/b/${bookId}/accounts?includeInactive=true&asOfDate=${today}`
-    );
-
-    // Flatten nested accounts
-    const flatAccounts = flattenAccounts(accountsData);
-
-    setAccounts(flatAccounts);
-    return flatAccounts;
-  }, [bookId]);
-
-  const fetchPayees = useCallback(async () => {
-    try {
-      const data = await apiGet<Array<{ id: number; name: string }>>(
-        `/api/b/${bookId}/payees`
-      );
-      setPayees(Array.isArray(data) ? data : []);
-    } catch (error) {
-      console.error("Error fetching payees:", error);
-      setPayees([]);
-    }
-  }, [bookId]);
-
-  const fetchMarketValues = useCallback(async () => {
-    try {
-      const today = toDateString(new Date());
-      const data = await apiGet<AccountMarketValue[]>(
-        `/api/b/${bookId}/investments/account-values?asOfDate=${today}`
-      );
-      setMarketValues(Array.isArray(data) ? data : []);
-    } catch (error) {
-      console.error("Error fetching market values:", error);
-      setMarketValues([]);
-    }
-  }, [bookId]);
-
-  const fetchProjectedTransactions = useCallback(async () => {
-    if (!showUpcoming) {
-      setProjectedTransactions([]);
-      return;
-    }
-    try {
-      const params = new URLSearchParams();
-      if (selectedAccountId) {
-        params.set("accountId", selectedAccountId.toString());
-      }
-      const data = await apiGet<DisplayTransaction[]>(
-        `/api/b/${bookId}/recurring/projected?${params.toString()}`
-      );
-      setProjectedTransactions(Array.isArray(data) ? data : []);
-    } catch (error) {
-      console.error("Error fetching projected transactions:", error);
-      setProjectedTransactions([]);
-    }
-  }, [bookId, showUpcoming, selectedAccountId]);
-
-  const fetchPlaidPendingTransactions = useCallback(async () => {
-    try {
-      const params = new URLSearchParams();
-      if (selectedAccountId) {
-        params.set("accountId", selectedAccountId.toString());
-      }
-      const data = await apiGet<DisplayTransaction[]>(
-        `/api/b/${bookId}/sync/pending-transactions?${params.toString()}`
-      );
-      setPlaidPendingTransactions(Array.isArray(data) ? data : []);
-    } catch (error) {
-      console.error("Error fetching pending Plaid transactions:", error);
-      setPlaidPendingTransactions([]);
-    }
-  }, [bookId, selectedAccountId]);
-
-  const fetchTransactionsPage = useCallback(
-    async (
-      pageOffset: number,
-      append: boolean,
-      context: {
-        selectedAccountId: number | null;
-        isInvestmentAccount: boolean;
-        investmentCashAccountId: number | null;
-        startDate: string;
-        endDate: string;
-        selectedPayeeId: number | null;
-        ensureId?: number | null;
-      }
-    ) => {
-      const {
-        selectedAccountId: contextAccountId,
-        isInvestmentAccount: contextIsInvestment,
-        investmentCashAccountId: contextCashAccountId,
-        startDate: contextStartDate,
-        endDate: contextEndDate,
-        selectedPayeeId: contextPayeeId,
-        ensureId: contextEnsureId,
-      } = context;
-      const params = new URLSearchParams({
-        limit: PAGE_SIZE.toString(),
-        offset: pageOffset.toString(),
-        includeMeta: "true",
-      });
-
-      if (contextEnsureId) {
-        params.set("ensureId", contextEnsureId.toString());
-      }
-
-      if (contextAccountId) {
-        if (contextIsInvestment && contextCashAccountId) {
-          params.set(
-            "accountIds",
-            `${contextAccountId},${contextCashAccountId}`
-          );
-          params.set("balanceAccountId", contextCashAccountId.toString());
-        } else {
-          params.set("accountId", contextAccountId.toString());
-        }
-      }
-
-      if (contextStartDate) {
-        params.set("startDate", contextStartDate);
-      }
-
-      if (contextEndDate) {
-        params.set("endDate", contextEndDate);
-      }
-
-      if (contextPayeeId !== null) {
-        params.set("payeeId", contextPayeeId.toString());
-      }
-
-      // apiGet throws (rather than parsing the error body as a page) so both
-      // callers' catch blocks actually run: refreshData's
-      // full-page/background-refresh handling and handleLoadMore's
-      // loadMoreFailed guard both depend on this rejecting — otherwise a
-      // non-2xx response parses as an empty page, totalCount drops to 0,
-      // the load-more sentinel disappears, and the user has no retry.
-      const transactionsData = await apiGet<{
-        transactions?: TransactionWithSplits[];
-        startingBalance?: number;
-        totalCount?: number;
-      }>(`/api/b/${bookId}/transactions?${params.toString()}`);
-
-      const pageTransactions: TransactionWithSplits[] =
-        transactionsData.transactions || [];
-
-      setTransactions((prev) =>
-        append ? [...prev, ...pageTransactions] : pageTransactions
-      );
-      if (!append) {
-        requestAnimationFrame(() => {
-          scrollTransactionsToTop();
-        });
-      }
-      setStartingBalance(transactionsData.startingBalance || 0);
-      setTotalCount(transactionsData.totalCount || pageTransactions.length);
-    },
-    [bookId, scrollTransactionsToTop]
-  );
-
-  const refreshData = useCallback(async (showLoading: boolean, ensureId?: number | null) => {
-    if (showLoading) {
-      setLoading(true);
-    }
-    try {
-      const [flatAccounts] = await Promise.all([
-        fetchAccounts(),
-        fetchMarketValues(),
-        fetchPayees(),
-      ]);
-      const selected = selectedAccountId
-        ? flatAccounts.find((account) => account.id === selectedAccountId)
-        : null;
-      const isSelectedInvestment =
-        selected?.type === "asset" && selected?.subtype === "investment";
-      const cashAccountId = isSelectedInvestment
-        ? flatAccounts.find(
-            (account) =>
-              account.parentId === selectedAccountId && account.isInvestmentCash
-          )?.id ?? null
-        : null;
-      await fetchTransactionsPage(0, false, {
-        selectedAccountId,
-        isInvestmentAccount: isSelectedInvestment,
-        investmentCashAccountId: cashAccountId,
-        startDate,
-        endDate,
-        selectedPayeeId,
-        ensureId,
-      });
-      setPositionsVersion((v) => v + 1);
-      setLoadMoreFailed(false);
-      setError(null);
-
-      // Auto-select account on initial page load (no accountId in URL)
-      if (!autoSelectDoneRef.current && !selectedAccountId) {
-        autoSelectDoneRef.current = true;
-
-        // 1. Try localStorage for last selected account
-        let targetAccountId: number | null = null;
-        try {
-          const stored = localStorage.getItem(`lastSelectedAccountId:${bookId}`);
-          if (stored) {
-            const storedId = Number(stored);
-            if (Number.isFinite(storedId) && flatAccounts.some((a) => a.id === storedId && a.isActive)) {
-              targetAccountId = storedId;
+  const drain = useCallback((): Promise<void> => {
+    const scope = scopeRef.current;
+    if (!scope || scope.key !== contextKey) return Promise.resolve();
+    if (!scope.active || scope.running || scope.loadingPage || !scope.pending ||
+        (scope.paused && scope.pending.background)) return scope.promise;
+    scope.running = true;
+    scope.promise = (async () => {
+      try {
+        while (scope.active && scope.pending && !(scope.paused && scope.pending.background)) {
+          // Merge local refresh calls and notification echoes before taking a
+          // snapshot. This is a fixed window, never a post-fetch suppression:
+          // every hint received during a fetch still gets a trailing fetch.
+          if (!scope.pending.immediate && !scope.pending.showLoading) {
+            await new Promise<void>((resume) => {
+              scope.wait = { timer: setTimeout(resume, REFRESH_COALESCE_MS), resume };
+            });
+            scope.wait = undefined;
+          }
+          if (!scope.active || !scope.pending || (scope.paused && scope.pending.background)) break;
+          const request = scope.pending;
+          scope.pending = null;
+          if (request.showLoading) setLoading(true);
+          try {
+            const today = toDateString(new Date());
+            const prefix = `/api/b/${bookId}`;
+            const init = { signal: scope.controller.signal };
+            const accountQuery = accountId ? `?accountId=${accountId}` : "";
+            const [accountRows, values, payeeRows, projected, pending] = await Promise.all([
+              apiGet<AccountWithBalance[]>(`${prefix}/accounts?includeInactive=true&asOfDate=${today}`, init),
+              apiGet<AccountMarketValue[]>(`${prefix}/investments/account-values?asOfDate=${today}`, init).catch(() => []),
+              apiGet<Array<{ id: number; name: string }>>(`${prefix}/payees`, init).catch(() => []),
+              showUpcoming ? apiGet<DisplayTransaction[]>(`${prefix}/recurring/projected${accountQuery}`, init).catch(() => []) : Promise.resolve([]),
+              apiGet<DisplayTransaction[]>(`${prefix}/sync/pending-transactions${accountQuery}`, init).catch(() => []),
+            ]);
+            const flatAccounts = flattenAccounts(accountRows);
+            const selected = flatAccounts.find((a) => a.id === accountId);
+            const investment = selected?.type === "asset" && selected.subtype === "investment";
+            const cashId = investment ? flatAccounts.find((a) => a.parentId === accountId && a.isInvestmentCash)?.id ?? null : null;
+            const params = pageParams(0, request.background ? Math.max(PAGE_SIZE, scope.loadedCount) : PAGE_SIZE, {
+              selectedAccountId: accountId, isInvestmentAccount: investment,
+              investmentCashAccountId: cashId, startDate, endDate, selectedPayeeId, ensureId: request.ensureId,
+            });
+            const page = await apiGet<PageResponse>(`${prefix}/transactions?${params}`, init);
+            if (!scope.active) return;
+            // An editor opened while the requests were in flight. Discard the
+            // snapshot and fetch again on close, retaining an explicit request.
+            if (request.background && scope.paused) {
+              scope.pending ??= request;
+              continue;
+            }
+            const rows = page.transactions ?? [];
+            setAccounts(flatAccounts); setMarketValues(Array.isArray(values) ? values : []);
+            setPayees(Array.isArray(payeeRows) ? payeeRows : []);
+            setProjectedTransactions(Array.isArray(projected) ? projected : []);
+            setPlaidPendingTransactions(Array.isArray(pending) ? pending : []);
+            setTransactions(rows); scope.loadedCount = rows.length;
+            setStartingBalance(page.startingBalance ?? 0);
+            setTotalCount(page.totalCount ?? rows.length);
+            setPositionsVersion((v) => v + 1);
+            setLoadMoreFailed(false); setError(null);
+            if (!request.background) {
+              scope.frame = requestAnimationFrame(() => { if (scope.active) scrollRef.current(); });
+            }
+            if (!autoSelectDone.current) {
+              autoSelectDone.current = true;
+              if (!accountId) {
+                let target: number | null = null;
+                try {
+                  const stored = Number(localStorage.getItem(`lastSelectedAccountId:${bookId}`));
+                  if (flatAccounts.some((a) => a.id === stored && a.isActive)) target = stored;
+                } catch { /* Storage may be unavailable. */ }
+                target ??= flatAccounts.filter((a) => a.isFavorite && a.isActive && !a.isInvestmentCash)
+                  .sort((a, b) => a.name.localeCompare(b.name))[0]?.id ?? null;
+                if (target !== null) routerRef.current.replace(`/b/${bookId}/transactions?accountId=${target}`, { scroll: false });
+              }
+            }
+          } catch {
+            if (scope.active) {
+              if (request.showLoading) setError("Could not load transactions.");
+              else toastRef.current.error("Could not refresh transactions.");
+            }
+          } finally {
+            if (scope.active) {
+              initialLoad.current = false;
+              setTransactionsLoading(false);
+              setLoading(false);
             }
           }
-        } catch {
-          // Ignore localStorage errors
         }
+      } finally { scope.running = false; }
+    })();
+    return scope.promise;
+  }, [contextKey, bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming]);
 
-        // 2. Fall back to first favorite account
-        if (targetAccountId === null) {
-          const firstFavorite = flatAccounts
-            .filter((a) => a.isFavorite && a.isActive && !a.isInvestmentCash)
-            .sort((a, b) => a.name.localeCompare(b.name))[0];
-          if (firstFavorite) {
-            targetAccountId = firstFavorite.id;
-          }
-        }
-
-        // 3. Redirect (replace, not push, to avoid back-button issues)
-        if (targetAccountId !== null) {
-          routerRef.current.replace(`/b/${bookId}/transactions?accountId=${targetAccountId}`, { scroll: false });
-          return; // refreshData will re-run with the new accountId
-        }
-      }
-
-      // Mark auto-select as done even if we had a selectedAccountId
-      if (!autoSelectDoneRef.current) {
-        autoSelectDoneRef.current = true;
-      }
-    } catch {
-      if (showLoading) {
-        // Nothing has rendered yet — the full-page error state is correct.
-        setError("Could not load transactions.");
-      } else {
-        // A background refresh (after a write, a filter change, etc.)
-        // failed. The already-rendered accounts/transactions are still
-        // correct, so keep them on screen and surface the failure via the
-        // existing toast instead of blanking the page — same reasoning as
-        // a failed "load more" below.
-        toast.error("Could not refresh transactions.");
-      }
-    } finally {
-      setTransactionsLoading(false);
-      if (showLoading) {
-        setLoading(false);
-      }
-    }
-  }, [fetchAccounts, fetchMarketValues, fetchPayees, fetchTransactionsPage, selectedAccountId, startDate, endDate, selectedPayeeId, bookId, toast]);
+  const enqueue = useCallback((request: RefreshRequest) => {
+    const scope = scopeRef.current;
+    if (!scope || scope.key !== contextKey || !scope.active) return Promise.resolve();
+    const previous = scope.pending;
+    scope.pending = {
+      showLoading: request.showLoading || (previous?.showLoading ?? false),
+      ensureId: request.ensureId ?? previous?.ensureId,
+      background: request.background && (previous?.background ?? true),
+      immediate: request.immediate || previous?.immediate,
+    };
+    return drain();
+  }, [contextKey, drain]);
+  const refreshData = useCallback((showLoading: boolean, ensureId?: number | null) =>
+    enqueue({ showLoading, ensureId, background: false }), [enqueue]);
 
   useEffect(() => {
-    const showLoading = initialLoadRef.current;
+    const scope: NonNullable<typeof scopeRef.current> = {
+      key: contextKey, active: true, paused: false, running: false, loadingPage: false,
+      loadedCount: PAGE_SIZE, pending: null as RefreshRequest | null,
+      controller: new AbortController(), promise: Promise.resolve(), frame: undefined as number | undefined,
+    };
+    scopeRef.current = scope;
+    const showLoading = initialLoad.current;
     const ensureId = ensureIdRef.current;
     ensureIdRef.current = null;
-    const run = async () => {
-      await refreshData(showLoading, ensureId);
-      initialLoadRef.current = false;
+    setTransactionsLoading(true);
+    setTransactions([]); setProjectedTransactions([]); setPlaidPendingTransactions([]);
+    setStartingBalance(0); setTotalCount(0);
+    void enqueue({ showLoading, ensureId, background: false, immediate: true });
+    return () => {
+      scope.active = false; scope.pending = null;
+      scope.controller.abort();
+      if (scope.wait) {
+        clearTimeout(scope.wait.timer);
+        scope.wait.resume();
+      }
+      if (scope.frame !== undefined) cancelAnimationFrame(scope.frame);
     };
-    // refreshData handles its own errors internally, so run() cannot reject.
-    void run();
-  }, [refreshData, ensureIdRef]);
+  }, [contextKey, enqueue, ensureIdRef]);
 
   useEffect(() => {
-    // fetchProjectedTransactions catches its own errors and degrades to [].
-    void fetchProjectedTransactions();
-  }, [fetchProjectedTransactions]);
+    const scope = scopeRef.current;
+    if (!scope) return;
+    scope.paused = deferBackgroundRefresh;
+    if (!scope.paused) void drain();
+  }, [contextKey, deferBackgroundRefresh, drain]);
+  useBookChanges(() => { void enqueue({ showLoading: false, background: true }); });
 
-  useEffect(() => {
-    // fetchPlaidPendingTransactions catches its own errors and degrades to [].
-    void fetchPlaidPendingTransactions();
-  }, [fetchPlaidPendingTransactions]);
+  const fetchTransactionsPage = useCallback(async (offset: number, append: boolean, context: PageContext) => {
+    const scope = scopeRef.current;
+    if (!scope || scope.key !== contextKey) return;
+    // Let a refresh complete before appending a page to that snapshot.
+    await scope.promise;
+    if (!scope.active) return;
+    // A reset may have changed pagination while the caller waited.
+    if (append && offset !== scope.loadedCount) return;
+    scope.loadingPage = true;
+    try {
+      const page = await apiGet<PageResponse>(`/api/b/${bookId}/transactions?${pageParams(offset, PAGE_SIZE, context)}`,
+        { signal: scope.controller.signal });
+      if (!scope.active) return;
+      const rows = page.transactions ?? [];
+      setTransactions((old) => append ? [...old, ...rows] : rows);
+      scope.loadedCount = append ? scope.loadedCount + rows.length : rows.length;
+      setStartingBalance(page.startingBalance ?? 0);
+      setTotalCount(page.totalCount ?? rows.length);
+      if (!append) scrollRef.current();
+    } finally {
+      scope.loadingPage = false;
+      if (scope.active) void drain();
+    }
+  }, [contextKey, bookId, drain]);
 
-  return {
-    accounts,
-    payees,
-    transactions,
-    projectedTransactions,
-    plaidPendingTransactions,
-    marketValues,
-    startingBalance,
-    totalCount,
-    positionsVersion,
-    loading,
-    error,
-    transactionsLoading,
-    loadMoreFailed,
-
-    fetchAccounts,
-    fetchPayees,
-    fetchMarketValues,
-    fetchProjectedTransactions,
-    fetchPlaidPendingTransactions,
-    fetchTransactionsPage,
-    refreshData,
-
-    setTransactions,
-    setAccounts,
-    setLoadMoreFailed,
-  };
+  return { accounts, payees, transactions, projectedTransactions, plaidPendingTransactions,
+    marketValues, startingBalance, totalCount, positionsVersion, loading, error, transactionsLoading,
+    loadMoreFailed, fetchTransactionsPage, refreshData, setTransactions, setAccounts, setLoadMoreFailed };
 }

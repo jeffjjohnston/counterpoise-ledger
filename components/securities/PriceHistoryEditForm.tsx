@@ -3,8 +3,8 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { evaluateExpression } from "@/lib/expression";
-import { resolveAmountOnBlur } from "@/lib/formatters";
+import { evaluateExpression } from "@/lib/wasm-client";
+import { resolveAmountOnBlur } from "@/lib/wasm-client";
 import { toMessage } from "@/lib/api-client";
 
 type PriceHistoryEditFormProps = {

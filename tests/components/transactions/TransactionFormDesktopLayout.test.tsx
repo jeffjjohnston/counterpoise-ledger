@@ -3,7 +3,7 @@
 // "Coverage gap" note at the top of that file). This file exercises the
 // desktop branch instead, reached via `fullLayout` (compact = !fullLayout &&
 // !editingTransaction). It copies the harness pieces it needs — mockAccounts,
-// renderWithToast, the next/navigation mock, the securities fetchMock —
+// renderWithToast, the @/lib/navigation mock, the securities fetchMock —
 // rather than importing them, matching how the payload gate was written.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -15,9 +15,11 @@ import type { AccountWithBalance } from "@/types";
 const renderWithToast = (ui: React.ReactElement) =>
   render(<ToastProvider>{ui}</ToastProvider>);
 
-vi.mock("next/navigation", () => ({
+vi.mock("@/lib/navigation", () => ({
+  Link: ({ href, children }: { href: string; children: React.ReactNode }) => <a href={href}>{children}</a>,
+  useSearchParams: () => new URLSearchParams(),
   useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
   usePathname: () => "/b/1/transactions",
 }));
 

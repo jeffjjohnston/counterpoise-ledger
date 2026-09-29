@@ -1,0 +1,3448 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Counterpoise API",
+    "description": "The routes a native client uses. Money is integer cents. Shares and prices are integer micros. Dates are YYYY-MM-DD strings.",
+    "version": "1.48.0",
+    "x-api-contract": 1
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "The server this document was fetched from."
+    }
+  ],
+  "paths": {
+    "/api/version": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "summary": "Server version and contract number.",
+        "operationId": "getVersion",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Version"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Start a cookie session.",
+        "operationId": "login",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "End the cookie session.",
+        "operationId": "logout",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/auth/me": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "The authenticated user.",
+        "operationId": "getMe",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/auth/api-keys": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "List the user's API keys.",
+        "operationId": "listApiKeys",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Mint an API key. The plaintext is returned once.",
+        "operationId": "createApiKey",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApiKeyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyCreated"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/auth/api-keys/{id}": {
+      "delete": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Revoke an API key.",
+        "operationId": "deleteApiKey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/books": {
+      "get": {
+        "tags": [
+          "books"
+        ],
+        "summary": "The books you are a member of, with your role in each.",
+        "operationId": "listBooks",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "books"
+        ],
+        "summary": "Create a book.",
+        "operationId": "createBook",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBookBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Book"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/books/{bookId}": {
+      "put": {
+        "tags": [
+          "books"
+        ],
+        "summary": "Rename a book or change its settings.",
+        "operationId": "updateBook",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBookBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Book"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "books"
+        ],
+        "summary": "Delete a book and everything in it.",
+        "operationId": "deleteBook",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/books/{bookId}/members": {
+      "get": {
+        "tags": [
+          "books"
+        ],
+        "summary": "The members of a book and their roles.",
+        "operationId": "listBookMembers",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookMemberList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "books"
+        ],
+        "summary": "Add an existing user to a book. Owner only.",
+        "operationId": "addBookMember",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddBookMemberBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookMember"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/books/{bookId}/members/{userId}": {
+      "put": {
+        "tags": [
+          "books"
+        ],
+        "summary": "Change a member's role. Owner only.",
+        "operationId": "updateBookMember",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBookMemberBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookMember"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "books"
+        ],
+        "summary": "Remove a member. An owner removes anyone; a member removes themselves.",
+        "operationId": "removeBookMember",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/accounts": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Root accounts with balances and one level of children.",
+        "operationId": "listAccounts",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Only accounts of this type: asset, liability, equity, income, or expense.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "includeInactive",
+            "in": "query",
+            "description": "Send true to include inactive accounts.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            }
+          },
+          {
+            "name": "asOfDate",
+            "in": "query",
+            "description": "Balances as of this date as YYYY-MM-DD.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountNodeList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Create an account.",
+        "operationId": "createAccount",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccountBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountNode"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/accounts/{id}": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "One account with its children and balance.",
+        "operationId": "getAccount",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountDetail"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Update an account.",
+        "operationId": "updateAccount",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAccountBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountWithChildren"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Delete an account that has no transactions.",
+        "operationId": "deleteAccount",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/transactions": {
+      "get": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "Transactions, newest first. With includeMeta=true the response is a TransactionPage.",
+        "operationId": "listTransactions",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "accountId",
+            "in": "query",
+            "description": "Only transactions with a split in this account.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "accountIds",
+            "in": "query",
+            "description": "Comma-separated account ids.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "balanceAccountId",
+            "in": "query",
+            "description": "Account for startingBalance. Defaults to the first of accountIds.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "payeeId",
+            "in": "query",
+            "description": "Only transactions with this payee.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "recurringRuleId",
+            "in": "query",
+            "description": "Only transactions this rule created.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Inclusive lower bound as YYYY-MM-DD.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "Inclusive upper bound as YYYY-MM-DD.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "includeMeta",
+            "in": "query",
+            "description": "Send true to receive a TransactionPage instead of a TransactionList.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Default 100. 0 means everything.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "ensureId",
+            "in": "query",
+            "description": "Extend the first page until it includes this transaction.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/TransactionList"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TransactionPage"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "Create a transaction. Splits must sum to zero.",
+        "operationId": "createTransaction",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTransactionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/transactions/{id}": {
+      "get": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "One transaction with its relations.",
+        "operationId": "getTransaction",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "Update a transaction. Splits, when sent, replace all existing splits.",
+        "operationId": "updateTransaction",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTransactionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The transaction changed after you loaded it. The server makes no change. This occurs only when you send expectedUpdatedAt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "Delete a transaction.",
+        "operationId": "deleteTransaction",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "expectedUpdatedAt",
+            "in": "query",
+            "description": "The updatedAt value you loaded. When you send it and the transaction changed since, the delete is refused (HTTP 409) and nothing changes. Omit it to skip the check.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The transaction changed after you loaded it. The server makes no change. This occurs only when you send expectedUpdatedAt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/payees": {
+      "get": {
+        "tags": [
+          "payees"
+        ],
+        "summary": "Payees with usage counts.",
+        "operationId": "listPayees",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "description": "Case-insensitive substring filter.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum rows.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PayeeList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "payees"
+        ],
+        "summary": "Create a payee, or return the existing one with the same normalized name.",
+        "operationId": "createPayee",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePayeeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PayeeRow"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/search": {
+      "get": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Search transactions, accounts, payees, and recurring rules.",
+        "operationId": "search",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Query text. A currency amount matches split amounts. Omitted or empty returns empty buckets.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Inclusive lower bound as YYYY-MM-DD.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "Inclusive upper bound as YYYY-MM-DD.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/investments/account-values": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Market value per investment account.",
+        "operationId": "listAccountMarketValues",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "asOfDate",
+            "in": "query",
+            "description": "Value as of this date as YYYY-MM-DD.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountMarketValueList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "name",
+          "type",
+          "subtype",
+          "parentId",
+          "isActive",
+          "isFavorite",
+          "isInvestmentCash",
+          "icon",
+          "createdAt",
+          "updatedAt",
+          "children",
+          "balance",
+          "hasTransactions"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/AccountType"
+          },
+          "subtype": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AccountSubtype"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parentId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "isFavorite": {
+            "type": "boolean"
+          },
+          "isInvestmentCash": {
+            "type": "boolean"
+          },
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A single emoji, or null to inherit the parent's icon."
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updatedAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountRow"
+            }
+          },
+          "balance": {
+            "$ref": "#/components/schemas/Cents"
+          },
+          "hasTransactions": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AccountMarketValue": {
+        "type": "object",
+        "required": [
+          "accountId",
+          "marketValueCents"
+        ],
+        "properties": {
+          "accountId": {
+            "type": "integer"
+          },
+          "marketValueCents": {
+            "$ref": "#/components/schemas/Cents"
+          }
+        }
+      },
+      "AccountMarketValueList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/AccountMarketValue"
+        }
+      },
+      "AccountNode": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "name",
+          "type",
+          "subtype",
+          "parentId",
+          "isActive",
+          "isFavorite",
+          "isInvestmentCash",
+          "icon",
+          "createdAt",
+          "updatedAt",
+          "balance",
+          "hasTransactions",
+          "children"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/AccountType"
+          },
+          "subtype": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AccountSubtype"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parentId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "isFavorite": {
+            "type": "boolean"
+          },
+          "isInvestmentCash": {
+            "type": "boolean"
+          },
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A single emoji, or null to inherit the parent's icon."
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updatedAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "balance": {
+            "$ref": "#/components/schemas/Cents"
+          },
+          "hasTransactions": {
+            "type": "boolean"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountNode"
+            }
+          }
+        }
+      },
+      "AccountNodeList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/AccountNode"
+        }
+      },
+      "AccountRow": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "name",
+          "type",
+          "subtype",
+          "parentId",
+          "isActive",
+          "isFavorite",
+          "isInvestmentCash",
+          "icon",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/AccountType"
+          },
+          "subtype": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AccountSubtype"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parentId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "isFavorite": {
+            "type": "boolean"
+          },
+          "isInvestmentCash": {
+            "type": "boolean"
+          },
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A single emoji, or null to inherit the parent's icon."
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updatedAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "AccountSubtype": {
+        "type": "string",
+        "enum": [
+          "bank",
+          "credit_card",
+          "loan",
+          "investment",
+          "cash",
+          "other"
+        ]
+      },
+      "AccountType": {
+        "type": "string",
+        "enum": [
+          "asset",
+          "liability",
+          "equity",
+          "income",
+          "expense"
+        ]
+      },
+      "AccountWithChildren": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "name",
+          "type",
+          "subtype",
+          "parentId",
+          "isActive",
+          "isFavorite",
+          "isInvestmentCash",
+          "icon",
+          "createdAt",
+          "updatedAt",
+          "children"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/AccountType"
+          },
+          "subtype": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AccountSubtype"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parentId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "isFavorite": {
+            "type": "boolean"
+          },
+          "isInvestmentCash": {
+            "type": "boolean"
+          },
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A single emoji, or null to inherit the parent's icon."
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updatedAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountRow"
+            }
+          }
+        }
+      },
+      "AddBookMemberBody": {
+        "type": "object",
+        "required": [
+          "username",
+          "role"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "description": "The exact username of an existing user. Case matters.",
+            "minLength": 1
+          },
+          "role": {
+            "type": "string",
+            "description": "owner: everything, including members, rename, delete and bank connections. editor: read and change the ledger. viewer: read only.",
+            "enum": [
+              "owner",
+              "editor",
+              "viewer"
+            ]
+          }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "A message safe to show to the user."
+          }
+        }
+      },
+      "ApiKeyCreated": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "key",
+          "keyPrefix",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string",
+            "description": "The plaintext key. It is returned once and never again."
+          },
+          "keyPrefix": {
+            "type": "string"
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "ApiKeyList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/ApiKeyListItem"
+        }
+      },
+      "ApiKeyListItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "keyPrefix",
+          "lastUsedAt",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "keyPrefix": {
+            "type": "string"
+          },
+          "lastUsedAt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "Book": {
+        "type": "object",
+        "required": [
+          "id",
+          "userId",
+          "name",
+          "upcomingDays",
+          "typesafeReconciliationEnabled",
+          "typesafeRevision",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "userId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "upcomingDays": {
+            "type": "integer"
+          },
+          "typesafeReconciliationEnabled": {
+            "type": "boolean"
+          },
+          "typesafeRevision": {
+            "type": "integer"
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updatedAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "role": {
+            "type": "string",
+            "description": "Your role in this book: owner, editor or viewer. Present in the book list.",
+            "enum": [
+              "owner",
+              "editor",
+              "viewer"
+            ]
+          }
+        }
+      },
+      "BookList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Book"
+        }
+      },
+      "BookMember": {
+        "type": "object",
+        "required": [
+          "userId",
+          "username",
+          "role",
+          "createdAt"
+        ],
+        "properties": {
+          "userId": {
+            "type": "integer"
+          },
+          "username": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "owner",
+              "editor",
+              "viewer"
+            ]
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "BookMemberList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/BookMember"
+        }
+      },
+      "Cents": {
+        "type": "integer",
+        "description": "Money in integer cents. Positive is a debit, negative is a credit."
+      },
+      "CreateAccountBody": {
+        "type": "object",
+        "required": [
+          "name",
+          "type"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Account name, as it will appear in the chart of accounts.",
+            "minLength": 1
+          },
+          "type": {
+            "type": "string",
+            "description": "Account type: asset, liability, equity, income, or expense. You cannot change this after creation.",
+            "enum": [
+              "asset",
+              "liability",
+              "equity",
+              "income",
+              "expense"
+            ]
+          },
+          "subtype": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "bank",
+                  "credit_card",
+                  "loan",
+                  "investment",
+                  "cash",
+                  "other"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Account subtype: bank, credit_card, loan, investment, cash, or other. Set to 'investment' to also create a paired cash sub-account automatically."
+          },
+          "parentId": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "ID of the parent account, to nest this account under it. Omit for a top-level account. Use get_account_tree to find a parentId."
+          },
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A single emoji to show for this account. Only income and expense accounts show an icon. Send null to inherit the icon from the parent account instead of setting one directly."
+          }
+        }
+      },
+      "CreateApiKeyBody": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "CreateBookBody": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The book's name, shown in the book switcher and page titles.",
+            "minLength": 1
+          }
+        }
+      },
+      "CreatePayeeBody": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The payee's name. Normalized on save: whitespace runs collapse to one space and curly quotes straighten to '. Case is NOT changed — \"IKEA\" and \"Ikea\" stay two different payees.",
+            "minLength": 1
+          }
+        }
+      },
+      "CreateTransactionBody": {
+        "type": "object",
+        "required": [
+          "date",
+          "splits"
+        ],
+        "properties": {
+          "date": {
+            "type": "string",
+            "format": "date",
+            "description": "Transaction date in YYYY-MM-DD format"
+          },
+          "description": {
+            "type": "string",
+            "description": "Transaction description"
+          },
+          "notes": {
+            "type": "string",
+            "description": "Additional notes"
+          },
+          "payeeName": {
+            "type": "string",
+            "description": "Payee name. Matched case-insensitively to an existing payee in this book; created if none matches."
+          },
+          "checkNumber": {
+            "type": "string",
+            "description": "Check number (only for bank account transactions)"
+          },
+          "isFloating": {
+            "type": "boolean",
+            "description": "If true, the transaction's effective date auto-advances to today until reconciled. Useful for checks or expected deposits where the clearing date is unknown."
+          },
+          "isReconciled": {
+            "type": "boolean",
+            "description": "If true, the transaction is recorded as already reconciled. If the transaction is floating (isFloating is true), also set isFloating to false and give the cleared date in the same call. If you set only isReconciled, the transaction stays floating, and its effective date keeps moving to today even though it is marked reconciled."
+          },
+          "splits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "accountId",
+                "amount"
+              ],
+              "properties": {
+                "accountId": {
+                  "type": "integer",
+                  "description": "The account ID for this split",
+                  "exclusiveMinimum": 0
+                },
+                "amount": {
+                  "type": "integer",
+                  "description": "Amount in cents. Positive = debit, negative = credit. All splits must sum to zero."
+                }
+              }
+            },
+            "description": "Transaction splits (must sum to zero)",
+            "minItems": 2
+          },
+          "investmentSplits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "securityId",
+                "action",
+                "sharesMicros",
+                "priceMicros"
+              ],
+              "properties": {
+                "securityId": {
+                  "type": "integer",
+                  "description": "The security ID",
+                  "exclusiveMinimum": 0
+                },
+                "action": {
+                  "type": "string",
+                  "description": "Investment action type",
+                  "enum": [
+                    "buy",
+                    "sell",
+                    "dividend",
+                    "capGain",
+                    "fee",
+                    "split"
+                  ]
+                },
+                "sharesMicros": {
+                  "type": "integer",
+                  "description": "Number of shares in micros (1,000,000 = 1 share). Always positive.",
+                  "minimum": 0
+                },
+                "priceMicros": {
+                  "type": "integer",
+                  "description": "Price per share in micros (1,000,000 = $1.00)",
+                  "minimum": 0
+                },
+                "feesCents": {
+                  "type": "integer",
+                  "description": "Fees in cents",
+                  "minimum": 0
+                },
+                "splitNumerator": {
+                  "type": "integer",
+                  "description": "For stock split: new share ratio numerator",
+                  "exclusiveMinimum": 0
+                },
+                "splitDenominator": {
+                  "type": "integer",
+                  "description": "For stock split: old share ratio denominator",
+                  "exclusiveMinimum": 0
+                }
+              }
+            },
+            "description": "Investment splits (required if transaction involves investment accounts)"
+          }
+        }
+      },
+      "InvestmentSplitRow": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "transactionId",
+          "accountId",
+          "securityId",
+          "action",
+          "sharesMicros",
+          "priceMicros",
+          "feesCents",
+          "splitNumerator",
+          "splitDenominator",
+          "security",
+          "account"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "transactionId": {
+            "type": "integer"
+          },
+          "accountId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "securityId": {
+            "type": "integer"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "buy",
+              "sell",
+              "dividend",
+              "capGain",
+              "fee",
+              "split"
+            ]
+          },
+          "sharesMicros": {
+            "$ref": "#/components/schemas/Micros"
+          },
+          "priceMicros": {
+            "$ref": "#/components/schemas/Micros"
+          },
+          "feesCents": {
+            "$ref": "#/components/schemas/Cents"
+          },
+          "splitNumerator": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "splitDenominator": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "security": {
+            "$ref": "#/components/schemas/SecurityRow"
+          },
+          "account": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AccountRow"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "LedgerDate": {
+        "type": "string",
+        "format": "date",
+        "description": "A calendar date as YYYY-MM-DD. No time zone."
+      },
+      "LoginBody": {
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "minLength": 1
+          },
+          "password": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "Micros": {
+        "type": "integer",
+        "description": "Shares or a price in micros. 1,000,000 micros is one share or one dollar."
+      },
+      "PayeeList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/PayeeListItem"
+        }
+      },
+      "PayeeListItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "lastTransactionDate",
+          "transactionCount"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "lastTransactionDate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LedgerDate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "transactionCount": {
+            "type": "integer"
+          }
+        }
+      },
+      "PayeeRow": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "name",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "SearchResponse": {
+        "type": "object",
+        "required": [
+          "transactions",
+          "accounts",
+          "payees",
+          "recurringRules"
+        ],
+        "properties": {
+          "transactions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchTransaction"
+            }
+          },
+          "accounts": {
+            "type": "object",
+            "required": [
+              "items",
+              "total",
+              "truncated"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "name",
+                    "type",
+                    "subtype",
+                    "isFavorite"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "integer"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "$ref": "#/components/schemas/AccountType"
+                    },
+                    "subtype": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/AccountSubtype"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "isFavorite": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "total": {
+                "type": "integer"
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            }
+          },
+          "payees": {
+            "type": "object",
+            "required": [
+              "items",
+              "total",
+              "truncated"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "name"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "integer"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "total": {
+                "type": "integer"
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            }
+          },
+          "recurringRules": {
+            "type": "object",
+            "required": [
+              "items",
+              "total",
+              "truncated"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "name",
+                    "frequency",
+                    "nextDate",
+                    "businessDaysOnly",
+                    "isActive"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "integer"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "frequency": {
+                      "type": "string"
+                    },
+                    "nextDate": {
+                      "$ref": "#/components/schemas/LedgerDate"
+                    },
+                    "businessDaysOnly": {
+                      "type": "boolean"
+                    },
+                    "isActive": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "total": {
+                "type": "integer"
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "SearchTransaction": {
+        "type": "object",
+        "required": [
+          "id",
+          "date",
+          "description",
+          "checkNumber",
+          "payee",
+          "splits"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "date": {
+            "$ref": "#/components/schemas/LedgerDate"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "checkNumber": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "payee": {
+            "anyOf": [
+              {
+                "type": "object",
+                "required": [
+                  "id",
+                  "name"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "splits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "accountId",
+                "accountName",
+                "amount",
+                "isFavorite",
+                "subtype",
+                "isInvestmentCash"
+              ],
+              "properties": {
+                "accountId": {
+                  "type": "integer"
+                },
+                "accountName": {
+                  "type": "string"
+                },
+                "amount": {
+                  "$ref": "#/components/schemas/Cents"
+                },
+                "isFavorite": {
+                  "type": "boolean"
+                },
+                "subtype": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "isInvestmentCash": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      },
+      "SecurityRow": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "name",
+          "symbol",
+          "securityType",
+          "fetchPrices",
+          "fixedPriceMicros",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "securityType": {
+            "type": "string",
+            "enum": [
+              "etf",
+              "mutual_fund",
+              "stock"
+            ]
+          },
+          "fetchPrices": {
+            "type": "boolean"
+          },
+          "fixedPriceMicros": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Micros"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "Success": {
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": true
+          }
+        }
+      },
+      "Timestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "A UTC instant as an ISO 8601 string with a Z suffix."
+      },
+      "Transaction": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "date",
+          "description",
+          "checkNumber",
+          "notes",
+          "payeeId",
+          "isReconciled",
+          "isFloating",
+          "recurringRuleId",
+          "createdAt",
+          "updatedAt",
+          "payee",
+          "splits",
+          "investmentSplits"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "date": {
+            "$ref": "#/components/schemas/LedgerDate",
+            "description": "The stored date. For a floating transaction the effective date is today; compute it on the client."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "checkNumber": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "payeeId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isReconciled": {
+            "type": "boolean"
+          },
+          "isFloating": {
+            "type": "boolean"
+          },
+          "recurringRuleId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdBy": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The user who created this row. An older client contract omits this field. Null means a system write."
+          },
+          "updatedBy": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The user who last changed this row. An older client contract omits this field. Null means a system write."
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updatedAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "payee": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PayeeRow"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "splits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransactionSplit"
+            }
+          },
+          "investmentSplits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InvestmentSplitRow"
+            }
+          }
+        }
+      },
+      "TransactionList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Transaction"
+        }
+      },
+      "TransactionPage": {
+        "type": "object",
+        "required": [
+          "transactions",
+          "startingBalance",
+          "totalCount"
+        ],
+        "properties": {
+          "transactions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Transaction"
+            }
+          },
+          "startingBalance": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Sum of the balance account's splits older than the oldest transaction on this page."
+          },
+          "totalCount": {
+            "type": "integer"
+          }
+        }
+      },
+      "TransactionSplit": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "transactionId",
+          "accountId",
+          "amount",
+          "account"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "transactionId": {
+            "type": "integer"
+          },
+          "accountId": {
+            "type": "integer"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/Cents"
+          },
+          "account": {
+            "$ref": "#/components/schemas/AccountRow"
+          }
+        }
+      },
+      "UpdateAccountBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "New account name."
+          },
+          "subtype": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "bank",
+                  "credit_card",
+                  "loan",
+                  "investment",
+                  "cash",
+                  "other"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New account subtype: bank, credit_card, loan, investment, cash, or other."
+          },
+          "parentId": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New parent account ID, to move this account under it. Send null to make it a top-level account."
+          },
+          "isActive": {
+            "type": "boolean",
+            "description": "Set to false to deactivate the account, or true to reactivate it. For an investment account, this also updates its paired cash sub-account."
+          },
+          "isFavorite": {
+            "type": "boolean",
+            "description": "Set to true to mark the account as a favorite."
+          },
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A single emoji to show for this account. Only income and expense accounts show an icon. Send null to inherit the icon from the parent account instead of setting one directly."
+          }
+        }
+      },
+      "UpdateBookBody": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The book's name, shown in the book switcher and page titles.",
+            "minLength": 1
+          },
+          "upcomingDays": {
+            "type": "integer",
+            "description": "How many days ahead recurring transactions are projected on the dashboard (integer, 1-365). Omit to leave it unchanged.",
+            "maximum": 365,
+            "minimum": 1
+          }
+        }
+      },
+      "UpdateBookMemberBody": {
+        "type": "object",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "owner: everything, including members, rename, delete and bank connections. editor: read and change the ledger. viewer: read only.",
+            "enum": [
+              "owner",
+              "editor",
+              "viewer"
+            ]
+          }
+        }
+      },
+      "UpdateTransactionBody": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "format": "date",
+            "description": "New date in YYYY-MM-DD format"
+          },
+          "description": {
+            "type": "string",
+            "description": "New description"
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New notes"
+          },
+          "payeeName": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New payee name"
+          },
+          "checkNumber": {
+            "type": "string",
+            "description": "New check number"
+          },
+          "isFloating": {
+            "type": "boolean",
+            "description": "Set to true to make the transaction float (effective date = today). Set to false to stop floating."
+          },
+          "isReconciled": {
+            "type": "boolean",
+            "description": "Set to true to mark the transaction reconciled. If the transaction is floating (isFloating is true), also set isFloating to false and set date to the cleared date in the same call. If you set only isReconciled, the transaction stays floating, and its effective date keeps moving to today even though it is marked reconciled."
+          },
+          "splits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "accountId",
+                "amount"
+              ],
+              "properties": {
+                "accountId": {
+                  "type": "integer",
+                  "description": "The account ID for this split",
+                  "exclusiveMinimum": 0
+                },
+                "amount": {
+                  "type": "integer",
+                  "description": "Amount in cents. Positive = debit, negative = credit. All splits must sum to zero."
+                }
+              }
+            },
+            "description": "New splits (replaces all existing, must sum to zero)",
+            "minItems": 2
+          },
+          "investmentSplits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "securityId",
+                "action",
+                "sharesMicros",
+                "priceMicros"
+              ],
+              "properties": {
+                "securityId": {
+                  "type": "integer",
+                  "description": "The security ID",
+                  "exclusiveMinimum": 0
+                },
+                "action": {
+                  "type": "string",
+                  "description": "Investment action type",
+                  "enum": [
+                    "buy",
+                    "sell",
+                    "dividend",
+                    "capGain",
+                    "fee",
+                    "split"
+                  ]
+                },
+                "sharesMicros": {
+                  "type": "integer",
+                  "description": "Number of shares in micros (1,000,000 = 1 share). Always positive.",
+                  "minimum": 0
+                },
+                "priceMicros": {
+                  "type": "integer",
+                  "description": "Price per share in micros (1,000,000 = $1.00)",
+                  "minimum": 0
+                },
+                "feesCents": {
+                  "type": "integer",
+                  "description": "Fees in cents",
+                  "minimum": 0
+                },
+                "splitNumerator": {
+                  "type": "integer",
+                  "description": "For stock split: new share ratio numerator",
+                  "exclusiveMinimum": 0
+                },
+                "splitDenominator": {
+                  "type": "integer",
+                  "description": "For stock split: old share ratio denominator",
+                  "exclusiveMinimum": 0
+                }
+              }
+            },
+            "description": "New investment splits (replaces all existing)"
+          },
+          "expectedUpdatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The updatedAt value you loaded. When you send it and the transaction changed since, the update is refused (HTTP 409) and nothing changes. Omit it to skip the check."
+          }
+        }
+      },
+      "User": {
+        "type": "object",
+        "required": [
+          "id",
+          "username"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "username": {
+            "type": "string"
+          }
+        }
+      },
+      "Version": {
+        "type": "object",
+        "required": [
+          "version",
+          "apiContract"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "description": "The server's package.json version."
+          },
+          "apiContract": {
+            "type": "integer",
+            "description": "Increases on a breaking change to this contract."
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "An API key: Authorization: Bearer cpk_..."
+      },
+      "cookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "counterpoise_session"
+      }
+    }
+  }
+}

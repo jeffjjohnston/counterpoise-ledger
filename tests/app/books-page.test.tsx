@@ -11,16 +11,11 @@ import { ToastProvider } from "@/components/ui/ToastProvider";
 // top-level `const` has already been initialized.
 const pushMock = vi.fn();
 
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: pushMock }),
-}));
-
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
-    <a href={href}>{children}</a>
-  ),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useRouter: () => ({ push: pushMock }),
+  })
+);
 
 type Book = {
   id: number;

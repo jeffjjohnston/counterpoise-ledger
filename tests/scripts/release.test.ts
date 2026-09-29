@@ -39,7 +39,20 @@ function commit(name: string, message: string) {
 function writePackageJson(version: string) {
   writeFileSync(
     join(repo, "package.json"),
-    `${JSON.stringify({ name: "fixture", version, private: true }, null, 2)}\n`
+    `${JSON.stringify(
+      {
+        name: "fixture",
+        version,
+        private: true,
+        scripts: {
+          // release.sh runs this after the version bump, so the fixture needs a
+          // real script to run rather than failing the commit on a missing one.
+          "openapi:generate": "mkdir -p openapi && printf '{}\\n' > openapi/openapi.json",
+        },
+      },
+      null,
+      2
+    )}\n`
   );
 }
 
@@ -250,6 +263,17 @@ describe("release.sh bumps the version once per release", () => {
     expect(run.code, run.output).toBe(0);
     expect(tags()).toEqual([]);
     expect(remoteTags()).toEqual([]);
+  });
+
+  it("does not publish an unrelated local tag while pushing the release branch", () => {
+    git(["tag", "stray-local-tag"]);
+
+    const run = release();
+
+    expect(run.code, run.output).toBe(0);
+    expect(tags()).toEqual(["stray-local-tag"]);
+    expect(remoteTags()).toEqual([]);
+    expect(remoteBranches()).toContain("release/v1.0.1");
   });
 
   it("resumes at the push instead of bumping again after a failed push", () => {

@@ -1,4 +1,4 @@
-import { test, expect } from "./fixtures";
+import { smallBookTest as test, expect } from "./fixtures";
 
 // Get today's date in MM/DD/YYYY format for the DateInput component
 const today = new Date();

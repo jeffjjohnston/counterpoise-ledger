@@ -642,6 +642,28 @@ describe("production checkout ownership", () => {
     expect(git(["tag", "--list"])).toBe("");
   });
 
+  it("deploys over Finder .DS_Store files and leaves them in place", () => {
+    // Finder writes these whenever a folder is opened. They carry no project
+    // data, and deleting them by hand was the only way past this check.
+    mkdirSync(join(buildDir, "app"), { recursive: true });
+    writeFileSync(join(buildDir, ".DS_Store"), "finder");
+    writeFileSync(join(buildDir, "app", ".DS_Store"), "finder");
+    const result = deploy();
+    expect(result.code, result.output).toBe(0);
+    expect(readFileSync(join(buildDir, ".DS_Store"), "utf8")).toBe("finder");
+    expect(readFileSync(join(buildDir, "app", ".DS_Store"), "utf8")).toBe("finder");
+  });
+
+  it("still refuses another stray file next to a .DS_Store", () => {
+    writeFileSync(join(buildDir, ".DS_Store"), "finder");
+    writeFileSync(join(buildDir, "junk.txt"), "preserve me");
+    const result = deploy();
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain("junk.txt");
+    expect(result.output).not.toContain(".DS_Store");
+    expect(dockerCalls()).toBe("");
+  });
+
   it("refuses to rewind production main", () => {
     git(["checkout", "main"]);
     git(["merge", "--ff-only", "origin/main"]);

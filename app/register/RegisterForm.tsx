@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import Link from "next/link";
+import { Link, useRouter } from "@/lib/navigation";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { apiPost, toMessage } from "@/lib/api-client";
+import { useRegistrationOpen } from "@/hooks/useRegistrationOpen";
 
 export function RegisterForm() {
   const router = useRouter();
@@ -14,11 +14,13 @@ export function RegisterForm() {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [hydrated, setHydrated] = useState(false);
+  const registrationOpen = useRegistrationOpen();
 
+  // Presentation only — POST /api/auth/register is the security boundary.
+  // This exists so a closed instance does not serve a form that can only fail.
   useEffect(() => {
-    setHydrated(true);
-  }, []);
+    if (registrationOpen === false) router.replace("/login");
+  }, [registrationOpen, router]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -41,12 +43,18 @@ export function RegisterForm() {
     }
   };
 
+  // Until the answer arrives, and while the redirect runs, show only the
+  // background. The form appears only after hydration, so it is ready to use.
+  if (registrationOpen !== true) {
+    return <div className="min-h-screen bg-surface-secondary" />;
+  }
+
   return (
     <div className="min-h-screen flex items-center justify-center bg-surface-secondary">
       <div className="w-full max-w-md px-4">
         <div
           className="bg-surface rounded-xl shadow-soft border border-border p-8"
-          data-testid={hydrated ? "register-ready" : undefined}
+          data-testid="register-ready"
         >
           <div className="text-center mb-8">
             <div
@@ -103,7 +111,7 @@ export function RegisterForm() {
               autoComplete="new-password"
             />
 
-            <Button type="submit" disabled={!hydrated || loading} className="w-full" size="lg">
+            <Button type="submit" disabled={loading} className="w-full" size="lg">
               {loading ? "Creating account..." : "Create account"}
             </Button>
           </form>

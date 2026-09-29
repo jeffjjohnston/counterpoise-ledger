@@ -1,0 +1,52 @@
+[package]
+name = "counterpoise-rust-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ledger-core = { path = "../core" }
+ledger-db = { path = "../db" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = "0.8"
+chrono = "0.4"
+futures-util = { version = "0.3", default-features = false }
+hex = "0.4"
+# The status-line reason phrase of a response, which `fetch` reports as `statusText`.
+hyper = "1"
+getrandom = "0.4"
+iana-time-zone = "0.1"
+libc = "0.2"
+scrypt = "0.11"
+percent-encoding = "2"
+# The asset-path and bearer-header patterns of the page gate (security.rs).
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+# Keep each number as written. JSON.parse reads a number beyond the double
+# range as Infinity; without this feature serde_json refuses the whole body.
+# Keep object keys in the order they were read, as a JavaScript object does,
+# so that a JSON.stringify port writes the same text.
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "macros"] }
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+unicode-segmentation = "1"
+rmcp = { version = "3.4.1", features = ["server", "transport-io", "transport-streamable-http-server"] }
+tower = { version = "0.5", features = ["util"] }
+# Serves the client build (static_pages.rs) and compresses responses
+# (compression.rs) with gzip or br. Each browser sends gzip, and br on HTTPS.
+tower-http = { version = "0.6", features = ["fs", "compression-gzip", "compression-br"] }
+jsonschema = { version = "0.58.1", default-features = false }
+# The OpenAPI document model. The two features keep the component and path
+# order that the source gives, so the committed file does not reorder.
+utoipa = { version = "6.0.0", features = ["preserve_order", "preserve_path_order"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+# Decode the compressed bodies in the tests of compression.rs. tower-http
+# uses these crates already, so they add nothing to the build.
+brotli-decompressor = "5"
+flate2 = "1"

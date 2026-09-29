@@ -1,0 +1,78 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`JSON numbers outside the double range > get the zod issue for Infinity, not the route's 500 message 1`] = `
+{
+  "account parent": {
+    "body": {
+      "error": "Invalid input: expected number, received Infinity",
+    },
+    "status": 400,
+  },
+  "fixed price": {
+    "body": {
+      "error": "fixedPriceMicros must be a positive whole number of micros",
+    },
+    "status": 400,
+  },
+  "issue report": {
+    "body": {
+      "error": "Description is required",
+    },
+    "status": 400,
+  },
+  "long integer amount": {
+    "body": {
+      "error": "Invalid input: expected number, received Infinity",
+    },
+    "status": 400,
+  },
+  "negative security name": {
+    "body": {
+      "error": "Invalid input: expected string, received -Infinity",
+    },
+    "status": 400,
+  },
+  "negative split amount": {
+    "body": {
+      "error": "Invalid input: expected number, received -Infinity",
+    },
+    "status": 400,
+  },
+  "payee name": {
+    "body": {
+      "error": "Name is required",
+    },
+    "status": 400,
+  },
+  "price micros": {
+    "body": {
+      "error": "Invalid priceMicros",
+    },
+    "status": 400,
+  },
+  "security name": {
+    "body": {
+      "error": "Invalid input: expected string, received Infinity",
+    },
+    "status": 400,
+  },
+  "split amount": {
+    "body": {
+      "error": "Invalid input: expected number, received Infinity",
+    },
+    "status": 400,
+  },
+  "top-level body": {
+    "body": {
+      "error": "Invalid input: expected object, received Infinity",
+    },
+    "status": 400,
+  },
+  "upcoming days": {
+    "body": {
+      "error": "upcomingDays must be an integer between 1 and 365",
+    },
+    "status": 400,
+  },
+}
+`;

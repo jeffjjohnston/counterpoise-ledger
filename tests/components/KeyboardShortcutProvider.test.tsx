@@ -7,11 +7,13 @@ import {
   type ShortcutDef,
 } from "@/components/KeyboardShortcutProvider";
 
-// Mock next/navigation — KeyboardShortcutProvider uses useRouter and useParams
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn() }),
-  useParams: () => ({ bookId: "1" }),
-}));
+// Mock @/lib/navigation — KeyboardShortcutProvider uses useRouter and useParams
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useRouter: () => ({ push: vi.fn() }),
+    useParams: () => ({ bookId: "1" }),
+  })
+);
 
 // ---- Helper components ----
 

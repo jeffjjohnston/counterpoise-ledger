@@ -1,8 +1,7 @@
 "use client";
 
-import Link from "next/link";
+import { Link, useParams } from "@/lib/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams } from "next/navigation";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { Tabs } from "@/components/ui/Tabs";
@@ -10,8 +9,10 @@ import { SecurityForm } from "@/components/securities/SecurityForm";
 import { StockSplitEditForm } from "@/components/securities/StockSplitEditForm";
 import { PriceHistoryEditForm } from "@/components/securities/PriceHistoryEditForm";
 import { SecurityLotsTable, type OpenLot } from "@/components/securities/SecurityLotsTable";
-import { formatCurrency, formatDate } from "@/lib/formatters";
+import { formatCurrency, formatDate } from "@/lib/wasm-client";
+import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookRole } from "@/components/BookRoleProvider";
 import { apiGet, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { Security } from "@/db/schema";
@@ -113,6 +114,7 @@ const calculateAmount = (split: SecuritySplit): number | null => {
 
 export default function SecurityDetailPage() {
   const bookId = useBookId();
+  const { canWrite } = useBookRole();
   const toast = useToast();
   const params = useParams<{ id: string }>();
   const securityId = Number(params.id);
@@ -483,7 +485,7 @@ export default function SecurityDetailPage() {
             {security.symbol} • {securityTypeLabels[security.securityType]}
           </p>
         </div>
-        <Button onClick={() => setShowEditModal(true)}>Edit Security</Button>
+        {canWrite && <Button onClick={() => setShowEditModal(true)}>Edit Security</Button>}
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -634,8 +636,11 @@ export default function SecurityDetailPage() {
                   .map((split) => (
                     <tr
                       key={split.id}
-                      onClick={() => setEditingSplit(split)}
-                      className="cursor-pointer hover:bg-surface-secondary transition-colors"
+                      onClick={canWrite ? () => setEditingSplit(split) : undefined}
+                      className={cn(
+                        "hover:bg-surface-secondary transition-colors",
+                        canWrite && "cursor-pointer"
+                      )}
                     >
                       <td className="px-6 py-4 text-fg-secondary">{formatDate(split.transactionDate)}</td>
                       <td className="px-6 py-4 text-fg font-medium">
@@ -684,8 +689,11 @@ export default function SecurityDetailPage() {
                         priceHistory.map((price) => (
                           <tr
                             key={price.priceDate}
-                            onClick={() => setEditingPrice(price)}
-                            className="cursor-pointer hover:bg-surface-secondary transition-colors"
+                            onClick={canWrite ? () => setEditingPrice(price) : undefined}
+                            className={cn(
+                              "hover:bg-surface-secondary transition-colors",
+                              canWrite && "cursor-pointer"
+                            )}
                           >
                             <td className="px-6 py-4 text-fg-secondary">{formatDate(price.priceDate)}</td>
                             <td className="px-6 py-4 text-right text-fg font-medium tabular-nums">

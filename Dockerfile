@@ -1,95 +1,101 @@
-# --- Stage 1: Install dependencies ---
-FROM node:26-alpine AS deps
+# syntax=docker/dockerfile:1.7
+# The production image (the `rust-api` service of docker-compose.yml).
+# docker-entrypoint.sh checks the database credential, applies the Drizzle
+# migrations and rebuilds the investment lots, then starts the Rust server,
+# which serves the client build, the API and MCP. Node is in the runtime
+# image only for migrate.js.
+
+# --- Compile the shared Rust core for the browser ---
+FROM rust:1.98 AS wasm-builder
+WORKDIR /app
+RUN rustup target add wasm32-unknown-unknown
+RUN cargo install wasm-bindgen-cli --version 0.2.128 --locked
+RUN apt-get update && apt-get install -y --no-install-recommends binaryen \
+    && rm -rf /var/lib/apt/lists/*
+COPY rust-api ./rust-api
+RUN cargo build --locked --release -p ledger-core --features wasm \
+    --target wasm32-unknown-unknown --manifest-path rust-api/Cargo.toml
+RUN wasm-bindgen --target web --out-dir /wasm-pkg \
+    rust-api/target/wasm32-unknown-unknown/release/ledger_core.wasm
+RUN wasm-opt --enable-bulk-memory --enable-nontrapping-float-to-int -Oz \
+    /wasm-pkg/ledger_core_bg.wasm -o /wasm-pkg/optimized.wasm \
+    && mv /wasm-pkg/optimized.wasm /wasm-pkg/ledger_core_bg.wasm
+
+# --- Build the client (vite build writes build/) ---
+FROM node:26-alpine AS client
 WORKDIR /app
 # .npmrc carries strict-allow-scripts=true, which makes package.json's
 # allowScripts map enforcing. Without it here, npm ci would run unapproved
 # install scripts and merely warn.
 COPY package.json package-lock.json .npmrc ./
 RUN npm ci
-
-# --- Stage 2: Build the application ---
-FROM node:26-alpine AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-
-# NEXT_PUBLIC_ vars must be present at build time (inlined by Next.js)
+COPY --from=wasm-builder /wasm-pkg/ledger_core.js /wasm-pkg/ledger_core.d.ts \
+    /wasm-pkg/ledger_core_bg.wasm /wasm-pkg/ledger_core_bg.wasm.d.ts ./lib/wasm/generated/
+# vite.config.ts puts these in the client at build time, so they must be here
+# now. A runtime value has no effect on a built client.
 ARG NEXT_PUBLIC_POSTHOG_KEY
 ARG NEXT_PUBLIC_POSTHOG_HOST
 ENV NEXT_PUBLIC_POSTHOG_KEY=$NEXT_PUBLIC_POSTHOG_KEY
 ENV NEXT_PUBLIC_POSTHOG_HOST=$NEXT_PUBLIC_POSTHOG_HOST
-
-# next.config.js reads this inside headers(), which Next.js evaluates at build
-# time and bakes into routes-manifest.json — a runtime-only env var here would
-# have no effect on the standalone server. Same pattern as the POSTHOG vars above.
-ARG ENABLE_HSTS
-ENV ENABLE_HSTS=$ENABLE_HSTS
-
-RUN npm run build
-RUN node scripts/bundle-node-entrypoints.mjs
-
-# bundle-node-entrypoints.mjs uses packages:"external", so mcp-server.mjs and
-# migrate.js need these at runtime. Record the exact versions this build's
-# lockfile resolved, so the runner installs those rather than whatever is newest.
-RUN node -e "const n=['drizzle-orm','postgres','@modelcontextprotocol/sdk','posthog-node','zod']; \
+RUN CORE_WASM_PREBUILT=1 npm run build
+# migrate.js needs these at runtime. Record the exact versions this build's
+# lockfile resolved, so the runtime installs those rather than whatever is
+# newest.
+RUN node -e "const n=['drizzle-orm','postgres']; \
   require('fs').writeFileSync('/app/runtime-deps.txt', \
     n.map(p => p + '@' + require('/app/node_modules/' + p + '/package.json').version).join(' '))" \
  && cat /app/runtime-deps.txt
 
-# --- Stage 3: Production runner ---
-FROM node:26-alpine AS runner
+# --- Build the server and ledger-cli ---
+FROM rust:1.98-alpine AS builder
+RUN apk add --no-cache musl-dev
 WORKDIR /app
+COPY package.json ./package.json
+COPY lib/api-contract.ts ./lib/api-contract.ts
+COPY rust-api ./rust-api
+ENV SQLX_OFFLINE=true
+RUN --mount=type=cache,id=counterpoise-rust-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=counterpoise-rust-target,target=/app/rust-api/target,sharing=locked \
+    cargo build --release --locked --manifest-path rust-api/Cargo.toml \
+      -p counterpoise-rust-api -p ledger-cli && \
+    cp rust-api/target/release/counterpoise-rust-api rust-api/target/release/ledger-cli /app/
 
+# --- Runtime ---
+FROM node:26-alpine
+# chrono::Local reads TZ from these files. Without them it uses UTC in silence.
+RUN apk add --no-cache tzdata
+WORKDIR /app
 # node (uid 1000) ships in node:26-alpine. Chown the directory itself so the
 # npm install below can write into it as that user.
 RUN chown node:node /app
-
 ENV NODE_ENV=production
-ENV PORT=3000
-ENV HOSTNAME=0.0.0.0
 
-# Copy standalone server output
-COPY --from=builder --chown=node:node /app/.next/standalone ./
+COPY --from=builder /app/counterpoise-rust-api /app/ledger-cli /usr/local/bin/
+COPY --from=client /app/build /srv/client
+ENV COUNTERPOISE_STATIC_DIR=/srv/client
 
-# Copy static assets (standalone doesn't include these)
-COPY --from=builder --chown=node:node /app/.next/static ./.next/static
-COPY --from=builder --chown=node:node /app/public ./public
+# The migration files and their runner.
+COPY --from=client --chown=node:node /app/db/migrations ./migrations
+COPY --from=client --chown=node:node /app/scripts/docker-migrate.mjs ./migrate.js
 
-# Copy migration files and runner
-COPY --from=builder --chown=node:node /app/db/migrations ./migrations
-COPY --from=builder --chown=node:node /app/scripts/docker-migrate.mjs ./migrate.js
-
-# Copy MCP server bundle
-COPY --from=builder --chown=node:node /app/dist/mcp-server.mjs ./mcp-server.mjs
-
-# Copy lot rebuild bundle (data migration, run by the entrypoint after schema migrations)
-COPY --from=builder --chown=node:node /app/dist/rebuild-lots.mjs ./rebuild-lots.js
-
-# Install runtime dependencies (not traced by standalone since these scripts are external).
-# Versions come from runtime-deps.txt, pinned in the builder to what this build's
-# package-lock.json resolved, so rebuilding a commit cannot silently pick up a newer
-# major of drizzle-orm, postgres, the MCP SDK, posthog-node or zod.
+# Install the runtime dependencies of migrate.js, at the versions that the
+# client stage recorded, so rebuilding a commit cannot silently pick up a newer
+# major of drizzle-orm or postgres.
 #
-# Known gap: their TRANSITIVE versions still resolve fresh here, because npm ci would
-# delete the traced node_modules that .next/standalone provides. Pinning those too means
-# either copying the full 491MB lockfile-pinned production tree, or bundling migrate.js
-# and mcp-server.mjs so the runner needs no install at all.
+# Known gap: their TRANSITIVE versions still resolve fresh here. Pinning those
+# too means copying the lockfile-pinned production tree, or bundling
+# migrate.js so the runtime needs no install at all.
 #
 # --ignore-scripts: no allowScripts map applies to this install, and none of these
 # packages need install scripts.
-COPY --from=builder --chown=node:node /app/runtime-deps.txt ./
+COPY --from=client --chown=node:node /app/runtime-deps.txt ./
 USER node
 RUN npm install --no-save --ignore-scripts $(cat runtime-deps.txt) \
  && rm runtime-deps.txt
 
-# Copy entrypoint
 COPY --chown=node:node docker-entrypoint.sh ./
 COPY --chown=node:node scripts/check-db-credential.sh ./
 
-EXPOSE 3000
-
-# busybox wget ships with alpine; no extra layer needed.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:3000/api/health || exit 1
-
+EXPOSE 4000
 ENTRYPOINT ["./docker-entrypoint.sh"]

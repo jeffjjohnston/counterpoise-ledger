@@ -1,14 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
 import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
 import { IconPicker } from "@/components/accounts/IconPicker";
 import { CategoryIcon } from "@/components/ui/CategoryIcon";
-import { buildCategoryLabelMap, isDescendantOf, resolveAccountIconSource } from "@/lib/accounting";
-import { getAccountShortName } from "@/lib/formatters";
+import { buildCategoryLabelMap, descendantAccountIds, resolveAccountIconSource } from "@/lib/wasm-client";
+import { getAccountShortName } from "@/lib/wasm-client";
 import type { Account } from "@/db/schema";
 import type { AccountWithBalance } from "@/types";
 
@@ -76,6 +76,10 @@ export function AccountForm({
   // For income/expense, allow any account of same type as parent (not just top-level)
   // For other types, only allow top-level accounts as parents
   const allowAnyParent = type === "income" || type === "expense";
+  const excludedDescendants = useMemo(
+    () => account ? descendantAccountIds(account.id, accounts) : new Set<number>(),
+    [account, accounts]
+  );
 
   const parentOptions = [
     { value: "", label: "No parent (top level)" },
@@ -217,7 +221,7 @@ export function AccountForm({
                   // one of its descendants makes the two point at each other,
                   // which the live preview below walks during render and the
                   // PUT route would happily persist.
-                  !(account && isDescendantOf(a, account.id, accounts))
+                  !excludedDescendants.has(a.id)
               )}
               value={parentId}
               onChange={(id) => setParentId(id)}

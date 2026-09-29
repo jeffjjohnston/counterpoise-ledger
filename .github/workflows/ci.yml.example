@@ -1,0 +1,229 @@
+# CI for a fork of Counterpoise.
+#
+# THIS FILE DOES NOT RUN. GitHub Actions reads only *.yml and *.yaml files in
+# .github/workflows/, so the ".example" suffix keeps it inactive. To turn it on
+# in your fork, remove the ".example" suffix from the file name.
+#
+# It is adapted from the upstream CI, which is not published. This version runs
+# on GitHub's hosted runners. It
+# checks lint, types, the OpenAPI contract, the Rust workspace, the production
+# build (with no database), and the unit and integration tests against PostgreSQL. It does not
+# run the end-to-end tests. To add them, install the Playwright browsers
+# (`npx playwright install --with-deps`) and run `npm run test:e2e` against the
+# same PostgreSQL service.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: counterpoise
+          POSTGRES_PASSWORD: counterpoise
+          POSTGRES_DB: counterpoise
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U counterpoise"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Install WASM bindings generator
+        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+
+      - name: Install WASM optimizer
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - run: npm ci
+
+      - name: Migrate SQLx schema
+        run: npx tsx db/migrate.ts
+        env:
+          DATABASE_URL: postgresql://counterpoise:counterpoise@localhost:5432/counterpoise
+
+      - name: Install SQLx CLI
+        run: |
+          cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features rustls,postgres --root "$RUNNER_TEMP/sqlx-cli"
+          echo "$RUNNER_TEMP/sqlx-cli/bin" >> "$GITHUB_PATH"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check --manifest-path rust-api/Cargo.toml
+
+      - name: Check Rust lint
+        run: cargo clippy --workspace --all-targets --manifest-path rust-api/Cargo.toml -- -D warnings
+        env:
+          SQLX_OFFLINE: "true"
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --manifest-path rust-api/Cargo.toml
+        env:
+          SQLX_OFFLINE: "true"
+
+      - name: Build pure core for WebAssembly
+        run: cargo build -p ledger-core --target wasm32-unknown-unknown --manifest-path rust-api/Cargo.toml
+
+      - name: Check SQLx query cache
+        run: cargo sqlx prepare --check --workspace
+        working-directory: rust-api
+        env:
+          DATABASE_URL: postgresql://counterpoise:counterpoise@localhost:5432/counterpoise
+
+      - name: Build Rust HTTP server and CLI for parity tests
+        run: cargo build --locked -p counterpoise-rust-api -p ledger-cli --manifest-path rust-api/Cargo.toml
+        env:
+          SQLX_OFFLINE: "true"
+
+      # The committed openapi.json must match the code.
+      - name: Check openapi.json is current
+        run: npm run openapi:check
+        env:
+          SQLX_OFFLINE: "true"
+
+      - name: Build the browser WASM
+        run: npm run core:wasm:build
+
+      - name: Test rebuilt browser WASM in Node and DOM
+        run: npx vitest run --project node --project dom tests/lib/wasm-client.test.ts tests/components/wasm-client.test.tsx
+
+      - name: Run the HTTP suites against the Rust server
+        run: npm run test:http
+
+      - name: Run MCP tool suites over the Rust HTTP transport
+        run: npm run test:mcp:http
+
+      - name: Run MCP tool suites over the Rust stdio transport
+        run: npm run test:mcp:stdio
+
+  lint-typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install WASM build tools
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.128 --locked
+          sudo apt-get update && sudo apt-get install -y binaryen
+
+      - run: npm ci
+
+      - run: npm run core:wasm:build
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+  # The build runs with no database service on purpose. A page that queries the
+  # database at build time passes a build that has one, and fails `docker build`.
+  production-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install WASM bindings generator
+        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+
+      - name: Install WASM optimizer
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - run: npm ci
+
+      - name: Build the client (no database)
+        run: npm run build
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: counterpoise
+          POSTGRES_PASSWORD: counterpoise
+          POSTGRES_DB: counterpoise
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U counterpoise"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install WASM build tools
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.128 --locked
+          sudo apt-get update && sudo apt-get install -y binaryen
+
+      - run: npm ci
+
+      - name: Create test databases
+        run: npm run db:create-test-dbs
+        env:
+          DATABASE_URL: postgresql://counterpoise:counterpoise@localhost:5432/counterpoise
+
+      - name: Run unit and integration tests with coverage
+        run: npm run test:coverage

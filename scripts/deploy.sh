@@ -111,10 +111,19 @@ BUILD_DIR_ORIGIN=$(git -C "$BUILD_DIR" remote get-url origin)
 
 # Never clean production automatically: it owns credentials and persistent dumps.
 # Refuse unexpected build-context files, including ignored nested checkouts.
+#
+# .DS_Store is the one exception. Finder writes it in every folder it opens,
+# at any depth, and it carries no project data. The build copies it into the
+# context, but nothing reads it. Refusing it only made someone delete the files
+# by hand before every deploy that followed a look in Finder.
 check_production_tree() {
   local extra modified
-  modified=$(git -C "$BUILD_DIR" status --porcelain)
-  extra=$(git -C "$BUILD_DIR" clean -nffdx -e "/$ENV_FILE" -e /backups/)
+  # Both halves must skip .DS_Store. `status` lists an untracked file unless an
+  # ignore rule hides it, and the rule that hides .DS_Store is often only in a
+  # user's global git config. List untracked files one by one, so the exclude
+  # also works inside a directory that holds nothing else.
+  modified=$(git -C "$BUILD_DIR" status --porcelain --untracked-files=all -- . ':(exclude,glob)**/.DS_Store')
+  extra=$(git -C "$BUILD_DIR" clean -nffdx -e "/$ENV_FILE" -e /backups/ -e .DS_Store)
   if [[ -n "$modified" || -n "$extra" ]]; then
     echo "Error: production checkout has unexpected files or changes. Resolve them before deploying:" >&2
     printf '%s\n%s\n' "$modified" "$extra" >&2
@@ -288,7 +297,15 @@ STAGE="build image"
 echo "==> Deploying $DEPLOY_TAG from $BUILD_DIR on main..."
 cd "$BUILD_DIR"
 # Recreate bind-mounting services so changed paths cannot retain deleted inodes.
-docker compose -f docker-compose.yml --env-file "$ENV_FILE" up -d --build --force-recreate app scheduler
+# The rust-api entrypoint runs the migrations before the server starts. --wait
+# makes this command fail unless every service is running and each healthcheck
+# passes, so a release whose migration fails or whose server does not come up
+# fails the deploy here.
+#
+# --remove-orphans removes the container of a service that the compose file no
+# longer has. The Next `app` service was one: its container held host port
+# 3000, which rust-api now takes.
+docker compose -f docker-compose.yml --env-file "$ENV_FILE" up -d --wait --wait-timeout 300 --build --force-recreate --remove-orphans rust-api scheduler
 
 trap - ERR
 echo "Deployed $DEPLOY_TAG (${DEPLOY_SHA:0:7}); verify /api/health before reporting release success."

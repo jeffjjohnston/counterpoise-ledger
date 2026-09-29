@@ -15,30 +15,33 @@ here; `docker-compose.yml` is production-only.
 
 ## Project Overview
 
-Counterpoise is a multi-book personal finance accounting application built with Next.js 16, implementing true double-entry bookkeeping with investment tracking. The app uses a PostgreSQL database for all data storage, supports user authentication, and includes a Moneydance import tool.
+Counterpoise is a multi-book personal finance accounting application with true double-entry bookkeeping and investment tracking. The UI is a React and React Router client that Vite builds into static files (`client/`, pages in `app/`). A Rust server (axum and sqlx, in `rust-api/`) serves every `/api` route, the MCP server and, in production, the client build; the browser runs its shared domain code as WASM. PostgreSQL holds all data, and Drizzle (`db/schema.ts`) is the only migrator. The app supports user authentication, shared books, and a Moneydance import tool (`ledger-cli import-moneydance`).
 
 ## Guides
 
 | Guide | Read it before you |
 | --- | --- |
-| [guides/architecture.md](guides/architecture.md) | Add a route, a page, or a database query. Holds the tech stack, the layered flow, and the three kinds of `db` |
+| [guides/architecture.md](guides/architecture.md) | Add a route, a page, or a database query. Holds the tech stack and the layered flow |
 | [guides/api-route-patterns.md](guides/api-route-patterns.md) | Write or change an API route |
+| [guides/api-contract.md](guides/api-contract.md) | Change a route a native client uses, or touch `openapi/` or `rust-api/server/src/openapi/` |
 | [guides/schema.md](guides/schema.md) | Work with any table. One entry per table, with the fields that are easy to get wrong |
-| [guides/library-reference.md](guides/library-reference.md) | Write a helper. It is probably already there — this lists every `lib/` function and every critical file |
+| [guides/library-reference.md](guides/library-reference.md) | Write a helper. It is probably already there — this lists the `lib/` client helpers and the critical Rust files |
 | [guides/investments.md](guides/investments.md) | Touch investment splits, positions, or FIFO lots |
 | [guides/securities-and-prices.md](guides/securities-and-prices.md) | Change price fetching, fixed-price securities, or the price entry pill |
 | [guides/recurring-transactions.md](guides/recurring-transactions.md) | Change recurring rules, their processing, or business-day shifts |
 | [guides/plaid-sync.md](guides/plaid-sync.md) | Change bank sync, auto-match, or reconciliation |
-| [guides/mcp-server.md](guides/mcp-server.md) | Add or change an MCP tool. Lists all 59 tools |
+| [guides/mcp-server.md](guides/mcp-server.md) | Add or change an MCP tool, or connect an MCP client. Lists all 63 tools |
 | [guides/components-and-ui.md](guides/components-and-ui.md) | Build or change UI |
 | [guides/testing.md](guides/testing.md) | Write a test, or claim that work is done |
 | [guides/database-management.md](guides/database-management.md) | Change the schema, add a migration, or touch the production database |
-| [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md) | Add an import to a route or an MCP tool, or write a payee, date, or split helper |
+| [guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md) | Upgrade an install past v1.48.0, the last PostgreSQL release, or change the notice that names this guide |
+| [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md) | Write a payee, date, or split helper |
 | [guides/moneydance-import.md](guides/moneydance-import.md) | Change the importer |
 | [guides/posthog-analytics.md](guides/posthog-analytics.md) | Add or query an analytics event |
 | [guides/release-and-deploy.md](guides/release-and-deploy.md) | Release, deploy, or change CI |
 | [guides/worktrees.md](guides/worktrees.md) | Work in a git worktree |
 | [guides/debugging.md](guides/debugging.md) | Debug a query, an unbalanced transaction, or a wrong position |
+| [guides/typesafe-experiment.md](guides/typesafe-experiment.md) | Change TypeSafe suggestions, their settings, the data sent, or retention |
 
 ## Skills
 
@@ -55,8 +58,9 @@ checks that the scripts alone do not enforce.
 ### Essential Commands
 ```bash
 docker compose -f docker-compose.dev.yml up -d --wait  # Dedicated dev/test PostgreSQL on localhost:5432
-npm run dev               # Start development server (http://localhost:3000)
-npm run build             # Build for production
+cargo run --manifest-path rust-api/Cargo.toml -p counterpoise-rust-api  # The API server (127.0.0.1:4000; needs DATABASE_URL). Every /api route runs here
+npm run dev               # Start the Vite dev server (http://localhost:3000); it sends /api to the Rust server
+npm run build             # Build the client into build/ (the Rust server serves it with COUNTERPOISE_STATIC_DIR)
 npm run lint              # Run ESLint
 npx tsc --noEmit          # Type-check without emitting files
 
@@ -76,11 +80,13 @@ npm run db:seed -- --book-id 2  # Seed into existing book (replaces book data on
 npm run db:rebuild-lots  # Regenerate investment lots from splits (guarded; --force to override)
 npx drizzle-kit studio   # Open Drizzle Studio (database GUI, requires DATABASE_URL)
 
-# MCP
-npm run mcp:dev          # Start MCP server for AI access to accounting data
+# MCP (the Rust server; needs DATABASE_URL and COUNTERPOISE_API_KEY)
+npm run mcp:dev          # Start the MCP server over stdio (cargo run ... -- mcp)
+npm run test:mcp:http    # Run the MCP tool suites over HTTP (needs the Rust server binary)
+npm run test:mcp:stdio   # Run the MCP tool suites over stdio
 
 # MCP (Docker — production)
-docker exec -i counterpoise-app-1 node /app/mcp-server.mjs  # Run MCP server via Docker
+docker exec -i -e COUNTERPOISE_API_KEY=cpk_... counterpoise-rust-api-1 counterpoise-rust-api mcp
 
 # Release & Deploy — read guides/release-and-deploy.md first
 ./scripts/release.sh [patch|minor|major] [--skip-checks] [--no-pr]  # In a RELEASE CHECKOUT: bump, name and push release/vX.Y.Z, open PR to main
@@ -95,11 +101,11 @@ npx vitest tests/lib/accounting.test.ts -t "validateSplits"  # Run specific test
 
 ### Import Scripts
 ```bash
-# Import from Moneydance export file into a specific book
-npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existing-book-id> --verbose
+# Import from Moneydance export file into a specific book (runs `ledger-cli import-moneydance`)
+npm run import:moneydance -- path/to/export.json --book-id <existing-book-id> --verbose
 
 # Dry run (no database writes)
-npx tsx scripts/import-moneydance/index.ts path/to/export.json --book-id <existing-book-id> --dry-run
+npm run import:moneydance -- path/to/export.json --book-id <existing-book-id> --dry-run
 ```
 
 Create the target book first, then use `npm run db:list-books` to discover its ID. `npm run db:seed` (without args) creates a sample `admin` user, sample book, and seed data.
@@ -108,8 +114,10 @@ Create the target book first, then use `npm run db:list-books` to discover its I
 
 ### After Making Code Changes
 
-After you change TypeScript files, always run `npx tsc --noEmit` and fix every
-error before you call the task complete. Run that exact command — `release.sh`
+After you change Rust files, run `cargo fmt --all`, `cargo clippy --workspace
+--all-targets -- -D warnings` and `cargo test --workspace` from `rust-api/`, as
+CI does. After you change TypeScript files, always run `npx tsc --noEmit` and
+fix every error before you call the task complete. Run that exact command — `release.sh`
 and CI run it, and it is the command that gates a release. If it reports errors
 that contradict `tsconfig.json`, the incremental cache is stale: see
 [guides/testing.md](guides/testing.md).
@@ -125,7 +133,7 @@ same day: see [guides/testing.md](guides/testing.md).
 ### Critical Accounting Rules
 
 1. **Balance Validation**: All transaction splits MUST sum to zero
-   - Use `validateSplits()` from `lib/accounting.ts` before creating transactions
+   - The Rust write paths check it with `validate_splits()` in `rust-api/core/src/accounting.rs`. The browser runs the same function through `lib/wasm-client.ts` before it sends a transaction
 
 2. **Normal Balances** (sign conventions):
    - Assets & Expenses: Positive (debit normal)
@@ -135,20 +143,21 @@ same day: see [guides/testing.md](guides/testing.md).
    - Shares stored in micros (multiply by 1,000,000)
    - Prices stored in micros
    - Cash amounts in cents
-   - **IMPORTANT**: `sharesMicros` in `investmentSplits` table should ALWAYS be stored as positive values. The `action` field (`buy` vs `sell`) determines the direction. Use `Math.abs(samtMicros)` when importing.
+   - `sharesMicros` in the `investmentSplits` table is always positive. The `action` field (`buy` vs `sell`) gives the direction. Use `Math.abs(samtMicros)` when importing.
 
 4. **Investment Position Calculation**:
-   - Use `aggregatePositions()` from `lib/investments.ts`
+   - Use `aggregate_positions()` in `rust-api/core/src/investments.rs`
    - Splits are processed chronologically; same-date ties retain insertion order
    - For `action === "split"`: apply the split ratio to existing shares (corporate action, not a sign-applied delta)
    - Otherwise: `sharesDelta = sign * sharesMicros` where `sign = action === "sell" ? -1 : 1`
 
 5. **Floating Transactions**:
    - `isFloating` boolean on transactions — effective date auto-advances to today
-   - Use `effectiveDateSql` from `lib/accounting.ts` in all SQL queries that filter/sort/aggregate by date
-   - Use `getEffectiveDate()` from `lib/accounting.ts` in client-side code for display and sorting
+   - In SQL that filters, sorts or aggregates by date, use the effective date: `CASE WHEN is_floating THEN CURRENT_DATE::text ELSE date END` (`EFFECTIVE_DATE` in `rust-api/server/src/routes/transactions.rs`; the other Rust route modules and `rust-api/db/src/lots.rs` repeat it)
+   - Use `getEffectiveDate()` from `lib/wasm-client.ts` in client-side code for display and sorting
    - When reconciling a floating transaction: set `isFloating=false`, update `date` to cleared date, set `isReconciled=true`
    - Stored `date` field retains the original entry date while floating; it's overwritten with the cleared date on reconciliation
+   - A floating row sorts **above** the settled rows sharing its effective date. The register's `ORDER BY` (effective date, then `is_floating`, then `id`, each descending) in `rust-api/server/src/routes/transactions.rs` is the definition; the starting-balance boundary in the same file and `TransactionList` (display order and its reversed running-balance order) repeat it and must move with it
 
 ### Read the guide before you touch these
 
@@ -161,29 +170,32 @@ the incident that produced it.
 - **Never alter the production database with direct DDL.** Drizzle tracks
   applied migrations by hash, and a manual change desyncs the schema from the
   migration history → [guides/database-management.md](guides/database-management.md)
-- **A module an API route or an MCP tool imports must contain declarations
-  only.** No CLI guard, no top-level `await`, no I/O. A bundled main-module
-  guard once nearly ran `DROP SCHEMA public CASCADE` against production →
-  [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md)
-- **`withAdvisoryLock` hands its callback a different `db`.** It is bound to a
-  reserved connection that has no `transaction()`. Go through
-  `getDbForConnection`, never `drizzle(connection)` →
-  [guides/architecture.md](guides/architecture.md)
-- **Lots and allocations are derived state.** `rebuildLots()` is the only
-  runtime inserter. The transaction CRUD paths call it inside the same
-  transaction as the write; the importer and the seed are the exceptions, and
-  rebuild per pair afterwards → [guides/investments.md](guides/investments.md)
-- **Never spread a raw request body into `values()`.** The zod schema is what
-  stops a client setting `bookId` or `id`. An id that references another row
-  must also be proved to belong to this book →
+- **Lots and allocations are derived state.** `rebuild_lots()` in
+  `rust-api/db/src/lots.rs` is the only runtime inserter. The transaction write
+  paths call it inside the same transaction as the write; the importer and the
+  seed are the exceptions, and rebuild per pair afterwards. The Docker
+  entrypoint's data migration runs `ledger-cli rebuild-lots`; `npm run
+  db:migrate` runs the TypeScript copy (`lib/lots-db.ts`), and a test holds
+  the two to the same rows → [guides/investments.md](guides/investments.md)
+- **Never write a request field that the route's validator did not name.**
+  The validator is what stops a client setting `bookId` or `id`. An id that
+  references another row must also be proved to belong to this book →
   [guides/api-route-patterns.md](guides/api-route-patterns.md)
-- **`isError(auth)` puts the response on `auth.error`, not `auth.response`** →
-  [guides/library-reference.md](guides/library-reference.md)
-- **`normalizePayeeName()` does not lowercase.** "IKEA" and "Ikea" are
+- **Payee `normalize_name()` does not lowercase.** "IKEA" and "Ikea" are
   deliberately distinct payees → [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md)
 - **The mobile/desktop breakpoint is declared in two places** — Tailwind `lg:`
   classes and `MOBILE_BREAKPOINT`. They must move together →
   [guides/components-and-ui.md](guides/components-and-ui.md)
-- **A tool's `inputSchema` must go through `toolShape()`.** Spreading `.shape`
-  drops `.refine()` and `.superRefine()`, so the tool accepts input the HTTP
-  route rejects → [guides/mcp-server.md](guides/mcp-server.md)
+- **`rust-api/server/mcp-tools.json` is the source of each MCP tool's
+  schema.** A `.describe()` or a rule in `lib/schemas/` no longer reaches a
+  tool; change the manifest and the Rust check together →
+  [guides/mcp-server.md](guides/mcp-server.md)
+- **A book route or MCP tool declares its access level.** A route passes
+  `AccessLevel::Read` to `authenticate_book` for a GET, `Write` for a change,
+  and `Owner` for an owner-only operation; an MCP handler gives `Level::Read`
+  for a read-only tool. A static test fails on a mismatch →
+  [guides/api-route-patterns.md](guides/api-route-patterns.md)
+- **Naive database timestamps store UTC wall-clock values.** The database
+  session uses the app timezone for calendar dates, so `NOW()` is unsafe for
+  `timestamp without time zone` writes. Bind UTC explicitly and test under a
+  non-UTC `TZ` → [guides/schema.md](guides/schema.md#timezones-and-timestamp-columns)

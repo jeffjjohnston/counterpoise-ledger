@@ -1,6 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { PositionsTable } from "@/components/accounts/PositionsTable";
+
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation()
+);
 
 describe("PositionsTable", () => {
   it("renders investment, cash, and total account value lines", () => {

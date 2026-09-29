@@ -5,6 +5,27 @@ import { e2eDatabaseUrl } from "./database";
 import { rebuildLots } from "../../lib/lots-db";
 import * as schema from "../../db/schema";
 
+/** Only the accounts and one register row needed by basic CRUD and access tests. */
+export async function seedSmallBookData(sql: postgres.Sql, bookId: number) {
+  const now = new Date();
+  const accounts = await insertAccounts(sql, bookId, [
+    { name: "Checking", type: "asset" },
+    { name: "Savings", type: "asset" },
+    { name: "Groceries", type: "expense" },
+    { name: "Salary", type: "income" },
+  ]);
+  const checking = accounts.find((account) => account.name === "Checking")!;
+  const salary = accounts.find((account) => account.name === "Salary")!;
+  await insertTransactionWithSplits(sql, bookId, {
+    date: formatDate(now),
+    description: "Opening salary",
+    splits: [
+      { accountId: checking.id, amount: 10000 },
+      { accountId: salary.id, amount: -10000 },
+    ],
+  });
+}
+
 const formatDate = (date: Date) => {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -23,21 +44,33 @@ const formatTransferDate = (index: number) => {
 };
 
 
-export async function seedBookData(sql: postgres.Sql, bookId: number) {
-async function insertAccount(
-  sql: postgres.Sql,
-  data: { name: string; type: string; subtype?: string; isInvestmentCash?: boolean; parentId?: number }
-) {
+type SeedAccount = { name: string; type: string; subtype?: string; isInvestmentCash?: boolean; parentId?: number };
+
+async function insertAccounts(sql: postgres.Sql, bookId: number, data: SeedAccount[]) {
   const now = new Date();
-  const [row] = await sql`
-    INSERT INTO accounts (book_id, name, type, subtype, is_investment_cash, parent_id, created_at, updated_at)
-    VALUES (${bookId}, ${data.name}, ${data.type}, ${data.subtype ?? null}, ${data.isInvestmentCash ?? false}, ${data.parentId ?? null}, ${now}, ${now})
+  const rows = data.map((account) => ({
+    book_id: bookId,
+    name: account.name,
+    type: account.type,
+    subtype: account.subtype ?? null,
+    is_investment_cash: account.isInvestmentCash ?? false,
+    parent_id: account.parentId ?? null,
+    created_at: now,
+    updated_at: now,
+  }));
+  const inserted = await sql`
+    INSERT INTO accounts ${sql(rows, "book_id", "name", "type", "subtype", "is_investment_cash", "parent_id", "created_at", "updated_at")}
     RETURNING id, name, type
   `;
-  return { id: row.id as number, name: data.name, type: data.type };
+  return inserted.map((row) => ({ id: row.id as number, name: row.name as string, type: row.type as string }));
 }
 
-async function insertPayee(sql: postgres.Sql, name: string) {
+async function insertAccount(sql: postgres.Sql, bookId: number, data: SeedAccount) {
+  const [account] = await insertAccounts(sql, bookId, [data]);
+  return account;
+}
+
+async function insertPayee(sql: postgres.Sql, bookId: number, name: string) {
   const now = new Date();
   const [row] = await sql`INSERT INTO payees (book_id, name, created_at) VALUES (${bookId}, ${name}, ${now}) RETURNING id`;
   return { id: row.id as number, name };
@@ -45,6 +78,7 @@ async function insertPayee(sql: postgres.Sql, name: string) {
 
 async function insertSecurity(
   sql: postgres.Sql,
+  bookId: number,
   data: { name: string; symbol: string; securityType: string }
 ) {
   const now = new Date();
@@ -58,6 +92,7 @@ async function insertSecurity(
 
 async function insertSecurityPrice(
   sql: postgres.Sql,
+  bookId: number,
   data: { securityId: number; priceDate: string; priceMicros: number }
 ) {
   await sql`
@@ -68,6 +103,7 @@ async function insertSecurityPrice(
 
 async function insertRecurringRule(
   sql: postgres.Sql,
+  bookId: number,
   data: {
     name: string;
     frequency: string;
@@ -97,6 +133,7 @@ async function insertRecurringRule(
 
 async function insertTransactionWithSplits(
   sql: postgres.Sql,
+  bookId: number,
   data: {
     date: string;
     description: string;
@@ -111,27 +148,30 @@ async function insertTransactionWithSplits(
   `;
   const txnId = row.id as number;
 
-  for (const split of data.splits) {
-    await sql`
-      INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount)
-      VALUES (${bookId}, ${txnId}, ${split.accountId}, ${split.amount})
-    `;
-  }
+  await sql`
+    INSERT INTO transaction_splits ${sql(data.splits.map((split) => ({
+      book_id: bookId,
+      transaction_id: txnId,
+      account_id: split.accountId,
+      amount: split.amount,
+    })), "book_id", "transaction_id", "account_id", "amount")}
+  `;
   return { id: txnId };
 }
 
+export async function seedBookData(sql: postgres.Sql, bookId: number) {
   const seed = buildSeedData();
 
-  const checking = await insertAccount(sql, { name: "Checking", type: "asset" });
-  const savings = await insertAccount(sql, { name: "Savings", type: "asset" });
-  const salary = await insertAccount(sql, { name: "Salary", type: "income" });
-  const groceries = await insertAccount(sql, {
+  const checking = await insertAccount(sql, bookId, { name: "Checking", type: "asset" });
+  const savings = await insertAccount(sql, bookId, { name: "Savings", type: "asset" });
+  const salary = await insertAccount(sql, bookId, { name: "Salary", type: "income" });
+  const groceries = await insertAccount(sql, bookId, {
     name: "Groceries",
     type: "expense",
   });
-  const rent = await insertAccount(sql, { name: "Rent", type: "expense" });
+  const rent = await insertAccount(sql, bookId, { name: "Rent", type: "expense" });
 
-  await insertTransactionWithSplits(sql, {
+  await insertTransactionWithSplits(sql, bookId, {
     date: seed.dates.currentMonth,
     description: "Salary (current month)",
     splits: [
@@ -140,7 +180,7 @@ async function insertTransactionWithSplits(
     ],
   });
 
-  await insertTransactionWithSplits(sql, {
+  await insertTransactionWithSplits(sql, bookId, {
     date: seed.dates.currentMonth,
     description: "Groceries (current month)",
     splits: [
@@ -149,7 +189,7 @@ async function insertTransactionWithSplits(
     ],
   });
 
-  await insertTransactionWithSplits(sql, {
+  await insertTransactionWithSplits(sql, bookId, {
     date: seed.dates.lastMonth,
     description: "Salary (last month)",
     splits: [
@@ -158,7 +198,7 @@ async function insertTransactionWithSplits(
     ],
   });
 
-  await insertTransactionWithSplits(sql, {
+  await insertTransactionWithSplits(sql, bookId, {
     date: seed.dates.lastMonth,
     description: "Rent (last month)",
     splits: [
@@ -167,7 +207,7 @@ async function insertTransactionWithSplits(
     ],
   });
 
-  await insertTransactionWithSplits(sql, {
+  await insertTransactionWithSplits(sql, bookId, {
     date: seed.dates.lastYear,
     description: "Salary (last year)",
     splits: [
@@ -176,7 +216,7 @@ async function insertTransactionWithSplits(
     ],
   });
 
-  await insertTransactionWithSplits(sql, {
+  await insertTransactionWithSplits(sql, bookId, {
     date: seed.dates.lastYear,
     description: "Groceries (last year)",
     splits: [
@@ -186,7 +226,7 @@ async function insertTransactionWithSplits(
   });
 
   for (let index = 0; index < seed.transferCount; index += 1) {
-    await insertTransactionWithSplits(sql, {
+    await insertTransactionWithSplits(sql, bookId, {
       date: formatTransferDate(index + 1),
       description: `Transfer ${index + 1}`,
       splits: [
@@ -197,8 +237,8 @@ async function insertTransactionWithSplits(
   }
 
   // Payees
-  const wholeFoods = await insertPayee(sql, "Whole Foods");
-  const acmeCorp = await insertPayee(sql, "Acme Corp");
+  const wholeFoods = await insertPayee(sql, bookId, "Whole Foods");
+  const acmeCorp = await insertPayee(sql, bookId, "Acme Corp");
 
   // Link salary transactions to Acme Corp payee
   await sql`UPDATE transactions SET payee_id = ${acmeCorp.id} WHERE book_id = ${bookId} AND description LIKE '%Salary%'`;
@@ -206,16 +246,16 @@ async function insertTransactionWithSplits(
   await sql`UPDATE transactions SET payee_id = ${wholeFoods.id} WHERE book_id = ${bookId} AND description LIKE '%Groceries%'`;
 
   // Investment accounts
-  const brokerage = await insertAccount(sql, { name: "Brokerage", type: "asset", subtype: "investment" });
-  const brokerageCash = await insertAccount(sql, { name: "Brokerage (Cash)", type: "asset", subtype: "cash", isInvestmentCash: true, parentId: brokerage.id });
-  const retirement = await insertAccount(sql, { name: "Retirement", type: "asset", subtype: "investment" });
-  await insertAccount(sql, { name: "Retirement (Cash)", type: "asset", subtype: "cash", isInvestmentCash: true, parentId: retirement.id });
+  const brokerage = await insertAccount(sql, bookId, { name: "Brokerage", type: "asset", subtype: "investment" });
+  const brokerageCash = await insertAccount(sql, bookId, { name: "Brokerage (Cash)", type: "asset", subtype: "cash", isInvestmentCash: true, parentId: brokerage.id });
+  const retirement = await insertAccount(sql, bookId, { name: "Retirement", type: "asset", subtype: "investment" });
+  await insertAccount(sql, bookId, { name: "Retirement (Cash)", type: "asset", subtype: "cash", isInvestmentCash: true, parentId: retirement.id });
 
   // Security
-  const vti = await insertSecurity(sql, { name: "Vanguard Total Stock Market", symbol: "VTI", securityType: "etf" });
+  const vti = await insertSecurity(sql, bookId, { name: "Vanguard Total Stock Market", symbol: "VTI", securityType: "etf" });
 
   // Security price
-  await insertSecurityPrice(sql, {
+  await insertSecurityPrice(sql, bookId, {
     securityId: vti.id,
     priceDate: seed.dates.currentMonth,
     priceMicros: 250_000_000,
@@ -226,7 +266,7 @@ async function insertTransactionWithSplits(
   const shareMicros = 4_000_000;
   const priceMicros = 250_000_000;
   const grossCents = 100_000; // $1,000
-  const buyTxn = await insertTransactionWithSplits(sql, {
+  const buyTxn = await insertTransactionWithSplits(sql, bookId, {
     date: seed.dates.lastYear,
     description: "Buy VTI",
     splits: [
@@ -267,12 +307,12 @@ async function insertTransactionWithSplits(
   // 1 of lot 2's 2 shares (basis $300, proceeds $400, gain $100 short), leaving
   // one open lot of 1 share. Dating the sell in the current month puts it inside
   // the report's default range, which runs Jan 1 to today.
-  const bnd = await insertSecurity(sql, {
+  const bnd = await insertSecurity(sql, bookId, {
     name: "Vanguard Total Bond Market",
     symbol: "BND",
     securityType: "etf",
   });
-  await insertSecurityPrice(sql, {
+  await insertSecurityPrice(sql, bookId, {
     securityId: bnd.id,
     priceDate: seed.dates.currentMonth,
     priceMicros: 400_000_000,
@@ -286,7 +326,7 @@ async function insertTransactionWithSplits(
 
   for (const trade of bndTrades) {
     const isBuy = trade.action === "buy";
-    const txn = await insertTransactionWithSplits(sql, {
+    const txn = await insertTransactionWithSplits(sql, bookId, {
       date: trade.date,
       description: trade.desc,
       splits: [
@@ -313,7 +353,7 @@ async function insertTransactionWithSplits(
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowStr = formatDate(tomorrow);
 
-  await insertRecurringRule(sql, {
+  await insertRecurringRule(sql, bookId, {
     name: "Monthly Rent",
     frequency: "monthly",
     startDate: seed.dates.lastYear,

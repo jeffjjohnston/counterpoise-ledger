@@ -2,16 +2,11 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, afterEach } from "vitest";
 import HomePage from "@/app/b/[bookId]/page";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-}));
-
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
-    <a href={href}>{children}</a>
-  ),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+  })
+);
 
 const accountsPayload = [
   {
@@ -90,6 +85,48 @@ describe("HomePage", () => {
 
     expect(screen.queryByText("Fidelity Cash")).not.toBeInTheDocument();
     expect(screen.getByText("Cash $10.00")).toBeInTheDocument();
+  });
+
+  it("shows hand-calculated assets, liabilities, and net worth without counting investment cash twice", async () => {
+    const accounts = [
+      ...accountsPayload,
+      {
+        id: 4,
+        name: "Credit Card",
+        type: "liability",
+        subtype: "credit_card",
+        parentId: null,
+        isInvestmentCash: false,
+        icon: null,
+        isActive: true,
+        balance: -50000,
+      },
+    ];
+    // Checking $2,500 + investments $400 market value + $10 cash = $2,910.
+    // The investment account's $500 cost basis is not its market value, and
+    // its $10 cash child is already included in the investment effective balance.
+    // A $500 credit balance leaves $2,410 net worth.
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accounts } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/account-values")) {
+        return { ok: true, json: async () => [{ accountId: 1, marketValueCents: 40000 }] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }));
+
+    render(<HomePage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Net Worth").parentElement).toHaveTextContent("$2,410.00");
+    });
+    expect(screen.getByText("Assets", { selector: "p" }).parentElement).toHaveTextContent("$2,910.00");
+    expect(screen.getByText("Liabilities", { selector: "p" }).parentElement).toHaveTextContent("$500.00");
   });
 
   it("uses book-scoped transaction links for account rows", async () => {

@@ -2,6 +2,8 @@ import { sql } from "drizzle-orm";
 import type { AccountWithBalance } from "@/types";
 import { toDateString, getAccountShortName } from "@/lib/formatters";
 import { transactions } from "@/db/schema";
+import { getInvestmentGrossAmountCents } from "@/lib/investment-arithmetic";
+export { getInvestmentGrossAmountCents } from "@/lib/investment-arithmetic";
 
 /** `transaction_splits.amount` is an int4 column holding whole cents. */
 const INT4_MIN = -2_147_483_648;
@@ -74,47 +76,6 @@ export type InvestmentSellBuilderInput = {
   feesCents?: number;
   costBasisCents?: number;
 };
-
-/** micros x micros -> cents: 10^6 x 10^6 / 10^2. */
-const MICROS_PRODUCT_PER_CENT = 10_000_000_000n;
-
-/**
- * floor((2n + d) / 2d) — the exact integer form of `Math.round(n / d)`,
- * including its half-toward-positive-infinity tie rule, with no double
- * arithmetic anywhere. BigInt division truncates toward zero, so the negative
- * branch corrects it to a true floor; shares and prices are non-negative by
- * contract, but a total function costs one comparison.
- */
-function roundHalfUp(numerator: bigint, denominator: bigint): bigint {
-  const doubled = numerator * 2n + denominator;
-  const divisor = denominator * 2n;
-  const quotient = doubled / divisor;
-  return doubled < 0n && doubled % divisor !== 0n ? quotient - 1n : quotient;
-}
-
-/**
- * The single definition of "shares x price, in cents". `calculateValueCents` in
- * lib/investments.ts delegates here, so positions, lot proceeds and the buy /
- * sell split builders cannot disagree about the same trade.
- *
- * Exact rather than floating point for two reasons found by measurement, not
- * theory. A double loses the half-cent tie at 25 shares x $0.0014 (3.5c, which
- * has to round to 4c), and past 2^53 — reached by any trade over ~$9,000 once
- * both operands are in micros — it cannot represent the product at all. Neither
- * shows up in a typical trade, and both are silent when they do.
- *
- * Inputs are rounded because a caller may have produced them by multiplying
- * user input by 10^6; BigInt() throws on a fractional Number, and a crash is a
- * worse failure than the cent this function exists to get right.
- */
-export function getInvestmentGrossAmountCents(
-  sharesMicros: number,
-  priceMicros: number
-): number {
-  const shares = BigInt(Math.round(sharesMicros));
-  const price = BigInt(Math.round(priceMicros));
-  return Number(roundHalfUp(shares * price, MICROS_PRODUCT_PER_CENT));
-}
 
 export function buildDividendSplits(
   input: InvestmentIncomeBuilderInput
@@ -1084,9 +1045,10 @@ type IconResolvable = { icon: string | null; parentId: number | null };
  * short-circuit can only ever exist in one place.
  *
  * `if (current.icon)` is truthiness, not a null check, so an empty string
- * would also read as "inherit". That is safe only because
- * `accountIconSchema` in `lib/schemas/accounts.ts` — the sole write path to
- * this column — maps `""` to `null` before it ever reaches the database.
+ * would also read as "inherit". That is safe only because the server's
+ * `account_icon()` in `rust-api/server/src/validation.rs` — the sole write
+ * path to this column — maps `""` to `null` before it ever reaches the
+ * database.
  */
 function findIconSource<T extends IconResolvable>(
   account: T,

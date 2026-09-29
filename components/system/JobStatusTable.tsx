@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { formatRelativeAge } from "@/lib/formatters";
+import { formatRelativeAge } from "@/lib/wasm-client";
 import { apiGet } from "@/lib/api-client";
 import {
   evaluateJobHealth,

@@ -147,6 +147,10 @@ case "$RELEASE_HEAD_STATE" in
     # recognise this commit on a retry. Changing the wording here without
     # changing it there turns every resume back into a double bump.
     npm version "$BUMP_TYPE" --no-git-tag-version >/dev/null
+    # info.version in the contract tracks package.json. Regenerate so the release
+    # commit carries a current openapi.json and CI's openapi:check stays green.
+    npm run openapi:generate
+    git add openapi/openapi.json
     NEW_VERSION="v$(release_declared_version)"
     git commit --quiet --all --message "release: $NEW_VERSION"
     echo "New version: $NEW_VERSION"

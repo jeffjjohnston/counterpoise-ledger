@@ -1,0 +1,23 @@
+[workspace]
+members = ["core", "db", "server", "cli"]
+default-members = ["server"]
+resolver = "3"
+
+# Less debuginfo makes dev and test builds faster, mostly on Linux, where the
+# linker must process all of it. The workspace crates keep line tables, so a
+# backtrace still shows the file and the line. The dependencies get none. To
+# use a debugger on the workspace code, build with CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = "line-tables-only"
+
+# `debug = false` alone also makes Cargo strip the dependencies. On macOS the
+# stripped sqlx-macros proc-macro then does not load ("mis-aligned LINKEDIT
+# string pool"), so do not strip.
+[profile.dev.package."*"]
+debug = false
+strip = "none"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

@@ -1,17 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
+import { Link } from "@/lib/navigation";
 import { useBookId } from "@/hooks/useBookId";
 import { AccountCard } from "@/components/accounts/AccountCard";
 import { Card, CardHeader } from "@/components/ui/Card";
-import { formatCurrency, formatDate, getAccountShortName, toDateString } from "@/lib/formatters";
+import { formatCurrency, formatDate, getAccountShortName, toDateString } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import {
   getDisplayBalance,
   BALANCE_SHEET_TYPES,
   flattenAccounts,
-} from "@/lib/accounting";
+} from "@/lib/wasm-client";
 import { apiGet } from "@/lib/api-client";
 import type { AccountWithBalance, TransactionWithSplits } from "@/types";
 import type { AccountMarketValue } from "@/lib/investments";

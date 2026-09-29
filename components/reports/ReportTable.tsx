@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback } from "react";
-import { formatCurrency, formatDate } from "@/lib/formatters";
+import { formatCurrency, formatDate } from "@/lib/wasm-client";
 import { Button } from "@/components/ui/Button";
 import type { ReportGroupNode, ReportSplit } from "@/lib/reports";
 

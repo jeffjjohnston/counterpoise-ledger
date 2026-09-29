@@ -36,9 +36,10 @@ export function IconPicker({
   // icon", so the button style carries the distinction rather than a
   // placeholder.
   // A strict null check, not truthiness — unlike `findIconSource` in
-  // lib/accounting.ts. Both are safe only because `accountIconSchema`
-  // (lib/schemas/accounts.ts) maps a stored "" to null before either side
-  // ever sees it; if that ever changed, this line and that one would disagree.
+  // lib/accounting.ts. Both are safe only because the server's
+  // `account_icon()` (rust-api/server/src/validation.rs) maps a stored "" to
+  // null before either side ever sees it; if that ever changed, this line and
+  // that one would disagree.
   const isSet = value !== null;
   const shown = value ?? inheritedIcon;
 

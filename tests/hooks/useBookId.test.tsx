@@ -2,9 +2,11 @@ import { describe, it, expect, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 import { useBookId } from "@/hooks/useBookId";
 
-vi.mock("next/navigation", () => ({
-  useParams: vi.fn().mockReturnValue({ bookId: "42" }),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: vi.fn().mockReturnValue({ bookId: "42" }),
+  })
+);
 
 describe("useBookId", () => {
   it("returns bookId from route params", () => {

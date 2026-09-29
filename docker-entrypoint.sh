@@ -1,4 +1,8 @@
 #!/bin/sh
+# The entrypoint of the production image. The server starts only after the
+# migrations and the lot rebuild succeed, so a new server never runs against a
+# schema that it does not expect. A failure stops the container, and the
+# deploy (`up --wait`) fails.
 set -e
 
 # Before migrations, because a run that gets this far has already connected
@@ -12,7 +16,7 @@ node /app/migrate.js
 # startup on purpose: the schema migration empties investment_lots, so starting
 # anyway would serve zero cost basis everywhere with no visible error.
 echo "Rebuilding investment lots..."
-node /app/rebuild-lots.js
+ledger-cli rebuild-lots
 
-echo "Starting Next.js server..."
-exec node /app/server.js
+echo "Starting the server..."
+exec counterpoise-rust-api

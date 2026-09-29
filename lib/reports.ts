@@ -1,5 +1,4 @@
-import { getDisplayBalance } from "@/lib/accounting";
-import { toDateString } from "@/lib/formatters";
+import { getDisplayBalance, toDateString } from "@/lib/wasm-client";
 
 export type GroupDimension = "week" | "month" | "year" | "payee" | "account";
 

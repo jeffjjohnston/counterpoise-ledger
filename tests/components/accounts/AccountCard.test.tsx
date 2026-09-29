@@ -1,23 +1,11 @@
 import { render, screen } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
-import type { ReactNode } from "react";
 import { AccountCard } from "@/components/accounts/AccountCard";
 import type { AccountWithBalance } from "@/types";
 
-vi.mock("next/link", () => ({
-  default: ({
-    href,
-    children,
-    ...props
-  }: {
-    href: string;
-    children: ReactNode;
-  }) => (
-    <a href={href} {...props}>
-      {children}
-    </a>
-  ),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation()
+);
 
 describe("AccountCard", () => {
   it("indents child accounts beneath their parents", () => {

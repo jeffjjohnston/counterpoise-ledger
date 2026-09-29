@@ -4,16 +4,14 @@ One of the guides [CLAUDE.md](../CLAUDE.md) points to. Read that file first;
 it carries the rules that apply everywhere and says when to come here.
 
 ## Transaction Balance Validation
-Before inserting transactions, always validate:
-```typescript
-import { validateSplits } from "@/lib/accounting";
-if (!validateSplits(splits)) {
-  throw new Error("Transaction splits must sum to zero");
-}
-```
+The splits of a transaction must sum to zero. The Rust transaction routes
+check this before they write, with `validate_splits()` in
+`rust-api/core/src/accounting.rs`. The browser runs the same check through
+the WASM core, and `validateSplits()` in `lib/accounting.ts` is the
+TypeScript copy.
 
 ## Investment Shares Sign
-Investment split `sharesMicros` should ALWAYS be positive. The `action` field determines direction:
+Investment split `sharesMicros` is always positive. The `action` field determines direction:
 - Buy: positive shares added to position
 - Sell: positive shares subtracted from position (sign applied in calculation)
 
@@ -23,47 +21,13 @@ Investment split `sharesMicros` should ALWAYS be positive. The `action` field de
 - Use `formatDate()` for display formatting
 
 ## Payee Normalization
-Payees are deduplicated using normalized names:
-```typescript
-import { normalizePayeeName } from "@/lib/payees";
-const normalized = normalizePayeeName(input); // Trims, collapses whitespace runs, normalizes curly quotes to '
-```
+Payees are deduplicated using normalized names. `normalize_name()` in
+`rust-api/server/src/routes/payees.rs` trims, collapses whitespace runs and
+straightens curly quotes to `'`. It uses the JavaScript whitespace set
+(`is_js_whitespace` in `rust-api/core/src/js.rs`), not Rust's.
 
 **It does not lowercase** — "IKEA" and "Ikea" are deliberately distinct
-payees. The importer has its own copy, `normalizeName()` in
-`scripts/import-moneydance/utils/format.ts`, which must stay behaviorally
-identical or an import creates duplicates of payees the app already has.
-
-## Modules Reachable From a Route or an MCP Tool Must Not Run Code at Import
-
-Anything an API route or an `mcp/tools/*` module imports — directly or through
-a chain — must contain **declarations only** at the top level. No CLI guard, no
-`await`, no I/O.
-
-The reason is the bundler, not the module system. `scripts/bundle-node-entrypoints.mjs`
-esbuild-bundles `mcp/server.ts` into the single `/app/mcp-server.mjs` that the
-Docker MCP client runs. Once a module is inlined there, `import.meta.url` is the
-**bundle's** URL, so the standard main-module guard
-
-```ts
-const isMainModule =
-  process.argv[1] !== undefined &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-```
-
-evaluates **true** under `node /app/mcp-server.mjs` and runs whatever it guards.
-
-This shipped once. `lib/books.ts` imported `seedBook` from `db/seed.ts` for the
-demo-book feature, which pulled `db/seed.ts`'s CLI guard into the bundle, where
-it would have run `DROP SCHEMA public CASCADE` against the production database
-on the first MCP connection after deploy. `db/seed.ts` is now declarations only
-and its CLI lives in `db/seed-cli.ts`.
-
-Every ordinary gate is blind to this: `npm run mcp:dev` is `npx tsx mcp/server.ts`,
-where the imported module is separate and `argv[1]` is the server, so the guard
-is false — and vitest, `tsc` and ESLint never build the artifact at all.
-`tests/mcp/bundle-safety.test.ts` is the only check that does; it builds both
-bundle targets with the real config and asserts the output carries no
-`DROP SCHEMA` and no main-module guard. **Extracting code into `lib/` reads like
-a pure refactor, which is exactly why nobody looks** — check a module's
-top-level statements before making it reachable from a route or a tool.
+payees. The importer has its own copy, `normalize_name()` in
+`rust-api/cli/src/import_moneydance/values.rs`, and the TypeScript copy is
+`normalizePayeeName()` in `lib/payees.ts`. They must stay behaviorally
+identical, or an import creates duplicates of payees the app already has.

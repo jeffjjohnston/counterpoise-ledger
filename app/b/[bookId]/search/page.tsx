@@ -1,12 +1,11 @@
 "use client";
 
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
-import { useSearchParams, useRouter } from "next/navigation";
-import Link from "next/link";
+import { Link, useRouter, useSearchParams } from "@/lib/navigation";
 import { useBookId } from "@/hooks/useBookId";
 import { DateRangeFilter } from "@/components/ui/DateRangeFilter";
-import { formatCurrency, formatDate } from "@/lib/formatters";
-import { getOccurrenceDate } from "@/lib/recurring";
+import { formatCurrency, formatDate } from "@/lib/wasm-client";
+import { getOccurrenceDate } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { apiGet } from "@/lib/api-client";
 

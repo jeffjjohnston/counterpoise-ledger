@@ -11,13 +11,14 @@ import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
 import { PayeeAutocomplete } from "@/components/ui/PayeeAutocomplete";
 import { Textarea } from "@/components/ui/Textarea";
 import { SplitEditor } from "./SplitEditor";
+import { tabTo } from "@/components/transactions/tab-to";
 import {
   toDateString,
   parseStrictCurrency,
   resolveAmountOnBlur,
   getAccountShortName,
-} from "@/lib/formatters";
-import { validateSplits } from "@/lib/accounting";
+} from "@/lib/wasm-client";
+import { validateSplits } from "@/lib/wasm-client";
 import type {
   AccountWithBalance,
   InvestmentSplitInput,
@@ -29,6 +30,7 @@ import { PlaidBanner } from "./PlaidBanner";
 import { useInvestmentEntry } from "./useInvestmentEntry";
 import { InvestmentEntrySection } from "./InvestmentEntrySection";
 import { NewExpenseSubflow } from "./NewExpenseSubflow";
+import { TransactionAuthorship } from "./TransactionAuthorship";
 
 interface TransactionFormProps {
   accounts: AccountWithBalance[];
@@ -53,6 +55,8 @@ interface TransactionFormProps {
   onAccountsUpdate?: () => void;
   isInvestmentAccountSelected?: boolean;
   fullLayout?: boolean;
+  /** Show the transaction without edit controls. For a viewer. */
+  readOnly?: boolean;
 }
 
 type TransactionMode = "simple" | "journal" | "investment";
@@ -74,6 +78,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   onAccountsUpdate,
   isInvestmentAccountSelected = false,
   fullLayout = false,
+  readOnly = false,
 }, ref) {
   const bookId = useBookId();
   const toast = useToast();
@@ -133,6 +138,8 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   const formRef = useRef<HTMLFormElement>(null);
   const descriptionRef = useRef<HTMLInputElement>(null);
   const payeeRef = useRef<HTMLInputElement>(null);
+  const addButtonRef = useRef<HTMLButtonElement>(null);
+  const journalAddButtonRef = useRef<HTMLButtonElement>(null);
   const autoFilledPayeeId = useRef<number | null>(null);
 
   const compact = !fullLayout && !editingTransaction;
@@ -156,6 +163,14 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     form.addEventListener("keydown", handler);
     return () => form.removeEventListener("keydown", handler);
   }, []);
+
+  // Amount is the last field of the register's quick-entry row and Add is the
+  // next element in it, so Tab is how the row gets committed from the
+  // keyboard. tabTo() explains why the form moves the focus itself. The
+  // desktop layout does not use this: its amount field is not the last one
+  // before its submit button.
+  const handleAmountKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) =>
+    tabTo(e, addButtonRef);
 
   const formatMicrosInput = (value: number) => {
     const formatted = (value / 1_000_000).toFixed(6);
@@ -550,6 +565,8 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    // A viewer's Enter key must not submit the form.
+    if (readOnly) return;
 
     let finalSplits: SplitInput[];
     let investmentSplits: InvestmentSplitInput[] | undefined;
@@ -833,6 +850,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               onBlur={() => {
                 setSimpleAmount(resolveAmountOnBlur(simpleAmount));
               }}
+              onKeyDown={handleAmountKeyDown}
               placeholder="0.00"
               required
               selectOnFocus
@@ -843,9 +861,20 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               it commits, and inconsistent with Journal and Investment modes,
               whose identical action is a full "Add Transaction" button. The
               aria-label stays: it contains the visible label, so it satisfies
-              Label in Name, and it says which thing is being added. */}
-          <div className="pr-4">
-            <Button type="submit" aria-label="Add Transaction" className="mb-px w-full">
+              Label in Name, and it says which thing is being added.
+
+              The box copies a compact Input: py-1, text-sm and a 1px border
+              (transparent here) give the same 30px height, so the top and
+              bottom edges align with the fields. The button keeps its natural
+              width at the right edge. Full width stretched it across three
+              register columns, wider than any field in the row. */}
+          <div className="pr-4 flex justify-end">
+            <Button
+              ref={addButtonRef}
+              type="submit"
+              aria-label="Add Transaction"
+              className="py-1 px-5 border border-transparent"
+            >
               Add
             </Button>
           </div>
@@ -885,9 +914,10 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               onChange={setSplits}
               accounts={accounts}
               onPendingChange={setHasPendingExpression}
+              submitRef={journalAddButtonRef}
             />
             <div className="flex justify-end">
-              <Button type="submit" size="sm">
+              <Button ref={journalAddButtonRef} type="submit" size="sm">
                 Add Transaction
                 <span className="ml-1.5 text-xs opacity-60" aria-hidden="true">
                   {typeof navigator !== "undefined" && /Mac/.test(navigator.platform) ? "⌘" : "Ctrl"}+↵
@@ -1022,9 +1052,11 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           bookId={bookId}
           transactionId={editingTransaction.id}
           onUnlinked={onPlaidUnlinked}
+          readOnly={readOnly}
         />
       )}
       <form ref={formRef} onSubmit={handleSubmit} className="space-y-4">
+      <fieldset disabled={readOnly} className="space-y-4 min-w-0">
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-sm font-medium text-fg-secondary">
           {editingTransaction ? "Edit Transaction" : "New Transaction"}
@@ -1247,35 +1279,52 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
       ) : (
         <InvestmentEntrySection investment={investment} accounts={accounts} compact={false} />
       )}
+      </fieldset>
+
+      {editingTransaction && (
+        <TransactionAuthorship createdBy={editingTransaction.createdBy} updatedBy={editingTransaction.updatedBy} />
+      )}
 
       <div className="flex justify-between pt-4 border-t">
-        <div className="flex gap-3">
-          {editingTransaction && onDelete && (
-            <Button type="button" variant="danger" onClick={onDelete}>
-              Delete
-            </Button>
-          )}
-          {editingTransaction && mode !== "investment" && onMakeRecurring && (
-            <Button type="button" variant="secondary" onClick={() => onMakeRecurring(editingTransaction.id)}>
-              Make recurring...
-            </Button>
-          )}
-        </div>
-        <div className="flex gap-3">
-          {onCancel && (
-            <Button type="button" variant="secondary" onClick={onCancel}>
-              Cancel
-            </Button>
-          )}
-          <Button type="submit">
-            {editingTransaction ? "Save Changes" : "Add Transaction"}
-            {!editingTransaction && (
-              <span className="ml-1.5 text-xs opacity-60" aria-hidden="true">
-                {typeof navigator !== "undefined" && /Mac/.test(navigator.platform) ? "⌘" : "Ctrl"}+↵
-              </span>
+        {readOnly ? (
+          <div className="flex w-full justify-end">
+            {onCancel && (
+              <Button type="button" variant="secondary" onClick={onCancel}>
+                Close
+              </Button>
             )}
-          </Button>
-        </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex gap-3">
+              {editingTransaction && onDelete && (
+                <Button type="button" variant="danger" onClick={onDelete}>
+                  Delete
+                </Button>
+              )}
+              {editingTransaction && mode !== "investment" && onMakeRecurring && (
+                <Button type="button" variant="secondary" onClick={() => onMakeRecurring(editingTransaction.id)}>
+                  Make recurring...
+                </Button>
+              )}
+            </div>
+            <div className="flex gap-3">
+              {onCancel && (
+                <Button type="button" variant="secondary" onClick={onCancel}>
+                  Cancel
+                </Button>
+              )}
+              <Button type="submit">
+                {editingTransaction ? "Save Changes" : "Add Transaction"}
+                {!editingTransaction && (
+                  <span className="ml-1.5 text-xs opacity-60" aria-hidden="true">
+                    {typeof navigator !== "undefined" && /Mac/.test(navigator.platform) ? "⌘" : "Ctrl"}+↵
+                  </span>
+                )}
+              </Button>
+            </div>
+          </>
+        )}
       </div>
     </form>
     </>

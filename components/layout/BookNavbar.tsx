@@ -1,11 +1,10 @@
 "use client";
 
-import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { Link, usePathname, useRouter } from "@/lib/navigation";
 import { useBookId } from "@/hooks/useBookId";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { cn } from "@/lib/utils";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTheme } from "@/components/ThemeProvider";
 import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
@@ -14,15 +13,13 @@ import { resetUser } from "@/lib/posthog-client";
 import { ReportIssueModal } from "@/components/ReportIssueModal";
 import { PriceEntryPill } from "@/components/layout/PriceEntryPill";
 import { JobHealthIndicator } from "@/components/layout/JobHealthIndicator";
-import { SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
+import { TypeSafeSettings } from "@/components/settings/TypeSafeSettings";
+import { BookMembersSettings } from "@/components/settings/BookMembersSettings";
+import { useBookChanges } from "@/components/BookChangesProvider";
+import { useBookRole } from "@/components/BookRoleProvider";
+import { BOOK_SESSION_ENDED_EVENT, SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
 import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
-
-type Book = {
-  id: number;
-  name: string;
-  upcomingDays: number;
-};
 
 type NavItem = {
   href: string;
@@ -35,10 +32,9 @@ export function BookNavbar() {
   const router = useRouter();
   const bookId = useBookId();
   const toast = useToast();
+  const { books, currentBook, canWrite, isOwner, status: roleStatus } = useBookRole();
   const { theme, setTheme, resolvedTheme } = useTheme();
   const logoSrc = resolvedTheme === "dark" ? "/favicon-dark-64x64.png" : "/favicon-64x64.png";
-  const [books, setBooks] = useState<Book[]>([]);
-  const [currentBook, setCurrentBook] = useState<Book | null>(null);
   const [showBookMenu, setShowBookMenu] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false);
@@ -73,15 +69,8 @@ export function BookNavbar() {
   ];
 
   useEffect(() => {
-    apiGet<Book[]>("/api/books")
-      .then((data) => {
-        setBooks(data);
-        const current = data.find((b) => b.id === parseInt(bookId));
-        setCurrentBook(current ?? null);
-        if (current) setUpcomingDays(current.upcomingDays);
-      })
-      .catch(() => {});
-  }, [bookId]);
+    if (currentBook) setUpcomingDays(currentBook.upcomingDays);
+  }, [currentBook]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -131,32 +120,51 @@ export function BookNavbar() {
       toast.error(toMessage(err, "Failed to sign out"));
       return;
     }
+    window.dispatchEvent(new Event(BOOK_SESSION_ENDED_EVENT));
     resetUser();
     router.push("/login");
   };
 
-  const fetchSyncPendingCount = useCallback(() => {
-    if (!bookId) return;
-    apiGet<{ count: number }>(`/api/b/${bookId}/sync/pending-count`)
-      .then((data) => {
-        setSyncPendingCount(data.count ?? 0);
-      })
-      .catch(() => {});
-  }, [bookId]);
-
+  const requestBadgeRefresh = useRef<() => void>(() => {});
+  useBookChanges((change) => {
+    if (change.type === "reset" || change.tables.some((table) =>
+      table === "plaid_accounts" || table === "plaid_transaction_reconciliation")) {
+      requestBadgeRefresh.current();
+    }
+  });
   useEffect(() => {
     if (!bookId) return;
-
-    fetchSyncPendingCount();
-    const interval = setInterval(fetchSyncPendingCount, 60_000);
-    return () => clearInterval(interval);
-  }, [bookId, fetchSyncPendingCount]);
-
-  useEffect(() => {
-    const handler = () => fetchSyncPendingCount();
+    let active = true;
+    let running = false;
+    let dirty = false;
+    const controller = new AbortController();
+    const refresh = async () => {
+      dirty = true;
+      if (running) return;
+      running = true;
+      try {
+        while (active && dirty) {
+          dirty = false;
+          try {
+            const data = await apiGet<{ count: number }>(`/api/b/${bookId}/sync/pending-count`, { signal: controller.signal });
+            if (active) setSyncPendingCount(data.count ?? 0);
+          } catch { /* Retain the last badge value; polling/focus can recover. */ }
+        }
+      } finally { running = false; }
+    };
+    requestBadgeRefresh.current = () => { void refresh(); };
+    void refresh();
+    const interval = setInterval(() => { void refresh(); }, 60_000);
+    const handler = () => { void refresh(); };
     window.addEventListener(SYNC_QUEUE_CHANGED_EVENT, handler);
-    return () => window.removeEventListener(SYNC_QUEUE_CHANGED_EVENT, handler);
-  }, [fetchSyncPendingCount]);
+    return () => {
+      active = false;
+      controller.abort();
+      clearInterval(interval);
+      requestBadgeRefresh.current = () => {};
+      window.removeEventListener(SYNC_QUEUE_CHANGED_EVENT, handler);
+    };
+  }, [bookId]);
 
   // Close mobile menu on route change
   useEffect(() => {
@@ -202,7 +210,6 @@ export function BookNavbar() {
           <div className="flex items-center justify-between h-14 lg:h-16">
             <div className="flex items-center">
               <Link href="/" className="flex items-center gap-2 shrink-0">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={logoSrc} alt="" className="w-7 h-7 lg:w-8 lg:h-8" />
                 <span className="text-lg lg:text-xl font-bold text-fg hidden sm:inline" title={`Counterpoise v${process.env.NEXT_PUBLIC_APP_VERSION}`}>Counterpoise</span>
               </Link>
@@ -221,6 +228,11 @@ export function BookNavbar() {
                   className="flex items-center gap-1 px-2 sm:px-3 py-1.5 text-sm font-medium text-fg-secondary bg-surface-tertiary rounded-md hover:bg-surface-tertiary/80 transition-colors max-w-[8rem] sm:max-w-[10rem]"
                 >
                   <span className="truncate">{currentBook?.name || "Loading..."}</span>
+                  {/* While the role loads, write controls stay hidden, but
+                      the user is not known to be read-only. */}
+                  {!canWrite && roleStatus !== "loading" && (
+                    <span className="ml-2 shrink-0 rounded-full bg-surface-tertiary px-2 py-0.5 text-xs text-fg-secondary">Read-only</span>
+                  )}
                   <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
                   </svg>
@@ -267,7 +279,7 @@ export function BookNavbar() {
 
             {/* Right cluster: price pill + breakpoint-specific controls */}
             <div className="flex items-center gap-2 self-stretch">
-              <PriceEntryPill bookId={bookId} />
+              {canWrite && <PriceEntryPill bookId={bookId} />}
               <JobHealthIndicator />
 
               {/* Desktop nav links — hidden on mobile */}
@@ -531,32 +543,38 @@ export function BookNavbar() {
             />
           </section>
 
-          <section className="pt-4 border-t border-border">
-            <Input
-              id="upcoming-days"
-              label="Upcoming recurring days"
-              type="number"
-              min={1}
-              max={365}
-              value={upcomingDays}
-              onChange={(e) => {
-                const val = parseInt(e.target.value, 10);
-                if (!isNaN(val) && val >= 1 && val <= 365) {
-                  setUpcomingDays(val);
-                }
-              }}
-              onBlur={() => {
-                if (!currentBook) return;
-                apiPut(`/api/books/${bookId}`, {
-                  name: currentBook.name,
-                  upcomingDays,
-                }).catch(() => {});
-              }}
-            />
-            <p className="mt-1 text-xs text-fg-tertiary">
-              Number of days into the future to show recurring transactions (1–365).
-            </p>
-          </section>
+          {isOwner && (
+            <section className="pt-4 border-t border-border">
+              <Input
+                id="upcoming-days"
+                label="Upcoming recurring days"
+                type="number"
+                min={1}
+                max={365}
+                value={upcomingDays}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (!isNaN(val) && val >= 1 && val <= 365) {
+                    setUpcomingDays(val);
+                  }
+                }}
+                onBlur={() => {
+                  if (!currentBook) return;
+                  apiPut(`/api/books/${bookId}`, {
+                    name: currentBook.name,
+                    upcomingDays,
+                  }).catch(() => {});
+                }}
+              />
+              <p className="mt-1 text-xs text-fg-tertiary">
+                Number of days into the future to show recurring transactions (1–365).
+              </p>
+            </section>
+          )}
+
+          {showAccountModal && currentBook && canWrite && <TypeSafeSettings key={bookId} bookId={bookId} bookName={currentBook.name} />}
+
+          {showAccountModal && <BookMembersSettings bookId={bookId} />}
 
           <section className="pt-4 border-t border-border">
             <h3 className="text-sm font-semibold text-fg">Security</h3>

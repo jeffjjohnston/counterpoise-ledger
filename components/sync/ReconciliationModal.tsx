@@ -1,15 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useBookId } from "@/hooks/useBookId";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
+import { Select } from "@/components/ui/Select";
 import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
 import { PayeeAutocomplete } from "@/components/ui/PayeeAutocomplete";
-import { flattenAccounts } from "@/lib/accounting";
-import { formatCurrency, formatDate, formatDateShort } from "@/lib/formatters";
+import { flattenAccounts } from "@/lib/wasm-client";
+import { formatCurrency, formatDate, formatDateShort } from "@/lib/wasm-client";
 import { SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
-import { apiGet, apiPost, toMessage } from "@/lib/api-client";
+import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
+import { useTypeSafeSuggestion } from "@/hooks/useTypeSafeSuggestion";
+import { TypeSafeSuggestion } from "@/components/sync/TypeSafeSuggestion";
 import { cn } from "@/lib/utils";
 import { useRegisterShortcuts } from "@/hooks/useRegisterShortcuts";
 import type { ShortcutDef } from "@/components/KeyboardShortcutProvider";
@@ -25,19 +28,29 @@ type ReconciliationResponse = {
 
 type Props = {
   isOpen: boolean;
-  row: AssignedSyncAccount | null;
+  /** Every synced account link in the book. The queue can hold rows from all of them. */
+  links: AssignedSyncAccount[];
+  /** The link to show first. Null shows all accounts. */
+  initialLinkId: number | null;
   onClose: () => void;
   onQueueChanged?: () => void | Promise<void>;
 };
 
 const PAGE_SIZE = 25;
 
+/** The bank account as the bank names it, with the mask when there is one. */
+function linkLabel(link: AssignedSyncAccount): string {
+  return link.plaidAccountMask
+    ? `${link.plaidAccountName} ••${link.plaidAccountMask}`
+    : link.plaidAccountName;
+}
+
 function isUnresolved(item: SyncReconciliationItem): boolean {
   return item.resolutionStatus === "pending" || item.reviewReason !== null;
 }
 
 // The server already scores and ranks every candidate. These are the tags
-// buildScoreTagsAndValue emits (lib/plaid-reconcile.ts); anything not listed
+// `score()` emits (rust-api/server/src/routes/reconcile.rs); anything not listed
 // is deliberately not shown, because a tag with no plain-English reading is
 // worse than no chip.
 const SCORE_TAG_LABELS: Record<string, string> = {
@@ -57,8 +70,8 @@ function candidateChips(candidate: SyncMatchCandidate): string[] {
 
 /**
  * Plaid signs a charge positive; the ledger negates it
- * (lib/plaid-reconcile.ts:753 computes expectedAmount = -amountCents, and the
- * created split is -amountCents). The queue must show what will be recorded,
+ * (rust-api/server/src/routes/reconcile.rs computes the expected amount as
+ * -amount_cents, and the created split is -amount_cents). The queue must show what will be recorded,
  * or fixing the missing direction cue would introduce a fresh disagreement
  * instead of removing one.
  */
@@ -112,12 +125,35 @@ function DisclosureChevron({ expanded }: { expanded: boolean }) {
 
 export function ReconciliationModal({
   isOpen,
-  row,
+  links,
+  initialLinkId,
   onClose,
   onQueueChanged,
 }: Props) {
   const bookId = useBookId();
-  const plaidLinkId = row?.plaidLinkId ?? null;
+
+  // The filter starts from initialLinkId each time the modal opens. It is set
+  // during render, not in an effect, so the first fetch after opening already
+  // uses the new filter and no fetch goes out with the previous one.
+  const [filterLinkId, setFilterLinkId] = useState<number | null>(initialLinkId);
+  const [wasOpen, setWasOpen] = useState(false);
+  if (isOpen !== wasOpen) {
+    setWasOpen(isOpen);
+    if (isOpen) setFilterLinkId(initialLinkId);
+  }
+
+  const linksById = useMemo(
+    () => new Map(links.map((link) => [link.plaidLinkId, link])),
+    [links]
+  );
+  const filterLink = filterLinkId === null ? null : linksById.get(filterLinkId) ?? null;
+  const showAccountTags = filterLinkId === null;
+
+  // Each queue fetch that starts a new list gets a number. A response for an
+  // older number is discarded, so a slow response for the previous filter
+  // cannot replace the list for the current one.
+  const queueRequest = useRef(0);
+
   const [items, setItems] = useState<SyncReconciliationItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -156,10 +192,15 @@ export function ReconciliationModal({
   const otherCandidates = selectedItem?.candidates.slice(1) ?? [];
   const canReview = selectedItem?.reviewReason != null;
   const position = items.findIndex((item) => item.id === selectedId) + 1;
+  const selectedLinkId = selectedItem?.plaidAccountLinkId ?? null;
+  const selectedLink = selectedLinkId === null ? null : linksById.get(selectedLinkId) ?? null;
+  const typesafe = useTypeSafeSuggestion(bookId, selectedLinkId, selectedItem?.id ?? null,
+    isOpen && !submitting && !!selectedItem && selectedItem.resolutionStatus === "pending" && !selectedItem.reviewReason && !selectedItem.pending);
+  const typesafeObservation = typesafe.observation;
 
   const eligibleCounterAccounts = useMemo(
-    () => accounts.filter((account) => account.id !== row?.counterpoiseAccountId),
-    [accounts, row?.counterpoiseAccountId]
+    () => accounts.filter((account) => account.id !== selectedLink?.counterpoiseAccountId),
+    [accounts, selectedLink?.counterpoiseAccountId]
   );
 
   const loadAccounts = useCallback(async () => {
@@ -174,7 +215,7 @@ export function ReconciliationModal({
 
   const fetchQueue = useCallback(
     async (targetOffset: number, reset: boolean) => {
-      if (plaidLinkId === null) return;
+      const request = reset ? ++queueRequest.current : queueRequest.current;
 
       if (reset) {
         setLoading(true);
@@ -184,9 +225,11 @@ export function ReconciliationModal({
       }
 
       try {
+        const filter = filterLinkId === null ? "" : `&linkId=${filterLinkId}`;
         const response = await apiGet<ReconciliationResponse>(
-          `/api/b/${bookId}/sync/accounts/${plaidLinkId}/reconcile?limit=${PAGE_SIZE}&offset=${targetOffset}`
+          `/api/b/${bookId}/sync/reconcile?limit=${PAGE_SIZE}&offset=${targetOffset}${filter}`
         );
+        if (request !== queueRequest.current) return;
         setItems((prev) => (reset ? response.items : [...prev, ...response.items]));
         setOffset(response.offset + response.items.length);
         setHasMore(response.hasMore);
@@ -197,17 +240,26 @@ export function ReconciliationModal({
           setSelectedId(firstId);
         }
       } catch (queueError) {
+        if (request !== queueRequest.current) return;
         setError(toMessage(queueError, "Failed to load reconciliation queue"));
       } finally {
-        setLoading(false);
-        setLoadingMore(false);
+        if (request === queueRequest.current) {
+          setLoading(false);
+          setLoadingMore(false);
+        }
       }
     },
-    [bookId, plaidLinkId]
+    [bookId, filterLinkId]
   );
 
+  // The account list does not change with the filter, so it loads once for
+  // each time the modal opens.
   useEffect(() => {
-    if (!isOpen || plaidLinkId === null) {
+    if (isOpen) void loadAccounts();
+  }, [isOpen, loadAccounts]);
+
+  useEffect(() => {
+    if (!isOpen) {
       return;
     }
 
@@ -220,8 +272,8 @@ export function ReconciliationModal({
     setPayeeName("");
     setError(null);
 
-    void Promise.all([loadAccounts(), fetchQueue(0, true)]);
-  }, [fetchQueue, isOpen, loadAccounts, plaidLinkId]);
+    void fetchQueue(0, true);
+  }, [fetchQueue, isOpen]);
 
   useEffect(() => {
     if (!selectedItem) {
@@ -237,10 +289,17 @@ export function ReconciliationModal({
   // A row with nothing to match against has only one path forward, so open
   // Create for it automatically. Every other row starts with both
   // disclosures folded, so a fresh selection always looks the same.
-  useEffect(() => {
+  //
+  // This is set during render, not in an effect. An effect runs after the
+  // paint, so when a new list arrives, the first row is painted for one
+  // frame with the disclosures of the empty selection before it (Create
+  // open). A filter change causes that each time.
+  const [disclosuresFor, setDisclosuresFor] = useState<SyncReconciliationItem | null>(null);
+  if (selectedItem !== disclosuresFor) {
+    setDisclosuresFor(selectedItem);
     setShowOthers(false);
     setShowCreate((selectedItem?.candidates.length ?? 0) === 0);
-  }, [selectedItem]);
+  }
 
   useEffect(() => {
     const query = payeeName.trim();
@@ -281,12 +340,14 @@ export function ReconciliationModal({
   const resolveSelected = useCallback(
     async (
       body:
+        | { action: "typesafe"; evaluationId: number; kind: "match" | "create" }
         | { action: "match"; transactionId: number }
         | { action: "match_update_amount"; transactionId: number }
         | { action: "create"; counterAccountId: number; payeeName: string }
         | { action: "ignore" | "keep_local" | "unlink" }
     ) => {
-      if (!row || !selectedItem) return;
+      if (!selectedItem) return;
+      const linkId = selectedItem.plaidAccountLinkId;
 
       setSubmitting(true);
       if (body.action === "match" || body.action === "match_update_amount") {
@@ -295,9 +356,13 @@ export function ReconciliationModal({
       setError(null);
 
       try {
-        const updatedItem = await apiPost<SyncReconciliationItem>(
-          `/api/b/${bookId}/sync/accounts/${row.plaidLinkId}/reconcile`,
-          { reconciliationId: selectedItem.id, ...body }
+        const observation = typesafeObservation();
+        const updatedItem = body.action === "typesafe" ? await apiPut<SyncReconciliationItem>(
+          `/api/b/${bookId}/sync/accounts/${linkId}/reconcile/suggestion`,
+          { evaluationId: body.evaluationId, kind: body.kind, activeReviewMs: observation.activeReviewMs }
+        ) : await apiPost<SyncReconciliationItem>(
+          `/api/b/${bookId}/sync/accounts/${linkId}/reconcile`,
+          { reconciliationId: selectedItem.id, ...body, ...(observation.evaluationId ? { typesafe: observation } : {}) }
         );
 
         // Computed outside setItems on purpose. A state updater has to be
@@ -332,7 +397,7 @@ export function ReconciliationModal({
         setMatchingAction(null);
       }
     },
-    [row, selectedItem, bookId, items, hasMore, fetchQueue, onQueueChanged]
+    [selectedItem, bookId, items, hasMore, fetchQueue, onQueueChanged, typesafeObservation]
   );
 
   const moveSelection = useCallback(
@@ -419,20 +484,51 @@ export function ReconciliationModal({
 
   useRegisterShortcuts(shortcuts);
 
+  // Links with nothing to review are left out, except the current filter,
+  // which must stay selectable after its last row is resolved.
+  const filterOptions = useMemo(() => {
+    const queued = links.filter(
+      (link) => link.pendingCount + link.reviewCount > 0 || link.plaidLinkId === filterLinkId
+    );
+    const total = links.reduce((sum, link) => sum + link.pendingCount + link.reviewCount, 0);
+    return [
+      { value: "", label: `All accounts (${total})` },
+      ...queued.map((link) => ({
+        value: link.plaidLinkId,
+        label: `${linkLabel(link)} (${link.pendingCount + link.reviewCount})`,
+      })),
+    ];
+  }, [filterLinkId, links]);
+
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title={row ? `Reconcile ${row.plaidAccountName}` : "Reconcile"}
+      title={filterLink ? `Reconcile ${linkLabel(filterLink)}` : "Reconcile all accounts"}
       size="xl"
     >
       <div className="mb-4">
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-xs text-fg-tertiary">
-            {items.length > 0 ? `${position} of ${totalCount}` : ""}
-          </span>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="w-64">
+              <Select
+                id="reconcile-account-filter"
+                aria-label="Account"
+                size="compact"
+                value={filterLinkId ?? ""}
+                options={filterOptions}
+                disabled={submitting}
+                onChange={(event) =>
+                  setFilterLinkId(event.target.value === "" ? null : Number(event.target.value))
+                }
+              />
+            </div>
+            <span className="text-xs text-fg-tertiary tabular-nums">
+              {items.length > 0 ? `${position} of ${totalCount}` : ""}
+            </span>
+          </div>
           {items.length > 0 && (
-            <div className="flex items-center gap-1.5 text-xs text-fg-tertiary">
+            <div className="hidden sm:flex items-center gap-1.5 text-xs text-fg-tertiary">
               <KeyCap>↑</KeyCap>
               <KeyCap>↓</KeyCap>
               <span>move</span>
@@ -496,6 +592,14 @@ export function ReconciliationModal({
                               {formatCurrency(signedAmount(item.amountCents))}
                             </span>
                           </div>
+                          {showAccountTags && linksById.has(item.plaidAccountLinkId) && (
+                            <p
+                              data-testid={`queue-item-account-${item.id}`}
+                              className="mt-0.5 text-xs text-fg-secondary truncate"
+                            >
+                              {linkLabel(linksById.get(item.plaidAccountLinkId)!)}
+                            </p>
+                          )}
                           {(() => {
                             const reason = queueReason(item);
                             return (
@@ -545,10 +649,31 @@ export function ReconciliationModal({
                       {formatDate(selectedItem.authorizedDate ?? selectedItem.date)}
                       {selectedItem.merchantName ? ` · ${selectedItem.merchantName}` : ""}
                     </p>
+                    {selectedLink && (
+                      <p
+                        data-testid="selected-account"
+                        className="text-xs text-fg-tertiary mt-1"
+                      >
+                        {linkLabel(selectedLink)} → {selectedLink.counterpoiseAccountName}
+                      </p>
+                    )}
                     {selectedItem.reviewReason && (
                       <p className="text-sm text-fg-warning mt-2">{queueReason(selectedItem).text}</p>
                     )}
                   </div>
+
+                  <TypeSafeSuggestion result={typesafe.result} loading={typesafe.loading} candidates={selectedItem.candidates}
+                    submitting={submitting} onRefresh={typesafe.refresh}
+                    onMatch={(evaluationId) => void resolveSelected({ action: "typesafe", evaluationId, kind: "match" })}
+                    onCreate={(evaluationId) => void resolveSelected({ action: "typesafe", evaluationId, kind: "create" })}
+                    onEdit={(proposal) => {
+                      // Edit copies the proposal into the ordinary Create form.
+                      // The user's Create click then sends the TypeSafe
+                      // observation, and the server records what was kept.
+                      setSelectedCounterAccountId(proposal.category.accountId);
+                      setPayeeName(proposal.payee.name);
+                      setShowCreate(true);
+                    }} />
 
                   {bestMatch && (
                     <div data-testid="best-match" className="overflow-hidden rounded-lg border border-accent">

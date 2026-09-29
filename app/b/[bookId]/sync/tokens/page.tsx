@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "@/lib/navigation";
 import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
 import { Button } from "@/components/ui/Button";
 import { ConfirmModal } from "@/components/ui/ConfirmModal";
@@ -10,9 +10,10 @@ import { Input } from "@/components/ui/Input";
 import { MenuButton } from "@/components/ui/MenuButton";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { Modal } from "@/components/ui/Modal";
-import { flattenAccounts } from "@/lib/accounting";
+import { flattenAccounts } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookRole } from "@/components/BookRoleProvider";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import type {
   AccountWithBalance,
@@ -47,6 +48,7 @@ const initialEditFormState: EditTokenForm = {
 export default function SyncTokensPage() {
   const router = useRouter();
   const bookId = useBookId();
+  const { isOwner, status: roleStatus } = useBookRole();
   const [tokens, setTokens] = useState<PlaidTokenListItem[]>([]);
   const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
   const [loading, setLoading] = useState(true);
@@ -287,7 +289,17 @@ export default function SyncTokensPage() {
     }
   };
 
-  if (loading) {
+  // While the role loads, it is the least privilege. Wait for it, so that an
+  // owner does not see the refusal for a moment.
+  if (!isOwner && roleStatus !== "loading") {
+    return (
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <p className="text-sm text-fg-secondary">Only an owner can manage bank connections.</p>
+      </div>
+    );
+  }
+
+  if (loading || !isOwner) {
     return (
       <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <div className="space-y-4">

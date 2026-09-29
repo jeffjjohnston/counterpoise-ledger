@@ -4,8 +4,12 @@ One of the guides [CLAUDE.md](../CLAUDE.md) points to. Read that file first;
 it carries the rules that apply everywhere and says when to come here.
 
 ## View SQL Queries
-Drizzle doesn't log by default. `.toSQL()` renders the statement and its
-parameters without running anything:
+The Rust server logs through `tracing`, and `RUST_LOG` sets the filter (the
+default is `info`). SQLx logs each statement at the `debug` level, so start
+the server with `RUST_LOG=info,sqlx=debug` to see the SQL of each request.
+
+In a TypeScript script or test, Drizzle doesn't log by default. `.toSQL()`
+renders the statement and its parameters without running anything:
 ```typescript
 const query = db.select().from(transactions).where(eq(transactions.bookId, 1));
 console.log(query.toSQL()); // { sql: "select ...", params: [1] }
@@ -15,11 +19,10 @@ console.log("Query result:", await query);
 ```
 
 ## Check Split Balance
-If transaction creation fails, log the split total:
-```typescript
-const total = splits.reduce((sum, s) => sum + s.amount, 0);
-console.log("Split total (must be 0):", total);
-```
+A transaction write whose splits do not sum to zero gets 400 `Transaction
+splits must sum to zero (debits = credits)` from
+`rust-api/server/src/routes/transactions.rs`. To find the difference, add up
+the `amount` of each split in the request body: the total must be 0.
 
 ## Investment Position Issues
 Check these common causes:

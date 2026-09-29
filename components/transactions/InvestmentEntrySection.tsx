@@ -1,15 +1,16 @@
 "use client";
 
-import type { ReactElement } from "react";
+import { useRef, type KeyboardEvent, type ReactElement } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
 import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
 import { SecurityAutocomplete } from "@/components/ui/SecurityAutocomplete";
-import { formatCurrency, resolveAmountOnBlur } from "@/lib/formatters";
-import { evaluateExpression } from "@/lib/expression";
+import { formatCurrency, resolveAmountOnBlur } from "@/lib/wasm-client";
+import { evaluateExpression } from "@/lib/wasm-client";
 import type { AccountWithBalance } from "@/types";
 import type { InvestmentEntry } from "./useInvestmentEntry";
+import { tabTo } from "./tab-to";
 
 // Renders the investment-specific field set (Security, Action, Investment
 // Account, the conditional Income/Fee accounts, and the action-specific
@@ -35,6 +36,10 @@ export function InvestmentEntrySection(props: {
   compact: boolean;
 }): ReactElement {
   const { investment, accounts, compact } = props;
+  // The compact row's Add button. Only one of the per-action rows renders at a
+  // time, so one ref serves all four.
+  const addButtonRef = useRef<HTMLButtonElement>(null);
+  const tabToAdd = (e: KeyboardEvent<HTMLInputElement>) => tabTo(e, addButtonRef);
 
   const formatMicrosInput = (value: number) => {
     const formatted = (value / 1_000_000).toFixed(6);
@@ -141,30 +146,30 @@ export function InvestmentEntrySection(props: {
               placeholder="2" min="1" step="any" selectOnFocus />
             <Input type="number" label="Split Denominator" id="investmentSplitDenominator" size="compact"
               value={investment.investmentSplitDenominator} onChange={(e) => investment.setInvestmentSplitDenominator(e.target.value)}
-              placeholder="1" min="1" step="any" selectOnFocus />
-            <Button type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
+              onKeyDown={tabToAdd} placeholder="1" min="1" step="any" selectOnFocus />
+            <Button ref={addButtonRef} type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
           </div>
         ) : investment.investmentAction === "dividend" ? (
           <div className="col-span-full grid grid-cols-[1fr_auto_auto] gap-2 items-end">
             <Input type="text" label="Dividend Amount" id="investmentDividendAmount" size="compact"
               value={investment.investmentDividendAmount} onChange={(e) => investment.setInvestmentDividendAmount(e.target.value)}
               onBlur={() => investment.setInvestmentDividendAmount(resolveAmountOnBlur(investment.investmentDividendAmount))}
-              placeholder="0.00" selectOnFocus />
+              onKeyDown={tabToAdd} placeholder="0.00" selectOnFocus />
             <div className="mb-1 text-sm text-fg-secondary font-medium whitespace-nowrap" data-testid="investment-total">
               {formatCurrency(investment.investmentTotal.totalCents)}
             </div>
-            <Button type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
+            <Button ref={addButtonRef} type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
           </div>
         ) : investment.investmentAction === "capGain" ? (
           <div className="col-span-full grid grid-cols-[1fr_auto_auto] gap-2 items-end">
             <Input type="text" label="Capital Gain Amount" id="investmentCapGainAmount" size="compact"
               value={investment.investmentCapGainAmount} onChange={(e) => investment.setInvestmentCapGainAmount(e.target.value)}
               onBlur={() => investment.setInvestmentCapGainAmount(resolveAmountOnBlur(investment.investmentCapGainAmount))}
-              placeholder="0.00" selectOnFocus />
+              onKeyDown={tabToAdd} placeholder="0.00" selectOnFocus />
             <div className="mb-1 text-sm text-fg-secondary font-medium whitespace-nowrap" data-testid="investment-total">
               {formatCurrency(investment.investmentTotal.totalCents)}
             </div>
-            <Button type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
+            <Button ref={addButtonRef} type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
           </div>
         ) : (
           <div className="col-span-full grid grid-cols-[1fr_1fr_1fr_auto_auto] gap-2 items-end">
@@ -178,11 +183,11 @@ export function InvestmentEntrySection(props: {
             <Input type="text" label="Fee" id="investmentFee" size="compact"
               value={investment.investmentFee} onChange={(e) => investment.setInvestmentFee(e.target.value)}
               onBlur={() => investment.setInvestmentFee(resolveAmountOnBlur(investment.investmentFee))}
-              placeholder="0.00" selectOnFocus />
+              onKeyDown={tabToAdd} placeholder="0.00" selectOnFocus />
             <div className="mb-1 text-sm text-fg-secondary font-medium whitespace-nowrap" data-testid="investment-total">
               {formatCurrency(investment.investmentTotal.totalCents)}
             </div>
-            <Button type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
+            <Button ref={addButtonRef} type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
           </div>
         )}
       </>

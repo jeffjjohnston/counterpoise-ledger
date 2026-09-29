@@ -67,6 +67,19 @@ describe("fetchPlaidAccounts", () => {
       "Plaid /accounts/get request failed: bad token (INVALID_ACCESS_TOKEN)"
     );
   });
+
+  it("requests the PLAID_API_URL origin when it is set", async () => {
+    configurePlaidEnv();
+    process.env.PLAID_API_URL = "http://127.0.0.1:9";
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ accounts: [] }) }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchPlaidAccounts("access-token")).resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:9/accounts/get",
+      expect.objectContaining({ method: "POST" })
+    );
+  });
 });
 
 describe("fetchPlaidTransactionsSync", () => {

@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import { Link } from "@/lib/navigation";
 import { cn } from "@/lib/utils";
 import type { HTMLAttributes } from "react";
 

@@ -2,7 +2,7 @@
  * Route-to-tool coverage. Data only, no logic — route-parity.test.ts enforces
  * it.
  *
- * Every exported HTTP method under app/api must appear in exactly one of
+ * Every route in rust-api/routes.json must appear in exactly one of
  * ROUTE_TOOLS or ROUTE_WAIVERS. That is the whole point: before this file,
  * "no tool for this route" and "deliberately no tool for this route" looked
  * identical, and five domains fell out of MCP coverage unnoticed.
@@ -48,6 +48,10 @@ export const ROUTE_TOOLS: Record<string, string[]> = {
   "PUT /books/[bookId]": ["update_book"],
   "DELETE /books/[bookId]": ["delete_book"],
   "POST /books/demo": ["create_demo_book"],
+  "GET /books/[bookId]/members": ["list_book_members"],
+  "POST /books/[bookId]/members": ["add_book_member"],
+  "PUT /books/[bookId]/members/[userId]": ["update_book_member"],
+  "DELETE /books/[bookId]/members/[userId]": ["remove_book_member"],
   "GET /b/[bookId]/payees": ["list_payees"],
   "POST /b/[bookId]/payees": ["create_payee"],
   "GET /b/[bookId]/payees/[id]": ["get_payee"],
@@ -78,14 +82,24 @@ export const ROUTE_TOOLS: Record<string, string[]> = {
   "GET /b/[bookId]/transactions/[id]/plaid": ["get_transaction_plaid_link"],
   "POST /b/[bookId]/transactions/[id]/plaid/unlink": ["unlink_plaid_transaction"],
   "GET /b/[bookId]/sync/accounts/[id]/reconcile": ["get_reconcile_candidates"],
+  "GET /b/[bookId]/sync/reconcile": ["get_reconcile_candidates"],
   "POST /b/[bookId]/sync/accounts/[id]/reconcile": ["reconcile_plaid_transaction"],
 };
 
 export const ROUTE_WAIVERS: Record<string, string> = {
+  "GET /b/[bookId]/events": "Browser-only SSE invalidation transport authenticated by session cookie. MCP writes already trigger the same database notifications; stdio tools return finite results and do not subscribe to browser view invalidations.",
+  "GET /b/[bookId]/settings/typesafe": "Web experiment controls; MCP does not participate in this opt-in UI pilot.",
+  "PATCH /b/[bookId]/settings/typesafe": "Explicit human opt-in to external transaction processing; not delegated to MCP.",
+  "DELETE /b/[bookId]/settings/typesafe": "Web-only experiment-data clearing with an explicit Settings confirmation.",
+  "POST /b/[bookId]/sync/accounts/[id]/reconcile/suggestion": "Opted-in web experiment; MCP queue reads must not trigger paid external evaluations.",
+  "PATCH /b/[bookId]/sync/accounts/[id]/reconcile/suggestion": "Records actual UI display; a machine call cannot establish human exposure.",
+  "PUT /b/[bookId]/sync/accounts/[id]/reconcile/suggestion": "Explicit human suggestion confirmation; MCP already has deterministic reconciliation.",
+  "GET /cron/typesafe-cleanup": "CRON_SECRET machine endpoint for experiment retention, not a user capability.",
   // Permanent — excluded by the 2026-08-23 parity design.
   "POST /auth/login": "Session auth. MCP authenticates with an API key.",
   "POST /auth/logout": "Session auth. MCP authenticates with an API key.",
   "POST /auth/register": "Account creation is not an MCP capability.",
+  "GET /auth/registration-open": "Public browser presentation gate; registration remains an HTTP-only human action.",
   "GET /auth/me": "Session identity. MCP identity comes from the API key.",
   "PUT /auth/password": "Credential change. Out of scope by decision.",
   "GET /auth/api-keys": "A tool that reads API keys is privilege escalation.",
@@ -95,19 +109,12 @@ export const ROUTE_WAIVERS: Record<string, string> = {
   "GET /cron/price-sync": "CRON_SECRET machine endpoint, not a user capability.",
   "GET /cron/recurring": "CRON_SECRET machine endpoint, not a user capability.",
   "GET /health": "Infrastructure probe.",
+  "GET /version": "Public contract probe for native clients. Not a user capability.",
   "POST /b/[bookId]/sync/tokens":
     "Creating a connection requires an access token that only the Plaid Link browser flow can " +
     "produce, so there is no legitimate way for an MCP caller to supply one — a tool that " +
     "accepted a caller-supplied credential here would be a way to write an arbitrary token into " +
     "the database.",
-  "GET /b/[bookId]/webmcp":
-    "This route is the MCP tool list itself, served over HTTP so the browser's WebMCP bridge " +
-    "can read it. A tool that lists the tools would be circular.",
-  "POST /b/[bookId]/webmcp":
-    "This route is the MCP tool dispatcher itself, served over HTTP for the same bridge. It " +
-    "calls a tool that registerAllTools already registered, so a tool for it would be circular. " +
-    "It also takes its bookId from the URL, not from an argument — see withoutBookId() in " +
-    "mcp/webmcp.ts.",
   "GET /b/[bookId]/accounts/[id]": "Covered by list_accounts.",
   "GET /b/[bookId]/transactions/[id]": "Covered by list_transactions.",
   "GET /b/[bookId]/securities/[id]": "Covered by get_security_detail.",

@@ -1,5 +1,5 @@
-import Link from "next/link";
-import { formatCurrency } from "@/lib/formatters";
+import { Link } from "@/lib/navigation";
+import { formatCurrency } from "@/lib/wasm-client";
 import type { PositionSummary } from "@/lib/investments";
 
 const formatShares = (sharesMicros: number) =>

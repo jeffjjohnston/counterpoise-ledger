@@ -20,8 +20,8 @@
 #     AFTER initdb has already created the cluster with it, and only on a
 #     first initialization — so refusing here would stop the container while
 #     leaving that password stored, skip the role below, and never run
-#     again. A refusal has to come before initdb — an entrypoint guard on
-#     the postgres service, which runs while PGDATA is still empty.
+#     again. That refusal lives in scripts/postgres-entrypoint-guard.sh, which
+#     runs as the service entrypoint while PGDATA is still empty.
 #
 #   - The privileges. The bootstrap role is a superuser. The application only
 #     ever runs plain DDL and DML — no CREATE EXTENSION, no role management —

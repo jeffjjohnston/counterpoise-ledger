@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -9,19 +9,25 @@ import {
   formatCurrency,
   parseStrictCurrency,
   resolveAmountOnBlur,
-} from "@/lib/formatters";
-import { evaluateExpression } from "@/lib/expression";
+} from "@/lib/wasm-client";
+import { evaluateExpression } from "@/lib/wasm-client";
 import type { AccountWithBalance } from "@/types";
 import type { SplitInput } from "@/types";
+import { tabTo } from "@/components/transactions/tab-to";
 
 interface SplitEditorProps {
   splits: SplitInput[];
   onChange: (splits: SplitInput[]) => void;
   accounts: AccountWithBalance[];
   onPendingChange?: (hasPending: boolean) => void;
+  /**
+   * The quick-entry submit button. When it is given, Tab from the last row's
+   * Credit moves the focus to it instead of to "+ Add Line".
+   */
+  submitRef?: RefObject<HTMLElement | null>;
 }
 
-export function SplitEditor({ splits, onChange, accounts, onPendingChange }: SplitEditorProps) {
+export function SplitEditor({ splits, onChange, accounts, onPendingChange, submitRef }: SplitEditorProps) {
   const [draftValues, setDraftValues] = useState(() =>
     splits.map((split) => ({
       debit: split.amount > 0 ? (split.amount / 100).toFixed(2) : "",
@@ -216,7 +222,10 @@ export function SplitEditor({ splits, onChange, accounts, onPendingChange }: Spl
               value={draftValues[index]?.credit ?? ""}
               onChange={(e) => handleAmountChange(index, "credit", e.target.value)}
               onBlur={() => handleAmountBlur(index, "credit")}
-              onKeyDown={(e) => handleAmountKeyDown(e, index, "credit")}
+              onKeyDown={(e) => {
+                handleAmountKeyDown(e, index, "credit");
+                if (submitRef && index === splits.length - 1) tabTo(e, submitRef);
+              }}
               placeholder="0.00"
               className="text-right"
               selectOnFocus

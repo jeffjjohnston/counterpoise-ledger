@@ -120,7 +120,9 @@ export function getPlaidConfig(): PlaidConfig {
   return {
     clientId,
     secret,
-    baseUrl: PLAID_BASE_URLS[plaidEnv],
+    // PLAID_API_URL replaces the origin of the selected environment. The
+    // HTTP parity tests point it at a local mock, so no test calls Plaid.
+    baseUrl: process.env.PLAID_API_URL || PLAID_BASE_URLS[plaidEnv],
     env: plaidEnv,
   };
 }

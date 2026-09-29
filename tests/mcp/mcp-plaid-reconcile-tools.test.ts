@@ -1,7 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import { eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { transactions } from "@/db/schema";
@@ -15,26 +12,13 @@ import {
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
+import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 
-// Mock MCP auth to return an authenticated user, same pattern as
-// mcp-account-tools.test.ts.
-vi.mock("@/mcp/auth", () => ({
-  getMcpAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  verifyBookAccess: vi.fn().mockResolvedValue(true),
-  requireAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  requireBookAuth: vi.fn().mockResolvedValue({ userId: 1, keyId: 1 }),
-}));
-
-vi.mock("@/db", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/db")>();
-  return { ...actual };
-});
-
-let client: Client;
-let server: McpServer;
+// The client sends a real key of user 1, who owns book 1.
+let mcp: McpTestClient;
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
-  callMcpTool(client, name, args);
+  callMcpTool(mcp.client, name, args);
 
 describe("MCP Plaid reconcile tools", () => {
   const bookId = 1;
@@ -42,23 +26,15 @@ describe("MCP Plaid reconcile tools", () => {
   beforeAll(async () => {
     await setupTestDatabase();
 
-    server = new McpServer({ name: "test", version: "0.0.1" });
-    const { registerPlaidReconcileTools } = await import("@/mcp/tools/plaid-reconcile");
-    registerPlaidReconcileTools(server);
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(clientTransport);
-  });
+    mcp = await connectMcpTestClient();
+  }, 120_000);
 
   beforeEach(async () => {
     await resetTestDatabase();
   });
 
   afterAll(async () => {
-    await client.close();
-    await server.close();
+    await mcp.close();
   });
 
   it("returns the queue with ranked candidates", async () => {
@@ -105,6 +81,59 @@ describe("MCP Plaid reconcile tools", () => {
     expect(isError).toBe(false);
     expect(data.totalCount).toBe(1);
     expect(data.items[0].candidates[0].transactionId).toBe(txn.id);
+  });
+
+  it("returns the queue for every linked account when no link is given", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const card = await createAccount({ name: "Card", type: "liability" });
+    const links = [];
+    for (const [accountId, suffix] of [
+      [checking.id, "checking"],
+      [card.id, "card"],
+    ] as const) {
+      const token = await createPlaidToken({
+        financialInstitution: "Chase",
+        itemId: `item-mcp-all-${suffix}`,
+        accessToken: "token",
+      });
+      links.push(
+        await createPlaidAccount({
+          tokenId: token.id,
+          plaidAccountId: `plaid-mcp-all-${suffix}`,
+          name: suffix,
+          type: "depository",
+          counterpoiseAccountId: accountId,
+        })
+      );
+    }
+    await createPlaidReconciliation({
+      plaidAccountLinkId: links[0].id,
+      plaidTransactionId: "older",
+      date: "2026-02-01",
+      amountCents: 100,
+      name: "OLDER",
+    });
+    await createPlaidReconciliation({
+      plaidAccountLinkId: links[1].id,
+      plaidTransactionId: "newer",
+      date: "2026-02-02",
+      amountCents: 200,
+      name: "NEWER",
+    });
+
+    const { data, isError } = await callTool("get_reconcile_candidates", { bookId });
+
+    expect(isError).toBe(false);
+    expect(data.totalCount).toBe(2);
+    expect(
+      data.items.map((item: { plaidTransactionId: string; plaidAccountLinkId: number }) => [
+        item.plaidTransactionId,
+        item.plaidAccountLinkId,
+      ])
+    ).toEqual([
+      ["newer", links[1].id],
+      ["older", links[0].id],
+    ]);
   });
 
   it("fails cleanly for an unknown link", async () => {
@@ -222,9 +251,9 @@ describe("MCP Plaid reconcile tools", () => {
       resolutionStatus: "pending",
     });
 
-    // toolShape() spreads .shape and drops reconcileSchema's superRefine, so
-    // this rule reaches the tool only through resolveReconciliation(). Without
-    // it the call would reach Drizzle with an undefined transactionId.
+    // The tool's JSON Schema cannot hold reconcileSchema's superRefine, so
+    // this rule reaches the tool only through the route. Without it the call
+    // would reach the database with no transactionId.
     const { data, isError } = await callTool("reconcile_plaid_transaction", {
       bookId,
       plaidAccountLinkId: link.id,

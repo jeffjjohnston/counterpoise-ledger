@@ -56,8 +56,9 @@ validation test. Concurrency tests synchronize on explicit signals or the specif
 blocked database operation, release holders in `finally`, and never use a fixed
 sleep to assume an interleaving happened.
 
-Calling a lib function with pooled `getDb()` does not cover the reserved-connection
-path. Anything reachable from `withAdvisoryLock` needs a test through the lock.
+A test that calls a helper on a pooled connection does not cover the
+reserved-connection path. Anything reachable from Rust's `with_advisory_lock`
+needs a test through the lock.
 
 UI tests query accessible roles and labels, interact, and check the result.
 An edit must survive reload or reopening; an unchanged row remaining visible
@@ -76,14 +77,125 @@ measurements in one place rather than testing repeated prose for agreement.
 - `npm run test:node` covers pure logic, schemas, and process tests.
 - `npm run test:dom` covers React/UI tests with DOM setup.
 - `npm run test:db` covers real PostgreSQL integration.
+- `npm run test:http` runs the HTTP suite against the Rust binary. Build it
+  with `SQLX_OFFLINE=true cargo build --locked -p counterpoise-rust-api -p
+  ledger-cli --manifest-path rust-api/Cargo.toml`. CI runs it. The suite ran
+  against the Node server too until the Next API handlers were retired, so
+  its snapshots and expected bodies are the ones both servers gave.
+  - `tests/http/rebuild-lots.test.ts` runs the TypeScript lot backfill (which
+    `npm run db:migrate` runs) and `ledger-cli rebuild-lots` (which the Docker
+    entrypoint runs) on the same data and compares every lot and allocation.
+  - `tests/http/seed.test.ts` and `tests/http/moneydance-import.test.ts` run
+    `ledger-cli seed` and `ledger-cli import-moneydance` (on both Moneydance
+    fixtures in `tests/fixtures/`). Both write dates relative to today, so the
+    tests check the counts, the balance and the rows that matter, and that two
+    runs write the same rows. `tests/helpers/table-dump.ts` holds the dump
+    they compare. Timestamps and password hashes are left out.
+- `npm run test:mcp:http` and `npm run test:mcp:stdio` run the MCP suites in
+  `tests/mcp` against the Rust server, over each transport. They need the
+  server binary too. See [mcp-server.md](mcp-server.md).
+- Some HTTP suites compare full response bodies with snapshots in
+  `tests/http/__snapshots__/`. After a deliberate change to one of these
+  responses, check the new body by hand, delete the affected snapshot and run
+  the suite to write it again. Run with `CI=1` to make a missing snapshot fail
+  instead of being written.
 - `npm run test:e2e` builds and starts its own server. It refuses an occupied port
-  rather than silently testing another checkout's server.
+  rather than silently testing another checkout's server. As in production,
+  there is one server: `playwright.config.ts` runs `npx vite build`, then the
+  Rust server with `RUST_BIND=127.0.0.1:3001` and `COUNTERPOISE_STATIC_DIR=build`.
+  The Rust server serves the client build and the API on `http://127.0.0.1:3001`.
+  `tests/e2e/static-client.spec.ts` checks the static client: a deep link
+  after a reload, Back, the not-found page, and a 404 for a missing chunk.
+- Rust workspace checks: `cargo fmt --all --check --manifest-path rust-api/Cargo.toml`,
+  `SQLX_OFFLINE=true cargo clippy --workspace --all-targets --manifest-path rust-api/Cargo.toml -- -D warnings`,
+  and `SQLX_OFFLINE=true cargo test --workspace --manifest-path rust-api/Cargo.toml`.
+  Set `COUNTERPOISE_RUST_TEST_DATABASE_URL` to a disposable migrated PostgreSQL
+  database to run the Rust lock, reference, and HTTP adapter tests. CI sets it
+  to its migrated service database; those tests fail in CI if it is absent.
+- With Homebrew's `rust` and `rust-wasm`, build the browser target using the
+  configuration supplied by `rust-wasm`. That configuration links with
+  `wasm-ld`, which Homebrew's `lld` formula supplies (`brew install lld`).
+  Without it, the crate compiles and the link fails with "linker `wasm-ld`
+  not found":
+
+  ```bash
+  cargo build --config "$(brew --prefix rust-wasm)/share/rust-wasm/cargo-config.toml" \
+    -p ledger-core --target wasm32-unknown-unknown \
+    --manifest-path rust-api/Cargo.toml
+  ```
+
+  The Homebrew target libraries live in a separate sysroot, so the plain
+  `cargo build --target wasm32-unknown-unknown` command cannot find `core`.
+  CI installs the target through `rustup` and uses the plain command there.
+- `npm run build`, `npm run dev`, and the npm test commands compile
+  `ledger-core` with its `wasm` feature, run `wasm-bindgen` 0.2.128 and
+  `wasm-opt`, then generate `lib/wasm/generated/` before using it. The
+  generated files are ignored: Homebrew and rustup produce different bytes,
+  and committing either build would make the other toolchain dirty the tree.
+  Install the CLI with `cargo install wasm-bindgen-cli --version 0.2.128
+  --locked` and Binaryen with `brew install binaryen`. If the CLI is outside
+  `PATH`, set `WASM_BINDGEN` to its binary path. The build script checks the
+  active `rustc` sysroot before selecting the Homebrew `rust-wasm` config and
+  `lld@22`; rustup uses its own target and linker. Docker compiles the same
+  target in a Rust build stage (`wasm-builder` in the root `Dockerfile`) and
+  passes the optimized bindings to the `client` stage, which runs the Vite
+  build. Every CI job that imports the browser adapter builds it from the Rust
+  source first, including unit, e2e, type checking, and the vacuity pass.
+  Before running `npx vitest` or `npx tsc` directly from a clean checkout,
+  run `npm run core:wasm:build`.
+- `rust-api/core/fixtures/core.json` is the corpus that the Rust core test
+  checks. The TypeScript helpers generated it until the TypeScript server was
+  retired; it is now test data. Add an edge case to it by hand alongside a
+  change to the shared logic, then make the Rust implementation pass the new
+  case. The corpus fixes the clock to a UTC date for floating-date and
+  fixed-price examples.
+- After changing a Rust SQL query or database schema, migrate a disposable
+  PostgreSQL database and run `DATABASE_URL=... cargo sqlx prepare --workspace`
+  from `rust-api/`. Commit the resulting `.sqlx` files. CI runs
+  `cargo sqlx prepare --check --workspace` against a migrated database to
+  catch stale query metadata.
 - `npm run test:coverage` reports coverage; use it to locate gaps, not as a
   correctness quota.
 
 `vitest.config.ts` owns project membership. Add new persistence suites to its
-database list or to `tests/api/`. Tests belong under `tests/`; worktrees are
-outside discovery. Shared helpers live under `tests/helpers/`.
+database list. Tests belong under `tests/`; worktrees are outside discovery.
+Shared helpers live under `tests/helpers/`.
+
+A component test that renders a `Link` or calls a router hook mocks
+`@/lib/navigation`, not `next/navigation`. `vi.mock` needs each export that
+the component uses, so use `mockNavigation()` from `tests/helpers/navigation.tsx`
+and give only what the test cares about:
+
+```ts
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+  })
+);
+```
+
+A test that copies its harness on purpose, so that a shared fixture cannot
+change what it checks, writes the whole mock inline
+(`TransactionFormInvestmentPayload.test.tsx`).
+
+For a route, add cases under `tests/http/` using `startHttpTestServer()` and
+`sessionHttpClient()` from `tests/helpers/http-parity.ts`. Seed rows through
+the database helpers, send real requests through the client, and check each
+successful response with `contract("<ComponentName>")` from
+`tests/helpers/contract.ts`. That helper validates the body against the
+component schema in `openapi/openapi.json`, and refuses any key the schema
+does not declare. `COUNTERPOISE_HTTP_SERVER=rust` (set by `npm run test:http`)
+adds the suite to the database project. The HTTP suite uses the same generated
+per-worker database, lease, migrations, and reset as other Vitest database
+suites. Start the server after `setupTestDatabase()` so it receives that
+worker's validated `DATABASE_URL`; stop it in `afterAll`. The HTTP suite
+covers account reads and writes, payee writes, the transaction register and
+transaction CRUD, investments and securities, security prices and the Tiingo
+fetch, recurring rules and their processing, Plaid connections, account
+mappings, the sync, reconciliation, the sync reads, live updates, TypeSafe
+settings, suggestions and retention, the scheduled jobs (`/api/cron/*`),
+version, book and member management, demo book creation, issue reports,
+health, job status, and WebMCP.
 
 Start `docker compose -f docker-compose.dev.yml up -d --wait`, then run
 `npm run db:create-test-dbs` once; it creates `counterpoise_dev` and
@@ -123,9 +235,8 @@ entrypoint override and the reasons. Read a run's outcome with:
 docker logs counterpoise-dev-postgres-1 2>&1 | grep test-db-sweep
 ```
 
-Production does **not** run test-database cleanup; its scheduler's sweep entry
-was removed when the two instances were split. Nothing schedules a sweep of the
-production instance, by design — the suite no longer creates databases there.
+Production does **not** run test-database cleanup, because the suite never
+creates databases on the production instance.
 
 To sweep by hand, from the host, against the dev instance:
 

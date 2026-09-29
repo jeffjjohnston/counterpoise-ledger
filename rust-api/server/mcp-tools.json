@@ -1,0 +1,3073 @@
+[
+  {
+    "name": "add_book_member",
+    "title": "Add Book Member",
+    "description": "Give an existing user access to a book. username must match exactly, including case. Owner only. Repeated failed attempts are rate-limited.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The exact username of an existing user. Case matters."
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "owner",
+            "editor",
+            "viewer"
+          ],
+          "description": "owner: everything, including members, rename, delete and bank connections. editor: read and change the ledger. viewer: read only."
+        }
+      },
+      "required": [
+        "bookId",
+        "username",
+        "role"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "analyze_usage",
+    "title": "Analyze Usage",
+    "description": "Query this server's PostHog project for usage events in the last `days` days. Returns totalEvents, eventCounts (each event name with its count, highest first) and recentEvents (the 20 newest events with their properties). eventType limits both to one event name, such as '$pageview' or 'transaction_created'. The data covers only the events of the calling user, across every book they use. The tool does not group by page or session; read page paths from the recentEvents properties.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "default": 7,
+          "description": "Number of days to look back",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 90
+        },
+        "eventType": {
+          "description": "Filter to specific event type (e.g., 'transaction_created', '$pageview')",
+          "type": "string"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "clear_plaid_sync_data",
+    "title": "Clear Plaid Sync Data",
+    "description": "Discard every staged transaction for a connection and reset its sync cursor, so the next sync re-fetches from the beginning. Local transactions already reconciled are not affected. This touches only this database and never calls Plaid.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the connection belongs to"
+        },
+        "tokenId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The Plaid connection ID"
+        }
+      },
+      "required": [
+        "bookId",
+        "tokenId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_account",
+    "title": "Create Account",
+    "description": "Create an account in the chart of accounts. Creating an account with subtype 'investment' also creates its paired cash sub-account automatically. Use get_account_tree to find a parentId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Account name, as it will appear in the chart of accounts."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "asset",
+            "liability",
+            "equity",
+            "income",
+            "expense"
+          ],
+          "description": "Account type: asset, liability, equity, income, or expense. You cannot change this after creation."
+        },
+        "subtype": {
+          "description": "Account subtype: bank, credit_card, loan, investment, cash, or other. Set to 'investment' to also create a paired cash sub-account automatically.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "bank",
+                "credit_card",
+                "loan",
+                "investment",
+                "cash",
+                "other"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parentId": {
+          "description": "ID of the parent account, to nest this account under it. Omit for a top-level account. Use get_account_tree to find a parentId.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "icon": {
+          "description": "A single emoji to show for this account. Only income and expense accounts show an icon. Send null to inherit the icon from the parent account instead of setting one directly.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "bookId",
+        "name",
+        "type"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_book",
+    "title": "Create Book",
+    "description": "Create a new accounting book for the authenticated user. A book is the top-level container for a ledger — every account, transaction, security and bank connection belongs to one.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The book's name, shown in the book switcher and page titles."
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_demo_book",
+    "title": "Create Demo Book",
+    "description": "Create a new book and fill it with realistic sample data — about three years of transactions across dozens of accounts, payees and securities — for exploring Counterpoise. Named 'Demo Book', or 'Demo Book 2', 'Demo Book 3', etc. if that name is already taken. This writes thousands of rows and can take several seconds.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_issue_report",
+    "title": "Create Issue Report",
+    "description": "File a bug or improvement report about Counterpoise itself. A separate workflow reviews these later; nothing happens immediately. Use this for a problem with the app, not for anything about the user's financial data.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What went wrong or what should improve, in the reporter's own words."
+        },
+        "page": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The app path the report is about, e.g. /b/1/transactions."
+        },
+        "type": {
+          "default": "bug",
+          "description": "The kind of report: bug, improvement, or other. Defaults to bug.",
+          "type": "string",
+          "enum": [
+            "bug",
+            "improvement",
+            "other"
+          ]
+        }
+      },
+      "required": [
+        "description",
+        "page"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_payee",
+    "title": "Create Payee",
+    "description": "Create a payee in the book. Does not fold case, so 'IKEA' and 'Ikea' are both created as distinct payees, and it does not search for a similar existing payee — use list_payees first to check for one. An EXACT repeat of an existing name in this book fails rather than inserting a second row, since the book allows only one payee per exact name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The payee's name. Normalized on save: whitespace runs collapse to one space and curly quotes straighten to '. Case is NOT changed — \"IKEA\" and \"Ikea\" stay two different payees."
+        }
+      },
+      "required": [
+        "bookId",
+        "name"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_recurring_rule",
+    "title": "Create Recurring Rule",
+    "description": "Create a recurring transaction rule. templateSplits is the transaction the rule will create each time it fires: at least two splits summing to zero, each on an account in this book. nextDate is computed from startDate and the recurrence fields — you cannot set it here; use update_recurring_rule to move it afterwards. Creating a rule creates no transaction: call process_recurring_rules for that.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A short label for the rule, shown in the recurring list — \"Rent\", \"Netflix\". This is not the description written onto the transactions it creates; that is templateDescription."
+        },
+        "frequency": {
+          "type": "string",
+          "enum": [
+            "daily",
+            "weekly",
+            "monthly",
+            "yearly"
+          ],
+          "description": "How often the rule fires: daily, weekly, monthly or yearly. Combined with interval — monthly with interval 3 is quarterly."
+        },
+        "startDate": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+          "description": "The date the schedule is anchored to, YYYY-MM-DD. nextDate is computed from it and then advanced past today, so a startDate in the past does not make the rule instantly overdue."
+        },
+        "endDate": {
+          "description": "The last scheduled date, YYYY-MM-DD, or null for no end. Must not be earlier than startDate. An occurrence scheduled on or before this date still counts even when a business-day shift lands it after.",
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "templateSplits": {
+          "minItems": 2,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "accountId": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "The account this split posts to. Must be an account in this book."
+              },
+              "amount": {
+                "type": "number",
+                "description": "Amount in cents. Positive is a debit, negative a credit. Every split in templateSplits must sum to zero."
+              }
+            },
+            "required": [
+              "accountId",
+              "amount"
+            ]
+          },
+          "description": "The transaction this rule creates each time it fires: at least two splits that sum to zero, each on an account in this book."
+        },
+        "autoCreateDaysBefore": {
+          "description": "How many days early process_recurring_rules may create an occurrence, 0 to 30. 0 means only on or after the day it is due.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30
+        },
+        "businessDaysOnly": {
+          "description": "When true, an occurrence landing on a weekend is dated the following Monday. The rule's own schedule does not move, so the cadence never creeps. Bank holidays are not modelled.",
+          "type": "boolean"
+        },
+        "interval": {
+          "description": "How many frequency units between occurrences, as a positive integer — 1 means every period. Applied to daily, weekly and monthly rules — weekly with interval 4 is every 4 weeks. A weekly rule uses it only while weekOfMonth is unset or 'every'; an nth-week-of-month pattern ignores it, as do yearly rules. Defaults to 1."
+        },
+        "daysOfWeek": {
+          "description": "For weekly rules: which weekdays it fires on, as an array of integers, Sunday 0 through Saturday 6. Omit or send null to use the weekday of startDate."
+        },
+        "weekOfMonth": {
+          "description": "For weekly rules: which weeks count. \"every\" (the default), \"2\" to \"5\" for every Nth week, or \"last\" for the final week of the month."
+        },
+        "daysOfMonth": {
+          "description": "For monthly rules: which days of the month it fires on, as an array of integers 1 to 31. Omit or send null to use the day of startDate."
+        },
+        "templateDescription": {
+          "description": "The description written onto each transaction this rule creates. Null leaves them without one."
+        },
+        "payeeId": {
+          "description": "An existing payee id in this book to attach to created transactions. Silently ignored if it does not belong to this book. payeeName wins when both are given."
+        },
+        "payeeName": {
+          "description": "A payee name to attach. Matched case-insensitively against this book's payees and CREATED if there is no match. Takes precedence over payeeId."
+        }
+      },
+      "required": [
+        "bookId",
+        "name",
+        "frequency",
+        "startDate",
+        "templateSplits"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_security",
+    "title": "Create Security",
+    "description": "Create a new security (ETF, mutual fund, or stock) in a book. Fails with an error if a security with the same symbol (case-insensitive) already exists in the book. Set fixedPriceMicros for a security whose price never moves, such as a money market fund at a $1.00 NAV. Doing so forces price fetching off.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to create the security in"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Display name of the security"
+        },
+        "symbol": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Ticker symbol (e.g. VTI, AAPL)"
+        },
+        "securityType": {
+          "type": "string",
+          "enum": [
+            "etf",
+            "mutual_fund",
+            "stock"
+          ],
+          "description": "Type of security"
+        },
+        "fetchPrices": {
+          "description": "Whether to fetch prices automatically (defaults to true)",
+          "type": "boolean"
+        },
+        "fixedPriceMicros": {
+          "description": "Price in micros (1,000,000 = $1.00) that never moves, for a security such as a money market fund held at a fixed NAV. Setting this forces fetchPrices off, since a fixed price and automatic fetching would otherwise contradict each other.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "bookId",
+        "name",
+        "symbol",
+        "securityType"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_transaction",
+    "title": "Create Transaction",
+    "description": "Create a new transaction with double-entry splits. Each split has an accountId and amount in cents. Positive amounts are debits, negative are credits. The splits must sum to zero, or the transaction is rejected. Optionally include investmentSplits for investment transactions. Use list_accounts to find account IDs first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "date": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+          "description": "Transaction date in YYYY-MM-DD format"
+        },
+        "description": {
+          "description": "Transaction description",
+          "type": "string"
+        },
+        "notes": {
+          "description": "Additional notes",
+          "type": "string"
+        },
+        "payeeName": {
+          "description": "Payee name. Matched case-insensitively to an existing payee in this book; created if none matches.",
+          "type": "string"
+        },
+        "checkNumber": {
+          "description": "Check number (only for bank account transactions)",
+          "type": "string"
+        },
+        "isFloating": {
+          "description": "If true, the transaction's effective date auto-advances to today until reconciled. Useful for checks or expected deposits where the clearing date is unknown.",
+          "type": "boolean"
+        },
+        "isReconciled": {
+          "description": "If true, the transaction is recorded as already reconciled. If the transaction is floating (isFloating is true), also set isFloating to false and give the cleared date in the same call. If you set only isReconciled, the transaction stays floating, and its effective date keeps moving to today even though it is marked reconciled.",
+          "type": "boolean"
+        },
+        "splits": {
+          "minItems": 2,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "accountId": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The account ID for this split"
+              },
+              "amount": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "Amount in cents. Positive = debit, negative = credit. All splits must sum to zero."
+              }
+            },
+            "required": [
+              "accountId",
+              "amount"
+            ]
+          },
+          "description": "Transaction splits (must sum to zero)"
+        },
+        "investmentSplits": {
+          "description": "Investment splits (required if transaction involves investment accounts)",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "securityId": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The security ID"
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "buy",
+                  "sell",
+                  "dividend",
+                  "capGain",
+                  "fee",
+                  "split"
+                ],
+                "description": "Investment action type"
+              },
+              "sharesMicros": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of shares in micros (1,000,000 = 1 share). Always positive."
+              },
+              "priceMicros": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Price per share in micros (1,000,000 = $1.00)"
+              },
+              "feesCents": {
+                "description": "Fees in cents",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "splitNumerator": {
+                "description": "For stock split: new share ratio numerator",
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "splitDenominator": {
+                "description": "For stock split: old share ratio denominator",
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "securityId",
+              "action",
+              "sharesMicros",
+              "priceMicros"
+            ]
+          }
+        }
+      },
+      "required": [
+        "bookId",
+        "date",
+        "splits"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_account",
+    "title": "Delete Account",
+    "description": "Delete an account. Refuses to delete an account that still has transactions or sub-accounts — clear or reassign those first. This cannot be undone. Use list_accounts or get_account_tree to find an accountId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "accountId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The account ID to delete"
+        }
+      },
+      "required": [
+        "bookId",
+        "accountId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_book",
+    "title": "Delete Book",
+    "description": "Permanently delete a book and ALL of its data — every account, transaction, split, security, price, lot, recurring rule, payee and bank connection in it. This cannot be undone. You must pass confirmBookName exactly matching the book's name; use list_books to read it first. Do not call this unless the user has explicitly asked to delete this specific book.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to delete"
+        },
+        "confirmBookName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The book's exact name, as a confirmation that this deletion is intended"
+        }
+      },
+      "required": [
+        "bookId",
+        "confirmBookName"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_issue_report",
+    "title": "Delete Issue Report",
+    "description": "Permanently delete one of your own issue reports. Use list_issue_reports to find an id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The issue report ID to delete."
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_payee",
+    "title": "Delete Payee",
+    "description": "Delete a payee. Refuses when the payee still has transactions — reassign or delete those first. This cannot be undone. Use list_payees to find a payeeId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "payeeId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The payee ID to delete"
+        }
+      },
+      "required": [
+        "bookId",
+        "payeeId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_plaid_token",
+    "title": "Delete Plaid Token",
+    "description": "Delete a bank connection and its entire reconciliation history. This removes the account mappings, every staged transaction still awaiting review, AND every already-resolved row — the matched, created and ignored ones. Local transactions are not deleted, but those that were matched lose their link to the bank transaction that confirmed them, and the matched history that payee-based auto-matching learns from is gone, so future syncs on a re-added connection will match less well. To discard only the pending queue and re-fetch from scratch, use clear_plaid_sync_data instead. This cannot be undone.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the connection belongs to"
+        },
+        "tokenId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The Plaid connection ID to delete"
+        }
+      },
+      "required": [
+        "bookId",
+        "tokenId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_recurring_rule",
+    "title": "Delete Recurring Rule",
+    "description": "Delete a recurring rule and its template splits. Transactions the rule already created are KEPT — their link to the rule is cleared, so they stop appearing in list_recurring_transactions. This cannot be undone; to stop a rule without losing it, set isActive false with update_recurring_rule instead.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "ruleId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The recurring rule ID to delete"
+        }
+      },
+      "required": [
+        "bookId",
+        "ruleId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_security",
+    "title": "Delete Security",
+    "description": "Permanently delete a security from a book. Refuses when the security still has investment transactions, so a delete cannot orphan them. This does not protect price history: deleting a security also deletes every price ever recorded for it, even one with no investment transactions at all.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the security belongs to"
+        },
+        "securityId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The security ID to delete"
+        }
+      },
+      "required": [
+        "bookId",
+        "securityId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_security_price",
+    "title": "Delete Security Price",
+    "description": "Delete one recorded price for a security on a specific date. The security and its other prices are left alone.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the security belongs to"
+        },
+        "securityId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The security whose price is being deleted"
+        },
+        "priceDate": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+          "description": "The date of the price entry to delete (YYYY-MM-DD)"
+        }
+      },
+      "required": [
+        "bookId",
+        "securityId",
+        "priceDate"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_transaction",
+    "title": "Delete Transaction",
+    "description": "Delete a transaction and all of its splits. This cannot be undone. Any Plaid reconciliation row matched to this transaction returns to pending, and investment lots are rebuilt for every affected security. Use list_transactions or search to find the transaction ID first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "transactionId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The transaction ID to delete"
+        },
+        "expectedUpdatedAt": {
+          "description": "The updatedAt value you loaded. When you send it and the transaction changed since, the delete is refused (HTTP 409) and nothing changes. Omit it to skip the check.",
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+        }
+      },
+      "required": [
+        "bookId",
+        "transactionId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "fetch_tiingo_prices",
+    "title": "Fetch Tiingo Prices",
+    "description": "Fetch the latest end-of-day price for one or more ticker symbols from Tiingo. Returns prices ([{symbol, price, date}], price in dollars) and errors (symbols that failed). This reads an external service and records nothing. To save a price, find its securityId with list_securities and call set_security_prices with priceMicros = price × 1,000,000. Requires TIINGO_API_KEY to be configured on the server.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID making the request"
+        },
+        "symbols": {
+          "minItems": 1,
+          "type": "array",
+          "items": {},
+          "description": "Ticker symbols to fetch the latest end-of-day price for (e.g. [\"VTI\", \"BND\"])"
+        }
+      },
+      "required": [
+        "bookId",
+        "symbols"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_account_balance_history",
+    "title": "Get Account Balance History",
+    "description": "Get the running balance for an account over time, showing each transaction's impact. Useful for tracking balance progression, finding when balances changed, or plotting account trends. Entries run oldest first from startDate, and limit keeps the earliest entries. A range longer than limit therefore loses its most recent entries, and no flag reports this; narrow startDate to see recent activity.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "accountId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The account ID to get history for"
+        },
+        "startDate": {
+          "description": "Start date inclusive (YYYY-MM-DD)",
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "endDate": {
+          "description": "End date inclusive (YYYY-MM-DD)",
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "limit": {
+          "default": 200,
+          "description": "Max entries to return (default 200, max 1000)",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "bookId",
+        "accountId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_account_tree",
+    "title": "Get Account Tree",
+    "description": "Get a hierarchical tree of all active accounts grouped by type (asset, liability, equity, income, expense). balance and balanceCents are in cents with the ledger sign: liabilities, equity and income are negative. Use list_accounts for display-signed balances, inactive accounts, or a balance as of a date.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_income_statement",
+    "title": "Get Income Statement",
+    "description": "Get an income statement (profit & loss) for a date range. Returns all income and expense accounts with their balances, plus totals. Balances are shown as positive numbers (income earned, expenses spent).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "startDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "Start date inclusive (YYYY-MM-DD)"
+        },
+        "endDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "End date inclusive (YYYY-MM-DD)"
+        },
+        "includeInactive": {
+          "default": false,
+          "description": "Include inactive accounts (default false)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bookId",
+        "startDate",
+        "endDate"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_investment_positions",
+    "title": "Get Investment Positions",
+    "description": "Get current investment positions across all accounts or for a specific account. Returns each security held with: shares, cost basis, current price, market value, and gain/loss. Optionally get per-account market value totals. Amounts are in dollars and shares in whole units, not cents or micros. Use list_securities for every security in the book with dividend income, and get_security_detail for the history and lots of one security.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "accountId": {
+          "description": "Filter to specific investment account",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "includeAccountValues": {
+          "default": false,
+          "description": "Also include total market value per account",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_payee",
+    "title": "Get Payee",
+    "description": "Get one payee by ID, with its transaction count and lastAccountId — the account on the largest debit split of its most recent transaction (null when the payee has no transactions). Use list_payees to find a payeeId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "payeeId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The payee ID to fetch"
+        }
+      },
+      "required": [
+        "bookId",
+        "payeeId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_plaid_status",
+    "title": "Get Plaid Status",
+    "description": "The state of a book's bank connections in one call: each connection (with its access token masked, and how many of the bank accounts it exposes are mapped to a Counterpoise account as mappedAccountCount of totalAccountCount), how many synced transactions are waiting to be reconciled, which accounts hold manually-entered transactions no bank transaction has matched, and every Plaid account mapped to a Counterpoise account — its plaidAccountMask (the last digits the bank shows) and its own pending and review counts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_projected_transactions",
+    "title": "Get Projected Transactions",
+    "description": "Project the transactions that active recurring rules WILL create over a date range, without creating anything. Defaults to tomorrow through the book's upcoming-days window. Each projected transaction carries a negative synthetic id and isProjected true — it is not in the ledger and its id cannot be passed to any other tool. Use list_recurring_transactions for occurrences that already happened.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "startDate": {
+          "description": "Inclusive start, YYYY-MM-DD. Defaults to tomorrow.",
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+        },
+        "endDate": {
+          "description": "Inclusive end, YYYY-MM-DD. Defaults to today plus the book's upcomingDays.",
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+        },
+        "accountId": {
+          "description": "Keep only rules with a template split on this account or on a direct child of it. Omit for every rule.",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_realized_gains",
+    "title": "Get Realized Gains",
+    "description": "Get realized capital gains and losses from investment sales for a date range — the answer to tax-time questions like 'what were my realized capital gains last year'. Returns one row per lot disposed of: a single sell that draws shares from three different purchase lots yields three rows (matching how a 1099-B reports each lot as a separate line), plus totals split into short-term and long-term gain, along with total proceeds and cost basis. A row with term 'unknown' means the sold shares couldn't be matched to a purchase lot — real proceeds but no basis or gain, excluded from the short/long totals and counted in unknownBasisDisposals so a data gap can't silently understate a reported gain. All amounts are in dollars.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "startDate": {
+          "description": "Start of the range, YYYY-MM-DD",
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "endDate": {
+          "description": "End of the range, YYYY-MM-DD",
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "accountId": {
+          "description": "Filter to a specific investment account",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_reconcile_candidates",
+    "title": "Get Reconcile Candidates",
+    "description": "The reconciliation queue for one linked bank account, or for every linked account in the book when plaidAccountLinkId is omitted: every synced transaction still awaiting a decision, plus any already-resolved one the bank has since changed or removed. Each item carries up to five ranked local transactions that might be the same spend, with a score and the reasons behind it, and a suggested counter account drawn from what this payee was categorised as before. Feed an item's id and its plaidAccountLinkId to reconcile_plaid_transaction to resolve it. Rows needing review are listed first; across all accounts, the rest follow newest bank date first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the connection belongs to"
+        },
+        "plaidAccountLinkId": {
+          "description": "The Plaid account link ID, as returned by get_plaid_status in assignedAccounts[].plaidLinkId. Omit to return the queue for all linked accounts.",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "limit": {
+          "default": 25,
+          "description": "Max items to return (default 25, max 100)",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "offset": {
+          "default": 0,
+          "description": "Pagination offset",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_report_data",
+    "title": "Get Report Data",
+    "description": "Get raw transaction split data for custom analysis. Returns one row per split in the date range, with its account info, effective date, and payee. Rows run oldest first and stop at limit; truncated is true when more rows exist, so the rows dropped are the most recent. Useful for building custom reports, grouping by category/payee/month, etc.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "startDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "Start date inclusive (YYYY-MM-DD)"
+        },
+        "endDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "End date inclusive (YYYY-MM-DD)"
+        },
+        "accountTypes": {
+          "description": "Filter by account types",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "asset",
+              "liability",
+              "equity",
+              "income",
+              "expense"
+            ]
+          }
+        },
+        "accountIds": {
+          "description": "Filter by specific account IDs",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "limit": {
+          "default": 2000,
+          "description": "Max rows to return (default 2000, max 5000)",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 5000
+        }
+      },
+      "required": [
+        "bookId",
+        "startDate",
+        "endDate"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_security_detail",
+    "title": "Get Security Detail",
+    "description": "Get detailed information about a specific security including: basic info, current position, price history, and all related transactions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "securityId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The security ID to look up"
+        },
+        "priceLimit": {
+          "default": 50,
+          "description": "Number of recent prices to return (default 50, max 200)",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 200
+        },
+        "priceOffset": {
+          "default": 0,
+          "description": "Number of most-recent prices to skip before taking priceLimit. Use with priceLimit to page through price history older than the most recent priceLimit rows.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "includeLots": {
+          "default": false,
+          "description": "Include the open FIFO lots for this security — one row per lot with its account, acquisition date, remaining shares, and remaining cost basis. Off by default because most questions do not need lot-level detail.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bookId",
+        "securityId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_system_status",
+    "title": "Get System Status",
+    "description": "Report the health of Counterpoise's background jobs: database backup, backup pruning, hourly recurring-transaction processing, bank sync, security price sync, and search reindex. Each job reports one of ok, stale, unverified, failed, missing, or unknown (no status directory mounted — the normal case in local development). Overall is 'attention' if any job needs it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_transaction_plaid_link",
+    "title": "Get Transaction Plaid Link",
+    "description": "The staged Plaid row a transaction is matched to. Returns null when the transaction was entered by hand rather than matched to a bank transaction.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the transaction belongs to"
+        },
+        "transactionId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The transaction ID to look up"
+        }
+      },
+      "required": [
+        "bookId",
+        "transactionId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_accounts",
+    "title": "List Accounts",
+    "description": "List all accounts in a book with their balances. Optionally filter by account type, active status, or compute balances as of a specific date.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "type": {
+          "description": "Filter by account type",
+          "type": "string",
+          "enum": [
+            "asset",
+            "liability",
+            "equity",
+            "income",
+            "expense"
+          ]
+        },
+        "includeInactive": {
+          "default": false,
+          "description": "Include inactive accounts (default false)",
+          "type": "boolean"
+        },
+        "asOfDate": {
+          "description": "Compute balances as of this date (YYYY-MM-DD)",
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_book_members",
+    "title": "List Book Members",
+    "description": "List the users who can open a book, with each user's role: owner, editor or viewer. Any member can call this.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_books",
+    "title": "List Books",
+    "description": "List the accounting books you can open in Counterpoise, with your role in each (owner, editor or viewer). Returns book IDs, names, roles and creation dates. Use this first to discover which bookId to pass to other tools.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_issue_reports",
+    "title": "List Issue Reports",
+    "description": "List the authenticated user's own issue reports, newest first. Never returns another user's reports.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_payees",
+    "title": "List Payees",
+    "description": "List payees in the book. Each row carries its transaction count and the date of its most recent transaction (null when unused). Sorted by name. A book imported from another app can hold thousands of payees, so pass search or limit rather than listing them all when you are looking for a particular one.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "search": {
+          "description": "Case-insensitive substring match on the payee name. Omit to list every payee.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum payees to return, applied after sorting by name. Omit for all.",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_pending_plaid_transactions",
+    "title": "List Pending Plaid Transactions",
+    "description": "Bank transactions a Plaid sync has staged but nothing has reconciled yet — waiting to be matched to an existing Counterpoise transaction, created as a new one, or ignored. Rows flagged for review (reviewReason) are not included; get_reconcile_candidates returns them.  These are staged bank transactions, not Counterpoise transactions: their ids are synthetic placeholders and must never be passed to create_transaction, update_transaction, delete_transaction, or any other transaction tool.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "accountId": {
+          "description": "Limit the results to this Counterpoise account. Omit to return every account.",
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_plaid_token_accounts",
+    "title": "List Plaid Token Accounts",
+    "description": "List the bank accounts a Plaid connection exposes and which Counterpoise account each is mapped to. This reads only local data and never contacts Plaid.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the connection belongs to"
+        },
+        "tokenId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The Plaid connection ID"
+        }
+      },
+      "required": [
+        "bookId",
+        "tokenId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_prices_due",
+    "title": "List Prices Due",
+    "description": "List securities in a book that need a manual price entry: those with automatic fetching off, no fixed price, an open position, and no price recorded for the most recent market day. Returns that due date alongside the securities.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_recurring_rules",
+    "title": "List Recurring Rules",
+    "description": "List every recurring transaction rule in the book, active and inactive, each with its payee and its template splits. Sorted active first, then by next scheduled date. nextDate is the next SCHEDULED date; with businessDaysOnly set, an occurrence landing on a weekend is dated the following Monday instead. There is no separate get-one tool — read a single rule from this list.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_recurring_transactions",
+    "title": "List Recurring Transactions",
+    "description": "List the transactions a recurring rule actually created within a date range, each with the id and name of the rule that created it. Dates are effective dates, so a floating transaction is matched on the date it currently reports. A transaction whose rule was deleted no longer appears here.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "startDate": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+          "description": "Inclusive start of the range, YYYY-MM-DD."
+        },
+        "endDate": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+          "description": "Inclusive end of the range, YYYY-MM-DD."
+        }
+      },
+      "required": [
+        "bookId",
+        "startDate",
+        "endDate"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_securities",
+    "title": "List Securities",
+    "description": "List every security in a book with its current position: shares held, cost basis from FIFO lots, latest price, market value, and total dividend and capital-gain income received. Book-wide, so holdings in inactive accounts are included.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_transactions",
+    "title": "List Transactions",
+    "description": "Query transactions with optional filters. Returns transactions with their splits (debit/credit entries), payee, and investment details. Use accountId for a single account, or accountIds for several at once. Results are ordered by effective date, newest first. A floating transaction (isFloating) has an effective date of today, so it sorts first and matches date filters as today. effectiveDate is the date used for sorting and filtering; date is the stored entry date.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "accountId": {
+          "description": "Filter to transactions involving this account",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "accountIds": {
+          "description": "Filter to transactions involving ANY of these accounts. Takes precedence over accountId when both are given.",
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "payeeId": {
+          "description": "Filter by payee",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "startDate": {
+          "description": "Start date inclusive (YYYY-MM-DD)",
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+        },
+        "endDate": {
+          "description": "End date inclusive (YYYY-MM-DD)",
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+        },
+        "limit": {
+          "default": 50,
+          "description": "Max results (default 50, max 500)",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 500
+        },
+        "offset": {
+          "default": 0,
+          "description": "Pagination offset",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "process_recurring_rules",
+    "title": "Process Recurring Rules",
+    "description": "Create the transactions recurring rules are due for. With processAll true, every active rule is processed up to its own lead window (autoCreateDaysBefore), rules past their endDate are deactivated, and a rule that is not yet due is left alone — so a repeat call creates nothing more. With ruleId, that ONE rule is FORCED: its next occurrence is created and the rule advances whether or not it was due, so calling twice creates two transactions. Passing neither creates nothing. Returns the ids created plus a skipped list naming rules that produced nothing because they have fewer than two template splits.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "ruleId": {
+          "description": "Process this ONE rule, forcing its next occurrence whether or not it is due, and advancing the rule. Wins over processAll when both are given.",
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "processAll": {
+          "description": "Process every active rule that is due within its own lead window. Ignored when ruleId is given.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bookId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "reconcile_plaid_transaction",
+    "title": "Reconcile Plaid Transaction",
+    "description": "Resolve one staged bank transaction from the reconciliation queue. Six actions: 'match' links it to a transaction you already entered and marks that transaction reconciled; 'match_update_amount' does the same and rewrites the transaction's two splits to the bank's amount (two-split, non-investment transactions only); 'create' writes a new two-split transaction from the bank's data; 'ignore' dismisses the bank transaction; 'keep_local' clears a review flag and keeps what you already have; 'unlink' returns a resolved row to the pending queue and stops its transaction being reconciled, unless another bank row still matches that transaction (a transfer seen on both sides). Matching or creating against a bank row that is already linked is refused — unlink it first. Matching a floating transaction also settles it, clearing its floating flag and stamping the bank's date. Get the reconciliationId and its candidate matches from get_reconcile_candidates first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the connection belongs to"
+        },
+        "plaidAccountLinkId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The Plaid account link ID this staged transaction belongs to"
+        },
+        "reconciliationId": {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991,
+          "description": "The id of the staged Plaid transaction to resolve, from the reconciliation queue."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "match",
+            "match_update_amount",
+            "create",
+            "ignore",
+            "keep_local",
+            "unlink"
+          ],
+          "description": "What to do with this bank transaction. 'match' links it to an existing transaction; 'match_update_amount' links it and rewrites that transaction's two splits to the bank's amount; 'create' writes a new two-split transaction from it; 'ignore' dismisses it; 'keep_local' clears a review flag and keeps what you already have; 'unlink' returns an already-resolved row to the pending queue."
+        },
+        "transactionId": {
+          "description": "The existing transaction to link to. Required for 'match' and 'match_update_amount', ignored otherwise.",
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "counterAccountId": {
+          "description": "The account the other side of the new transaction posts to. Required for 'create', ignored otherwise, and it must not be the account this connection is linked to.",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "payeeName": {
+          "description": "The payee to record on a created transaction. Only read for 'create'; defaults to the bank's merchant name, then to the raw transaction name. If no payee with this name already exists in the book (case-insensitively), a new payee row is created — an additive, reversible side effect of 'create'.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "bookId",
+        "plaidAccountLinkId",
+        "reconciliationId",
+        "action"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "remove_book_member",
+    "title": "Remove Book Member",
+    "description": "Remove a user's access to a book. An owner can remove any member. Any member can remove themselves (leave the book). The last owner cannot be removed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "userId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The member's user ID, from list_book_members"
+        }
+      },
+      "required": [
+        "bookId",
+        "userId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "search",
+    "title": "Search",
+    "description": "Search across transactions (description, notes, payee, check number, and an exact split amount when the query parses as money: '50' matches ±$50.00), accounts (name), payees (name), and recurring rules (name, template description). Returns up to 25 results per entity type; the accounts, payees, and recurringRules buckets each carry total and truncated so a cut list is never mistaken for a complete one. The transactions bucket has no total, so 25 transactions can be a partial list. Use this for free-text discovery; to filter by account, payee or date without a text query, use list_transactions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Search query"
+        },
+        "startDate": {
+          "description": "Limit transaction search start date (YYYY-MM-DD)",
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+        },
+        "endDate": {
+          "description": "Limit transaction search end date (YYYY-MM-DD)",
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+        }
+      },
+      "required": [
+        "bookId",
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "set_plaid_token_accounts",
+    "title": "Set Plaid Account Mapping",
+    "description": "Map a Plaid connection's bank accounts to Counterpoise accounts. Pass counterpoiseAccountId null to unmap one. This replaces the mapping for every plaidAccountId you list and leaves any you omit alone. Refuses the whole batch if an id is not one of this connection's accounts, is not an account in this book, or is already mapped to a different Plaid account.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the connection belongs to"
+        },
+        "tokenId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The Plaid connection ID"
+        },
+        "assignments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "plaidAccountId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The Plaid account id to assign, from this connection's account list."
+              },
+              "counterpoiseAccountId": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The Counterpoise account id to map this Plaid account to, or null to unmap it. Required on every element — there is no way to leave it out."
+              }
+            },
+            "required": [
+              "plaidAccountId",
+              "counterpoiseAccountId"
+            ]
+          },
+          "description": "The plaidAccountId-to-counterpoiseAccountId mappings to set. Each plaidAccountId you list is replaced with the counterpoiseAccountId given; a plaidAccountId this connection has but you omit is left alone."
+        }
+      },
+      "required": [
+        "bookId",
+        "tokenId",
+        "assignments"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "set_security_prices",
+    "title": "Set Security Prices",
+    "description": "Record manual prices for securities in a book. Each entry overwrites any existing price for the same security and date. Entries that are malformed are skipped and reported back in `discarded`; the whole batch is rejected only if no entry is usable, or if any security belongs to a different book.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the securities belong to"
+        },
+        "priceUpdates": {
+          "type": "array",
+          "items": {},
+          "description": "Prices to record. Each entry is an object with securityId (positive integer), priceMicros (positive number, 1,000,000 = $1.00), and priceDate (YYYY-MM-DD)."
+        }
+      },
+      "required": [
+        "bookId",
+        "priceUpdates"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "sync_plaid_token",
+    "title": "Sync Plaid Connection",
+    "description": "Fetch new, changed and removed transactions from Plaid for one connection and stage them for reconciliation, then run auto-matching. Reaches Plaid and changes data. Returns counts of what was added, modified, removed and auto-matched. A demo connection cannot sync and says so.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the connection belongs to"
+        },
+        "tokenId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The Plaid connection ID to sync"
+        }
+      },
+      "required": [
+        "bookId",
+        "tokenId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "unlink_plaid_transaction",
+    "title": "Unlink Plaid Transaction",
+    "description": "Remove a transaction's Plaid link. The bank transaction returns to the pending queue, and the local transaction stops being reconciled — this does not delete anything.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the transaction belongs to"
+        },
+        "transactionId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The transaction ID to unlink"
+        }
+      },
+      "required": [
+        "bookId",
+        "transactionId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_account",
+    "title": "Update Account",
+    "description": "Update an account's fields. All fields are optional — only provided fields are changed. Use list_accounts or get_account_tree to find an accountId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "accountId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The account ID to update"
+        },
+        "name": {
+          "description": "New account name.",
+          "type": "string"
+        },
+        "subtype": {
+          "description": "New account subtype: bank, credit_card, loan, investment, cash, or other.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "bank",
+                "credit_card",
+                "loan",
+                "investment",
+                "cash",
+                "other"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parentId": {
+          "description": "New parent account ID, to move this account under it. Send null to make it a top-level account.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "isActive": {
+          "description": "Set to false to deactivate the account, or true to reactivate it. For an investment account, this also updates its paired cash sub-account.",
+          "type": "boolean"
+        },
+        "isFavorite": {
+          "description": "Set to true to mark the account as a favorite.",
+          "type": "boolean"
+        },
+        "icon": {
+          "description": "A single emoji to show for this account. Only income and expense accounts show an icon. Send null to inherit the icon from the parent account instead of setting one directly.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "bookId",
+        "accountId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_book",
+    "title": "Update Book",
+    "description": "Rename a book, and optionally change how many days ahead it projects recurring transactions. name is always required — to change only upcomingDays, resend the book's current name. Use list_books to read it and to find a bookId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to update"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The book's name, shown in the book switcher and page titles."
+        },
+        "upcomingDays": {
+          "description": "How many days ahead recurring transactions are projected on the dashboard (integer, 1-365). Omit to leave it unchanged.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 365
+        }
+      },
+      "required": [
+        "bookId",
+        "name"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_book_member",
+    "title": "Update Book Member",
+    "description": "Change a member's role. Owner only. A book must keep at least one owner, so the last owner cannot be demoted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "userId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The member's user ID, from list_book_members"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "owner",
+            "editor",
+            "viewer"
+          ],
+          "description": "owner: everything, including members, rename, delete and bank connections. editor: read and change the ledger. viewer: read only."
+        }
+      },
+      "required": [
+        "bookId",
+        "userId",
+        "role"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_issue_report",
+    "title": "Update Issue Report",
+    "description": "Change the description, type, or status of one of your own issue reports. Use list_issue_reports to find an id. At least one field must be given.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The issue report ID to update."
+        },
+        "description": {
+          "description": "New description. Omit to leave it unchanged.",
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "description": "New status: new, resolved, or wontfix. Omit to leave it unchanged.",
+          "type": "string",
+          "enum": [
+            "new",
+            "resolved",
+            "wontfix"
+          ]
+        },
+        "type": {
+          "description": "New type: bug, improvement, or other. Omit to leave it unchanged.",
+          "type": "string",
+          "enum": [
+            "bug",
+            "improvement",
+            "other"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_plaid_token",
+    "title": "Update Plaid Token",
+    "description": "Replace a bank connection's institution name and item id. This is a full replace, not a patch: financialInstitution and itemId are both required on every call. Rotating the connection's access token is not available through this interface — that credential can only be re-obtained through the Plaid Link browser flow, and this tool does not accept one.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the connection belongs to"
+        },
+        "tokenId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The Plaid connection ID to update"
+        },
+        "financialInstitution": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The bank or brokerage name for this connection. Required."
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Plaid's item id for this connection. Required, and must not already belong to another connection in this book."
+        }
+      },
+      "required": [
+        "bookId",
+        "tokenId",
+        "financialInstitution",
+        "itemId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_recurring_rule",
+    "title": "Update Recurring Rule",
+    "description": "Update a recurring rule. Every field is optional and an omitted field is left alone. Passing templateSplits REPLACES every existing template split, so send the complete set. Changing any schedule field (frequency, interval, daysOfWeek, weekOfMonth, daysOfMonth, startDate) recomputes nextDate from startDate unless you pass nextDate yourself, and the recomputed date never moves back before the last transaction this rule already created. To pause a rule, send isActive false rather than deleting it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "ruleId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The recurring rule ID to update"
+        },
+        "startDate": {
+          "description": "The date the schedule is anchored to, YYYY-MM-DD. nextDate is computed from it and then advanced past today, so a startDate in the past does not make the rule instantly overdue.",
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+        },
+        "endDate": {
+          "description": "The last scheduled date, YYYY-MM-DD, or null for no end. Must not be earlier than startDate. An occurrence scheduled on or before this date still counts even when a business-day shift lands it after.",
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nextDate": {
+          "description": "Force the next scheduled date, YYYY-MM-DD. Overrides the recompute that changing a schedule field would otherwise trigger. Omit unless you are deliberately moving the rule.",
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "templateSplits": {
+          "minItems": 2,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "accountId": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "The account this split posts to. Must be an account in this book."
+              },
+              "amount": {
+                "type": "number",
+                "description": "Amount in cents. Positive is a debit, negative a credit. Every split in templateSplits must sum to zero."
+              }
+            },
+            "required": [
+              "accountId",
+              "amount"
+            ]
+          },
+          "description": "The transaction this rule creates each time it fires: at least two splits that sum to zero, each on an account in this book."
+        },
+        "autoCreateDaysBefore": {
+          "description": "How many days early process_recurring_rules may create an occurrence, 0 to 30. 0 means only on or after the day it is due.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30
+        },
+        "businessDaysOnly": {
+          "description": "When true, an occurrence landing on a weekend is dated the following Monday. The rule's own schedule does not move, so the cadence never creeps. Bank holidays are not modelled.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "A new label for the rule. Omit to leave it unchanged.",
+          "type": "string"
+        },
+        "frequency": {
+          "type": "string",
+          "enum": [
+            "daily",
+            "weekly",
+            "monthly",
+            "yearly"
+          ],
+          "description": "How often the rule fires: daily, weekly, monthly or yearly. Combined with interval — monthly with interval 3 is quarterly."
+        },
+        "isActive": {
+          "description": "False pauses the rule — it stops projecting and stops being processed, but is kept. Prefer this over delete_recurring_rule for a temporary stop.",
+          "type": "boolean"
+        },
+        "interval": {
+          "description": "How many frequency units between occurrences, as a positive integer — 1 means every period. Applied to daily, weekly and monthly rules — weekly with interval 4 is every 4 weeks. A weekly rule uses it only while weekOfMonth is unset or 'every'; an nth-week-of-month pattern ignores it, as do yearly rules. Defaults to 1."
+        },
+        "daysOfWeek": {
+          "description": "For weekly rules: which weekdays it fires on, as an array of integers, Sunday 0 through Saturday 6. Omit or send null to use the weekday of startDate."
+        },
+        "weekOfMonth": {
+          "description": "For weekly rules: which weeks count. \"every\" (the default), \"2\" to \"5\" for every Nth week, or \"last\" for the final week of the month."
+        },
+        "daysOfMonth": {
+          "description": "For monthly rules: which days of the month it fires on, as an array of integers 1 to 31. Omit or send null to use the day of startDate."
+        },
+        "templateDescription": {
+          "description": "The description written onto each transaction this rule creates. Null leaves them without one."
+        },
+        "payeeId": {
+          "description": "An existing payee id in this book to attach to created transactions. Silently ignored if it does not belong to this book. payeeName wins when both are given."
+        },
+        "payeeName": {
+          "description": "A payee name to attach. Matched case-insensitively against this book's payees and CREATED if there is no match. Takes precedence over payeeId."
+        }
+      },
+      "required": [
+        "bookId",
+        "ruleId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_security",
+    "title": "Update Security",
+    "description": "Update a security's name, symbol, type, price-fetching setting, or fixed price. Only the fields you pass are changed. Setting fixedPriceMicros forces price fetching off.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the security belongs to"
+        },
+        "securityId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The security ID to update"
+        },
+        "name": {
+          "description": "New display name for the security",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "New ticker symbol (e.g. VTI, AAPL)",
+          "type": "string"
+        },
+        "securityType": {
+          "description": "New type of security",
+          "type": "string",
+          "enum": [
+            "etf",
+            "mutual_fund",
+            "stock"
+          ]
+        },
+        "fetchPrices": {
+          "description": "Whether to fetch prices automatically for this security",
+          "type": "boolean"
+        },
+        "fixedPriceMicros": {
+          "description": "Price in micros (1,000,000 = $1.00) that never moves, for a security such as a money market fund held at a fixed NAV. Setting this forces fetchPrices off. Pass null to clear it; fetching stays off until you turn it back on.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "bookId",
+        "securityId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_security_price",
+    "title": "Update Security Price",
+    "description": "Change a recorded price for one security on one date. Pass a different priceDate to move the entry to another date.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID the security belongs to"
+        },
+        "securityId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The security whose price is being changed"
+        },
+        "currentDate": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+          "description": "The date of the existing price entry to change (YYYY-MM-DD)"
+        },
+        "priceDate": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+          "description": "The date this price applies to (YYYY-MM-DD). Pass a different date to move the entry."
+        },
+        "priceMicros": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Price in micros (1,000,000 = $1.00)"
+        },
+        "source": {
+          "description": "Where the price came from, such as \"manual\""
+        }
+      },
+      "required": [
+        "bookId",
+        "securityId",
+        "currentDate",
+        "priceDate",
+        "priceMicros"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_transaction",
+    "title": "Update Transaction",
+    "description": "Update an existing transaction. All fields are optional — only provided fields will be updated. If splits are provided, they replace ALL existing splits (must sum to zero). Use list_transactions or search to find transaction IDs. Pass expectedUpdatedAt from the row you read to refuse the update if someone changed it since.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID"
+        },
+        "transactionId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The transaction ID to update"
+        },
+        "date": {
+          "description": "New date in YYYY-MM-DD format",
+          "type": "string",
+          "format": "date",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+        },
+        "description": {
+          "description": "New description",
+          "type": "string"
+        },
+        "notes": {
+          "description": "New notes",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payeeName": {
+          "description": "New payee name",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checkNumber": {
+          "description": "New check number",
+          "type": "string"
+        },
+        "isFloating": {
+          "description": "Set to true to make the transaction float (effective date = today). Set to false to stop floating.",
+          "type": "boolean"
+        },
+        "isReconciled": {
+          "description": "Set to true to mark the transaction reconciled. If the transaction is floating (isFloating is true), also set isFloating to false and set date to the cleared date in the same call. If you set only isReconciled, the transaction stays floating, and its effective date keeps moving to today even though it is marked reconciled.",
+          "type": "boolean"
+        },
+        "splits": {
+          "description": "New splits (replaces all existing, must sum to zero)",
+          "minItems": 2,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "accountId": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The account ID for this split"
+              },
+              "amount": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "Amount in cents. Positive = debit, negative = credit. All splits must sum to zero."
+              }
+            },
+            "required": [
+              "accountId",
+              "amount"
+            ]
+          }
+        },
+        "investmentSplits": {
+          "description": "New investment splits (replaces all existing)",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "securityId": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The security ID"
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "buy",
+                  "sell",
+                  "dividend",
+                  "capGain",
+                  "fee",
+                  "split"
+                ],
+                "description": "Investment action type"
+              },
+              "sharesMicros": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of shares in micros (1,000,000 = 1 share). Always positive."
+              },
+              "priceMicros": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Price per share in micros (1,000,000 = $1.00)"
+              },
+              "feesCents": {
+                "description": "Fees in cents",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "splitNumerator": {
+                "description": "For stock split: new share ratio numerator",
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "splitDenominator": {
+                "description": "For stock split: old share ratio denominator",
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "securityId",
+              "action",
+              "sharesMicros",
+              "priceMicros"
+            ]
+          }
+        },
+        "expectedUpdatedAt": {
+          "description": "The updatedAt value you loaded. When you send it and the transaction changed since, the update is refused (HTTP 409) and nothing changes. Omit it to skip the check.",
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+        }
+      },
+      "required": [
+        "bookId",
+        "transactionId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  }
+]

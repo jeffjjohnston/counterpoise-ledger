@@ -3,16 +3,18 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { TransactionForm } from "@/components/transactions/TransactionForm";
 import { ToastProvider } from "@/components/ui/ToastProvider";
 import type { AccountWithBalance } from "@/types";
-import * as accounting from "@/lib/accounting";
+import * as accounting from "@/lib/wasm-client";
 
 const renderWithToast = (ui: React.ReactElement) =>
   render(<ToastProvider>{ui}</ToastProvider>);
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/b/1/transactions",
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    usePathname: () => "/b/1/transactions",
+  })
+);
 
 const mockAccounts: AccountWithBalance[] = [
   {
@@ -426,6 +428,8 @@ describe("TransactionForm investment mode", () => {
           isReconciled: false,
           isFloating: false,
           recurringRuleId: null,
+          createdBy: null,
+          updatedBy: null,
           createdAt: new Date(),
           updatedAt: new Date(),
           payee: null,
@@ -739,6 +743,8 @@ describe("TransactionForm investment mode", () => {
           isReconciled: false,
           isFloating: false,
           recurringRuleId: null,
+          createdBy: null,
+          updatedBy: null,
           createdAt: new Date(),
           updatedAt: new Date(),
           payee: null,
@@ -896,5 +902,42 @@ describe("TransactionForm investment mode", () => {
     await pickSecurity("ACME");
 
     expect(screen.getByLabelText("Price")).toHaveValue("2.50");
+  });
+
+  // Report #37 fixed simple mode only. On macOS, Safari and Firefox keep
+  // buttons out of the tab order unless Full Keyboard Access is on, so the
+  // form moves the focus from the row's last field to Add itself.
+  describe("Tab from the last field reaches Add", () => {
+    it.each([
+      ["buy", "Fee"],
+      ["split", "Split Denominator"],
+      ["dividend", "Dividend Amount"],
+      ["capGain", "Capital Gain Amount"],
+    ])("in a %s row, from %s", async (action, label) => {
+      setup();
+      await enterInvestmentMode();
+      fireEvent.change(screen.getByLabelText("Action"), { target: { value: action } });
+
+      const field = screen.getByLabelText(label);
+      field.focus();
+      const notPrevented = fireEvent.keyDown(field, { key: "Tab" });
+
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Add Transaction" })
+      );
+      expect(notPrevented).toBe(false);
+    });
+
+    it("leaves Shift+Tab to the browser", async () => {
+      setup();
+      await enterInvestmentMode();
+
+      const fee = screen.getByLabelText("Fee");
+      fee.focus();
+      const notPrevented = fireEvent.keyDown(fee, { key: "Tab", shiftKey: true });
+
+      expect(document.activeElement).toBe(fee);
+      expect(notPrevented).toBe(true);
+    });
   });
 });

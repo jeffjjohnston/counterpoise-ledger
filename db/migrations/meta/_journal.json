@@ -155,6 +155,48 @@
       "when": 1788174476820,
       "tag": "0021_absent_mongu",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1789681302388,
+      "tag": "0022_broken_meggan",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1789930747914,
+      "tag": "0023_book_change_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1789934741818,
+      "tag": "0024_book_settings_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790111038646,
+      "tag": "0025_wild_thunderball",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790184133899,
+      "tag": "0026_careless_gideon",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790184139471,
+      "tag": "0027_book_members_owner",
+      "breakpoints": true
     }
   ]
 }

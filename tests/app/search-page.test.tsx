@@ -2,25 +2,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import SearchPage from "@/app/b/[bookId]/search/page";
-import type { ReactNode } from "react";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/b/1/search",
-  useSearchParams: () => new URLSearchParams(),
-}));
-
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({
-    children,
-    href,
-  }: {
-    children: ReactNode;
-    href: string;
-  }) => <a href={href}>{children}</a>,
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    usePathname: () => "/b/1/search",
+    useSearchParams: () => new URLSearchParams(),
+  })
+);
 
 describe("SearchPage", () => {
   beforeEach(() => {

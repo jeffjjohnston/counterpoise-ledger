@@ -37,6 +37,27 @@ describe("PayeeAutocomplete (ID mode)", () => {
     expect(screen.queryByText("Target")).not.toBeInTheDocument();
   });
 
+  it("lists prefix matches before other substring matches", () => {
+    const ranked = [
+      { id: 1, name: "American Civil Liberties Union" },
+      { id: 2, name: "Reunion Hall" },
+      { id: 3, name: "United Airlines" },
+    ];
+    render(
+      <PayeeAutocomplete payees={ranked} value={null} onChange={vi.fn()} />
+    );
+    const input = screen.getByRole("textbox");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "uni" } });
+
+    const options = screen.getAllByRole("button").map((b) => b.textContent);
+    expect(options).toEqual([
+      "United Airlines",
+      "American Civil Liberties Union",
+      "Reunion Hall",
+    ]);
+  });
+
   it("calls onChange with payee id when selected", () => {
     const onChange = vi.fn();
     render(

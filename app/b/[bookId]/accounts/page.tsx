@@ -1,13 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
+import { Link } from "@/lib/navigation";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { AccountForm } from "@/components/accounts/AccountForm";
 import { CategoryIcon } from "@/components/ui/CategoryIcon";
-import { formatCurrency, getAccountShortName } from "@/lib/formatters";
+import { formatCurrency, getAccountShortName } from "@/lib/wasm-client";
 import {
   ACCOUNT_TYPE_LABELS,
   ACCOUNT_TYPE_ORDER,
@@ -17,9 +17,10 @@ import {
   flattenAccountTreeWithDepth,
   flattenAccounts,
   getDisplayBalance,
-} from "@/lib/accounting";
+} from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookRole } from "@/components/BookRoleProvider";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { AccountMarketValue } from "@/lib/investments";
@@ -27,6 +28,7 @@ import type { AccountWithBalance } from "@/types";
 
 export default function AccountsPage() {
   const bookId = useBookId();
+  const { canWrite } = useBookRole();
   const toast = useToast();
   const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
   const [loading, setLoading] = useState(true);
@@ -219,7 +221,7 @@ export default function AccountsPage() {
             />
             Show Inactive
           </label>
-          <Button onClick={() => setShowModal(true)} size="sm">New Account</Button>
+          {canWrite && <Button onClick={() => setShowModal(true)} size="sm">New Account</Button>}
         </div>
       </div>
 
@@ -333,35 +335,41 @@ export default function AccountsPage() {
                             )}
                           </div>
                           <div className="hidden lg:flex items-center gap-2 w-36">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => setEditingAccount(account)}
-                            >
-                              Edit
-                            </Button>
-                            {!account.hasTransactions &&
-                              (!account.children || account.children.length === 0) && (
+                            {canWrite && (
+                              <>
                                 <Button
                                   variant="ghost"
                                   size="sm"
-                                  onClick={() => handleDelete(account.id)}
-                                  className="text-fg-danger hover:text-fg-danger"
+                                  onClick={() => setEditingAccount(account)}
                                 >
-                                  Delete
+                                  Edit
                                 </Button>
-                              )}
+                                {!account.hasTransactions &&
+                                  (!account.children || account.children.length === 0) && (
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      onClick={() => handleDelete(account.id)}
+                                      className="text-fg-danger hover:text-fg-danger"
+                                    >
+                                      Delete
+                                    </Button>
+                                  )}
+                              </>
+                            )}
                           </div>
                           {/* Mobile edit button */}
-                          <button
-                            onClick={() => setEditingAccount(account)}
-                            className="lg:hidden p-1.5 text-fg-tertiary hover:text-fg-secondary rounded-md"
-                            aria-label="Edit account"
-                          >
-                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                            </svg>
-                          </button>
+                          {canWrite && (
+                            <button
+                              onClick={() => setEditingAccount(account)}
+                              className="lg:hidden p-1.5 text-fg-tertiary hover:text-fg-secondary rounded-md"
+                              aria-label="Edit account"
+                            >
+                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                              </svg>
+                            </button>
+                          )}
                         </div>
                       </div>
                     );
@@ -437,7 +445,11 @@ export default function AccountsPage() {
           <EmptyState
             title="No accounts yet"
             description="Create your chart of accounts to start tracking finances."
-            action={{ label: "Create your first account", onClick: () => setShowModal(true) }}
+            action={
+              canWrite
+                ? { label: "Create your first account", onClick: () => setShowModal(true) }
+                : undefined
+            }
           />
         )}
       </div>

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { formatCurrency } from "@/lib/formatters";
+import { formatCurrency } from "@/lib/wasm-client";
 import { Button } from "@/components/ui/Button";
 import { ConfirmModal } from "@/components/ui/ConfirmModal";
 import { apiPost, toMessage } from "@/lib/api-client";
@@ -14,6 +14,8 @@ interface PlaidBannerProps {
   bookId: string;
   transactionId: number;
   onUnlinked: () => void;
+  /** A viewer has no write access. Hide the unlink action — the server would refuse it. */
+  readOnly?: boolean;
 }
 
 export function PlaidBanner({
@@ -21,6 +23,7 @@ export function PlaidBanner({
   bookId,
   transactionId,
   onUnlinked,
+  readOnly = false,
 }: PlaidBannerProps) {
   const toast = useToast();
   const [expanded, setExpanded] = useState(false);
@@ -169,15 +172,17 @@ export function PlaidBanner({
             >
               {showRawJson ? "Hide Raw JSON" : "View Raw JSON"}
             </Button>
-            <Button
-              type="button"
-              variant="danger"
-              className="text-xs"
-              onClick={() => setConfirmingUnlink(true)}
-              disabled={unlinking}
-            >
-              {unlinking ? "Unlinking…" : "Unlink from Plaid"}
-            </Button>
+            {!readOnly && (
+              <Button
+                type="button"
+                variant="danger"
+                className="text-xs"
+                onClick={() => setConfirmingUnlink(true)}
+                disabled={unlinking}
+              >
+                {unlinking ? "Unlinking…" : "Unlink from Plaid"}
+              </Button>
+            )}
           </div>
         </div>
       )}

@@ -8,11 +8,13 @@ import type {
   SyncReconciliationItem,
 } from "@/types";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/b/1/sync",
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    usePathname: () => "/b/1/sync",
+  })
+);
 
 const baseRow: AssignedSyncAccount = {
   plaidLinkId: 11,
@@ -83,17 +85,21 @@ function makeItem(
 // button or fire a keyboard shortcut pass one to see what got sent.
 function stubQueueList(
   items: SyncReconciliationItem[],
-  onPost?: (body: unknown) => Promise<Response> | Response
+  onPost?: (body: unknown) => Promise<Response> | Response,
+  typesafeTarget?: number
 ) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
+
+    if (url.endsWith("/settings/typesafe")) return new Response(JSON.stringify({ enabled: typesafeTarget !== undefined, configured: true, revision: 1 }));
+    if (url.endsWith("/reconcile/suggestion")) return new Response(JSON.stringify({ status: "ready", evaluationId: 123, transactionId: typesafeTarget, revision: 1 }));
 
     if (url === "/api/b/1/accounts?includeInactive=true") {
       return { ok: true, json: async () => [] } as Response;
     }
 
     if (
-      url === "/api/b/1/sync/accounts/11/reconcile?limit=25&offset=0" &&
+      url === "/api/b/1/sync/reconcile?limit=25&offset=0&linkId=11" &&
       (!init || init.method === "GET")
     ) {
       return {
@@ -161,7 +167,7 @@ function reconcilePosts(fetchMock: ReturnType<typeof vi.fn>) {
     .filter(
       ([url, init]) =>
         String(url).includes("/sync/accounts/") &&
-        String(url).includes("/reconcile") &&
+        String(url).endsWith("/reconcile") &&
         (init as RequestInit | undefined)?.method === "POST"
     )
     .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
@@ -251,7 +257,7 @@ describe("ReconciliationModal", () => {
       }
 
       if (
-        url === "/api/b/1/sync/accounts/11/reconcile?limit=25&offset=0" &&
+        url === "/api/b/1/sync/reconcile?limit=25&offset=0&linkId=11" &&
         (!init || init.method === "GET")
       ) {
         return {
@@ -286,7 +292,7 @@ describe("ReconciliationModal", () => {
     render(
       <ReconciliationModal
         isOpen
-        row={row}
+        links={[row]} initialLinkId={row.plaidLinkId}
         onClose={vi.fn()}
       />
     );
@@ -323,7 +329,7 @@ describe("ReconciliationModal", () => {
     });
     stubQueueFetch(item);
 
-    render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
+    render(<ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />);
 
     // The sole candidate is promoted into the decision block, where the
     // explanation lives in the button's title tooltip rather than a
@@ -357,7 +363,7 @@ describe("ReconciliationModal", () => {
       });
     });
 
-    render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
+    render(<ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />);
 
     const matchButton = await screen.findByRole("button", { name: "Match" });
     await flushEffects();
@@ -405,7 +411,7 @@ describe("ReconciliationModal", () => {
       });
     });
 
-    render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
+    render(<ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />);
 
     // Settle the fold before touching it -- see the guard test below for why
     // clicking straight off a findBy* can be undone by an effect that has
@@ -442,7 +448,7 @@ describe("ReconciliationModal", () => {
     // carry its own Match & Update branch, this action would be entirely
     // unreachable, not just buried a click deeper. A plain `match` here
     // would reconcile the transaction without correcting its amount to the
-    // bank's figure (see lib/plaid-reconcile.ts), which is a correctness bug
+    // bank's figure (see rust-api/server/src/routes/reconcile.rs), which is a correctness bug
     // in a double-entry ledger.
     const item = makeItem({
       candidates: [
@@ -463,7 +469,7 @@ describe("ReconciliationModal", () => {
       } as Response;
     });
 
-    render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
+    render(<ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />);
 
     // No disclosure to open first -- the only candidate is the decision
     // block itself.
@@ -514,7 +520,7 @@ describe("ReconciliationModal", () => {
       })
     );
 
-    render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
+    render(<ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />);
     await onceRendered("best-match");
     await flushEffects();
 
@@ -558,7 +564,7 @@ describe("ReconciliationModal", () => {
     });
 
     it("shows the reason a queue row is here, and reserves amber for bank changes", async () => {
-      render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       const exact = await screen.findByTestId("queue-item-1");
       expect(exact).toHaveTextContent("exact match found");
       expect(exact.querySelector(".text-fg-warning")).toBeNull();
@@ -569,20 +575,20 @@ describe("ReconciliationModal", () => {
     });
 
     it("shows a queue row with no candidates as having no match", async () => {
-      render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       expect(await screen.findByTestId("queue-item-2")).toHaveTextContent("no match");
     });
 
     it("negates the Plaid amount so the queue shows what the ledger will record", async () => {
       // reconciliation item amountCents: 4250 (Plaid signs a charge positive)
-      render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       // formatCurrency renders a true Unicode minus (U+2212), not an ASCII
       // hyphen — see lib/formatters.ts — so the expectation below uses it too.
       expect(await screen.findByTestId("queue-item-1")).toHaveTextContent("−$42.50");
     });
 
     it("labels the best match from the tags the server sent, not from a delta", async () => {
-      render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       const best = await screen.findByTestId("best-match");
       expect(best).toHaveTextContent("exact amount");
       expect(best).toHaveTextContent("same day");
@@ -637,7 +643,7 @@ describe("ReconciliationModal", () => {
     });
 
     it("promotes the top candidate out of the list into one decision", async () => {
-      render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       const best = await screen.findByTestId("best-match");
       expect(within(best).getByRole("button", { name: /^Match/ })).toBeInTheDocument();
 
@@ -647,7 +653,7 @@ describe("ReconciliationModal", () => {
     });
 
     it("opens Create by default when there is nothing to match against", async () => {
-      render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       const emptyRow = await screen.findByTestId("queue-item-22");
       await flushEffects();
       fireEvent.click(emptyRow);
@@ -655,7 +661,7 @@ describe("ReconciliationModal", () => {
     });
 
     it("keeps the escape hatches in a footer, disabled when they do not apply", async () => {
-      render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       const footer = await screen.findByTestId("resolve-footer");
 
       expect(within(footer).getByRole("button", { name: /Ignore/ })).toBeEnabled();
@@ -665,7 +671,7 @@ describe("ReconciliationModal", () => {
     });
 
     it("enables Keep local and Unlink on a row the bank changed", async () => {
-      render(<ReconciliationModal isOpen row={row} onClose={vi.fn()} />);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       const changedRow = await screen.findByTestId("queue-item-23");
       await flushEffects();
       fireEvent.click(changedRow);
@@ -693,7 +699,7 @@ describe("ReconciliationModal", () => {
       }
 
       if (
-        url.startsWith("/api/b/1/sync/accounts/11/reconcile?") &&
+        url.startsWith("/api/b/1/sync/reconcile?") &&
         (!init || init.method === "GET")
       ) {
         queueGets += 1;
@@ -722,7 +728,7 @@ describe("ReconciliationModal", () => {
 
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<ReconciliationModal isOpen row={baseRow} onClose={vi.fn()} />);
+    render(<ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />);
     await screen.findByTestId("queue-item-1");
     await flushEffects();
     expect(queueGets).toBe(1);
@@ -745,7 +751,7 @@ describe("ReconciliationModal", () => {
     function renderModal() {
       return render(
         <KeyboardShortcutProvider>
-          <ReconciliationModal isOpen row={row} onClose={vi.fn()} />
+          <ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />
         </KeyboardShortcutProvider>
       );
     }
@@ -902,6 +908,18 @@ describe("ReconciliationModal", () => {
       expect(reconcilePosts(fetchMock)[0]).toMatchObject({ action: "ignore" });
     });
 
+    it("keeps Enter on the deterministic best match after a different TypeSafe suggestion arrives", async () => {
+      const item = makeItem({ candidates: [makeCandidate({ transactionId: 101 }), makeCandidate({ transactionId: 102, payeeName: "Other Cafe" })] });
+      const fetchMock = stubQueueList([item], () => new Response(JSON.stringify({ ...item, resolutionStatus: "matched", matchedTransactionId: 101 })), 102);
+      await renderModalReady("best-match");
+      expect(await screen.findByRole("button", { name: "Match this transaction" })).toBeVisible();
+      await flushEffects();
+      expect(reconcilePosts(fetchMock)).toHaveLength(0);
+      fireEvent.keyDown(document, { key: "Enter" });
+      await waitFor(() => expect(reconcilePosts(fetchMock)).toHaveLength(1));
+      expect(reconcilePosts(fetchMock)[0]).toMatchObject({ action: "match", transactionId: 101 });
+    });
+
     // The guard on flushEffects. Every test above waits with findByTestId,
     // which resolves off a MutationObserver and then, by an accident of RTL's
     // implementation, awaits a setTimeout(0). That stray tick is usually long
@@ -943,6 +961,319 @@ describe("ReconciliationModal", () => {
         action: "match",
         transactionId: 101,
       });
+    });
+  });
+
+  describe("all accounts in one list", () => {
+    const cardRow: AssignedSyncAccount = {
+      ...baseRow,
+      plaidLinkId: 12,
+      plaidAccountId: "plaid-card",
+      plaidAccountName: "Sapphire",
+      plaidAccountMask: "4321",
+      counterpoiseAccountId: 3,
+      counterpoiseAccountName: "Credit Card",
+    };
+    const links = [baseRow, cardRow];
+
+    const checkingItem = makeItem({ id: 1, plaidAccountLinkId: 11, name: "CHECKING ROW" });
+    const cardItem = makeItem({ id: 2, plaidAccountLinkId: 12, name: "CARD ROW" });
+
+    // Answers the book-wide queue GET for each filter, and records each GET
+    // URL and each resolve POST URL.
+    function stubBookQueue() {
+      const gets: string[] = [];
+      const posts: string[] = [];
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+
+        if (url.endsWith("/settings/typesafe")) {
+          return new Response(JSON.stringify({ enabled: false, configured: true, revision: 1 }));
+        }
+        if (url === "/api/b/1/accounts?includeInactive=true") {
+          return { ok: true, json: async () => [] } as Response;
+        }
+        if (url.startsWith("/api/b/1/sync/reconcile?")) {
+          gets.push(url);
+          const linkId = new URL(url, "http://localhost").searchParams.get("linkId");
+          const items =
+            linkId === "12" ? [cardItem] : linkId === "11" ? [checkingItem] : [cardItem, checkingItem];
+          return {
+            ok: true,
+            json: async () => ({ items, totalCount: items.length, offset: 0, limit: 25, hasMore: false }),
+          } as Response;
+        }
+        const post = url.match(/^\/api\/b\/1\/sync\/accounts\/(\d+)\/reconcile$/);
+        if (post && init?.method === "POST") {
+          posts.push(url);
+          const body = JSON.parse(String(init.body));
+          const item = [checkingItem, cardItem].find((each) => each.id === body.reconciliationId)!;
+          return { ok: true, json: async () => ({ ...item, resolutionStatus: "ignored" }) } as Response;
+        }
+        throw new Error(`Unexpected fetch url: ${url}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      return { gets, posts };
+    }
+
+    it("lists rows from every account, each tagged with its bank account", async () => {
+      const { gets } = stubBookQueue();
+      render(<ReconciliationModal isOpen links={links} initialLinkId={null} onClose={vi.fn()} />);
+
+      expect(await screen.findByTestId("queue-item-account-2")).toHaveTextContent("Sapphire ••4321");
+      expect(screen.getByTestId("queue-item-account-1")).toHaveTextContent("Chase Checking");
+      expect(screen.getByRole("heading", { name: "Reconcile all accounts" })).toBeInTheDocument();
+      expect(gets).toEqual(["/api/b/1/sync/reconcile?limit=25&offset=0"]);
+
+      // The first row is selected; the detail names the ledger account it posts to.
+      expect(screen.getByTestId("selected-account")).toHaveTextContent("Sapphire ••4321 → Credit Card");
+    });
+
+    it("sends a decision to the link of the selected row", async () => {
+      const { posts } = stubBookQueue();
+      render(<ReconciliationModal isOpen links={links} initialLinkId={null} onClose={vi.fn()} />);
+
+      fireEvent.click(await screen.findByTestId("queue-item-1"));
+      fireEvent.click(
+        within(screen.getByTestId("resolve-footer")).getByRole("button", { name: "Ignore" })
+      );
+      await waitFor(() => expect(posts).toEqual(["/api/b/1/sync/accounts/11/reconcile"]));
+
+      await waitFor(() => expect(screen.queryByTestId("queue-item-1")).toBeNull());
+      fireEvent.click(
+        within(screen.getByTestId("resolve-footer")).getByRole("button", { name: "Ignore" })
+      );
+      await waitFor(() =>
+        expect(posts).toEqual([
+          "/api/b/1/sync/accounts/11/reconcile",
+          "/api/b/1/sync/accounts/12/reconcile",
+        ])
+      );
+    });
+
+    it("narrows to one account from the filter, and hides the account tags there", async () => {
+      const { gets } = stubBookQueue();
+      render(<ReconciliationModal isOpen links={links} initialLinkId={11} onClose={vi.fn()} />);
+
+      await screen.findByTestId("queue-item-1");
+      expect(screen.queryByTestId("queue-item-account-1")).toBeNull();
+      expect(screen.getByRole("heading", { name: "Reconcile Chase Checking" })).toBeInTheDocument();
+
+      fireEvent.change(screen.getByRole("combobox", { name: "Account" }), {
+        target: { value: "12" },
+      });
+      await screen.findByTestId("queue-item-2");
+      expect(screen.queryByTestId("queue-item-1")).toBeNull();
+
+      fireEvent.change(screen.getByRole("combobox", { name: "Account" }), {
+        target: { value: "" },
+      });
+      await screen.findByTestId("queue-item-account-1");
+
+      expect(gets).toEqual([
+        "/api/b/1/sync/reconcile?limit=25&offset=0&linkId=11",
+        "/api/b/1/sync/reconcile?limit=25&offset=0&linkId=12",
+        "/api/b/1/sync/reconcile?limit=25&offset=0",
+      ]);
+    });
+
+    it("never paints a row that has candidates with Create open, when a new filter's list arrives", async () => {
+      const matchable = makeItem({
+        id: 3,
+        plaidAccountLinkId: 12,
+        candidates: [makeCandidate({ transactionId: 700 })],
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url.endsWith("/settings/typesafe")) {
+            return new Response(JSON.stringify({ enabled: false, configured: true, revision: 1 }));
+          }
+          if (url === "/api/b/1/accounts?includeInactive=true") {
+            return { ok: true, json: async () => [] } as Response;
+          }
+          if (url.startsWith("/api/b/1/sync/reconcile?")) {
+            const items = url.endsWith("linkId=12") ? [matchable] : [checkingItem];
+            return {
+              ok: true,
+              json: async () => ({ items, totalCount: 1, offset: 0, limit: 25, hasMore: false }),
+            } as Response;
+          }
+          throw new Error(`Unexpected fetch url: ${url}`);
+        })
+      );
+
+      render(<ReconciliationModal isOpen links={links} initialLinkId={11} onClose={vi.fn()} />);
+      await screen.findByTestId("queue-item-1");
+
+      const rendered = onceRendered("best-match");
+      fireEvent.change(screen.getByRole("combobox", { name: "Account" }), {
+        target: { value: "12" },
+      });
+      await rendered;
+
+      // Read at the DOM mutation, before React runs passive effects.
+      expect(screen.getByRole("button", { name: "Create new transaction" })).toHaveAttribute(
+        "aria-expanded",
+        "false"
+      );
+    });
+
+    it("keeps a slow response for the previous filter out of the list", async () => {
+      let releaseFirst: () => void = () => {};
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let getCount = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url.endsWith("/settings/typesafe")) {
+            return new Response(JSON.stringify({ enabled: false, configured: true, revision: 1 }));
+          }
+          if (url === "/api/b/1/accounts?includeInactive=true") {
+            return { ok: true, json: async () => [] } as Response;
+          }
+          if (url.startsWith("/api/b/1/sync/reconcile?")) {
+            getCount += 1;
+            const items = getCount === 1 ? [checkingItem] : [cardItem];
+            if (getCount === 1) await firstGate;
+            return {
+              ok: true,
+              json: async () => ({ items, totalCount: 1, offset: 0, limit: 25, hasMore: false }),
+            } as Response;
+          }
+          throw new Error(`Unexpected fetch url: ${url}`);
+        })
+      );
+
+      render(<ReconciliationModal isOpen links={links} initialLinkId={11} onClose={vi.fn()} />);
+      fireEvent.change(screen.getByRole("combobox", { name: "Account" }), {
+        target: { value: "12" },
+      });
+      await screen.findByTestId("queue-item-2");
+
+      releaseFirst();
+      await flushEffects();
+      expect(screen.queryByTestId("queue-item-1")).toBeNull();
+      expect(screen.getByTestId("queue-item-2")).toBeInTheDocument();
+    });
+  });
+
+  describe("TypeSafe proposal", () => {
+    // Deliberately different from makeItem()'s own merchantName ("Blue
+    // Bottle") and suggestedCounterAccountId (2, "Food:Dining"). The
+    // selection effect already fills the Create form with those defaults, so
+    // a proposal that reused them would leave the Edit test passing even if
+    // onEdit did nothing.
+    const proposal = {
+      payee: { name: "Blue Bottle Coffee", payeeId: 9 },
+      category: { accountId: 3, name: "Food:Coffee" },
+    };
+
+    function stubProposal() {
+      const puts: unknown[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url.endsWith("/settings/typesafe"))
+            return new Response(
+              JSON.stringify({ enabled: true, configured: true, revision: 1 }),
+            );
+          if (url.endsWith("/reconcile/suggestion")) {
+            if (init?.method === "PUT") {
+              puts.push(JSON.parse(String(init.body)));
+              return new Response(
+                JSON.stringify({ ...makeItem(), resolutionStatus: "created" }),
+              );
+            }
+            if (init?.method === "PATCH") return new Response("{}");
+            return new Response(
+              JSON.stringify({
+                status: "ready",
+                evaluationId: 55,
+                revision: 1,
+                transactionId: null,
+                proposal,
+              }),
+            );
+          }
+          if (url === "/api/b/1/accounts?includeInactive=true")
+            return new Response(
+              JSON.stringify([
+                {
+                  id: 2,
+                  name: "Food:Dining",
+                  type: "expense",
+                  isActive: true,
+                  balance: 0,
+                  children: [],
+                },
+                {
+                  id: 3,
+                  name: "Food:Coffee",
+                  type: "expense",
+                  isActive: true,
+                  balance: 0,
+                  children: [],
+                },
+              ]),
+            );
+          if (url.startsWith("/api/b/1/sync/reconcile?"))
+            return new Response(
+              JSON.stringify({
+                items: [makeItem()],
+                totalCount: 1,
+                offset: 0,
+                limit: 25,
+                hasMore: false,
+              }),
+            );
+          if (url.startsWith("/api/b/1/payees?")) return new Response("[]");
+          throw new Error(`Unexpected fetch url: ${url}`);
+        }),
+      );
+      return puts;
+    }
+
+    it("creates the proposed transaction through the suggestion route", async () => {
+      const puts = stubProposal();
+      render(
+        <ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Create transaction" }));
+      await waitFor(() =>
+        expect(puts).toEqual([
+          { evaluationId: 55, kind: "create", activeReviewMs: expect.any(Number) },
+        ]),
+      );
+    });
+
+    it("fills the Create form from the proposal on Edit", async () => {
+      stubProposal();
+      render(
+        <ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />,
+      );
+      const editButton = await screen.findByRole("button", { name: "Edit…" });
+
+      // Before Edit is clicked, the Create form still holds the selection
+      // effect's own defaults (from makeItem()'s merchantName and
+      // suggestedCounterAccountId) -- not the proposal's values. Asserting
+      // this first proves the later assertions are a change Edit caused,
+      // not a coincidence of the defaults.
+      expect(screen.getByLabelText("Payee")).toHaveValue("Blue Bottle");
+      expect(screen.getByLabelText("Counter account")).toHaveValue("Food:Dining");
+
+      fireEvent.click(editButton);
+
+      expect(
+        screen.getByRole("button", { name: "Create new transaction" }),
+      ).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByLabelText("Payee")).toHaveValue("Blue Bottle Coffee");
+      expect(screen.getByLabelText("Counter account")).toHaveValue("Food:Coffee");
     });
   });
 });

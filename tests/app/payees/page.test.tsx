@@ -2,16 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import PayeesPage from "@/app/b/[bookId]/payees/page";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-}));
-
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
-    <a href={href}>{children}</a>
-  ),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+  })
+);
 
 describe("PayeesPage", () => {
   const getRenderedPayeeOrder = () =>

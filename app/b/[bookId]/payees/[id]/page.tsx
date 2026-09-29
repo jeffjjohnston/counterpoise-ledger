@@ -1,15 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
+import { Link, useParams, useRouter } from "@/lib/navigation";
 import { TransactionList } from "@/components/transactions/TransactionList";
 import { TransactionForm } from "@/components/transactions/TransactionForm";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
-import { flattenAccounts } from "@/lib/accounting";
+import { flattenAccounts } from "@/lib/wasm-client";
 import { useBookId } from "@/hooks/useBookId";
-import { apiGet, apiPut, apiDelete, toMessage } from "@/lib/api-client";
+import { useBookRole } from "@/components/BookRoleProvider";
+import { apiGet, apiDelete, toMessage } from "@/lib/api-client";
+import {
+  putTransaction,
+  deleteTransactionRequest,
+  isTransactionConflict,
+  TRANSACTION_CONFLICT_MESSAGE,
+} from "@/lib/transaction-requests";
 import { useToast } from "@/components/ui/ToastProvider";
 import type {
   AccountWithBalance,
@@ -28,6 +34,7 @@ const PAGE_SIZE = 50;
 
 export default function PayeeDetailPage() {
   const bookId = useBookId();
+  const { canWrite } = useBookRole();
   const toast = useToast();
   const router = useRouter();
   const params = useParams<{ id: string }>();
@@ -213,10 +220,16 @@ export default function PayeeDetailPage() {
     // called synchronously with no await and no catch of its own, so an
     // uncaught rejection here would be an unhandled promise rejection.
     try {
-      await apiPut(`/api/b/${bookId}/transactions/${editingTransaction.id}`, data);
+      await putTransaction(bookId, editingTransaction, data);
       setEditingTransaction(null);
       await refreshData(false);
     } catch (e) {
+      if (isTransactionConflict(e)) {
+        toast.error(TRANSACTION_CONFLICT_MESSAGE);
+        setEditingTransaction(null);
+        await refreshData(false);
+        return;
+      }
       toast.error(toMessage(e, "Failed to update transaction"));
     }
   };
@@ -229,10 +242,16 @@ export default function PayeeDetailPage() {
     // Caught here — see handleUpdateTransaction above: TransactionForm calls
     // onDelete directly from a button's onClick with no await and no catch.
     try {
-      await apiDelete(`/api/b/${bookId}/transactions/${editingTransaction.id}`);
+      await deleteTransactionRequest(bookId, editingTransaction);
       setEditingTransaction(null);
       await refreshData(false);
     } catch (e) {
+      if (isTransactionConflict(e)) {
+        toast.error(TRANSACTION_CONFLICT_MESSAGE);
+        setEditingTransaction(null);
+        await refreshData(false);
+        return;
+      }
       toast.error(toMessage(e, "Failed to delete transaction"));
     }
   };
@@ -301,7 +320,7 @@ export default function PayeeDetailPage() {
             {payee.transactionCount} transaction
             {payee.transactionCount === 1 ? "" : "s"}
           </div>
-          {payee.transactionCount === 0 && (
+          {canWrite && payee.transactionCount === 0 && (
             <Button
               variant="danger"
               size="sm"
@@ -361,6 +380,7 @@ export default function PayeeDetailPage() {
             onCancel={() => setEditingTransaction(null)}
             onDelete={handleDeleteTransaction}
             onAccountsUpdate={() => refreshData(false)}
+            readOnly={!canWrite}
           />
         )}
       </Modal>

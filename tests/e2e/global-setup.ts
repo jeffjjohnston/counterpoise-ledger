@@ -7,7 +7,7 @@ import { leaseTestDatabase } from "../helpers/database-safety";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
-import { hashPassword } from "../../lib/auth";
+import { hashPassword } from "../helpers/password";
 import { MIGRATIONS_FOLDER } from "../../db/create-book";
 
 const E2E_DB_URL = e2eDatabaseUrl();

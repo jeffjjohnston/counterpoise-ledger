@@ -15,6 +15,8 @@ function makeTx(
     isReconciled: false,
     isFloating: false,
     recurringRuleId: null,
+    createdBy: null,
+    updatedBy: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
     payee: null,

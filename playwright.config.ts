@@ -17,19 +17,27 @@ export default defineConfig({
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
   },
-  webServer: {
-    command:
-      "npx next build --webpack && cp -R .next/static .next/standalone/.next/static && PORT=3001 HOSTNAME=127.0.0.1 node .next/standalone/server.js",
-    url: "http://127.0.0.1:3001",
-    reuseExistingServer: false,
-    timeout: 120000,
-    env: {
-      DATABASE_URL: e2eDbUrl,
-      NODE_ENV: "test",
-      // The E2E database is seeded with users, so the default rule would close
-      // registration and redirect the navigation spec to /login.
-      REGISTRATION_ENABLED: "true",
+  // One server, as in production: the Rust server serves the client build
+  // and the API. The build comes first, so the server has pages to serve.
+  webServer: [
+    {
+      command: "npx vite build && cargo run --locked --manifest-path rust-api/Cargo.toml",
+      url: "http://127.0.0.1:3001/health",
+      reuseExistingServer: false,
+      timeout: 180000,
+      env: {
+        DATABASE_URL: e2eDbUrl,
+        TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        // Playwright starts web servers before globalSetup migrates the E2E
+        // database. Compile SQLx macros from the checked-in query cache.
+        SQLX_OFFLINE: "true",
+        RUST_BIND: "127.0.0.1:3001",
+        COUNTERPOISE_STATIC_DIR: "build",
+        // The E2E database is seeded with users, so the default rule would close
+        // registration and redirect the navigation spec to /login.
+        REGISTRATION_ENABLED: "true",
+      },
     },
-  },
+  ],
   globalSetup: "./tests/e2e/global-setup.ts",
 });

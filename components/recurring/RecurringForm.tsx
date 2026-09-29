@@ -6,18 +6,18 @@ import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
 import { SplitEditor } from "@/components/transactions/SplitEditor";
 import { PayeeAutocomplete } from "@/components/ui/PayeeAutocomplete";
-import { formatDate, formatDateShort, toDateString } from "@/lib/formatters";
+import { formatDate, formatDateShort, toDateString } from "@/lib/wasm-client";
 import {
   describeRecurrence,
   validateSplits,
   type RecurrenceConfig,
-} from "@/lib/accounting";
+} from "@/lib/wasm-client";
 import {
   MAX_AUTO_CREATE_DAYS_BEFORE,
   maxIntervalFor,
   previewOccurrences,
   scheduleKey,
-} from "@/lib/recurring";
+} from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { apiGet } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";

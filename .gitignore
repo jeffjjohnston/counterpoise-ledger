@@ -6,6 +6,8 @@ coverage/
 out/
 build/
 dist/
+rust-api/target/
+lib/wasm/generated/
 data/
 *.db
 *.db-journal

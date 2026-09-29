@@ -1,60 +1,21 @@
-import { describe, it, expect, beforeAll } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { registerAllTools } from "@/mcp/register-all";
+import { describe, it, expect } from "vitest";
+import manifest from "@/rust-api/server/mcp-tools.json";
+import routes from "@/rust-api/routes.json";
 import { ROUTE_TOOLS, ROUTE_WAIVERS, TOOLS_WITHOUT_ROUTES } from "./route-coverage";
 
-const API_ROOT = resolve(__dirname, "../../app/api");
-// `async` is optional here on purpose. Next.js does not require a route
-// handler to be async, so a non-async handler with a required `async` in
-// this pattern would not match — discoverRouteMethods() would silently drop
-// it, and the parity guard would never flag the missing MCP tool.
-const METHOD_RE = /export\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\b/g;
-// Next.js accepts route.js, route.jsx, and route.tsx alongside route.ts. All
-// 56 current route files are .ts, so this widening changes no discovered
-// route today — it is free insurance against a future .tsx route silently
-// going unguarded.
-const ROUTE_FILE_RE = /^route\.[jt]sx?$/;
-
-/** Every "<METHOD> <path>" key the app actually serves. */
+/**
+ * Every "<METHOD> <path>" key the API serves, with the /api prefix removed:
+ * the routes in rust-api/routes.json, and the health probe that the Rust
+ * router registers by name. MCP over HTTP and WebMCP are the MCP transports
+ * themselves, not routes a tool could cover.
+ */
 function discoverRouteMethods(): string[] {
-  const keys: string[] = [];
-
-  function walk(dir: string) {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-      } else if (ROUTE_FILE_RE.test(entry.name)) {
-        const source = readFileSync(full, "utf8");
-        const suffixLength = 1 + entry.name.length; // "/" + the filename
-        const routePath =
-          "/" + full.slice(API_ROOT.length + 1, -suffixLength).split(/[\\/]/).join("/");
-        for (const match of source.matchAll(METHOD_RE)) {
-          keys.push(`${match[1]} ${routePath}`);
-        }
-      }
-    }
-  }
-
-  walk(API_ROOT);
-  return keys.sort();
+  const keys = routes.map((route) => `${route.method} ${route.path.replace(/^\/api/, "")}`);
+  return [...keys, "GET /health"].sort();
 }
 
-let registeredToolNames: string[];
-
-beforeAll(async () => {
-  const server = new McpServer({ name: "test", version: "1.0.0" });
-  registerAllTools(server);
-
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: "test-client", version: "1.0.0" });
-  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
-  registeredToolNames = (await client.listTools()).tools.map((t) => t.name);
-});
+/** Every tool the MCP server serves: the manifest's names. */
+const registeredToolNames = manifest.map((tool) => tool.name);
 
 describe("MCP route parity", () => {
   it("accounts for every route method", () => {

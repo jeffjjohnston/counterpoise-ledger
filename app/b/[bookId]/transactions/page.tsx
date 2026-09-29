@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef, useMemo, Suspense } from "react";
-import { useSearchParams, useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "@/lib/navigation";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookRole } from "@/components/BookRoleProvider";
 import {
   AccountList,
   DEFAULT_EXPANDED_TYPES,
@@ -23,12 +24,18 @@ import {
   ACCOUNT_TYPE_ORDER,
   getEffectiveDate,
   getNextBusinessDay,
-} from "@/lib/accounting";
+} from "@/lib/wasm-client";
 import { useRegisterShortcuts } from "@/hooks/useRegisterShortcuts";
 import type { ShortcutDef } from "@/components/KeyboardShortcutProvider";
 import { mergeTransactionsForDisplay } from "@/lib/merge-transactions";
-import { toDateString, formatDate, isValidDateString } from "@/lib/formatters";
+import { toDateString, formatDate, isValidDateString } from "@/lib/wasm-client";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
+import {
+  putTransaction,
+  deleteTransactionRequest,
+  isTransactionConflict,
+  TRANSACTION_CONFLICT_MESSAGE,
+} from "@/lib/transaction-requests";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { PositionSummary } from "@/lib/investments";
 import type {
@@ -55,6 +62,7 @@ const TransactionsPageSkeleton = () => (
 );
 
 function TransactionsPageInner() {
+  const { canWrite } = useBookRole();
   const [positions, setPositions] = useState<PositionSummary[]>([]);
   const [positionsLoading, setPositionsLoading] = useState(false);
   const [editingTransaction, setEditingTransaction] =
@@ -263,6 +271,7 @@ function TransactionsPageInner() {
     showUpcoming,
     scrollTransactionsToTop,
     ensureIdRef,
+    deferBackgroundRefresh: !!editingTransaction || mobileCreateOpen,
   });
 
   const selectedAccount = selectedAccountId
@@ -487,11 +496,17 @@ function TransactionsPageInner() {
     if (!editingTransaction) return;
 
     try {
-      await apiPut(`/api/b/${bookId}/transactions/${editingTransaction.id}`, data);
+      await putTransaction(bookId, editingTransaction, data);
       toast.success("Transaction updated");
       setEditingTransaction(null);
       void refreshData(false);
     } catch (e) {
+      if (isTransactionConflict(e)) {
+        toast.error(TRANSACTION_CONFLICT_MESSAGE);
+        setEditingTransaction(null);
+        void refreshData(false);
+        return;
+      }
       toast.error(toMessage(e, "Failed to update transaction"));
     }
   };
@@ -502,10 +517,16 @@ function TransactionsPageInner() {
     if (!confirm("Are you sure you want to delete this transaction?")) return;
 
     try {
-      await apiDelete(`/api/b/${bookId}/transactions/${editingTransaction.id}`);
+      await deleteTransactionRequest(bookId, editingTransaction);
       setEditingTransaction(null);
       void refreshData(false);
     } catch (e) {
+      if (isTransactionConflict(e)) {
+        toast.error(TRANSACTION_CONFLICT_MESSAGE);
+        setEditingTransaction(null);
+        void refreshData(false);
+        return;
+      }
       toast.error(toMessage(e, "Failed to delete transaction"));
     }
   };
@@ -582,7 +603,22 @@ function TransactionsPageInner() {
       );
 
       try {
-        await apiPut(`/api/b/${bookId}/transactions/${transactionId}`, payload);
+        const updated = await apiPut<TransactionWithSplits>(
+          `/api/b/${bookId}/transactions/${transactionId}`,
+          payload
+        );
+        // Merge the server's updatedAt/updatedBy into the local row. Without
+        // this the row keeps the value it was loaded with until the next
+        // live-update refetch, and a save in the edit modal right after
+        // toggling reconciled would send that stale value and get refused
+        // as a conflict.
+        setTransactions((prev) =>
+          prev.map((tx) =>
+            tx.id === transactionId
+              ? { ...tx, updatedAt: updated.updatedAt, updatedBy: updated.updatedBy }
+              : tx
+          )
+        );
         setReconcileVersion((v) => v + 1);
       } catch (error) {
         console.error("Error toggling reconciled:", error);
@@ -637,7 +673,18 @@ function TransactionsPageInner() {
       );
 
       try {
-        await apiPut(`/api/b/${bookId}/transactions/${transactionId}`, payload);
+        const updated = await apiPut<TransactionWithSplits>(
+          `/api/b/${bookId}/transactions/${transactionId}`,
+          payload
+        );
+        // Merge updatedAt/updatedBy — see handleToggleReconciled above for why.
+        setTransactions((prev) =>
+          prev.map((tx) =>
+            tx.id === transactionId
+              ? { ...tx, updatedAt: updated.updatedAt, updatedBy: updated.updatedBy }
+              : tx
+          )
+        );
         toast.success(`Moved to ${formatDate(nextDate)}`);
         // The date moved into the future, so balances as-of today changed —
         // refresh the sidebar/account balances and running balances like the
@@ -1009,16 +1056,18 @@ function TransactionsPageInner() {
               </div>
             )}
           </div>
-          <div className="hidden lg:block border-b border-border bg-surface px-4 py-3">
-            <TransactionForm
-              ref={transactionFormRef}
-              accounts={accounts}
-              selectedAccountId={selectedAccountId}
-              isInvestmentAccountSelected={isInvestmentAccount}
-              onSubmit={handleCreateTransaction}
-              onAccountsUpdate={() => refreshData(false)}
-            />
-          </div>
+          {canWrite && (
+            <div className="hidden lg:block border-b border-border bg-surface px-4 py-3">
+              <TransactionForm
+                ref={transactionFormRef}
+                accounts={accounts}
+                selectedAccountId={selectedAccountId}
+                isInvestmentAccountSelected={isInvestmentAccount}
+                onSubmit={handleCreateTransaction}
+                onAccountsUpdate={() => refreshData(false)}
+              />
+            </div>
+          )}
           <StaleSyncBanner
             bookId={bookId}
             // positionsVersion bumps on every refreshData (create/update/
@@ -1092,43 +1141,47 @@ function TransactionsPageInner() {
       </div>
 
       {/* Mobile FAB for new transaction */}
-      <button
-        type="button"
-        onClick={() => setMobileCreateOpen(true)}
-        className="lg:hidden fixed bottom-6 right-4 z-30 w-14 h-14 bg-accent hover:bg-accent-hover text-fg-on-accent rounded-full shadow-lg flex items-center justify-center transition-colors active:scale-95"
-        style={{ bottom: "calc(1.5rem + env(safe-area-inset-bottom, 0px))" }}
-        aria-label="New transaction"
-      >
-        <svg className="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-        </svg>
-      </button>
+      {canWrite && (
+        <button
+          type="button"
+          onClick={() => setMobileCreateOpen(true)}
+          className="lg:hidden fixed bottom-6 right-4 z-30 w-14 h-14 bg-accent hover:bg-accent-hover text-fg-on-accent rounded-full shadow-lg flex items-center justify-center transition-colors active:scale-95"
+          style={{ bottom: "calc(1.5rem + env(safe-area-inset-bottom, 0px))" }}
+          aria-label="New transaction"
+        >
+          <svg className="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+          </svg>
+        </button>
+      )}
 
       {/* Mobile create transaction modal */}
-      <Modal
-        isOpen={mobileCreateOpen}
-        onClose={() => setMobileCreateOpen(false)}
-        title="New Transaction"
-        size="lg"
-      >
-        <TransactionForm
-          accounts={accounts}
-          selectedAccountId={selectedAccountId}
-          isInvestmentAccountSelected={isInvestmentAccount}
-          fullLayout
-          onSubmit={async (data) => {
-            await handleCreateTransaction(data);
-            setMobileCreateOpen(false);
-          }}
-          onCancel={() => setMobileCreateOpen(false)}
-          onAccountsUpdate={() => refreshData(false)}
-        />
-      </Modal>
+      {canWrite && (
+        <Modal
+          isOpen={mobileCreateOpen}
+          onClose={() => setMobileCreateOpen(false)}
+          title="New Transaction"
+          size="lg"
+        >
+          <TransactionForm
+            accounts={accounts}
+            selectedAccountId={selectedAccountId}
+            isInvestmentAccountSelected={isInvestmentAccount}
+            fullLayout
+            onSubmit={async (data) => {
+              await handleCreateTransaction(data);
+              setMobileCreateOpen(false);
+            }}
+            onCancel={() => setMobileCreateOpen(false)}
+            onAccountsUpdate={() => refreshData(false)}
+          />
+        </Modal>
+      )}
 
       <Modal
         isOpen={!!editingTransaction}
         onClose={() => setEditingTransaction(null)}
-        title="Edit Transaction"
+        title={canWrite ? "Edit Transaction" : "Transaction"}
         size="lg"
       >
         {editingTransaction && (
@@ -1138,15 +1191,31 @@ function TransactionsPageInner() {
             isInvestmentAccountSelected={isInvestmentAccount}
             editingTransaction={editingTransaction}
             plaidData={editingPlaidData}
-            onPlaidUnlinked={() => {
+            onPlaidUnlinked={async () => {
               setEditingPlaidData(null);
               toast.success("Transaction unlinked from Plaid");
+              // The unlink set a new updatedAt (and may have cleared
+              // isReconciled). Reload the row so the modal's next save
+              // sends the current value instead of a stale one, which
+              // would otherwise get refused as a conflict.
+              const transactionId = editingTransaction.id;
+              try {
+                const refreshed = await apiGet<TransactionWithSplits>(
+                  `/api/b/${bookId}/transactions/${transactionId}`
+                );
+                setEditingTransaction((prev) =>
+                  prev && prev.id === transactionId ? refreshed : prev
+                );
+              } catch (error) {
+                console.error("Error reloading transaction after unlink:", error);
+              }
             }}
             onSubmit={handleUpdateTransaction}
             onCancel={() => setEditingTransaction(null)}
             onDelete={handleDeleteTransaction}
             onMakeRecurring={handleMakeRecurring}
             onAccountsUpdate={() => refreshData(false)}
+            readOnly={!canWrite}
           />
         )}
       </Modal>

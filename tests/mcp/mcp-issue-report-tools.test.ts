@@ -1,59 +1,47 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import { setupTestDatabase, resetTestDatabase, createUser } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
+import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 import { getDb } from "@/db";
 import { issueReports } from "@/db/schema";
 import { eq } from "drizzle-orm";
-import { createIssueReport } from "@/lib/issue-reports";
 
-// Issue reports are user-scoped, not book-scoped: every tool here calls
-// requireAuth(), never requireBookAuth(). Mock auth to the same userId the
-// seeded test user (tests/helpers/db-utils.ts) has, same pattern as
-// mcp-book-tools.test.ts.
-vi.mock("@/mcp/auth", () => ({
-  getMcpAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  verifyBookAccess: vi.fn().mockResolvedValue(true),
-  requireAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  requireBookAuth: vi.fn().mockResolvedValue({ userId: 1, keyId: 1 }),
-}));
+let mcp: McpTestClient;
 
-vi.mock("@/db", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/db")>();
-  return { ...actual };
-});
-
-let client: Client;
-let server: McpServer;
+/** An issue report row, as the create route writes it. */
+async function createIssueReport(
+  db: ReturnType<typeof getDb>,
+  userId: number,
+  input: { description: string; type: "bug" | "improvement" | "other"; page: string }
+) {
+  const [report] = await db.insert(issueReports).values({ userId, ...input }).returning();
+  return report;
+}
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
-  callMcpTool(client, name, args);
+  callMcpTool(mcp.client, name, args);
+
+// The Rust server reads STATUS_DIR from its own environment, which is fixed
+// when it starts, so the directory is set at connect as well as per test.
+const MISSING_STATUS_DIR = "/tmp/counterpoise-test-no-such-status-dir";
 
 describe("MCP Issue Report Tools", () => {
-  const userId = 1; // matches the mocked requireAuth() above
+  const userId = 1; // the user of the test client's key
 
   beforeAll(async () => {
     await setupTestDatabase();
 
-    server = new McpServer({ name: "test", version: "0.0.1" });
-    const { registerIssueReportTools } = await import("@/mcp/tools/issue-reports");
-    registerIssueReportTools(server);
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(clientTransport);
-  });
+    mcp = await connectMcpTestClient({
+      env: { STATUS_DIR: MISSING_STATUS_DIR },
+    });
+  }, 120_000);
 
   beforeEach(async () => {
     await resetTestDatabase();
   });
 
   afterAll(async () => {
-    await client.close();
-    await server.close();
+    await mcp.close();
   });
 
   describe("create_issue_report", () => {
@@ -78,6 +66,29 @@ describe("MCP Issue Report Tools", () => {
 
       expect(isError).toBe(false);
       expect(data.type).toBe("bug");
+    });
+
+    it("refuses a description of only whitespace at the schema boundary", async () => {
+      // The zod schema trims before min(1); the JSON Schema that Rust
+      // validates has no trim. The error is the SDK's plain text.
+      const result = await mcp.client.callTool({
+        name: "create_issue_report",
+        arguments: { description: "   ", page: "/b/1" },
+      });
+
+      expect(result.isError).toBe(true);
+      const [content] = result.content as Array<{ type: string; text: string }>;
+      expect(content.text).toMatch(/^MCP error -32602: Input validation error: .*Description is required/s);
+      expect(await getDb().select().from(issueReports)).toHaveLength(0);
+    });
+
+    it("stores the description trimmed", async () => {
+      const { data } = await callTool("create_issue_report", {
+        description: "  Padded  ",
+        page: "/b/1",
+      });
+
+      expect(data.description).toBe("Padded");
     });
   });
 
@@ -130,7 +141,8 @@ describe("MCP Issue Report Tools", () => {
       });
 
       expect(isError).toBe(true);
-      expect(data.error).toMatch(/not found/i);
+      // The library names the ID; the HTTP route does not.
+      expect(data.error).toBe(`Issue report ${theirs.id} not found`);
 
       // The guard actually guards: the other user's report is unchanged.
       const rows = await getDb().select().from(issueReports).where(eq(issueReports.id, theirs.id));
@@ -147,7 +159,24 @@ describe("MCP Issue Report Tools", () => {
       const { data, isError } = await callTool("update_issue_report", { id: report.id });
 
       expect(isError).toBe(true);
-      expect(data.error).toMatch(/no valid fields/i);
+      expect(data.error).toBe("No valid fields to update");
+    });
+
+    it("refuses a description of only whitespace at the schema boundary", async () => {
+      const report = await createIssueReport(getDb(), userId, {
+        description: "Mine",
+        type: "bug",
+        page: "/b/1",
+      });
+
+      const result = await mcp.client.callTool({
+        name: "update_issue_report",
+        arguments: { id: report.id, description: " " },
+      });
+
+      expect(result.isError).toBe(true);
+      const [content] = result.content as Array<{ type: string; text: string }>;
+      expect(content.text).toMatch(/^MCP error -32602: Input validation error: .*Description cannot be empty/s);
     });
   });
 
@@ -162,7 +191,7 @@ describe("MCP Issue Report Tools", () => {
       const { data, isError } = await callTool("delete_issue_report", { id: report.id });
 
       expect(isError).toBe(false);
-      expect(data.success).toBe(true);
+      expect(data).toEqual({ success: true, id: report.id });
 
       const rows = await getDb().select().from(issueReports).where(eq(issueReports.id, report.id));
       expect(rows).toHaveLength(0);
@@ -179,7 +208,7 @@ describe("MCP Issue Report Tools", () => {
       const { data, isError } = await callTool("delete_issue_report", { id: theirs.id });
 
       expect(isError).toBe(true);
-      expect(data.error).toMatch(/not found/i);
+      expect(data.error).toBe(`Issue report ${theirs.id} not found`);
 
       const rows = await getDb().select().from(issueReports).where(eq(issueReports.id, theirs.id));
       expect(rows).toHaveLength(1);
@@ -187,16 +216,7 @@ describe("MCP Issue Report Tools", () => {
   });
 
   describe("get_system_status", () => {
-    const originalStatusDir = process.env.STATUS_DIR;
-
-    afterEach(() => {
-      if (originalStatusDir === undefined) delete process.env.STATUS_DIR;
-      else process.env.STATUS_DIR = originalStatusDir;
-    });
-
     it("reports unknown when no status directory is mounted", async () => {
-      process.env.STATUS_DIR = "/tmp/counterpoise-test-no-such-status-dir";
-
       const { data, isError } = await callTool("get_system_status");
 
       expect(isError).toBe(false);

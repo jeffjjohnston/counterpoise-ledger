@@ -27,29 +27,41 @@ Before creating investment transactions, validate:
 ## Lot Tracking
 
 Lots and allocations are **derived state**, not something any write path is
-meant to populate directly. `rebuildLots()` in `/lib/lots-db.ts` is the only
-code that **inserts** rows into `investment_lots` or `investment_lot_allocations`
-— but it is not the only thing that ever writes those tables, and an earlier
-version of this section overstated that it was. One other path touches them:
+meant to populate directly. The lot rebuild is the only code that **inserts**
+rows into `investment_lots` or `investment_lot_allocations`. It exists twice:
+
+- **Rust**: `rebuild_lots()` in `rust-api/db/src/lots.rs` (the `ledger-db`
+  crate). Every write path runs it: the transaction routes, the Moneydance
+  importer, the seed, and `ledger-cli rebuild-lots`.
+- **TypeScript**: `rebuildLots()` in `/lib/lots-db.ts`. Only the backfill
+  script (`/scripts/rebuild-lots.ts`) runs it, from `npm run db:migrate`. The
+  Docker entrypoint runs the Rust backfill, `ledger-cli rebuild-lots`.
+
+`tests/http/rebuild-lots.test.ts` holds the two to the same rows (see below).
+
+The rebuild is not the only thing that writes those tables. One other path
+touches them:
 - Rows disappear via FK cascade (`onDelete: "cascade"` in `/db/schema.ts`)
   wherever a transaction, investment split, or lot is deleted, without going
-  through `rebuildLots` at all: deleting a transaction cascades to its
+  through the rebuild at all: deleting a transaction cascades to its
   investment splits and their lot allocations (the transaction DELETE route,
   `tests/helpers/db-utils.ts` test teardown); deleting a lot cascades to its
-  allocations (`scripts/import-moneydance/overwrite.ts`, which deletes
-  `investment_lots` directly and never touches `investment_lot_allocations`
-  itself). Grepping TypeScript for `insert`/`update`/`delete` cannot see a
-  cascade declared in the DDL, which is exactly how this claim ended up wrong
-  more than once — check the schema, not just the call sites.
+  allocations (`overwrite_book()` in `rust-api/cli/src/import_moneydance/mod.rs`,
+  which deletes `investment_lots` directly and never touches
+  `investment_lot_allocations` itself). Grepping the code for
+  `insert`/`update`/`delete` cannot see a cascade declared in the DDL — check
+  the schema, not only the call sites.
 
-Aside from that path, `rebuildLots` is the sole writer. It deletes and
+Aside from that path, the rebuild is the sole writer. It deletes and
 regenerates one (account, security) pair by replaying that pair's investment
-splits through the pure `replayLots()` engine in `/lib/lots.ts`.
+splits through the pure `replay_lots()` engine in `rust-api/core/src/lots.rs`
+(`replayLots()` in `/lib/lots.ts` for the TypeScript backfill).
 
-The transaction CRUD paths call `rebuildLots` inside the same DB transaction
-as the write itself: `createTransaction`, `updateTransaction` (for both the
-prior and current pairs, since an edit can move a split to a different
-security or account), and the transaction DELETE route.
+The Rust transaction routes (`rust-api/server/src/routes/transactions.rs`) run
+the rebuild inside the same database transaction as the write itself:
+`collect_affected_pairs()` then `rebuild_lots_for_pairs()` on create, update
+(for both the prior and current pairs, since an edit can move a split to a
+different security or account), and delete.
 
 **The importer and the seed are the exceptions.** Both write splits first and
 rebuild afterwards, per pair, in their own transactions — the importer in
@@ -59,30 +71,33 @@ backdated, so an incremental engine has no cheap way to answer which existing
 allocations a newly inserted earlier buy invalidates — recomputing the whole
 pair from its splits sidesteps that question entirely.
 
-`rebuildLots` takes `pg_advisory_xact_lock(accountId, securityId)` as its
+
+The rebuild takes `pg_advisory_xact_lock(accountId, securityId)` as its
 *first* statement, before it even runs the SELECT that reads the pair's
 splits. The lock has to come first because the rows it inserts are computed
 from that read — locking only at the later DELETE would leave the read itself
 unprotected, letting two concurrent rebuilds of the same pair each read a
-stale view and then both write from it. This locking only works when
-`rebuildLots` runs inside an explicit `db.transaction(...)`: the advisory lock
-is released at commit or rollback, so a caller that passes the top-level `db`
-instead of a `tx` acquires and releases it within its own implicit
-single-statement transaction and gets no protection across calls. Every
-production call site passes a real `tx`.
+stale view and then both write from it. This locking only works when the
+rebuild runs inside an explicit database transaction: the advisory lock is
+released at commit or rollback, so a caller that runs it outside one acquires
+and releases it within its own implicit single-statement transaction and gets
+no protection across calls. Every production caller passes a connection
+inside a transaction.
 
-The deploy-time backfill (`/scripts/rebuild-lots.ts`, run by
+The deploy-time backfill (`ledger-cli rebuild-lots`, run by
 `docker-entrypoint.sh` after migrations, guarded — see the Critical Files
-Reference table in [guides/library-reference.md](library-reference.md)) does every book and pair inside **one transaction**, not one per
-pair. That's what makes its "allocations already exist" guard trustworthy:
-with per-pair commits, a crash partway through plus Docker's
-`restart: unless-stopped` on the `app` service would let the guard see partial
-progress as "already populated" on the next boot and silently skip the
+Reference table in [guides/library-reference.md](library-reference.md); its
+TypeScript copy `/scripts/rebuild-lots.ts` works the same way) does every book
+and pair inside **one transaction**, not one per pair. That's what makes its
+"allocations already exist" guard trustworthy: with per-pair commits, a crash
+partway through followed by the next run (the container's
+`restart: unless-stopped`, or the next deploy) would let the guard see partial
+progress as "already populated" and silently skip the
 remaining pairs — serving zero cost basis for them while reporting success. A
-failure aborts container startup on purpose, because the alternative is
+failure stops the container before the server starts. This is on purpose, because the alternative is
 serving that zero cost basis with no visible error. Note that this only
 catches a rebuild that *fails*. A rebuild that succeeds and is wrong — say
-from a bug in `replayLots` — starts up cleanly and serves incorrect cost
+from a bug in the replay engine — starts up cleanly and serves incorrect cost
 basis and realized gains with no error anywhere, which no automated signal
 here can distinguish from a correct one.
 
@@ -93,8 +108,8 @@ basis/proceeds relationship. Adding them is not a matter of relaxing that
 filter: the enum, the lot matching and the gain calculation each need a
 direction before any of it means anything.
 
-**Floating transactions drift, latently.** `rebuildLots` materializes
-`effectiveDateSql` into `investment_lots.acquiredDate` at rebuild time — a
+**Floating transactions drift, latently.** The rebuild materializes the
+effective date (`effectiveDateSql`) into `investment_lots.acquiredDate` at rebuild time — a
 snapshot, not a live value. A **floating** transaction's effective date
 advances to today every day until it's reconciled, but a floating buy's
 persisted `acquiredDate` freezes at whatever "today" was on the last rebuild
@@ -102,26 +117,48 @@ and does not follow it. Left open, the lot looks older than it actually is
 (biasing term classification toward long-term) and its FIFO ordering can drift
 relative to fixed-date trades. The drift is latent until an installation
 actually holds a floating investment transaction, and a ledger with none is
-unaffected. The pair self-heals on any write that triggers `rebuildLots` for
+unaffected. The pair self-heals on any write that triggers the rebuild for
 it — there is nothing to migrate ahead of time.
 
-The Moneydance importer used to keep its own lot bookkeeping — Pass 1 created
-buys and lots, Pass 2 matched sells to them FIFO and stamped
-`investmentSplits.lotId`. Both were superseded by the Lot Rebuild phase and
-have been deleted, along with the `lotId` column itself (migration 0020). The
-importer now writes investment splits only; lots and allocations come from
-`rebuildLots` alone.
+The Moneydance importer writes investment splits only; lots and allocations come
+from the rebuild alone.
 
-Two things about that removal are worth keeping:
+### The two lot rebuilds
 
-- **It was proven, not assumed.** Importing `tests/fixtures/moneydance-sample.json`
-  before and after the deletion produced byte-identical `investment_lots` and
-  `investment_lot_allocations`. That fixture is the right control because it
-  holds a 2-for-1 split between the buys and the sell, so the rebuild has to
-  apply the corporate action to get the sell's basis right. Pass 2's stamp did
-  not even survive its own import run: the FK was `onDelete: "set null"`, so
-  `rebuildLots` deleting Pass 1's lots nulled every value Pass 2 had written.
-- **Dropping the column shipped alone.** Adding the lots tables was backward
+`rust-api/db/src/lots.rs` holds `rebuild_lots()`, `rebuild_lots_for_pairs()`,
+`find_all_lot_pairs()`, `collect_affected_pairs()`, and `backfill_lots()`.
+`/lib/lots-db.ts` holds the TypeScript copies (`rebuildLots()`,
+`rebuildLotsForPairs()`, `findAllLotPairs()`, `collectAffectedPairs()`) that
+the deploy-time backfill runs. The rules above apply to both: the advisory
+lock is the first statement, the caller passes a connection inside a
+transaction, and the backfill is one transaction for every book. The Rust
+rebuild evaluates the effective date with `CURRENT_DATE` in the session time
+zone, as `effectiveDateSql` does.
+
+`ledger-cli rebuild-lots [--force]` runs the backfill with the guard and
+messages of `scripts/rebuild-lots.ts`, and exits 1 on failure. The `migrate`
+job's entrypoint still runs the TypeScript script. An update collects the pairs
+before and after it replaces the splits, because a replaced account or
+security still needs a rebuild.
+
+`tests/http/rebuild-lots.test.ts` seeds and imports through `ledger-cli`, adds
+edge cases, runs both backfills, and requires identical rows. A change to one
+engine must change the other. Run the same
+comparison on a production-shaped copy before a change to either engine
+ships.
+
+The Rust routes that read lots — positions, account values, security detail,
+security lots, and realized gains — keep two JavaScript details. The security
+detail route values a position with a floating-point product, not the exact
+micros product. The realized-gain term adds one year with `setUTCFullYear`, so
+a lot bought on 29 February reaches one year on 1 March.
+
+- **`tests/fixtures/moneydance-sample.json` is the control for importer lot
+  changes.** Compare `investment_lots` and `investment_lot_allocations` before
+  and after the change. The fixture holds a 2-for-1 split between the buys and
+  the sell, so the rebuild must apply the corporate action to get the sell's
+  basis correct.
+- **Dropping the `lotId` column (migration 0020) shipped alone.** Adding the lots tables was backward
   compatible, so that release could be rolled back from. This one cannot:
   Drizzle's relational `with: { investmentSplits: … }` selects every column, so
   the previous image's SQL still names `lot_id` on every transaction read and

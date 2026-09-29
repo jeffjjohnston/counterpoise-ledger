@@ -1,23 +1,29 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
+import { Link, useParams, useRouter } from "@/lib/navigation";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { TransactionList } from "@/components/transactions/TransactionList";
 import { TransactionForm } from "@/components/transactions/TransactionForm";
 import { RecurringForm } from "@/components/recurring/RecurringForm";
-import { formatCurrency, formatDate, toDateString } from "@/lib/formatters";
-import { describeRecurrence, flattenAccounts } from "@/lib/accounting";
+import { formatCurrency, formatDate, toDateString } from "@/lib/wasm-client";
+import { describeRecurrence, flattenAccounts } from "@/lib/wasm-client";
 import {
   buildRuleRecurrenceConfig,
   isRecurringRuleDue,
   previewOccurrences,
-} from "@/lib/recurring";
+} from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookRole } from "@/components/BookRoleProvider";
 import { apiDelete, apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
+import {
+  putTransaction,
+  deleteTransactionRequest,
+  isTransactionConflict,
+  TRANSACTION_CONFLICT_MESSAGE,
+} from "@/lib/transaction-requests";
 import { useToast } from "@/components/ui/ToastProvider";
 import type {
   AccountWithBalance,
@@ -94,6 +100,7 @@ function SectionCard({
 
 export default function RecurringRuleDetailPage() {
   const bookId = useBookId();
+  const { canWrite } = useBookRole();
   const toast = useToast();
   const router = useRouter();
   const params = useParams<{ id: string }>();
@@ -219,10 +226,16 @@ export default function RecurringRuleDetailPage() {
     // called with no await and no catch of its own, so an uncaught rejection
     // would be an unhandled promise rejection.
     try {
-      await apiPut(`/api/b/${bookId}/transactions/${editingTransaction.id}`, data);
+      await putTransaction(bookId, editingTransaction, data);
       setEditingTransaction(null);
       await refreshData(false);
     } catch (e) {
+      if (isTransactionConflict(e)) {
+        toast.error(TRANSACTION_CONFLICT_MESSAGE);
+        setEditingTransaction(null);
+        await refreshData(false);
+        return;
+      }
       toast.error(toMessage(e, "Failed to update transaction"));
     }
   };
@@ -232,10 +245,16 @@ export default function RecurringRuleDetailPage() {
     if (!confirm("Are you sure you want to delete this transaction?")) return;
 
     try {
-      await apiDelete(`/api/b/${bookId}/transactions/${editingTransaction.id}`);
+      await deleteTransactionRequest(bookId, editingTransaction);
       setEditingTransaction(null);
       await refreshData(false);
     } catch (e) {
+      if (isTransactionConflict(e)) {
+        toast.error(TRANSACTION_CONFLICT_MESSAGE);
+        setEditingTransaction(null);
+        await refreshData(false);
+        return;
+      }
       toast.error(toMessage(e, "Failed to delete transaction"));
     }
   };
@@ -375,30 +394,34 @@ export default function RecurringRuleDetailPage() {
             &larr; Back to Recurring
           </Link>
           <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={handleProcess}
-              title={
-                isDue
-                  ? "Create the transaction this rule is due for"
-                  : "Create this rule's next occurrence now, before it is due"
-              }
-            >
-              Process Now
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
-              Edit
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={handleDelete}
-              disabled={deleting}
-              className="text-fg-danger hover:text-fg-danger"
-            >
-              {deleting ? "Deleting..." : "Delete"}
-            </Button>
+            {canWrite && (
+              <>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={handleProcess}
+                  title={
+                    isDue
+                      ? "Create the transaction this rule is due for"
+                      : "Create this rule's next occurrence now, before it is due"
+                  }
+                >
+                  Process Now
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
+                  Edit
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleDelete}
+                  disabled={deleting}
+                  className="text-fg-danger hover:text-fg-danger"
+                >
+                  {deleting ? "Deleting..." : "Delete"}
+                </Button>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -488,7 +511,7 @@ export default function RecurringRuleDetailPage() {
       <Modal
         isOpen={!!editingTransaction}
         onClose={() => setEditingTransaction(null)}
-        title="Edit Transaction"
+        title={canWrite ? "Edit Transaction" : "Transaction"}
         size="lg"
       >
         {editingTransaction && (
@@ -500,17 +523,21 @@ export default function RecurringRuleDetailPage() {
             onCancel={() => setEditingTransaction(null)}
             onDelete={handleDeleteTransaction}
             onAccountsUpdate={() => refreshData(false)}
+            readOnly={!canWrite}
           />
         )}
       </Modal>
 
+      {/* The role can drop to viewer while the form is open: the role loads
+          after the page, and an owner can demote a member at any time. A
+          viewer must not keep an editable form. */}
       <Modal
-        isOpen={editing}
+        isOpen={editing && canWrite}
         onClose={() => setEditing(false)}
         title="Edit Recurring Transaction"
         size="lg"
       >
-        {editing && (
+        {editing && canWrite && (
           <RecurringForm
             rule={rule}
             accounts={accounts}

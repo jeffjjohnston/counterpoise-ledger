@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, Suspense, useCallback } from "react";
-import Link from "next/link";
+import { Link, useRouter, useSearchParams } from "@/lib/navigation";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
@@ -9,20 +9,20 @@ import {
   RecurringForm,
   type PrefillData,
 } from "@/components/recurring/RecurringForm";
-import { formatCurrency, formatDate, toDateString, getAccountShortName } from "@/lib/formatters";
+import { formatCurrency, formatDate, toDateString, getAccountShortName } from "@/lib/wasm-client";
 import {
   describeRecurrence,
   flattenAccounts,
   getNextDate,
-} from "@/lib/accounting";
+} from "@/lib/wasm-client";
 import {
   buildRuleRecurrenceConfig,
   getOccurrenceDate,
   isRecurringRuleDue,
-} from "@/lib/recurring";
-import { useSearchParams, useRouter } from "next/navigation";
+} from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookRole } from "@/components/BookRoleProvider";
 import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type {
@@ -124,6 +124,7 @@ function getRuleOccurrencesInRange(
 
 function RecurringPageInner() {
   const bookId = useBookId();
+  const { canWrite } = useBookRole();
   const toast = useToast();
   const [rules, setRules] = useState<RecurringRuleWithSplits[]>([]);
   const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
@@ -192,6 +193,9 @@ function RecurringPageInner() {
   }, [fetchData]);
 
   useEffect(() => {
+    // A viewer cannot create a rule, so the link opens the list only. The
+    // effect runs again when the role loads.
+    if (!canWrite) return;
     const fromTransaction = searchParams.get("fromTransaction");
     if (!fromTransaction) return;
     const transactionId = parseInt(fromTransaction, 10);
@@ -230,7 +234,7 @@ function RecurringPageInner() {
     })();
 
     return () => { cancelled = true; };
-  }, [bookId, searchParams]);
+  }, [bookId, canWrite, searchParams]);
 
   const closeNewRuleModal = useCallback(() => {
     setShowModal(false);
@@ -378,12 +382,12 @@ function RecurringPageInner() {
           Recurring Transactions
         </h1>
         <div className="flex items-center gap-3">
-          {dueRules.length > 0 && (
+          {canWrite && dueRules.length > 0 && (
             <Button variant="secondary" onClick={handleProcessAll}>
               Process All Due ({dueRules.length})
             </Button>
           )}
-          <Button onClick={() => setShowModal(true)}>New Rule</Button>
+          {canWrite && <Button onClick={() => setShowModal(true)}>New Rule</Button>}
         </div>
       </div>
 
@@ -555,16 +559,19 @@ function RecurringPageInner() {
                   <span className="text-lg font-semibold text-fg tabular-nums">
                     {formatCurrency(amount)}
                   </span>
-                  {/* Pause/Resume is the one row action that stays. Edit,
-                      Delete and Process Now live on the detail page, where the
-                      rule's history is in view to decide against. */}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleToggleActive(rule)}
-                  >
-                    {rule.isActive ? "Pause" : "Resume"}
-                  </Button>
+                  {/* Pause/Resume is the one row action that stays, and it
+                      shows only for a user who can write. Edit, Delete and
+                      Process Now stay on the detail page, where the rule's
+                      history helps the user decide. */}
+                  {canWrite && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleToggleActive(rule)}
+                    >
+                      {rule.isActive ? "Pause" : "Resume"}
+                    </Button>
+                  )}
                 </div>
               </div>
               <div className="px-6 py-3 bg-surface-secondary border-t border-border-secondary">
@@ -581,13 +588,18 @@ function RecurringPageInner() {
 
         {rules.length === 0 && (
           <div className="text-center py-12 text-fg-tertiary">
-            No recurring rules yet.{" "}
-            <button
-              onClick={() => setShowModal(true)}
-              className="text-fg-accent hover:underline"
-            >
-              Create your first recurring transaction
-            </button>
+            No recurring rules yet.
+            {canWrite && (
+              <>
+                {" "}
+                <button
+                  onClick={() => setShowModal(true)}
+                  className="text-fg-accent hover:underline"
+                >
+                  Create your first recurring transaction
+                </button>
+              </>
+            )}
           </div>
         )}
 
@@ -598,8 +610,10 @@ function RecurringPageInner() {
         )}
       </div>
 
+      {/* The role can drop to viewer while the form is open. A viewer must
+          not keep an editable form. */}
       <Modal
-        isOpen={showModal}
+        isOpen={showModal && canWrite}
         onClose={closeNewRuleModal}
         title="New Recurring Transaction"
         size="lg"

@@ -4,17 +4,12 @@ import PayeeDetailPage from "@/app/b/[bookId]/payees/[id]/page";
 import type { TransactionWithSplits } from "@/types";
 
 const mockPush = vi.fn();
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1", id: "1" }),
-  useRouter: () => ({ push: mockPush }),
-}));
-
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
-    <a href={href}>{children}</a>
-  ),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1", id: "1" }),
+    useRouter: () => ({ push: mockPush }),
+  })
+);
 
 vi.mock("@/components/transactions/TransactionList", () => ({
   TransactionList: ({
@@ -84,6 +79,8 @@ describe("PayeeDetailPage", () => {
     isReconciled: false,
     isFloating: false,
     recurringRuleId: null,
+    createdBy: null,
+    updatedBy: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     payee: { id: 1, bookId: 1, name: "Blue Bottle", createdAt: new Date() },

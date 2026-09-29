@@ -1,11 +1,27 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import RecurringPage from "@/app/b/[bookId]/recurring/page";
 
-vi.mock("next/navigation", () => ({
-  useSearchParams: () => new URLSearchParams(),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
-  useParams: () => ({ bookId: "1" }),
+// One stable object, so the page effect that reads it does not run again on
+// each render. A test that opens the page from a transaction replaces it.
+let searchParamsValue = new URLSearchParams();
+
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useSearchParams: () => searchParamsValue,
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    useParams: () => ({ bookId: "1" }),
+  })
+);
+
+let bookRoleValue: { canWrite: boolean; isOwner: boolean; role: string } = {
+  canWrite: true,
+  isOwner: true,
+  role: "owner",
+};
+
+vi.mock("@/components/BookRoleProvider", () => ({
+  useBookRole: () => bookRoleValue,
 }));
 
 vi.mock("@/components/ui/Modal", () => ({
@@ -624,5 +640,129 @@ describe("RecurringPage search filter", () => {
 
     const fridayCell = screen.getByTestId("calendar-day-cell-2026-02-13");
     expect(within(fridayCell).getByText("Friday Catchup Rule")).toBeInTheDocument();
+  });
+});
+
+describe("RecurringPage viewer access", () => {
+  const stubFetchWithRules = (rules: typeof recurringPayload) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/b/1/recurring") {
+        return { ok: true, json: async () => rules } as Response;
+      }
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/recurring/transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-02-08T12:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    bookRoleValue = { canWrite: true, isOwner: true, role: "owner" };
+    searchParamsValue = new URLSearchParams();
+  });
+
+  // "Make recurring" on a transaction opens this page with
+  // ?fromTransaction=<id>. The page then opens a new rule form with a prefill.
+  const openFromTransaction = () => {
+    searchParamsValue = new URLSearchParams({ fromTransaction: "55" });
+    const fetchMock = stubFetchWithRules(recurringPayload);
+    const listFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/transactions/55") {
+        return {
+          ok: true,
+          json: async () => ({
+            id: 55,
+            description: "Rent",
+            payeeId: null,
+            payee: null,
+            splits: [
+              { accountId: 2, amount: 150000 },
+              { accountId: 1, amount: -150000 },
+            ],
+          }),
+        } as Response;
+      }
+      return listFetch(input);
+    });
+    render(<RecurringPage />);
+    return fetchMock;
+  };
+
+  it("opens the prefilled new rule form from a transaction for an owner", async () => {
+    openFromTransaction();
+
+    expect(await screen.findByTestId("modal")).toBeInTheDocument();
+  });
+
+  it("does not open an editable new rule form from a transaction for a viewer", async () => {
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+    openFromTransaction();
+
+    await screen.findByTestId("recurring-rule-card-1");
+    // Give any prefill request time to settle. The form must stay closed.
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    expect(screen.queryByTestId("modal")).not.toBeInTheDocument();
+  });
+
+  it("hides Process All Due, New Rule and each row's Pause/Resume from a viewer", async () => {
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+    stubFetchWithRules(recurringPayload);
+
+    render(<RecurringPage />);
+    await screen.findByTestId("recurring-rule-card-1");
+
+    expect(
+      screen.queryByRole("button", { name: /Process All Due/ })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New Rule" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume" })).not.toBeInTheDocument();
+  });
+
+  it("hides the empty-state create link from a viewer but still says there are no rules", async () => {
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+    stubFetchWithRules([]);
+
+    render(<RecurringPage />);
+
+    expect(await screen.findByText(/No recurring rules yet/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Create your first recurring transaction" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows Process All Due, New Rule and each row's Pause/Resume for an owner", async () => {
+    stubFetchWithRules(recurringPayload);
+
+    render(<RecurringPage />);
+    const card = await screen.findByTestId("recurring-rule-card-1");
+
+    expect(
+      screen.getByRole("button", { name: /Process All Due/ })
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "New Rule" })).toBeInTheDocument();
+    expect(within(card).getByRole("button", { name: "Pause" })).toBeInTheDocument();
   });
 });

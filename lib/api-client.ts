@@ -1,9 +1,9 @@
 /**
  * The single client-side entry point for talking to this app's API.
  *
- * Server-side fetches (lib/plaid.ts, lib/tiingo.ts, lib/posthog-query.ts) call
- * EXTERNAL services with their own auth and error shapes. They do not belong
- * here and must not be migrated to it.
+ * Script fetches (lib/plaid.ts, lib/posthog-query.ts) call EXTERNAL services
+ * with their own auth and error shapes. They do not belong here and must not
+ * be migrated to it.
  */
 
 /** A non-ok response from our own API, carrying its `{ error }` message. */
@@ -47,8 +47,8 @@ export async function apiFetch<T>(url: string, init: ApiInit = {}): Promise<T> {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
-  // Every route in this app answers with JSON — no route returns 204 or an
-  // empty body, and no client code reads .blob()/.text(). res.json() can
+  // Routes used by this helper answer with JSON. The book event stream uses
+  // EventSource directly and never passes through here. res.json() can
   // still reject, and only a genuine parse failure is tolerable here — a
   // 500 serving an HTML error page, or an empty body. Both reject with
   // SyntaxError.

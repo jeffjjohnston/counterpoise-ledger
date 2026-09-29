@@ -1,6 +1,6 @@
 "use client";
 
-import { useRouter } from "next/navigation";
+import { useRouter } from "@/lib/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { MenuButton } from "@/components/ui/MenuButton";
@@ -8,8 +8,9 @@ import { ConfirmModal } from "@/components/ui/ConfirmModal";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { ReconciliationModal } from "@/components/sync/ReconciliationModal";
-import { formatDate, toDateString } from "@/lib/formatters";
+import { formatDate, toDateString } from "@/lib/wasm-client";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookRole } from "@/components/BookRoleProvider";
 import { apiGet, apiPost, apiDelete, toMessage } from "@/lib/api-client";
 import { cn } from "@/lib/utils";
 import { SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
@@ -65,6 +66,7 @@ function syncStatus(
 
 export default function SyncPage() {
   const bookId = useBookId();
+  const { canWrite, isOwner } = useBookRole();
   const router = useRouter();
   const [rows, setRows] = useState<AssignedSyncAccount[]>([]);
   const [loading, setLoading] = useState(true);
@@ -77,7 +79,8 @@ export default function SyncPage() {
   );
   const [syncingById, setSyncingById] = useState<Record<number, boolean>>({});
   const [resettingById, setResettingById] = useState<Record<number, boolean>>({});
-  const [selectedRow, setSelectedRow] = useState<AssignedSyncAccount | null>(null);
+  // The link the review modal opens on. Null opens it on all accounts.
+  const [reconcileLinkId, setReconcileLinkId] = useState<number | null>(null);
   const [showReconcileModal, setShowReconcileModal] = useState(false);
   const [resetTarget, setResetTarget] = useState<{ tokenId: number; institution: string } | null>(
     null
@@ -171,14 +174,13 @@ export default function SyncPage() {
     [groupedRows]
   );
 
-  const openReconcileModal = (row: AssignedSyncAccount) => {
-    setSelectedRow(row);
+  const openReconcileModal = (linkId: number | null) => {
+    setReconcileLinkId(linkId);
     setShowReconcileModal(true);
   };
 
   const closeReconcileModal = () => {
     setShowReconcileModal(false);
-    setSelectedRow(null);
   };
 
   // Returns the error message, or null on success. handleSync keeps setting
@@ -337,23 +339,35 @@ export default function SyncPage() {
       <div className="mb-6">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-bold text-fg">Sync</h1>
-          <div className="inline-flex items-center gap-2">
-            <Button
-              onClick={() => void handleSyncAll()}
-              disabled={anySyncing || rows.length === 0}
-            >
-              {anySyncing ? "Syncing…" : "Sync all"}
-            </Button>
-            <MenuButton
-              label="Sync options"
-              items={[
-                {
-                  label: "Manage connections",
-                  onSelect: () => router.push(`/b/${bookId}/sync/tokens`),
-                },
-              ]}
-            />
-          </div>
+          {canWrite && (
+            <div className="inline-flex items-center gap-2">
+              {summary.queueTotal > 0 && (
+                <Button onClick={() => openReconcileModal(null)}>
+                  Review {summary.queueTotal}
+                </Button>
+              )}
+              <Button
+                variant={summary.queueTotal > 0 ? "secondary" : "primary"}
+                onClick={() => void handleSyncAll()}
+                disabled={anySyncing || rows.length === 0}
+              >
+                {anySyncing ? "Syncing…" : "Sync all"}
+              </Button>
+              {/* The connections page is for owners only. The menu has no
+                  other item, so an editor gets no menu. */}
+              {isOwner && (
+                <MenuButton
+                  label="Sync options"
+                  items={[
+                    {
+                      label: "Manage connections",
+                      onSelect: () => router.push(`/b/${bookId}/sync/tokens`),
+                    },
+                  ]}
+                />
+              )}
+            </div>
+          )}
         </div>
         <p data-testid="sync-summary" className="mt-1.5 text-sm text-fg-secondary">
           {summary.connectionCount} {summary.connectionCount === 1 ? "connection" : "connections"}
@@ -381,7 +395,7 @@ export default function SyncPage() {
               <p className="mt-1 text-13 text-fg-tertiary">{errorBanner.detail}</p>
             )}
           </div>
-          {errorBanner.tokenId !== null && (
+          {canWrite && errorBanner.tokenId !== null && (
             <Button
               size="sm"
               onClick={() => void handleSync(errorBanner.tokenId as number)}
@@ -398,7 +412,7 @@ export default function SyncPage() {
           <EmptyState
             title="No bank accounts are connected yet"
             description="Connect a bank, then map its accounts to accounts in this book. Synced transactions appear here for you to review."
-            action={{ label: "Connect a bank", href: `/b/${bookId}/sync/tokens` }}
+            action={isOwner ? { label: "Connect a bank", href: `/b/${bookId}/sync/tokens` } : undefined}
           />
         </div>
       ) : (
@@ -433,26 +447,28 @@ export default function SyncPage() {
                       </p>
                     </div>
                   </div>
-                  <div className="inline-flex items-center gap-2">
-                    <Button
-                      size="sm"
-                      onClick={() => void handleSync(tokenId)}
-                      disabled={isSyncing}
-                    >
-                      {isSyncing ? "Syncing…" : "Sync"}
-                    </Button>
-                    <MenuButton
-                      label={`${institution} actions`}
-                      items={[
-                        {
-                          label: "Reset sync data",
-                          variant: "danger",
-                          disabled: isSyncing || isResetting,
-                          onSelect: () => setResetTarget({ tokenId, institution }),
-                        },
-                      ]}
-                    />
-                  </div>
+                  {canWrite && (
+                    <div className="inline-flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        onClick={() => void handleSync(tokenId)}
+                        disabled={isSyncing}
+                      >
+                        {isSyncing ? "Syncing…" : "Sync"}
+                      </Button>
+                      <MenuButton
+                        label={`${institution} actions`}
+                        items={[
+                          {
+                            label: "Reset sync data",
+                            variant: "danger",
+                            disabled: isSyncing || isResetting,
+                            onSelect: () => setResetTarget({ tokenId, institution }),
+                          },
+                        ]}
+                      />
+                    </div>
+                  )}
                 </div>
                 {groupRows.map((row) => {
                   const queueCount = row.pendingCount + row.reviewCount;
@@ -527,13 +543,15 @@ export default function SyncPage() {
                           <span className="sr-only">Nothing to review</span>
                         </span>
                       ) : (
-                        <Button
-                          size="sm"
-                          className="min-h-11 sm:min-h-0"
-                          onClick={() => openReconcileModal(row)}
-                        >
-                          Review {queueCount}
-                        </Button>
+                        canWrite && (
+                          <Button
+                            size="sm"
+                            className="min-h-11 sm:min-h-0"
+                            onClick={() => openReconcileModal(row.plaidLinkId)}
+                          >
+                            Review {queueCount}
+                          </Button>
+                        )
                       )}
                     </div>
                   );
@@ -546,7 +564,8 @@ export default function SyncPage() {
 
       <ReconciliationModal
         isOpen={showReconcileModal}
-        row={selectedRow}
+        links={rows}
+        initialLinkId={reconcileLinkId}
         onClose={closeReconcileModal}
         onQueueChanged={() => void fetchAssignedAccounts()}
       />

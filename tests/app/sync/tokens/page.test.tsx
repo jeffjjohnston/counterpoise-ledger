@@ -2,9 +2,20 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, describe, expect, it, vi } from "vitest";
 import SyncTokensPage from "@/app/b/[bookId]/sync/tokens/page";
 
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn() }),
-  useParams: () => ({ bookId: "1" }),
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useRouter: () => ({ push: vi.fn() }),
+    useParams: () => ({ bookId: "1" }),
+  })
+);
+
+// The page reads the role from the book layout. Each test starts as an owner
+// whose role has loaded.
+const OWNER_ROLE = { canWrite: true, isOwner: true, role: "owner", status: "ready" };
+let bookRoleValue: { canWrite: boolean; isOwner: boolean; role: string; status: string } = OWNER_ROLE;
+
+vi.mock("@/components/BookRoleProvider", () => ({
+  useBookRole: () => bookRoleValue,
 }));
 
 const accountsPayload = [
@@ -26,6 +37,28 @@ const accountsPayload = [
 describe("SyncTokensPage", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    bookRoleValue = OWNER_ROLE;
+  });
+
+  describe("role", () => {
+    const stubEmpty = () =>
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] }) as Response));
+
+    it("tells an editor that only an owner can manage bank connections", () => {
+      bookRoleValue = { canWrite: true, isOwner: false, role: "editor", status: "ready" };
+      stubEmpty();
+      render(<SyncTokensPage />);
+      expect(screen.getByText("Only an owner can manage bank connections.")).toBeInTheDocument();
+    });
+
+    it("does not refuse an owner while the role loads", () => {
+      // While the role loads, the provider gives the least privilege. The
+      // page must wait for the role, not refuse the user.
+      bookRoleValue = { canWrite: false, isOwner: false, role: "viewer", status: "loading" };
+      stubEmpty();
+      render(<SyncTokensPage />);
+      expect(screen.queryByText("Only an owner can manage bank connections.")).not.toBeInTheDocument();
+    });
   });
 
   it("renders token rows with edit actions and no access token column", async () => {

@@ -2,9 +2,16 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { fail, ok } from "@/mcp/tools/_result";
-import { READ } from "@/mcp/tools/_annotations";
 import { callMcpTool } from "@/tests/helpers/mcp";
+
+/** The envelopes of `ok()` and `fail()` in rust-api/server/src/mcp/call.rs. */
+const ok = (data: unknown) => ({
+  content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+});
+const fail = (message: string) => ({
+  content: [{ type: "text" as const, text: JSON.stringify({ error: message }, null, 2) }],
+  isError: true,
+});
 
 /**
  * Guards the decoding contract every other MCP tool test depends on.
@@ -25,7 +32,7 @@ let server: McpServer;
 
 beforeAll(async () => {
   server = new McpServer({ name: "test", version: "0.0.1" });
-  const config = { title: "T", description: "test tool", inputSchema: {}, annotations: READ };
+  const config = { title: "T", description: "test tool", inputSchema: {} };
 
   server.registerTool("returns_ok", config, async () => ok({ id: 7 }));
   server.registerTool("returns_fail", config, async () => fail(MESSAGE));

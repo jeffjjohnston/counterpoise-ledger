@@ -11,6 +11,7 @@ test-results/
 screenshots/
 moneydance_exports/
 output/
+build/
 .claude
 .playwright-mcp/
 .venv
@@ -18,6 +19,8 @@ pgdata/
 data/
 backups/
 coverage/
+rust-api/target/
+lib/wasm/generated/
 
 # EVERY PATTERN ABOVE IS TOP-LEVEL-ONLY, and that is not a style choice: Docker
 # matches these against the path relative to the context root, so `tests/`

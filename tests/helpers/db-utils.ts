@@ -4,25 +4,22 @@ import { ensureTestDatabase, leaseTestDatabase, workerDatabaseName, workerDataba
 import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
-import { getDb } from "../../db";
+import { getDb, getSqlClient_raw } from "../../db";
 import {
   accounts,
+  bookMembers,
   transactions,
   transactionSplits,
   recurringRules,
   recurringTemplateSplits,
   securities,
   investmentLots,
-  investmentLotAllocations,
   investmentSplits,
   securityPrices,
   payees,
   plaidTokens,
   plaidAccounts,
   plaidTransactionReconciliation,
-  issueReports,
-  apiKeys,
-  sessions,
   users,
   books,
 } from "../../db/schema";
@@ -49,10 +46,8 @@ function createQuietSql(url: string) {
 
 async function resetMetaSequences() {
   await db.execute(
-    sql`SELECT setval(pg_get_serial_sequence('users', 'id'), 1, true)`
-  );
-  await db.execute(
-    sql`SELECT setval(pg_get_serial_sequence('books', 'id'), 1, true)`
+    sql`SELECT setval(pg_get_serial_sequence('users', 'id'), 1, true),
+               setval(pg_get_serial_sequence('books', 'id'), 1, true)`
   );
 }
 
@@ -91,38 +86,21 @@ export const setupTestDatabase = async () => {
 export const resetTestDatabase = async () => {
   workerDatabaseUrl();
   if (!releaseLease) throw new Error("Call setupTestDatabase before resetting test data");
-  // Delete book-scoped data (FK ordering)
-  await db.delete(investmentLotAllocations);
-  // Must run before transactions: a lot's opened_split_id (-> investment_splits,
-  // set null) and closed_transaction_id (-> transactions, set null) can each
-  // point at a DIFFERENT transaction than the one it's associated with by
-  // account. Deleting every transaction in one bulk statement cascades both
-  // FK paths at once, and Postgres's set-null trigger ordering across that
-  // combination fails with a bogus FK violation rather than nulling the
-  // column. Deleting investment_lots first removes the rows before the
-  // cascade has anything to trip over.
-  await db.delete(investmentLots);
-  await db.delete(plaidTransactionReconciliation);
-  await db.delete(plaidAccounts);
-  await db.delete(plaidTokens);
-  await db.delete(transactionSplits);
-  await db.delete(transactions);
-  await db.delete(recurringTemplateSplits);
-  await db.delete(recurringRules);
-  await db.delete(investmentSplits);
-  await db.delete(securityPrices);
-  await db.delete(securities);
-  await db.delete(payees);
-  await db.delete(accounts);
-  // Delete and re-insert meta data so FK targets always exist
-  await db.delete(issueReports);
-  await db.delete(apiKeys);
-  await db.delete(sessions);
-  await db.delete(books);
-  await db.delete(users);
-  await db.insert(users).values({ id: 1, username: "testuser", passwordHash: "unused" });
-  await db.insert(books).values({ id: 1, userId: 1, name: "Test Book" });
-  await resetMetaSequences();
+  // Every application table depends on users through books or a direct FK, so
+  // cascading deletes clear them without a hand-kept table order. Reset all
+  // public sequences, then advance the two explicit baseline ids. This entire
+  // reset and reseed uses one simple-protocol round trip.
+  await getSqlClient_raw()`
+    DELETE FROM users;
+    SELECT setval(format('%I.%I', schemaname, sequencename)::regclass, 1, false)
+    FROM pg_sequences WHERE schemaname = 'public';
+    INSERT INTO users (id, username, password_hash, created_at)
+    VALUES (1, 'testuser', 'unused', NOW());
+    INSERT INTO books (id, user_id, name, created_at, updated_at)
+    VALUES (1, 1, 'Test Book', NOW(), NOW());
+    SELECT setval(pg_get_serial_sequence('users', 'id'), 1, true),
+           setval(pg_get_serial_sequence('books', 'id'), 1, true);
+  `.simple();
 };
 
 export const createAccount = async (data: {
@@ -177,6 +155,14 @@ export const createBook = async (data: {
     .returning();
 
   return book;
+};
+
+export const addBookMember = async (data: {
+  bookId: number;
+  userId: number;
+  role: "owner" | "editor" | "viewer";
+}) => {
+  await db.insert(bookMembers).values(data);
 };
 
 export const createTransactionWithSplits = async (data: {

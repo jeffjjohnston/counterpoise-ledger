@@ -1,8 +1,9 @@
 "use client";
 
-import { usePathname, useSearchParams } from "next/navigation";
+import { usePathname, useSearchParams } from "@/lib/navigation";
 import { useEffect } from "react";
 import posthog from "posthog-js";
+import { redactedCaptureUrl } from "@/lib/posthog-url";
 
 export function PostHogPageview() {
   const pathname = usePathname();
@@ -10,9 +11,13 @@ export function PostHogPageview() {
 
   useEffect(() => {
     if (pathname && posthog.__loaded) {
-      let url = window.origin + pathname;
-      const search = searchParams.toString();
-      if (search) url += "?" + search;
+      // Never build this URL by hand. The query string carries what the user
+      // typed on the search page, so it goes through the redaction helper.
+      const url = redactedCaptureUrl(
+        window.origin,
+        pathname,
+        searchParams.toString(),
+      );
       posthog.capture("$pageview", { $current_url: url });
     }
   }, [pathname, searchParams]);

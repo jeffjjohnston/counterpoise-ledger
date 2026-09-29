@@ -4,8 +4,8 @@ import { useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
-import { evaluateExpression } from "@/lib/expression";
-import { formatPriceMicrosInput } from "@/lib/formatters";
+import { evaluateExpression } from "@/lib/wasm-client";
+import { formatPriceMicrosInput } from "@/lib/wasm-client";
 import type { Security } from "@/db/schema";
 
 interface SecurityFormProps {

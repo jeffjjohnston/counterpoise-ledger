@@ -2,11 +2,13 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import RecurringRuleDetailPage from "@/app/b/[bookId]/recurring/[id]/page";
 
-vi.mock("next/navigation", () => ({
-  useSearchParams: () => new URLSearchParams(),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
-  useParams: () => ({ bookId: "1", id: "7" }),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useSearchParams: () => new URLSearchParams(),
+    useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+    useParams: () => ({ bookId: "1", id: "7" }),
+  })
+);
 
 vi.mock("@/components/ui/Modal", () => ({
   Modal: ({ isOpen, children }: { isOpen: boolean; children: React.ReactNode }) =>

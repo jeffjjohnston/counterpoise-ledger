@@ -1,7 +1,6 @@
 "use client";
 
-import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { Link, usePathname } from "@/lib/navigation";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/components/ThemeProvider";
 import { ThemeToggle } from "@/components/ui/ThemeToggle";
@@ -27,7 +26,6 @@ export function Navbar() {
         <div className="flex items-center justify-between h-16">
           <div className="flex items-center">
             <Link href="/" className="flex items-center gap-2">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={logoSrc} alt="" className="w-8 h-8" />
               <span className="text-xl font-bold text-fg" title={`Counterpoise v${process.env.NEXT_PUBLIC_APP_VERSION}`}>Counterpoise</span>
             </Link>

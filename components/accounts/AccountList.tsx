@@ -1,8 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import Link from "next/link";
-import { formatCurrency, getAccountShortName } from "@/lib/formatters";
+import { Link } from "@/lib/navigation";
+import { formatCurrency, getAccountShortName } from "@/lib/wasm-client";
 import {
   ACCOUNT_TYPE_LABELS,
   ACCOUNT_SUBTYPE_LABELS,
@@ -12,7 +12,7 @@ import {
   buildAccountTree,
   flattenAccountTreeWithDepth,
   flattenAccounts,
-} from "@/lib/accounting";
+} from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import type { AccountWithBalance } from "@/types";
 

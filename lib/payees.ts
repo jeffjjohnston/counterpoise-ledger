@@ -44,7 +44,8 @@ export interface ListPayeesOptions {
    * Case-insensitive substring match on the payee name. Normalized the same
    * way a stored name is, so a search typed with curly quotes finds the row
    * saved with straight ones. An empty string means "no filter", the same as
-   * omitting it.
+   * omitting it. When given, rows come back ranked by match quality (see
+   * lib/payee-match.ts) and then by name; without it, by name alone.
    */
   search?: string;
   /** Maximum rows to return. Omit for all of them. */
@@ -86,6 +87,11 @@ export interface PayeeDetail extends PayeeSummary {
 // recorded the route as covered.
 // ---------------------------------------------------------------------------
 
+/** Makes `%`, `_` and `\` literal in a LIKE pattern (default escape `\`). */
+function escapeLikePattern(term: string): string {
+  return term.replace(/[\\%_]/g, "\\$&");
+}
+
 /** Lists payees with their transaction count and most recent transaction date. */
 export async function listPayees(
   db: AppDb,
@@ -94,11 +100,25 @@ export async function listPayees(
 ): Promise<PayeeListRow[]> {
   const normalizedSearch = options.search ? normalizePayeeName(options.search) : "";
   const bookFilter = eq(payees.bookId, bookId);
-  // `%` and `_` in the search term are deliberately not escaped — they behave
-  // as LIKE wildcards, exactly as they did before this function existed.
+  // Escape `%`, `_` and `\` so the term matches literally. The autocomplete
+  // filters the rows it receives with `includes()`, which is literal; if the
+  // SQL treated the term as a LIKE pattern, "un_" would rank "United" as a
+  // prefix match, fill the limit, and starve the one row the client keeps.
+  const lowerSearch = escapeLikePattern(normalizedSearch.toLowerCase());
   const whereClause = normalizedSearch
-    ? and(bookFilter, sql`lower(${payees.name}) like ${`%${normalizedSearch.toLowerCase()}%`}`)
+    ? and(bookFilter, sql`lower(${payees.name}) like ${`%${lowerSearch}%`}`)
     : bookFilter;
+  // Rank the matches before the LIMIT cuts them. The tiers are the ones
+  // `rankPayeeMatch()` in lib/payee-match.ts applies on the client: a name
+  // that starts with the term, then a word that starts with it, then any
+  // other substring. Without this, "uni" put "American Civil Liberties
+  // Union" ahead of "United", and a limit of 8 could drop "United" entirely.
+  const matchRank = sql`case
+    when lower(${payees.name}) like ${`${lowerSearch}%`} then 0
+    when lower(${payees.name}) like ${`% ${lowerSearch}%`} then 1
+    else 2
+  end`;
+  const ordering = normalizedSearch ? [matchRank, asc(payees.name)] : [asc(payees.name)];
 
   const query = db
     .select({
@@ -113,7 +133,7 @@ export async function listPayees(
     .leftJoin(transactions, eq(transactions.payeeId, payees.id))
     .where(whereClause)
     .groupBy(payees.id)
-    .orderBy(asc(payees.name));
+    .orderBy(...ordering);
 
   return options.limit ? await query.limit(options.limit) : await query;
 }

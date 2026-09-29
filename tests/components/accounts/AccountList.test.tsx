@@ -1,23 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { AccountList } from "@/components/accounts/AccountList";
 import type { AccountWithBalance } from "@/types";
 
-vi.mock("next/link", () => ({
-  default: ({
-    href,
-    children,
-    ...props
-  }: {
-    href: string;
-    children: ReactNode;
-  }) => (
-    <a href={href} {...props}>
-      {children}
-    </a>
-  ),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation()
+);
 
 describe("AccountList", () => {
   it("hides investment cash accounts and rolls cash into investment totals", () => {

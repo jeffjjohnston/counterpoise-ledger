@@ -47,7 +47,7 @@ done
 echo "==> multi-resolution .ico (16/32/48)"
 magick "$MARK_LIGHT" \
   \( -clone 0 -resize 16x16 \) \( -clone 0 -resize 32x32 \) \( -clone 0 -resize 48x48 \) \
-  -delete 0 -strip app/favicon.ico
+  -delete 0 -strip public/favicon.ico
 magick "$MARK_DARK" \
   \( -clone 0 -resize 16x16 \) \( -clone 0 -resize 32x32 \) \( -clone 0 -resize 48x48 \) \
   -delete 0 -strip public/favicon-dark.ico
@@ -57,7 +57,7 @@ magick "$ICON_LIGHT" -resize 192x192 "${PNGOPT[@]}" public/android-chrome-192x19
 magick "$ICON_LIGHT" -resize 512x512 "${PNGOPT[@]}" public/android-chrome-512x512.png
 magick "$ICON_DARK"  -resize 192x192 "${PNGOPT[@]}" public/android-chrome-dark-192x192.png
 magick "$ICON_DARK"  -resize 512x512 "${PNGOPT[@]}" public/android-chrome-dark-512x512.png
-magick "$ICON_LIGHT" -resize 180x180 "${PNGOPT[@]}" app/apple-icon.png
+magick "$ICON_LIGHT" -resize 180x180 "${PNGOPT[@]}" public/apple-icon.png
 magick "$ICON_DARK"  -resize 180x180 "${PNGOPT[@]}" public/apple-touch-icon-dark.png
 magick "$ICON_LIGHT" -resize 1024x1024 "${PNGOPT[@]}" public/icon-1024.png
 
@@ -125,4 +125,4 @@ done
 
 echo
 echo "done. generated:"
-ls -1 public/*.png public/*.ico app/favicon.ico app/apple-icon.png | sed 's/^/  /'
+ls -1 public/*.png public/*.ico | sed 's/^/  /'

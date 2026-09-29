@@ -3,31 +3,46 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import SyncPage from "@/app/b/[bookId]/sync/page";
 import { SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn() }),
-}));
-
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
-    <a href={href}>{children}</a>
-  ),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+    useRouter: () => ({ push: vi.fn() }),
+  })
+);
 
 vi.mock("@/components/sync/ReconciliationModal", () => ({
   ReconciliationModal: ({
     isOpen,
-    row,
+    links,
+    initialLinkId,
   }: {
     isOpen: boolean;
-    row: { plaidAccountName: string } | null;
-  }) => (isOpen ? <div>Reconciling {row?.plaidAccountName}</div> : null),
+    links: Array<{ plaidLinkId: number; plaidAccountName: string }>;
+    initialLinkId: number | null;
+  }) =>
+    isOpen ? (
+      <div>
+        Reconciling{" "}
+        {initialLinkId === null
+          ? `all ${links.length} links`
+          : links.find((link) => link.plaidLinkId === initialLinkId)?.plaidAccountName}
+      </div>
+    ) : null,
+}));
+
+// The page reads the role from the book layout. Each test starts as an owner.
+// A test that needs another role sets this value.
+const OWNER_ROLE = { canWrite: true, isOwner: true, role: "owner" };
+let bookRoleValue: { canWrite: boolean; isOwner: boolean; role: string } = OWNER_ROLE;
+
+vi.mock("@/components/BookRoleProvider", () => ({
+  useBookRole: () => bookRoleValue,
 }));
 
 describe("SyncPage", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    bookRoleValue = OWNER_ROLE;
   });
 
   it("renders grouped assigned accounts with header sync controls", async () => {
@@ -344,11 +359,87 @@ describe("SyncPage", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<SyncPage />);
-    const reviewButton = await screen.findByRole("button", { name: "Review 5" });
+    const reviewButton = within(await screen.findByTestId("mapping-11")).getByRole("button", {
+      name: "Review 5",
+    });
     expect(reviewButton).toBeInTheDocument();
     // Pins the >=44px touch target (min-h-11 = 2.75rem): the primary action
     // on a page whose whole point is to work on a phone must stay reachable.
     expect(reviewButton).toHaveClass("min-h-11");
+  });
+
+  it("opens one review of every account from the header, and one account from its row", async () => {
+    const mapping = (plaidLinkId: number, name: string, pendingCount: number) => ({
+      plaidLinkId,
+      financialInstitution: "Ally Bank",
+      tokenId: 5,
+      itemId: "item-1",
+      plaidAccountId: `plaid-${plaidLinkId}`,
+      plaidAccountName: name,
+      counterpoiseAccountId: plaidLinkId,
+      counterpoiseAccountName: name,
+      lastSyncedAt: null,
+      lastError: null,
+      pendingCount,
+      reviewCount: 0,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/b/1/sync/assigned-accounts") {
+          return {
+            ok: true,
+            json: async () => [mapping(11, "Ally Savings", 2), mapping(12, "Ally Checking", 3)],
+          } as Response;
+        }
+        throw new Error(`Unexpected fetch url: ${url}`);
+      })
+    );
+
+    render(<SyncPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "Review 5" }));
+    expect(screen.getByText("Reconciling all 2 links")).toBeInTheDocument();
+
+    fireEvent.click(
+      within(screen.getByTestId("mapping-12")).getByRole("button", { name: "Review 3" })
+    );
+    expect(screen.getByText("Reconciling Ally Checking")).toBeInTheDocument();
+  });
+
+  it("offers no header Review when nothing is queued", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/b/1/sync/assigned-accounts") {
+          return {
+            ok: true,
+            json: async () => [
+              {
+                plaidLinkId: 11,
+                financialInstitution: "Ally Bank",
+                tokenId: 5,
+                itemId: "item-1",
+                plaidAccountId: "plaid-1",
+                plaidAccountName: "Ally Savings",
+                counterpoiseAccountId: 1,
+                counterpoiseAccountName: "Savings",
+                lastSyncedAt: null,
+                lastError: null,
+                pendingCount: 0,
+                reviewCount: 0,
+              },
+            ],
+          } as Response;
+        }
+        throw new Error(`Unexpected fetch url: ${url}`);
+      })
+    );
+
+    render(<SyncPage />);
+    await screen.findByRole("button", { name: "Sync all" });
+    expect(screen.queryByRole("button", { name: /^Review/ })).toBeNull();
   });
 
   it("keeps Reset out of the card header and behind a confirmation", async () => {
@@ -956,5 +1047,60 @@ describe("SyncPage", () => {
     expect(banner).toHaveTextContent("Citi: ITEM_LOGIN_REQUIRED");
     // The plural rollup phrasing belongs to the failures.length > 1 branch only.
     expect(banner).not.toHaveTextContent(/connections failed to sync/);
+  });
+
+  describe("Manage connections", () => {
+    // Stubs one mapped connection, so the header shows its controls.
+    function stubOneConnection() {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url === "/api/b/1/sync/assigned-accounts") {
+            return {
+              ok: true,
+              json: async () => [
+                {
+                  plaidLinkId: 11,
+                  financialInstitution: "Chase",
+                  tokenId: 5,
+                  itemId: "item-1",
+                  plaidAccountId: "plaid-1",
+                  plaidAccountName: "Chase Checking",
+                  counterpoiseAccountId: 1,
+                  counterpoiseAccountName: "Checking",
+                  lastSyncedAt: null,
+                  pendingCount: 0,
+                  reviewCount: 0,
+                },
+              ],
+            } as Response;
+          }
+          throw new Error(`Unexpected fetch url: ${url}`);
+        })
+      );
+    }
+
+    it("offers Manage connections to an owner", async () => {
+      stubOneConnection();
+      render(<SyncPage />);
+      expect(await screen.findByText("Chase Checking")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Sync options" }));
+      expect(screen.getByRole("menuitem", { name: "Manage connections" })).toBeInTheDocument();
+    });
+
+    it("does not offer Manage connections to an editor, because that page is for owners only", async () => {
+      bookRoleValue = { canWrite: true, isOwner: false, role: "editor" };
+      stubOneConnection();
+      render(<SyncPage />);
+      expect(await screen.findByText("Chase Checking")).toBeInTheDocument();
+
+      // The editor still syncs. Only the owner-only item goes away.
+      expect(screen.getByRole("button", { name: "Sync all" })).toBeInTheDocument();
+      const options = screen.queryByRole("button", { name: "Sync options" });
+      if (options) fireEvent.click(options);
+      expect(screen.queryByRole("menuitem", { name: "Manage connections" })).not.toBeInTheDocument();
+    });
   });
 });

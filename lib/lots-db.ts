@@ -6,9 +6,9 @@
  * transaction as the write, so a pair's splits and its lots move together.
  *
  * THE IMPORTER DOES NOT. It writes investment splits in one phase and rebuilds
- * every pair in a later one, each rebuild in its own transaction, after stock
- * splits are imported (scripts/import-moneydance/index.ts). A rebuild that
- * fails there does not roll back the splits already imported.
+ * every pair in a later one, after stock splits are imported
+ * (rust-api/cli/src/import_moneydance/). A rebuild that fails there rolls the
+ * import back.
  *
  * It is still not the only thing that ever writes those tables:
  *
@@ -16,8 +16,8 @@
  *   or lot is deleted, without going through this file at all: deleting a
  *   transaction cascades to its investment splits and their lot allocations
  *   (the transaction DELETE route, tests/helpers/db-utils.ts teardown);
- *   deleting a lot cascades to its allocations (scripts/import-moneydance/
- *   overwrite.ts, which deletes investment_lots directly and never touches
+ *   deleting a lot cascades to its allocations (the importer's --overwrite,
+ *   which deletes investment_lots directly and never touches
  *   investment_lot_allocations itself).
  *
  * This comment has been wrong before — grepping TypeScript for insert/update/

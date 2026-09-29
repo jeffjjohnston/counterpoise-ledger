@@ -23,7 +23,8 @@ MERGE the PR (a merge commit)   ← never squash: the release commits have to st
     ▼
 ./scripts/deploy.sh --ref <the merge commit>
     │                          ← publishes tag vX.Y.Z once, at that commit, then
-    │                            builds and restarts the containers
+    │                            builds the image and restarts the containers;
+    │                            the app entrypoint runs the migrations
     ▼
 PR: main → dev, merged (not squashed)   ← carries the bump and any release fix
                                           back without rewriting dev
@@ -52,6 +53,11 @@ problem that squash-merging a long-running branch produces:
   detached HEAD is the expected starting state: the branch name carries the
   version, which is not knowable until the bump has written `package.json`, so
   `release.sh` names the branch itself afterwards.
+- **The release checkout needs the Rust toolchain.** After the bump,
+  `release.sh` runs `npm run openapi:generate`, which builds and runs
+  `counterpoise-rust-api openapi` with `cargo`. The document carries the
+  package version, so the release commit includes the regenerated
+  `openapi/openapi.json`.
 - **The version tag is published once, and never moves.** `release.sh` creates
   no tag at all. `deploy.sh` creates it, annotated, against the commit named by
   `--ref` — the commit the PR actually merged — and pushes it **without
@@ -73,11 +79,9 @@ problem that squash-merging a long-running branch produces:
   of them: production's `main` is fast-forwarded to the deploy commit before
   the tree check and the Compose validation, so a refusal from either of those
   leaves that checkout advanced. Nothing is published or restarted, and the
-  next run fast-forwards to the same commit, but the checkout is not restored. It does **not** rebase `dev`, does
-  not force-push anything, keeps no resume file, and takes no fork point: all of
-  those existed only to drive the rebase the merge commit removes. A deploy left
-  half-finished by the OLD flow is refused by name — `.git/DEPLOY_FORK_POINT`
-  means a dev rebase is still owed, and this script cannot perform it.
+  next run fast-forwards to the same commit, but the checkout is not restored. It does **not** rebase `dev`, force-push, keep a resume file, or take a fork
+  point. If `.git/DEPLOY_FORK_POINT` exists, it refuses: that file marks a deploy
+  that expects a `dev` rebase, which this script does not perform.
 - **Production owns its checkout and configuration.** Builds and production
   Compose run in a separate checkout on `main` — `~/prod/counterpoise` by
   default, or wherever `COUNTERPOISE_BUILD_DIR` points. It must already be a clone
@@ -95,7 +99,9 @@ problem that squash-merging a long-running branch produces:
   destructive clean. A missing or invalid production configuration stops the
   deploy before a version tag is published or containers are restarted.
 - **Backups default to the production checkout's `backups/`.** The deploy passes
-  the resolved absolute path to both services. `COUNTERPOISE_BACKUPS_DIR` can
+  the resolved absolute path to the Rust API and scheduler services. The Rust
+  API mounts it read-only for job status; the scheduler writes to it.
+  `COUNTERPOISE_BACKUPS_DIR` can
   name another existing absolute directory; a missing directory is refused so
   Docker cannot silently create an empty backup destination.
 - **Resuming a failed deploy**: run the same command again. Every stage is
@@ -123,13 +129,13 @@ problem that squash-merging a long-running branch produces:
 - **CI** (the workflow file itself is maintainer tooling and is not published;
   a fork supplies its own). It runs on every PR to **main
   and to dev** — lint, type-check, tests against a PostgreSQL service container,
-  and a `production-build` job that builds with **no database service**, since a
-  page querying the database at build time passes E2E (which has one) and fails
-  `docker build` (which does not). The back-merge PR targets `dev`, so it is
+  and a `production-build` job that runs `npm run build` (the Vite client
+  build) with **no database service**, as `docker build` does. The job was
+  added when a page that queried the database at build time passed E2E (which
+  has one) and failed `docker build` (which does not). The back-merge PR targets `dev`, so it is
   checked exactly as a feature PR is.
 - **Why dev is a CI branch too**: dev is where day-to-day work lands and what
-  releases are cut from, so while main was the only trigger everything merged
-  straight to dev reached the release path unverified. dev gets the **same
+  releases are cut from, so CI on dev checks work before it reaches the release path. dev gets the **same
   jobs** main gets; no *job* is conditioned on the target branch, so adding a job
   covers both branches at once (the `concurrency` block below is keyed to the
   base branch, but it decides only whether a superseded run is cancelled — never
@@ -164,8 +170,49 @@ problem that squash-merging a long-running branch produces:
   because a pull request's head is frozen (pushing to its head branch updates
   it) but because `dev` is not that branch. The release PR's head is
   `release/vX.Y.Z`, and only pushes there become part of the merge.
-- **The session-hash migration is not reversible by redeploying the previous
-  image.** Once the `sessions.token` column is renamed to `token_hash`, the old
-  code queries a column that no longer exists and 500s on every authenticated
-  request. Rolling back requires a forward migration (or a new fix-forward
-  deploy), not an image rollback.
+- When `API_CONTRACT` in `lib/api-contract.ts` increased since the last tag, the
+  release pull request body must say so and name the minimum iOS client version
+  that supports the new contract. See guides/api-contract.md.
+- **A migration that renames or drops a column cannot be rolled back by
+  redeploying the previous image.** The previous code queries a column that no
+  longer exists and returns 500. For example, after `sessions.token` became
+  `token_hash`, the old image failed every authenticated request. Roll back with
+  a forward migration or a fix-forward deploy.
+- **A bad release is undone by a new release, not by a redeploy.**
+  `scripts/deploy.sh` only fast-forwards production's `main`, so it refuses
+  an older commit. Revert the release's changes on `dev` with `git revert`
+  (never a reset or a force-push), and ship the revert as the next release.
+  The move of the client from Next to Vite is such a change. Reverting it
+  restores the Next app, `proxy.ts` and the `app` service. Revert it before
+  any older change below, because the older trees need the Next app.
+  The retirement of the Node API handlers is such a change too. Reverting the
+  retirement commits, the health gate below and the later edits of this text,
+  newest first, restores the pre-retirement
+  routing: the Next handlers exist again, and the proxy retries a safe read on
+  Node only after a transport error or a 502, 503 or 504. Login and writes get
+  no automatic fallback. To send routes to Node, remove their entries from
+  `rust-api/routes.json` in the same release; that works for login and
+  writes too, and for a Rust handler that answers wrongly (for example an
+  incorrect 200). Follow the manifest rules in the reverted tree's
+  `guides/architecture.md`: a `[param]` entry also captures its static
+  siblings, so overlapping entries leave together, and the manifest and
+  contract checks (`every_operation_is_a_rust_route` among them) change in
+  the same release. With every entry removed, the whole API except
+  `/api/mcp` and WebMCP, which have no Next handler, runs on Node, and the
+  reverted health gate lets the app start while Rust is down.
+- **The deploy fails unless the migrations succeed and every server comes up
+  healthy.** `deploy.sh` runs `docker compose up -d --wait --wait-timeout 300
+  --build --force-recreate --remove-orphans rust-api scheduler`. The
+  `rust-api` entrypoint checks the credential, applies the Drizzle migrations
+  and rebuilds the lots before it starts the server. A failed migration stops
+  the container, and `up --wait` exits 1, so a new server never runs against
+  the old schema. A Rust server that does not answer `/health` also fails the
+  deploy step. After the step, check `/api/health` before you report the
+  release as a success.
+- **`rust-api` is the only web service.** It serves the UI, the API and MCP,
+  and publishes `${APP_BIND:-127.0.0.1}:3000:4000`. The host port is still
+  3000, so a reverse proxy needs no change. The scheduler calls
+  `http://rust-api:4000/api/cron/...`. `--remove-orphans` removes the
+  container of a service that the compose file no longer has. The first
+  deploy with this layout removes the old `counterpoise-app-1` container,
+  which held host port 3000.

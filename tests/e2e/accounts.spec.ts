@@ -1,4 +1,4 @@
-import { test, expect } from "./fixtures";
+import { smallBookTest as test, expect } from "./fixtures";
 
 function accountRow(page: import("@playwright/test").Page, name: string) {
   return page

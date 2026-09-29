@@ -1,15 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import Link from "next/link";
+import { Link, useRouter } from "@/lib/navigation";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { identifyUser } from "@/lib/posthog-client";
 import { apiPost, toMessage } from "@/lib/api-client";
+import { useRegistrationOpen } from "@/hooks/useRegistrationOpen";
 
-export function LoginForm({ registrationOpen }: { registrationOpen: boolean }) {
+export function LoginForm() {
   const router = useRouter();
+  const registrationOpen = useRegistrationOpen();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -90,7 +91,7 @@ export function LoginForm({ registrationOpen }: { registrationOpen: boolean }) {
             </Button>
           </form>
 
-          {registrationOpen && (
+          {registrationOpen === true && (
             <p className="text-center text-sm text-fg-tertiary mt-6">
               Don&apos;t have an account?{" "}
               <Link href="/register" className="text-fg-accent hover:underline font-medium">

@@ -1,32 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { BookNavbar } from "@/components/layout/BookNavbar";
+import { BookRoleProvider } from "@/components/BookRoleProvider";
 
 const pushMock = vi.fn();
 
-vi.mock("next/navigation", () => ({
-  usePathname: () => "/b/1/transactions",
-  useRouter: () => ({ push: pushMock }),
-  useParams: () => ({ bookId: "1" }),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    usePathname: () => "/b/1/transactions",
+    useRouter: () => ({ push: pushMock }),
+    useParams: () => ({ bookId: "1" }),
+  })
+);
 
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({
-    href,
-    children,
-    ...props
-  }: {
-    href: string;
-    children: ReactNode;
-    onClick?: () => void;
-  }) => (
-    <a href={href} {...props}>
-      {children}
-    </a>
-  ),
-}));
+// BookRoleProvider also fetches /api/books/1/members and /api/auth/me. Some
+// fetch mocks below answer only /api/books, or answer every URL alike. Those
+// extra calls then fail, or return the wrong shape. The provider reports a
+// failure with a toast, and no ToastProvider is mounted here. Members stays
+// empty and the current user id stays null. Neither affects the assertions
+// below.
+const renderNavbar = () => render(<BookRoleProvider><BookNavbar /></BookRoleProvider>);
 
 describe("BookNavbar", () => {
   afterEach(() => {
@@ -49,7 +42,7 @@ describe("BookNavbar", () => {
 
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
 
     await waitFor(() => {
       expect(screen.getByText("Primary Book")).toBeInTheDocument();
@@ -72,7 +65,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
 
     await waitFor(() => {
       expect(screen.getByText("Primary Book")).toBeInTheDocument();
@@ -91,7 +84,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     const transactionsLink = screen.getByRole("link", { name: "Transactions" });
@@ -114,7 +107,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     const brand = screen.getByRole("link", { name: "Counterpoise" });
@@ -132,7 +125,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    const { container } = render(<BookNavbar />);
+    const { container } = renderNavbar();
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     const desktopNav = screen.getByRole("link", { name: "Transactions" }).closest("div.hidden");
@@ -176,7 +169,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText("Open menu"));
@@ -200,7 +193,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     const link = screen.getByRole("link", { name: "Transactions" });
@@ -226,7 +219,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     // Primary items are visible
@@ -253,7 +246,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: /more/i }));
@@ -274,7 +267,7 @@ describe("BookNavbar", () => {
     } as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
     await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText("Open book menu"));
@@ -294,9 +287,11 @@ describe("BookNavbar", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url === "/api/books") {
+        // The pill is for a user who can write. The role comes from this
+        // list. Without it the provider gives the least privilege.
         return {
           ok: true,
-          json: async () => [{ id: 1, name: "Primary Book" }],
+          json: async () => [{ id: 1, name: "Primary Book", upcomingDays: 30, userId: 1, role: "owner" }],
         } as Response;
       }
       if (url.includes("/sync/pending-count")) {
@@ -323,8 +318,55 @@ describe("BookNavbar", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BookNavbar />);
+    renderNavbar();
 
     expect(await screen.findByRole("button", { name: /1 price due/ })).toBeInTheDocument();
+  });
+
+  it("shows a Read-only badge and no price entry for a viewer", async () => {
+    // The prices-due stub answers with a due security — the same shape that
+    // renders the pill for a writer in "shows the price entry pill when
+    // manual prices are due" above. That proves the assertion below is
+    // catching the canWrite gate, not an empty response that would leave the
+    // pill unrendered either way.
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/books") return { ok: true, json: async () => [{ id: 1, name: "Shared", upcomingDays: 30, userId: 9, role: "viewer" }] } as Response;
+      if (url.includes("/sync/pending-count")) return { ok: true, json: async () => ({ count: 0 }) } as Response;
+      if (url.includes("/securities/prices-due")) {
+        return {
+          ok: true,
+          json: async () => ({
+            dueDate: "2026-07-02",
+            securities: [
+              {
+                securityId: 5,
+                name: "SPY Jul '26 630C",
+                symbol: "SPY260731C630",
+                lastPriceMicros: 4_350_000,
+                lastPriceDate: "2026-07-01",
+              },
+            ],
+          }),
+        } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }));
+    renderNavbar();
+    await waitFor(() => expect(screen.getByText("Read-only")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /price due/ })).not.toBeInTheDocument();
+  });
+
+  it("shows no Read-only badge while the role loads", async () => {
+    // The books list never answers, so the role stays unknown. The provider
+    // gives the least privilege, but the user is not known to be read-only.
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/books") return new Promise<Response>(() => {});
+      return { ok: true, json: async () => ({}) } as Response;
+    }));
+    renderNavbar();
+    await act(async () => {});
+    expect(screen.queryByText("Read-only")).not.toBeInTheDocument();
   });
 });

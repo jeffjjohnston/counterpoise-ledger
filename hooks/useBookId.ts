@@ -1,6 +1,6 @@
 "use client";
 
-import { useParams } from "next/navigation";
+import { useParams } from "@/lib/navigation";
 
 export function useBookId(): string {
   const params = useParams();

@@ -3,16 +3,22 @@ import { vi, describe, it, expect, afterEach } from "vitest";
 import AccountsPage from "@/app/b/[bookId]/accounts/page";
 import { ToastProvider } from "@/components/ui/ToastProvider";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+  })
+);
+
+let bookRoleValue: { canWrite: boolean; isOwner: boolean; role: string } = {
+  canWrite: true,
+  isOwner: true,
+  role: "owner",
+};
+
+vi.mock("@/components/BookRoleProvider", () => ({
+  useBookRole: () => bookRoleValue,
 }));
 
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
-    <a href={href}>{children}</a>
-  ),
-}));
 
 vi.mock("@/components/accounts/AccountForm", () => ({
   AccountForm: ({
@@ -83,6 +89,34 @@ const accountsPayload = [
 describe("AccountsPage", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    bookRoleValue = { canWrite: true, isOwner: true, role: "owner" };
+  });
+
+  it("hides the empty-state create action from a viewer with no accounts", async () => {
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/account-values")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<AccountsPage />);
+
+    expect(await screen.findByText("No accounts yet")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Create your first account" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Create your first account" })
+    ).not.toBeInTheDocument();
   });
 
   it("hides investment cash accounts and shows cash balance on the investment row", async () => {

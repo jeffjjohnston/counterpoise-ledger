@@ -1,0 +1,70 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`security price HTTP parity > fetches Tiingo prices per symbol and reports each failure 1`] = `
+[
+  "/tiingo/daily/%C3%9F/prices?token=test-key",
+  "/tiingo/daily/0/prices?token=test-key",
+  "/tiingo/daily/1.5/prices?token=test-key",
+  "/tiingo/daily/1e+21/prices?token=test-key",
+  "/tiingo/daily/1e-7/prices?token=test-key",
+  "/tiingo/daily/5/prices?token=test-key",
+  "/tiingo/daily/A,B,/prices?token=test-key",
+  "/tiingo/daily/BADDATE/prices?token=test-key",
+  "/tiingo/daily/BRK%20B/prices?token=test-key",
+  "/tiingo/daily/BROKE/prices?token=test-key",
+  "/tiingo/daily/EMPTY/prices?token=test-key",
+  "/tiingo/daily/LENGTHZERO/prices?token=test-key",
+  "/tiingo/daily/MISS/prices?token=test-key",
+  "/tiingo/daily/NOADJ/prices?token=test-key",
+  "/tiingo/daily/NODATE/prices?token=test-key",
+  "/tiingo/daily/NULLADJ/prices?token=test-key",
+  "/tiingo/daily/NULLBODY/prices?token=test-key",
+  "/tiingo/daily/NULLDATE/prices?token=test-key",
+  "/tiingo/daily/NULLFIRST/prices?token=test-key",
+  "/tiingo/daily/OBJ/prices?token=test-key",
+  "/tiingo/daily/VTI/prices?token=test-key",
+  "/tiingo/daily/X?y=1/prices?token=test-key",
+  "/tiingo/daily/[object%20Object]/prices?token=test-key",
+  "/tiingo/daily/bnd/prices?token=test-key",
+  "/tiingo/daily/null/prices?token=test-key",
+  "/tiingo/daily/true/prices?token=test-key",
+  "/tiingo/x/prices?token=test-key",
+]
+`;
+
+exports[`security price HTTP parity > stores a source that is not a string as Node does 1`] = `
+{
+  """": {
+    "source": "",
+    "status": 200,
+  },
+  "1.5": {
+    "source": "1.5",
+    "status": 200,
+  },
+  "5": {
+    "source": "5",
+    "status": 200,
+  },
+  "[1,"b"]": {
+    "source": "1,b",
+    "status": 200,
+  },
+  "false": {
+    "source": "false",
+    "status": 200,
+  },
+  "null": {
+    "source": null,
+    "status": 200,
+  },
+  "true": {
+    "source": "true",
+    "status": 200,
+  },
+  "{"a":1}": {
+    "source": "[object Object]",
+    "status": 200,
+  },
+}
+`;

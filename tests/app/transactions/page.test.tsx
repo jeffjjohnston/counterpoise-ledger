@@ -3,17 +3,34 @@ import { vi, describe, it, expect, afterEach } from "vitest";
 import TransactionsPage from "@/app/b/[bookId]/transactions/page";
 import { PRICES_SAVED_EVENT } from "@/lib/events";
 import { toDateString } from "@/lib/formatters";
+import { TRANSACTION_CONFLICT_MESSAGE } from "@/lib/transaction-requests";
 import type { TransactionWithSplits } from "@/types";
 
 const pushMock = vi.fn();
 const replaceMock = vi.fn();
 let transactionListProps: Record<string, unknown> | null = null;
+let transactionFormProps: Record<string, unknown> | null = null;
 let searchParamsValue = new URLSearchParams("accountId=1");
+const toast = { error: vi.fn(), success: vi.fn() };
 
-vi.mock("next/navigation", () => ({
-  useSearchParams: () => searchParamsValue,
-  useRouter: () => ({ push: pushMock, replace: replaceMock }),
-  useParams: () => ({ bookId: "1" }),
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useSearchParams: () => searchParamsValue,
+    useRouter: () => ({ push: pushMock, replace: replaceMock }),
+    useParams: () => ({ bookId: "1" }),
+  })
+);
+
+vi.mock("@/components/ui/ToastProvider", () => ({ useToast: () => toast }));
+
+let bookRoleValue: { canWrite: boolean; isOwner: boolean; role: string } = {
+  canWrite: true,
+  isOwner: true,
+  role: "owner",
+};
+
+vi.mock("@/components/BookRoleProvider", () => ({
+  useBookRole: () => bookRoleValue,
 }));
 
 vi.mock("@/components/accounts/AccountList", () => ({
@@ -47,7 +64,18 @@ vi.mock("@/components/transactions/TransactionList", () => ({
 }));
 
 vi.mock("@/components/transactions/TransactionForm", () => ({
-  TransactionForm: () => <div data-testid="transaction-form" />,
+  // The page mounts TransactionForm up to three times at once (the desktop
+  // quick-add panel, the mobile create modal, and the edit modal) whenever
+  // canWrite is true. Only the edit-modal instance passes editingTransaction,
+  // so that is the one captured, under its own testid — a plain
+  // "transaction-form" match would be ambiguous with the others mounted.
+  TransactionForm: (props: Record<string, unknown>) => {
+    if (props.editingTransaction) {
+      transactionFormProps = props;
+      return <div data-testid="edit-transaction-form" />;
+    }
+    return <div data-testid="transaction-form" />;
+  },
 }));
 
 vi.mock("@/components/transactions/InvestmentPositionsSection", () => ({
@@ -101,6 +129,54 @@ const transactionsPayload = {
 
 const positionsPayload: unknown[] = [];
 
+/** The fetch responses every test needs, regardless of what it is testing. */
+function standardFetchResponse(url: string): Response | undefined {
+  if (url.startsWith("/api/b/1/accounts")) {
+    return { ok: true, json: async () => accountsPayload } as Response;
+  }
+  if (url.startsWith("/api/b/1/investments/positions")) {
+    return { ok: true, json: async () => positionsPayload } as Response;
+  }
+  if (url.startsWith("/api/b/1/investments/account-values")) {
+    return { ok: true, json: async () => [] } as Response;
+  }
+  if (url === "/api/b/1/payees") {
+    return { ok: true, json: async () => [] } as Response;
+  }
+  if (url.startsWith("/api/b/1/sync/stale-unmatched")) {
+    return { ok: true, json: async () => ({ totalCount: 0, accounts: [] }) } as Response;
+  }
+  if (url.startsWith("/api/b/1/sync/pending-transactions")) {
+    return { ok: true, json: async () => [] } as Response;
+  }
+  return undefined;
+}
+
+function makeTransaction(
+  overrides: Partial<TransactionWithSplits> = {}
+): TransactionWithSplits {
+  return {
+    id: 7,
+    bookId: 1,
+    date: "2024-06-01",
+    description: "Coffee",
+    checkNumber: null,
+    notes: null,
+    payeeId: null,
+    isReconciled: false,
+    isFloating: false,
+    recurringRuleId: null,
+    createdBy: null,
+    updatedBy: null,
+    createdAt: new Date("2024-06-01T00:00:00.000Z"),
+    updatedAt: new Date("2024-06-01T00:00:00.000Z"),
+    payee: null,
+    splits: [],
+    investmentSplits: [],
+    ...overrides,
+  };
+}
+
 describe("TransactionsPage", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -109,7 +185,11 @@ describe("TransactionsPage", () => {
     pushMock.mockReset();
     replaceMock.mockReset();
     transactionListProps = null;
+    transactionFormProps = null;
+    toast.error.mockClear();
+    toast.success.mockClear();
     searchParamsValue = new URLSearchParams("accountId=1");
+    bookRoleValue = { canWrite: true, isOwner: true, role: "owner" };
   });
 
   it("fetches transactions once for investment accounts", async () => {
@@ -217,6 +297,48 @@ describe("TransactionsPage", () => {
     expect(accountUrl.searchParams.get("includeInactive")).toBe("true");
     expect(accountUrl.searchParams.get("asOfDate")).toBe(today);
     expect(marketValueUrl.searchParams.get("asOfDate")).toBe(today);
+  });
+
+  it("hides the mobile FAB from a viewer", async () => {
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return { ok: true, json: async () => transactionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/positions")) {
+        return { ok: true, json: async () => positionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/account-values")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url === "/api/b/1/payees") {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url.startsWith("/api/b/1/sync/stale-unmatched")) {
+        return { ok: true, json: async () => ({ totalCount: 0, accounts: [] }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/sync/pending-transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<TransactionsPage />);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
+
+    expect(
+      screen.queryByRole("button", { name: "New transaction" })
+    ).not.toBeInTheDocument();
   });
 
   it("refreshes data when the navbar pill reports saved prices", async () => {
@@ -491,6 +613,8 @@ describe("TransactionsPage", () => {
       isReconciled: false,
       isFloating: false,
       recurringRuleId: null,
+      createdBy: null,
+      updatedBy: null,
       createdAt: new Date(),
       updatedAt: new Date(),
       payee: null,
@@ -596,6 +720,8 @@ describe("TransactionsPage", () => {
       isReconciled: false,
       isFloating: false,
       recurringRuleId: null,
+      createdBy: null,
+      updatedBy: null,
       createdAt: new Date(),
       updatedAt: new Date(),
       payee: null,
@@ -752,6 +878,8 @@ describe("TransactionsPage", () => {
       isReconciled: false,
       isFloating: false,
       recurringRuleId: null,
+      createdBy: null,
+      updatedBy: null,
       createdAt: new Date(),
       updatedAt: new Date(),
       payee: null,
@@ -892,5 +1020,212 @@ describe("TransactionsPage", () => {
         (transactionListProps?.transactions as unknown[] | undefined)?.length
       ).toBe(75);
     });
+  });
+
+  it("reloads the transaction after an in-modal Plaid unlink, so the next save sends the new updatedAt", async () => {
+    const original = makeTransaction({
+      id: 7,
+      updatedAt: new Date("2024-06-01T00:00:00.000Z"),
+    });
+    const reloaded = { ...original, updatedAt: new Date("2024-06-02T00:00:00.000Z") };
+    const putBodies: Array<Record<string, unknown>> = [];
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url === "/api/b/1/transactions/7" && method === "GET") {
+        return { ok: true, json: async () => reloaded } as Response;
+      }
+      if (url === "/api/b/1/transactions/7" && method === "PUT") {
+        putBodies.push(JSON.parse(init!.body as string));
+        return { ok: true, json: async () => reloaded } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions/7/plaid")) {
+        return { ok: true, json: async () => null } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return { ok: true, json: async () => transactionsPayload } as Response;
+      }
+      const standard = standardFetchResponse(url);
+      if (standard) return standard;
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TransactionsPage />);
+
+    await waitFor(() => expect(transactionListProps?.onEdit).toBeTypeOf("function"));
+
+    act(() => {
+      (transactionListProps!.onEdit as (t: TransactionWithSplits) => void)(original);
+    });
+
+    await waitFor(() => expect(transactionFormProps?.onPlaidUnlinked).toBeTypeOf("function"));
+
+    // The banner's unlink action, driven in-modal.
+    await act(async () => {
+      await (transactionFormProps!.onPlaidUnlinked as () => Promise<void>)();
+    });
+
+    // The modal's editingTransaction now carries the reloaded (newer) updatedAt.
+    await waitFor(() =>
+      expect(
+        (transactionFormProps?.editingTransaction as TransactionWithSplits | null)?.updatedAt
+      ).toEqual(reloaded.updatedAt)
+    );
+
+    await act(async () => {
+      await (transactionFormProps!.onSubmit as (data: unknown) => Promise<void>)({
+        date: original.date,
+        description: original.description ?? "",
+        splits: [],
+      });
+    });
+
+    // The save must send the NEW (reloaded) updatedAt, not the stale one the
+    // modal opened with — otherwise the server refuses it as a conflict.
+    expect(putBodies).toHaveLength(1);
+    expect(putBodies[0].expectedUpdatedAt).toBe(reloaded.updatedAt.toISOString());
+  });
+
+  it("shows the conflict toast and closes the modal on a 409 save", async () => {
+    const editing = makeTransaction({
+      id: 8,
+      updatedAt: new Date("2024-06-01T00:00:00.000Z"),
+    });
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url === "/api/b/1/transactions/8" && method === "PUT") {
+        return {
+          ok: false,
+          status: 409,
+          json: async () => ({ error: TRANSACTION_CONFLICT_MESSAGE }),
+        } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions/8/plaid")) {
+        return { ok: true, json: async () => null } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return { ok: true, json: async () => transactionsPayload } as Response;
+      }
+      const standard = standardFetchResponse(url);
+      if (standard) return standard;
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TransactionsPage />);
+
+    await waitFor(() => expect(transactionListProps?.onEdit).toBeTypeOf("function"));
+
+    act(() => {
+      (transactionListProps!.onEdit as (t: TransactionWithSplits) => void)(editing);
+    });
+
+    await waitFor(() => expect(transactionFormProps?.onSubmit).toBeTypeOf("function"));
+    expect(screen.getByTestId("edit-transaction-form")).toBeInTheDocument();
+
+    await act(async () => {
+      await (transactionFormProps!.onSubmit as (data: unknown) => Promise<void>)({
+        date: editing.date,
+        description: editing.description ?? "",
+        splits: [],
+      });
+    });
+
+    expect(toast.error).toHaveBeenCalledWith(TRANSACTION_CONFLICT_MESSAGE);
+    await waitFor(() =>
+      expect(screen.queryByTestId("edit-transaction-form")).not.toBeInTheDocument()
+    );
+  });
+
+  it("merges the reconcile toggle's updatedAt, so the next save is not treated as a conflict", async () => {
+    const original = makeTransaction({
+      id: 9,
+      isReconciled: false,
+      updatedAt: new Date("2024-06-01T00:00:00.000Z"),
+    });
+    const afterToggle = {
+      ...original,
+      isReconciled: true,
+      updatedAt: new Date("2024-06-03T00:00:00.000Z"),
+      updatedBy: 5,
+    };
+    const putBodies: Array<Record<string, unknown>> = [];
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url === "/api/b/1/transactions/9" && method === "PUT") {
+        putBodies.push(JSON.parse(init!.body as string));
+        return { ok: true, json: async () => afterToggle } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions/9/plaid")) {
+        return { ok: true, json: async () => null } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return {
+          ok: true,
+          json: async () => ({ transactions: [original], startingBalance: 0, totalCount: 1 }),
+        } as Response;
+      }
+      const standard = standardFetchResponse(url);
+      if (standard) return standard;
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TransactionsPage />);
+
+    await waitFor(() => {
+      expect(transactionListProps?.onToggleReconciled).toBeTypeOf("function");
+      expect(
+        (transactionListProps?.transactions as TransactionWithSplits[] | undefined)?.some(
+          (t) => t.id === 9
+        )
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      await (
+        transactionListProps!.onToggleReconciled as (
+          id: number,
+          reconciled: boolean
+        ) => Promise<void>
+      )(9, true);
+    });
+
+    await waitFor(() => {
+      const row = (transactionListProps?.transactions as TransactionWithSplits[]).find(
+        (t) => t.id === 9
+      );
+      expect(row?.updatedAt).toEqual(afterToggle.updatedAt);
+    });
+
+    const rowAfterToggle = (
+      transactionListProps!.transactions as TransactionWithSplits[]
+    ).find((t) => t.id === 9)!;
+
+    act(() => {
+      (transactionListProps!.onEdit as (t: TransactionWithSplits) => void)(rowAfterToggle);
+    });
+
+    await waitFor(() => expect(transactionFormProps?.onSubmit).toBeTypeOf("function"));
+
+    await act(async () => {
+      await (transactionFormProps!.onSubmit as (data: unknown) => Promise<void>)({
+        date: original.date,
+        description: original.description ?? "",
+        splits: [],
+      });
+    });
+
+    // First PUT was the reconcile toggle (no expectedUpdatedAt); second is the
+    // modal save, which must carry the toggle response's updatedAt rather
+    // than the stale value the row had when the modal first opened.
+    expect(putBodies).toHaveLength(2);
+    expect(putBodies[1].expectedUpdatedAt).toBe(afterToggle.updatedAt.toISOString());
   });
 });

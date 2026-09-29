@@ -1,7 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import { getDb } from "@/db";
 import { recurringRules, recurringTemplateSplits, transactions } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -14,26 +11,12 @@ import {
   createTransactionWithSplits,
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
+import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 
-// Mock MCP auth to return an authenticated user, same pattern as
-// mcp-payee-tools.test.ts.
-vi.mock("@/mcp/auth", () => ({
-  getMcpAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  verifyBookAccess: vi.fn().mockResolvedValue(true),
-  requireAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  requireBookAuth: vi.fn().mockResolvedValue({ userId: 1, keyId: 1 }),
-}));
-
-vi.mock("@/db", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/db")>();
-  return { ...actual };
-});
-
-let client: Client;
-let server: McpServer;
+let mcp: McpTestClient;
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
-  callMcpTool(client, name, args);
+  callMcpTool(mcp.client, name, args);
 
 describe("MCP Recurring Tools", () => {
   const bookId = 1;
@@ -41,23 +24,15 @@ describe("MCP Recurring Tools", () => {
   beforeAll(async () => {
     await setupTestDatabase();
 
-    server = new McpServer({ name: "test", version: "0.0.1" });
-    const { registerRecurringTools } = await import("@/mcp/tools/recurring");
-    registerRecurringTools(server);
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(clientTransport);
-  });
+    mcp = await connectMcpTestClient();
+  }, 120_000);
 
   beforeEach(async () => {
     await resetTestDatabase();
   });
 
   afterAll(async () => {
-    await client.close();
-    await server.close();
+    await mcp.close();
   });
 
   async function fixture() {
@@ -172,9 +147,31 @@ describe("MCP Recurring Tools", () => {
       // Regression guard for Step 1. zod accepted an absent endDate all
       // along; the published JSON Schema said otherwise, and the schema is
       // what a model reads.
-      const { tools } = await client.listTools();
+      const { tools } = await mcp.client.listTools();
       const create = tools.find((t) => t.name === "create_recurring_rule");
       expect(create?.inputSchema.required).not.toContain("endDate");
+    });
+
+    it("takes an empty endDate as no end, as the create form sends it", async () => {
+      // zod preprocesses "" to null. The published JSON Schema cannot say
+      // so and refuses "", so the Rust server applies the same preprocess
+      // before its schema check.
+      const { checking, rent } = await fixture();
+
+      const { data, isError } = await callTool("create_recurring_rule", {
+        bookId,
+        name: "Rent",
+        frequency: "monthly",
+        startDate: "2026-01-15",
+        endDate: "",
+        templateSplits: [
+          { accountId: rent.id, amount: 150000 },
+          { accountId: checking.id, amount: -150000 },
+        ],
+      });
+
+      expect(isError).toBe(false);
+      expect(data.endDate).toBeNull();
     });
   });
 

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { parsePriceMicros } from "@/lib/pricing";
-import { formatDateShort } from "@/lib/formatters";
+import { formatDateShort } from "@/lib/wasm-client";
 import { useRegisterShortcuts } from "@/hooks/useRegisterShortcuts";
 import type { ShortcutDef } from "@/components/KeyboardShortcutProvider";
 import { PRICES_SAVED_EVENT } from "@/lib/events";

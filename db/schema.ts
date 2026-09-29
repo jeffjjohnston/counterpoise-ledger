@@ -4,6 +4,7 @@ import {
   integer,
   bigint,
   boolean,
+  jsonb,
   serial,
   timestamp,
   foreignKey,
@@ -15,6 +16,7 @@ import {
   type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
+import type { MatchSnapshot, TypeSafeAnswers } from "../lib/typesafe/types";
 
 // ── Meta tables ────────────────────────────────────────────────────────────────
 
@@ -64,6 +66,8 @@ export const books = pgTable("books", {
     .references(() => users.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
   upcomingDays: integer("upcoming_days").notNull().default(30),
+  typesafeReconciliationEnabled: boolean("typesafe_reconciliation_enabled").notNull().default(false),
+  typesafeRevision: integer("typesafe_revision").notNull().default(0),
   createdAt: timestamp("created_at")
     .notNull()
     .$defaultFn(() => new Date()),
@@ -73,6 +77,85 @@ export const books = pgTable("books", {
 }, (table) => [
   check("upcoming_days_range", sql`${table.upcomingDays} >= 1 AND ${table.upcomingDays} <= 365`),
 ]);
+
+// The only source of book access. An AFTER INSERT trigger on books adds the
+// creator as owner (migration 0027). So every book has an owner row. The
+// application keeps at least one owner per book. See
+// rust-api/server/src/routes/members.rs.
+export const bookMembers = pgTable(
+  "book_members",
+  {
+    bookId: integer("book_id")
+      .notNull()
+      .references(() => books.id, { onDelete: "cascade" }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    role: text("role", { enum: ["owner", "editor", "viewer"] }).notNull(),
+    createdAt: timestamp("created_at")
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  (table) => [
+    primaryKey({ columns: [table.bookId, table.userId] }),
+    index("book_members_user_id_idx").on(table.userId),
+    check("book_members_role_check", sql`${table.role} IN ('owner', 'editor', 'viewer')`),
+  ]
+);
+
+export type BookMemberRow = typeof bookMembers.$inferSelect;
+
+// Experiment records never grant ledger mutation authority. Only book has an FK:
+// retain pre-decision evidence even when a staged row is unlinked/deleted.
+export const typesafeEvaluations = pgTable("typesafe_evaluations", {
+  id: serial("id").primaryKey(),
+  bookId: integer("book_id").notNull().references(() => books.id, { onDelete: "cascade" }),
+  reconciliationId: integer("reconciliation_id").notNull(),
+  linkId: integer("link_id").notNull(),
+  revision: integer("revision").notNull(),
+  fingerprint: text("fingerprint").notNull(),
+  attempt: text("attempt").notNull(),
+  snapshot: jsonb("snapshot").$type<MatchSnapshot>().notNull(),
+  status: text("status", { enum: ["pending", "ready", "error", "stale", "skipped"] }).notNull(),
+  choice: text("choice"),
+  probabilities: jsonb("probabilities").$type<Record<string, number>>(),
+  confidence: jsonb("confidence").$type<number>(),
+  usage: jsonb("usage").$type<{ input_tokens: number; output_tokens: number }>(),
+  answers: jsonb("answers").$type<TypeSafeAnswers>(),
+  errorCode: text("error_code"),
+  startedAt: timestamp("started_at").notNull().defaultNow(),
+  completedAt: timestamp("completed_at"),
+  displayedAt: timestamp("displayed_at"),
+  latencyMs: integer("latency_ms"),
+}, (t) => [uniqueIndex("typesafe_evaluation_input").on(t.bookId, t.fingerprint), index("typesafe_evaluation_age").on(t.startedAt)]);
+
+export const typesafeDecisions = pgTable("typesafe_decisions", {
+  id: serial("id").primaryKey(),
+  bookId: integer("book_id").notNull().references(() => books.id, { onDelete: "cascade" }),
+  reconciliationId: integer("reconciliation_id").notNull(),
+  evaluationId: integer("evaluation_id").references(() => typesafeEvaluations.id, { onDelete: "cascade" }),
+  action: text("action").notNull(),
+  transactionId: integer("transaction_id"),
+  suggestionVisible: boolean("suggestion_visible").notNull().default(false),
+  acceptedSuggestion: boolean("accepted_suggestion").notNull().default(false),
+  // Set only for a create decision after a visible proposal: true when the
+  // created value equals the proposed value.
+  proposalPayeeKept: boolean("proposal_payee_kept"),
+  proposalCategoryKept: boolean("proposal_category_kept"),
+  activeReviewMs: integer("active_review_ms"),
+  decidedAt: timestamp("decided_at").notNull().defaultNow(),
+}, (t) => [index("typesafe_decision_book").on(t.bookId, t.reconciliationId)]);
+
+export const typesafeQuotas = pgTable("typesafe_quotas", {
+  bookId: integer("book_id").notNull().references(() => books.id, { onDelete: "cascade" }),
+  day: text("day").notNull(),
+  attempts: integer("attempts").notNull().default(0),
+}, (t) => [primaryKey({ columns: [t.bookId, t.day] })]);
+
+export const typesafeAggregates = pgTable("typesafe_aggregates", {
+  bookId: integer("book_id").primaryKey().references(() => books.id, { onDelete: "cascade" }),
+  counts: jsonb("counts").$type<Record<string, number>>().notNull(),
+});
 
 export const issueReports = pgTable("issue_reports", {
   id: serial("id").primaryKey(),
@@ -179,6 +262,11 @@ export const transactions = pgTable("transactions", {
   isReconciled: boolean("is_reconciled").notNull().default(false),
   isFloating: boolean("is_floating").notNull().default(false),
   recurringRuleId: integer("recurring_rule_id").references(() => recurringRules.id, { onDelete: "set null" }),
+  // The user who created or last changed this row. Null means a system write
+  // (recurring processing, Plaid auto-match, the importer) or a row older
+  // than these columns.
+  createdBy: integer("created_by").references((): AnyPgColumn => users.id, { onDelete: "set null" }),
+  updatedBy: integer("updated_by").references((): AnyPgColumn => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at")
     .notNull()
     .$defaultFn(() => new Date()),

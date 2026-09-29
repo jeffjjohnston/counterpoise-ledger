@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { TransactionList, computeRowMenuPosition } from "@/components/transactions/TransactionList";
 import type { TransactionWithSplits, AccountWithBalance, DisplayTransaction } from "@/types";
+import { toDateString } from "@/lib/formatters";
 
 // Controllable mobile flag so we can exercise both the desktop table and the mobile
 // card layouts. Defaults to desktop (matches jsdom, which lacks matchMedia).
@@ -23,6 +24,8 @@ const baseTransaction = {
   isReconciled: false,
   isFloating: false,
   recurringRuleId: null,
+  createdBy: null,
+  updatedBy: null,
   createdAt: new Date(),
   updatedAt: new Date(),
   payee: null,
@@ -713,6 +716,116 @@ describe("TransactionList", () => {
 
       expect(screen.getByText("Float")).toBeInTheDocument();
       expect(screen.queryByText(/^~/)).not.toBeInTheDocument();
+    });
+
+    it("lists a floating row above a settled row entered later the same day", () => {
+      // The register sorts by effective date, which puts a floating row on
+      // today alongside every settled row dated today. Ordering the tie by id
+      // alone buries the floating row under the day's later entries; it has
+      // to stay at the top of the day.
+      // The local date, as getEffectiveDate() uses. toISOString() gives the
+      // UTC date, which is already tomorrow on a US evening.
+      const today = toDateString(new Date());
+      const rows: TransactionWithSplits[] = [
+        {
+          ...baseTransaction,
+          id: 80,
+          bookId: 1,
+          isFloating: true,
+          date: "2020-01-01",
+          payeeId: 8,
+          payee: { id: 8, bookId: 1, name: "Floating Rent", createdAt: new Date() },
+          splits: [
+            { id: 801, bookId: 1, transactionId: 80, accountId: 1, amount: -500, account: mockAccounts[0] },
+            { id: 802, bookId: 1, transactionId: 80, accountId: 2, amount: 500, account: mockAccounts[1] },
+          ],
+        },
+        {
+          ...baseTransaction,
+          id: 81,
+          bookId: 1,
+          date: today,
+          payeeId: 9,
+          payee: { id: 9, bookId: 1, name: "Settled Market", createdAt: new Date() },
+          splits: [
+            { id: 811, bookId: 1, transactionId: 81, accountId: 1, amount: -2000, account: mockAccounts[0] },
+            { id: 812, bookId: 1, transactionId: 81, accountId: 2, amount: 2000, account: mockAccounts[1] },
+          ],
+        },
+      ];
+
+      render(
+        <TransactionList
+          transactions={rows}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          startingBalance={10000}
+          onEdit={vi.fn()}
+        />
+      );
+
+      // The amount cell carries the row's transaction id, so reading the
+      // cells in document order reads the register's order.
+      const order = screen
+        .getAllByTestId(/^transaction-amount-/)
+        .map((cell) => cell.getAttribute("data-testid"));
+      expect(order).toEqual(["transaction-amount-80", "transaction-amount-81"]);
+    });
+
+    it("runs the balance through the settled row before the floating one", () => {
+      // The running balance accumulates in the reverse of the display order,
+      // so a floating row printed at the top of the day is the LAST row of
+      // that day to accumulate. Leaving the balance sorted by id alone makes
+      // the two columns disagree: the register would show the day's balances
+      // running the wrong way.
+      // The local date, as getEffectiveDate() uses. toISOString() gives the
+      // UTC date, which is already tomorrow on a US evening.
+      const today = toDateString(new Date());
+      const rows: TransactionWithSplits[] = [
+        {
+          ...baseTransaction,
+          id: 80,
+          bookId: 1,
+          isFloating: true,
+          date: "2020-01-01",
+          payeeId: 8,
+          payee: { id: 8, bookId: 1, name: "Floating Rent", createdAt: new Date() },
+          splits: [
+            { id: 801, bookId: 1, transactionId: 80, accountId: 1, amount: -500, account: mockAccounts[0] },
+            { id: 802, bookId: 1, transactionId: 80, accountId: 2, amount: 500, account: mockAccounts[1] },
+          ],
+        },
+        {
+          ...baseTransaction,
+          id: 81,
+          bookId: 1,
+          date: today,
+          payeeId: 9,
+          payee: { id: 9, bookId: 1, name: "Settled Market", createdAt: new Date() },
+          splits: [
+            { id: 811, bookId: 1, transactionId: 81, accountId: 1, amount: -2000, account: mockAccounts[0] },
+            { id: 812, bookId: 1, transactionId: 81, accountId: 2, amount: 2000, account: mockAccounts[1] },
+          ],
+        },
+      ];
+
+      render(
+        <TransactionList
+          transactions={rows}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          startingBalance={10000}
+          onEdit={vi.fn()}
+        />
+      );
+
+      // $100.00 in, less the $20.00 settled row, less the $5.00 floating one.
+      const bodyRows = screen.getAllByRole("row").slice(1);
+      const balances = bodyRows.map((row) => {
+        const cells = row.querySelectorAll("td");
+        return cells[cells.length - 2]?.textContent?.trim();
+      });
+      expect(balances).toEqual(["$75.00", "$80.00"]);
     });
 
     it("does not show a Float pill on a settled transaction", () => {

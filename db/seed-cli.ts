@@ -1,73 +1,45 @@
 /**
  * CLI entry for the sample-data seed. Run by `npm run db:seed`.
  *
- *   npm run db:seed                  Full destructive reset + seed (see seed()).
+ *   npm run db:seed                  Full destructive reset + seed.
  *   npm run db:seed -- --book-id 2   Replace the contents of book 2 only.
  *
- * This file exists so db/seed.ts can stay side-effect free. db/seed.ts is
- * imported by application code (lib/books.ts → the demo-book route and the
- * create_demo_book MCP tool), and esbuild inlines everything it reaches into
- * dist/mcp-server.mjs. A main-module guard living in that module resolved
- * against the bundle's own path once inlined, so `node /app/mcp-server.mjs`
- * ran the destructive seed against production. Nothing imports THIS file, so
- * the guard below can only ever be true when a human runs it directly.
+ * The seed itself is `ledger-cli seed` (rust-api/db/src/seed.rs). Rust never
+ * applies DDL, so for a full reset this script drops the schemas and runs the
+ * Drizzle migrations first. `cargo run` builds the CLI when its source has
+ * changed. The Rust CLI checks the arguments and the book.
+ *
+ * The main-module guard lives here, in a file that nothing imports, so it can
+ * only ever be true when a human runs it directly. A guard in an imported
+ * module once resolved against a bundle's own path in the former TypeScript
+ * MCP server, and would have run the destructive seed against production.
  */
-import { eq } from "drizzle-orm";
+import { spawnSync } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
-import { getDb } from "./index";
-import * as schema from "./schema";
-import { seed, seedBook } from "./seed";
+import { closeDb } from "./index";
+import { resetDatabase } from "./reset";
 
-export function runSeedCli(): Promise<number> {
-  return seed()
-    .then(() => 0)
-    .catch((error) => {
-      console.error("Seed failed:", error);
-      return 1;
-    });
-}
+const CARGO_MANIFEST = fileURLToPath(new URL("../rust-api/Cargo.toml", import.meta.url));
 
-async function main() {
+async function main(): Promise<number> {
   const args = process.argv.slice(2);
-  const bookIdIndex = args.indexOf("--book-id");
 
-  if (bookIdIndex !== -1) {
-    const bookIdStr = args[bookIdIndex + 1];
-    if (!bookIdStr) {
-      console.error("Error: --book-id requires a numeric argument");
-      process.exit(1);
-    }
-    const bookId = parseInt(bookIdStr, 10);
-    if (isNaN(bookId)) {
-      console.error(`Error: invalid book ID "${bookIdStr}"`);
-      process.exit(1);
-    }
-
-    const db = getDb();
-
-    // Verify book exists
-    const [book] = await db
-      .select({ id: schema.books.id, name: schema.books.name })
-      .from(schema.books)
-      .where(eq(schema.books.id, bookId));
-
-    if (!book) {
-      console.error(`Error: book ${bookId} not found. Use 'npm run db:list-books' to see available books.`);
-      process.exit(1);
-    }
-
-    // db/seed.ts's logSeed() stays private to that module; this line is the
-    // only progress message the CLI adds, and the CLI is always an explicit
-    // human invocation, so it prints unconditionally.
-    console.log(`  Found book '${book.name}' (id: ${book.id})`);
-    await seedBook(db, bookId);
-  } else {
-    const exitCode = await runSeedCli();
-    process.exit(exitCode);
+  if (!args.includes("--book-id")) {
+    await resetDatabase();
+    await closeDb();
   }
 
-  process.exit(0);
+  const result = spawnSync(
+    "cargo",
+    ["run", "--quiet", "--locked", "--manifest-path", CARGO_MANIFEST, "-p", "ledger-cli", "--", "seed", ...args],
+    { stdio: "inherit" }
+  );
+  if (result.error) {
+    console.error("Seed failed: could not run cargo:", result.error.message);
+    return 1;
+  }
+  return result.status ?? 1;
 }
 
 const isMainModule =
@@ -75,8 +47,10 @@ const isMainModule =
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMainModule) {
-  main().catch((error) => {
-    console.error("Seed failed:", error);
-    process.exit(1);
-  });
+  main()
+    .then((exitCode) => process.exit(exitCode))
+    .catch((error) => {
+      console.error("Seed failed:", error);
+      process.exit(1);
+    });
 }

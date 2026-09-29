@@ -1,45 +1,53 @@
-import { describe, it, expect, beforeAll } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { Tool, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
-import { registerAllTools } from "@/mcp/register-all";
-import {
-  READ,
-  READ_NETWORK,
-  CREATE,
-  UPDATE,
-  DESTRUCTIVE,
-  DESTRUCTIVE_NONIDEMPOTENT,
-  WRITE_NETWORK,
-} from "@/mcp/tools/_annotations";
-import * as annotationPresets from "@/mcp/tools/_annotations";
+import { describe, it, expect } from "vitest";
+import manifest from "@/rust-api/server/mcp-tools.json";
 
-let tools: Tool[];
+type ToolAnnotations = {
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+};
+type Tool = { name: string; annotations?: ToolAnnotations; inputSchema: unknown };
 
-beforeAll(async () => {
-  const server = new McpServer({ name: "test", version: "1.0.0" });
-  registerAllTools(server);
+const tools = manifest as Tool[];
 
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: "test-client", version: "1.0.0" });
-  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
-  tools = (await client.listTools()).tools;
-});
+// The annotation presets. Each tool in rust-api/server/mcp-tools.json carries
+// exactly one of them.
+const READ: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
+const READ_NETWORK: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: true };
+const CREATE: ToolAnnotations = {
+  readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false,
+};
+const UPDATE: ToolAnnotations = {
+  readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+};
+const DESTRUCTIVE: ToolAnnotations = {
+  readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false,
+};
+const DESTRUCTIVE_NONIDEMPOTENT: ToolAnnotations = {
+  readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false,
+};
+const WRITE_NETWORK: ToolAnnotations = {
+  readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true,
+};
+
+const PRESETS = { READ, READ_NETWORK, CREATE, UPDATE, DESTRUCTIVE, DESTRUCTIVE_NONIDEMPOTENT, WRITE_NETWORK };
 
 /**
- * Every tool this server registers, mapped to the preset it must carry.
- * Presets come from the constants themselves — not re-spelled literals — so a
- * change to a preset's hint values propagates here instead of drifting out of
- * sync. A new tool that is missing a row here fails the coverage test below
- * rather than going unchecked.
+ * Every tool in the manifest, mapped to the preset it must carry. A new tool
+ * that is missing a row here fails the coverage test below rather than going
+ * unchecked.
  */
-export const EXPECTED_ANNOTATIONS: Record<string, ToolAnnotations> = {
+const EXPECTED_ANNOTATIONS: Record<string, ToolAnnotations> = {
   list_books: READ,
   create_book: CREATE,
   update_book: UPDATE,
   delete_book: DESTRUCTIVE,
   create_demo_book: CREATE,
+  list_book_members: READ,
+  add_book_member: CREATE,
+  update_book_member: UPDATE,
+  remove_book_member: DESTRUCTIVE,
   list_accounts: READ,
   get_account_tree: READ,
   create_account: CREATE,
@@ -97,12 +105,12 @@ export const EXPECTED_ANNOTATIONS: Record<string, ToolAnnotations> = {
 };
 
 describe("tool annotations", () => {
-  it("registers every tool with annotations", () => {
+  it("gives every tool annotations", () => {
     const missing = tools.filter((t) => !t.annotations).map((t) => t.name);
     expect(missing).toEqual([]);
   });
 
-  it("maps exactly the registered tool set — no tool missing a row, no stale row", () => {
+  it("maps exactly the manifest's tool set — no tool missing a row, no stale row", () => {
     const registeredNames = tools.map((t) => t.name).sort();
     const expectedNames = Object.keys(EXPECTED_ANNOTATIONS).sort();
     expect(registeredNames).toEqual(expectedNames);
@@ -117,15 +125,7 @@ describe("tool annotations", () => {
   );
 
   it("never defines a preset that is both readOnly and destructive", () => {
-    const presets = {
-      READ,
-      READ_NETWORK,
-      CREATE,
-      UPDATE,
-      DESTRUCTIVE,
-      DESTRUCTIVE_NONIDEMPOTENT,
-      WRITE_NETWORK,
-    };
+    const presets = PRESETS;
     const contradictory = Object.entries(presets)
       .filter(([, preset]) => preset.readOnlyHint === true && preset.destructiveHint === true)
       .map(([name]) => name);
@@ -139,15 +139,7 @@ describe("tool annotations", () => {
   // distinction from READ_NETWORK for any client that applies the defaults.
   // These two tests exist so that cannot come back.
   it("sets openWorldHint explicitly on every preset", () => {
-    const presets = {
-      READ,
-      READ_NETWORK,
-      CREATE,
-      UPDATE,
-      DESTRUCTIVE,
-      DESTRUCTIVE_NONIDEMPOTENT,
-      WRITE_NETWORK,
-    };
+    const presets = PRESETS;
     const implicit = Object.entries(presets)
       .filter(([, preset]) => preset.openWorldHint === undefined)
       .map(([name]) => name);
@@ -179,30 +171,10 @@ describe("tool annotations", () => {
     ).toEqual([]);
   });
 
-  it("includes every exported preset in the preset-hygiene checks", () => {
-    // The three checks above take a hardcoded object. A preset added to
-    // _annotations.ts but not to those objects is silently unchecked, which
-    // is the failure this test exists to make impossible.
-    const checked = new Set([
-      "READ",
-      "READ_NETWORK",
-      "CREATE",
-      "UPDATE",
-      "DESTRUCTIVE",
-      "DESTRUCTIVE_NONIDEMPOTENT",
-      "WRITE_NETWORK",
-    ]);
-    const exported = Object.keys(annotationPresets).filter(
-      (name) => name === name.toUpperCase()
-    );
-
-    expect(exported.filter((name) => !checked.has(name))).toEqual([]);
-  });
-
   // A tool that spreads a shared schema inherits that schema's descriptions —
   // or its lack of them. create_security once shipped with every field
-  // description silently stripped, because lib/schemas/securities.ts carried
-  // none. This is the guard for that, and it binds every tool.
+  // description silently stripped, because the shared zod schema it spread
+  // carried none. This is the guard for that, and it binds every tool.
   it("describes every input field of every tool", () => {
     const undescribed: string[] = [];
     const inspectedPaths: string[] = [];
@@ -242,11 +214,11 @@ describe("tool annotations", () => {
 
     expect(
       undescribed,
-      "Add .describe() to these fields — in lib/schemas/ if the tool spreads a shared schema."
+      "Add a description to these fields in rust-api/server/mcp-tools.json."
     ).toEqual([]);
 
     // Positive control. The assertion above is satisfied by inspecting
-    // nothing, so if the SDK ever changes the shape it publishes — a $ref
+    // nothing, so if the manifest's schemas change shape — a $ref
     // indirection, a renamed `properties` key — this test would keep passing
     // while checking no field at all.
     //

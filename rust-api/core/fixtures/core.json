@@ -1,0 +1,5828 @@
+{
+  "version": 1,
+  "sources": [
+    "lib/accounting.ts",
+    "lib/recurring.ts",
+    "lib/expression.ts",
+    "lib/formatters.ts",
+    "lib/investments.ts",
+    "lib/lots.ts"
+  ],
+  "cases": [
+    {
+      "name": "empty",
+      "op": "validateSplits",
+      "input": {
+        "amounts": []
+      },
+      "expected": true
+    },
+    {
+      "name": "balanced",
+      "op": "validateSplits",
+      "input": {
+        "amounts": [
+          100,
+          -100
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "unbalanced",
+      "op": "validateSplits",
+      "input": {
+        "amounts": [
+          100,
+          -99
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "fractional",
+      "op": "validateSplits",
+      "input": {
+        "amounts": [
+          3.5,
+          -3.5
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "outOfRange",
+      "op": "validateSplits",
+      "input": {
+        "amounts": [
+          2147483648,
+          -2147483648
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "int4Boundary",
+      "op": "validateSplits",
+      "input": {
+        "amounts": [
+          2147483647,
+          -2147483647
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "Math.round 0.49999999999999994",
+      "op": "mathRound",
+      "input": {
+        "value": 0.49999999999999994
+      },
+      "expected": 0
+    },
+    {
+      "name": "Math.round 0.5",
+      "op": "mathRound",
+      "input": {
+        "value": 0.5
+      },
+      "expected": 1
+    },
+    {
+      "name": "Math.round -0.5",
+      "op": "mathRound",
+      "input": {
+        "value": -0.5
+      },
+      "expected": 0
+    },
+    {
+      "name": "Math.round 4503599627370497",
+      "op": "mathRound",
+      "input": {
+        "value": 4503599627370497
+      },
+      "expected": 4503599627370497
+    },
+    {
+      "name": "half-cent tie",
+      "op": "grossAmount",
+      "input": {
+        "sharesMicros": 25000000,
+        "priceMicros": 1400
+      },
+      "expected": 4
+    },
+    {
+      "name": "large product",
+      "op": "grossAmount",
+      "input": {
+        "sharesMicros": 250000000,
+        "priceMicros": 45500000
+      },
+      "expected": 1137500
+    },
+    {
+      "name": "negative half tie",
+      "op": "grossAmount",
+      "input": {
+        "sharesMicros": -25000000,
+        "priceMicros": 1400
+      },
+      "expected": -3
+    },
+    {
+      "name": "zero",
+      "op": "grossAmount",
+      "input": {
+        "sharesMicros": 0,
+        "priceMicros": 1000000
+      },
+      "expected": 0
+    },
+    {
+      "name": "dividend",
+      "op": "buildDividend",
+      "input": {
+        "cashAccountId": 2,
+        "incomeAccountId": 3,
+        "amountCents": 1234
+      },
+      "expected": [
+        {
+          "accountId": 2,
+          "amount": 1234
+        },
+        {
+          "accountId": 3,
+          "amount": -1234
+        }
+      ]
+    },
+    {
+      "name": "capital gain",
+      "op": "buildCapGain",
+      "input": {
+        "cashAccountId": 2,
+        "incomeAccountId": 3,
+        "amountCents": 1234
+      },
+      "expected": [
+        {
+          "accountId": 2,
+          "amount": 1234
+        },
+        {
+          "accountId": 3,
+          "amount": -1234
+        }
+      ]
+    },
+    {
+      "name": "buy {\"securityAccountId\":1,\"cashAccountId\":2,\"sharesMicros\":2000000,\"priceMicros\":10000000}",
+      "op": "buildBuy",
+      "input": {
+        "securityAccountId": 1,
+        "cashAccountId": 2,
+        "sharesMicros": 2000000,
+        "priceMicros": 10000000
+      },
+      "expected": [
+        {
+          "accountId": 1,
+          "amount": 2000
+        },
+        {
+          "accountId": 2,
+          "amount": -2000
+        }
+      ]
+    },
+    {
+      "name": "buy {\"securityAccountId\":1,\"cashAccountId\":2,\"feeAccountId\":3,\"sharesMicros\":2000000,\"priceMicros\":10000000,\"feesCents\":50}",
+      "op": "buildBuy",
+      "input": {
+        "securityAccountId": 1,
+        "cashAccountId": 2,
+        "feeAccountId": 3,
+        "sharesMicros": 2000000,
+        "priceMicros": 10000000,
+        "feesCents": 50
+      },
+      "expected": [
+        {
+          "accountId": 1,
+          "amount": 2000
+        },
+        {
+          "accountId": 3,
+          "amount": 50
+        },
+        {
+          "accountId": 2,
+          "amount": -2050
+        }
+      ]
+    },
+    {
+      "name": "buy {\"securityAccountId\":1,\"cashAccountId\":2,\"sharesMicros\":2000000,\"priceMicros\":10000000,\"feesCents\":50}",
+      "op": "buildBuy",
+      "input": {
+        "securityAccountId": 1,
+        "cashAccountId": 2,
+        "sharesMicros": 2000000,
+        "priceMicros": 10000000,
+        "feesCents": 50
+      },
+      "expected": {
+        "error": "feeAccountId is required when feesCents is provided."
+      }
+    },
+    {
+      "name": "sell {\"securityAccountId\":1,\"cashAccountId\":2,\"sharesMicros\":2000000,\"priceMicros\":15000000}",
+      "op": "buildSell",
+      "input": {
+        "securityAccountId": 1,
+        "cashAccountId": 2,
+        "sharesMicros": 2000000,
+        "priceMicros": 15000000
+      },
+      "expected": [
+        {
+          "accountId": 2,
+          "amount": 3000
+        },
+        {
+          "accountId": 1,
+          "amount": -3000
+        }
+      ]
+    },
+    {
+      "name": "sell {\"securityAccountId\":1,\"cashAccountId\":2,\"feeAccountId\":3,\"gainLossAccountId\":4,\"sharesMicros\":2000000,\"priceMicros\":15000000,\"feesCents\":50,\"costBasisCents\":2000}",
+      "op": "buildSell",
+      "input": {
+        "securityAccountId": 1,
+        "cashAccountId": 2,
+        "feeAccountId": 3,
+        "gainLossAccountId": 4,
+        "sharesMicros": 2000000,
+        "priceMicros": 15000000,
+        "feesCents": 50,
+        "costBasisCents": 2000
+      },
+      "expected": [
+        {
+          "accountId": 2,
+          "amount": 2950
+        },
+        {
+          "accountId": 3,
+          "amount": 50
+        },
+        {
+          "accountId": 4,
+          "amount": -1000
+        },
+        {
+          "accountId": 1,
+          "amount": -2000
+        }
+      ]
+    },
+    {
+      "name": "sell {\"securityAccountId\":1,\"cashAccountId\":2,\"sharesMicros\":2000000,\"priceMicros\":15000000,\"costBasisCents\":2000}",
+      "op": "buildSell",
+      "input": {
+        "securityAccountId": 1,
+        "cashAccountId": 2,
+        "sharesMicros": 2000000,
+        "priceMicros": 15000000,
+        "costBasisCents": 2000
+      },
+      "expected": {
+        "error": "gainLossAccountId is required when costBasisCents produces a gain or loss."
+      }
+    },
+    {
+      "name": "buy mapping",
+      "op": "mapInvestmentAction",
+      "input": {
+        "action": "buy",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": [
+        {
+          "role": "security",
+          "amount": 1000
+        },
+        {
+          "role": "expense",
+          "amount": 25
+        },
+        {
+          "role": "cash",
+          "amount": -1025
+        }
+      ]
+    },
+    {
+      "name": "buy validity",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "buy",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": true
+    },
+    {
+      "name": "sell mapping",
+      "op": "mapInvestmentAction",
+      "input": {
+        "action": "sell",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": [
+        {
+          "role": "cash",
+          "amount": 975
+        },
+        {
+          "role": "expense",
+          "amount": 25
+        },
+        {
+          "role": "security",
+          "amount": -1000
+        }
+      ]
+    },
+    {
+      "name": "sell validity",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "sell",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": true
+    },
+    {
+      "name": "dividend mapping",
+      "op": "mapInvestmentAction",
+      "input": {
+        "action": "dividend",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": [
+        {
+          "role": "cash",
+          "amount": 1000
+        },
+        {
+          "role": "income",
+          "amount": -1000
+        }
+      ]
+    },
+    {
+      "name": "dividend validity",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "dividend",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": true
+    },
+    {
+      "name": "capGain mapping",
+      "op": "mapInvestmentAction",
+      "input": {
+        "action": "capGain",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": [
+        {
+          "role": "cash",
+          "amount": 1000
+        },
+        {
+          "role": "income",
+          "amount": -1000
+        }
+      ]
+    },
+    {
+      "name": "capGain validity",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "capGain",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": true
+    },
+    {
+      "name": "fee mapping",
+      "op": "mapInvestmentAction",
+      "input": {
+        "action": "fee",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": [
+        {
+          "role": "expense",
+          "amount": 25
+        },
+        {
+          "role": "cash",
+          "amount": -25
+        }
+      ]
+    },
+    {
+      "name": "fee validity",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "fee",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": true
+    },
+    {
+      "name": "split mapping",
+      "op": "mapInvestmentAction",
+      "input": {
+        "action": "split",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": []
+    },
+    {
+      "name": "split validity",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "split",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000,
+        "feesCents": 25,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": true
+    },
+    {
+      "name": "invalid/edge action {\"action\":\"buy\",\"sharesMicros\":0,\"priceMicros\":1000000}",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "buy",
+        "sharesMicros": 0,
+        "priceMicros": 1000000
+      },
+      "expected": false
+    },
+    {
+      "name": "invalid/edge action {\"action\":\"sell\",\"sharesMicros\":-1,\"priceMicros\":1000000}",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "sell",
+        "sharesMicros": -1,
+        "priceMicros": 1000000
+      },
+      "expected": false
+    },
+    {
+      "name": "invalid/edge action {\"action\":\"split\",\"sharesMicros\":0,\"priceMicros\":0,\"splitNumerator\":1,\"splitDenominator\":0}",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "split",
+        "sharesMicros": 0,
+        "priceMicros": 0,
+        "splitNumerator": 1,
+        "splitDenominator": 0
+      },
+      "expected": false
+    },
+    {
+      "name": "invalid/edge action {\"action\":\"dividend\",\"sharesMicros\":0,\"priceMicros\":0}",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "dividend",
+        "sharesMicros": 0,
+        "priceMicros": 0
+      },
+      "expected": true
+    },
+    {
+      "name": "invalid/edge action {\"action\":\"buy\",\"sharesMicros\":1000000000000000,\"priceMicros\":100000000000000}",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "buy",
+        "sharesMicros": 1000000000000000,
+        "priceMicros": 100000000000000
+      },
+      "expected": false
+    },
+    {
+      "name": "invalid/edge action {\"action\":\"buy\",\"sharesMicros\":1000000,\"priceMicros\":1000000,\"feesCents\":9223372036854775000}",
+      "op": "validateInvestmentAction",
+      "input": {
+        "action": "buy",
+        "sharesMicros": 1000000,
+        "priceMicros": 1000000,
+        "feesCents": 9223372036854775000
+      },
+      "expected": false
+    },
+    {
+      "name": "action collection empty",
+      "op": "validateInvestmentActions",
+      "input": {
+        "actions": []
+      },
+      "expected": true
+    },
+    {
+      "name": "action collection valid",
+      "op": "validateInvestmentActions",
+      "input": {
+        "actions": [
+          {
+            "action": "buy",
+            "sharesMicros": 1000000,
+            "priceMicros": 5000000
+          },
+          {
+            "action": "dividend",
+            "sharesMicros": 0,
+            "priceMicros": 0
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "action collection invalid",
+      "op": "validateInvestmentActions",
+      "input": {
+        "actions": [
+          {
+            "action": "buy",
+            "sharesMicros": 1000000,
+            "priceMicros": 5000000
+          },
+          {
+            "action": "sell",
+            "sharesMicros": 0,
+            "priceMicros": 0
+          }
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "investment payload {\"securityId\":1,\"action\":\"buy\",\"sharesMicros\":1000000,\"priceMicros\":10000000}",
+      "op": "validateInvestmentSplitPayload",
+      "input": {
+        "securityId": 1,
+        "action": "buy",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000
+      },
+      "expected": true
+    },
+    {
+      "name": "investment payload {\"securityId\":1,\"action\":\"split\",\"sharesMicros\":0,\"priceMicros\":0,\"splitNumerator\":2,\"splitDenominator\":1}",
+      "op": "validateInvestmentSplitPayload",
+      "input": {
+        "securityId": 1,
+        "action": "split",
+        "sharesMicros": 0,
+        "priceMicros": 0,
+        "splitNumerator": 2,
+        "splitDenominator": 1
+      },
+      "expected": true
+    },
+    {
+      "name": "investment payload {\"securityId\":1,\"action\":\"split\",\"sharesMicros\":0,\"priceMicros\":0,\"splitNumerator\":2,\"splitDenominator\":0}",
+      "op": "validateInvestmentSplitPayload",
+      "input": {
+        "securityId": 1,
+        "action": "split",
+        "sharesMicros": 0,
+        "priceMicros": 0,
+        "splitNumerator": 2,
+        "splitDenominator": 0
+      },
+      "expected": false
+    },
+    {
+      "name": "investment payload {\"securityId\":1,\"action\":\"split\",\"sharesMicros\":0,\"priceMicros\":0,\"splitNumerator\":1.5,\"splitDenominator\":1}",
+      "op": "validateInvestmentSplitPayload",
+      "input": {
+        "securityId": 1,
+        "action": "split",
+        "sharesMicros": 0,
+        "priceMicros": 0,
+        "splitNumerator": 1.5,
+        "splitDenominator": 1
+      },
+      "expected": false
+    },
+    {
+      "name": "investment payload {\"securityId\":1,\"action\":\"buy\",\"sharesMicros\":1.5,\"priceMicros\":10000000,\"feesCents\":-1}",
+      "op": "validateInvestmentSplitPayload",
+      "input": {
+        "securityId": 1,
+        "action": "buy",
+        "sharesMicros": 1.5,
+        "priceMicros": 10000000,
+        "feesCents": -1
+      },
+      "expected": true
+    },
+    {
+      "name": "investment payload {\"securityId\":null,\"action\":\"buy\",\"sharesMicros\":1000000,\"priceMicros\":10000000}",
+      "op": "validateInvestmentSplitPayload",
+      "input": {
+        "securityId": null,
+        "action": "buy",
+        "sharesMicros": 1000000,
+        "priceMicros": 10000000
+      },
+      "expected": false
+    },
+    {
+      "name": "type label asset",
+      "op": "accountTypeLabel",
+      "input": {
+        "type": "asset"
+      },
+      "expected": "Assets"
+    },
+    {
+      "name": "type label liability",
+      "op": "accountTypeLabel",
+      "input": {
+        "type": "liability"
+      },
+      "expected": "Liabilities"
+    },
+    {
+      "name": "type label equity",
+      "op": "accountTypeLabel",
+      "input": {
+        "type": "equity"
+      },
+      "expected": "Equity"
+    },
+    {
+      "name": "type label income",
+      "op": "accountTypeLabel",
+      "input": {
+        "type": "income"
+      },
+      "expected": "Income"
+    },
+    {
+      "name": "type label expense",
+      "op": "accountTypeLabel",
+      "input": {
+        "type": "expense"
+      },
+      "expected": "Expenses"
+    },
+    {
+      "name": "type label unknown",
+      "op": "accountTypeLabel",
+      "input": {
+        "type": "unknown"
+      },
+      "expected": null
+    },
+    {
+      "name": "subtype label bank",
+      "op": "accountSubtypeLabel",
+      "input": {
+        "subtype": "bank"
+      },
+      "expected": "Bank Account"
+    },
+    {
+      "name": "subtype label credit_card",
+      "op": "accountSubtypeLabel",
+      "input": {
+        "subtype": "credit_card"
+      },
+      "expected": "Credit Card"
+    },
+    {
+      "name": "subtype label loan",
+      "op": "accountSubtypeLabel",
+      "input": {
+        "subtype": "loan"
+      },
+      "expected": "Loan"
+    },
+    {
+      "name": "subtype label investment",
+      "op": "accountSubtypeLabel",
+      "input": {
+        "subtype": "investment"
+      },
+      "expected": "Investment"
+    },
+    {
+      "name": "subtype label cash",
+      "op": "accountSubtypeLabel",
+      "input": {
+        "subtype": "cash"
+      },
+      "expected": "Cash"
+    },
+    {
+      "name": "subtype label other",
+      "op": "accountSubtypeLabel",
+      "input": {
+        "subtype": "other"
+      },
+      "expected": "Other"
+    },
+    {
+      "name": "subtype label unknown",
+      "op": "accountSubtypeLabel",
+      "input": {
+        "subtype": "unknown"
+      },
+      "expected": null
+    },
+    {
+      "name": "date 0001-01-01",
+      "op": "isValidDate",
+      "input": {
+        "value": "0001-01-01"
+      },
+      "expected": false
+    },
+    {
+      "name": "date 0099-12-31",
+      "op": "isValidDate",
+      "input": {
+        "value": "0099-12-31"
+      },
+      "expected": false
+    },
+    {
+      "name": "date 0100-01-01",
+      "op": "isValidDate",
+      "input": {
+        "value": "0100-01-01"
+      },
+      "expected": true
+    },
+    {
+      "name": "date 2024-02-29",
+      "op": "isValidDate",
+      "input": {
+        "value": "2024-02-29"
+      },
+      "expected": true
+    },
+    {
+      "name": "date 2025-02-29",
+      "op": "isValidDate",
+      "input": {
+        "value": "2025-02-29"
+      },
+      "expected": false
+    },
+    {
+      "name": "date 2026-02-30",
+      "op": "isValidDate",
+      "input": {
+        "value": "2026-02-30"
+      },
+      "expected": false
+    },
+    {
+      "name": "date 2025-1-01",
+      "op": "isValidDate",
+      "input": {
+        "value": "2025-1-01"
+      },
+      "expected": false
+    },
+    {
+      "name": "date 2025-12-31",
+      "op": "isValidDate",
+      "input": {
+        "value": "2025-12-31"
+      },
+      "expected": true
+    },
+    {
+      "name": "date garbage",
+      "op": "isValidDate",
+      "input": {
+        "value": "garbage"
+      },
+      "expected": false
+    },
+    {
+      "name": "next business 0050-01-01",
+      "op": "nextBusinessDay",
+      "input": {
+        "value": "0050-01-01"
+      },
+      "expected": {
+        "error": "Invalid date: 0050-01-01"
+      }
+    },
+    {
+      "name": "business 0050-01-01",
+      "op": "isBusinessDay",
+      "input": {
+        "value": "0050-01-01"
+      },
+      "expected": {
+        "error": "Invalid date: 0050-01-01"
+      }
+    },
+    {
+      "name": "advance business 0050-01-01",
+      "op": "advanceBusinessDay",
+      "input": {
+        "value": "0050-01-01"
+      },
+      "expected": {
+        "error": "Invalid date: 0050-01-01"
+      }
+    },
+    {
+      "name": "next business 2025-05-30",
+      "op": "nextBusinessDay",
+      "input": {
+        "value": "2025-05-30"
+      },
+      "expected": "2025-06-02"
+    },
+    {
+      "name": "business 2025-05-30",
+      "op": "isBusinessDay",
+      "input": {
+        "value": "2025-05-30"
+      },
+      "expected": true
+    },
+    {
+      "name": "advance business 2025-05-30",
+      "op": "advanceBusinessDay",
+      "input": {
+        "value": "2025-05-30"
+      },
+      "expected": "2025-05-30"
+    },
+    {
+      "name": "next business 2025-05-31",
+      "op": "nextBusinessDay",
+      "input": {
+        "value": "2025-05-31"
+      },
+      "expected": "2025-06-02"
+    },
+    {
+      "name": "business 2025-05-31",
+      "op": "isBusinessDay",
+      "input": {
+        "value": "2025-05-31"
+      },
+      "expected": false
+    },
+    {
+      "name": "advance business 2025-05-31",
+      "op": "advanceBusinessDay",
+      "input": {
+        "value": "2025-05-31"
+      },
+      "expected": "2025-06-02"
+    },
+    {
+      "name": "next business 2025-06-01",
+      "op": "nextBusinessDay",
+      "input": {
+        "value": "2025-06-01"
+      },
+      "expected": "2025-06-02"
+    },
+    {
+      "name": "business 2025-06-01",
+      "op": "isBusinessDay",
+      "input": {
+        "value": "2025-06-01"
+      },
+      "expected": false
+    },
+    {
+      "name": "advance business 2025-06-01",
+      "op": "advanceBusinessDay",
+      "input": {
+        "value": "2025-06-01"
+      },
+      "expected": "2025-06-02"
+    },
+    {
+      "name": "next business 2026-02-30",
+      "op": "nextBusinessDay",
+      "input": {
+        "value": "2026-02-30"
+      },
+      "expected": {
+        "error": "Invalid date: 2026-02-30"
+      }
+    },
+    {
+      "name": "business 2026-02-30",
+      "op": "isBusinessDay",
+      "input": {
+        "value": "2026-02-30"
+      },
+      "expected": {
+        "error": "Invalid date: 2026-02-30"
+      }
+    },
+    {
+      "name": "advance business 2026-02-30",
+      "op": "advanceBusinessDay",
+      "input": {
+        "value": "2026-02-30"
+      },
+      "expected": {
+        "error": "Invalid date: 2026-02-30"
+      }
+    },
+    {
+      "name": "sign asset",
+      "op": "normalBalanceSign",
+      "input": {
+        "type": "asset"
+      },
+      "expected": 1
+    },
+    {
+      "name": "balance asset",
+      "op": "displayBalance",
+      "input": {
+        "balance": -1234,
+        "type": "asset"
+      },
+      "expected": -1234
+    },
+    {
+      "name": "sign expense",
+      "op": "normalBalanceSign",
+      "input": {
+        "type": "expense"
+      },
+      "expected": 1
+    },
+    {
+      "name": "balance expense",
+      "op": "displayBalance",
+      "input": {
+        "balance": -1234,
+        "type": "expense"
+      },
+      "expected": -1234
+    },
+    {
+      "name": "sign liability",
+      "op": "normalBalanceSign",
+      "input": {
+        "type": "liability"
+      },
+      "expected": -1
+    },
+    {
+      "name": "balance liability",
+      "op": "displayBalance",
+      "input": {
+        "balance": -1234,
+        "type": "liability"
+      },
+      "expected": 1234
+    },
+    {
+      "name": "sign equity",
+      "op": "normalBalanceSign",
+      "input": {
+        "type": "equity"
+      },
+      "expected": -1
+    },
+    {
+      "name": "balance equity",
+      "op": "displayBalance",
+      "input": {
+        "balance": -1234,
+        "type": "equity"
+      },
+      "expected": 1234
+    },
+    {
+      "name": "sign income",
+      "op": "normalBalanceSign",
+      "input": {
+        "type": "income"
+      },
+      "expected": -1
+    },
+    {
+      "name": "balance income",
+      "op": "displayBalance",
+      "input": {
+        "balance": -1234,
+        "type": "income"
+      },
+      "expected": 1234
+    },
+    {
+      "name": "sign unknown",
+      "op": "normalBalanceSign",
+      "input": {
+        "type": "unknown"
+      },
+      "expected": 1
+    },
+    {
+      "name": "balance unknown",
+      "op": "displayBalance",
+      "input": {
+        "balance": -1234,
+        "type": "unknown"
+      },
+      "expected": -1234
+    },
+    {
+      "name": "effective false",
+      "op": "effectiveDate",
+      "input": {
+        "date": "2024-01-12",
+        "isFloating": false,
+        "today": "2026-09-25"
+      },
+      "expected": "2024-01-12"
+    },
+    {
+      "name": "effective true",
+      "op": "effectiveDate",
+      "input": {
+        "date": "2024-01-12",
+        "isFloating": true,
+        "today": "2026-09-25"
+      },
+      "expected": "2026-09-25"
+    },
+    {
+      "name": "expression \"2+3*4\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "2+3*4"
+      },
+      "expected": 14
+    },
+    {
+      "name": "expression \"(2+3)*4\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "(2+3)*4"
+      },
+      "expected": 20
+    },
+    {
+      "name": "expression \"-3+5\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "-3+5"
+      },
+      "expected": 2
+    },
+    {
+      "name": "expression \"1/0\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "1/0"
+      },
+      "expected": null
+    },
+    {
+      "name": "expression \"5.\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "5."
+      },
+      "expected": null
+    },
+    {
+      "name": "expression \".5+1\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": ".5+1"
+      },
+      "expected": 1.5
+    },
+    {
+      "name": "expression \"$1,200 / 4\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "$1,200 / 4"
+      },
+      "expected": 300
+    },
+    {
+      "name": "expression \"1e3\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "1e3"
+      },
+      "expected": null
+    },
+    {
+      "name": "expression \"\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": ""
+      },
+      "expected": null
+    },
+    {
+      "name": "expression \"  3.25  \"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "  3.25  "
+      },
+      "expected": 3.25
+    },
+    {
+      "name": "expression \"3++2\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "3++2"
+      },
+      "expected": null
+    },
+    {
+      "name": "expression \"((2))\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "((2))"
+      },
+      "expected": 2
+    },
+    {
+      "name": "expression \"1.2.3\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "1.2.3"
+      },
+      "expected": null
+    },
+    {
+      "name": "expression \"1 + 2\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "1 + 2"
+      },
+      "expected": 3
+    },
+    {
+      "name": "expression \"1\\u000b+2\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "1\u000b+2"
+      },
+      "expected": 3
+    },
+    {
+      "name": "expression \"1﻿+2\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "1﻿+2"
+      },
+      "expected": 3
+    },
+    {
+      "name": "expression \"-0\"",
+      "op": "evaluateExpression",
+      "input": {
+        "value": "-0"
+      },
+      "expected": 0
+    },
+    {
+      "name": "expression negative zero sign",
+      "op": "expressionIsNegativeZero",
+      "input": {
+        "value": "-0"
+      },
+      "expected": true
+    },
+    {
+      "name": "currency 0",
+      "op": "formatCurrency",
+      "input": {
+        "cents": 0
+      },
+      "expected": "$0.00"
+    },
+    {
+      "name": "currency 1",
+      "op": "formatCurrency",
+      "input": {
+        "cents": 1
+      },
+      "expected": "$0.01"
+    },
+    {
+      "name": "currency -1",
+      "op": "formatCurrency",
+      "input": {
+        "cents": -1
+      },
+      "expected": "−$0.01"
+    },
+    {
+      "name": "currency 123456789",
+      "op": "formatCurrency",
+      "input": {
+        "cents": 123456789
+      },
+      "expected": "$1,234,567.89"
+    },
+    {
+      "name": "currency -123456789",
+      "op": "formatCurrency",
+      "input": {
+        "cents": -123456789
+      },
+      "expected": "−$1,234,567.89"
+    },
+    {
+      "name": "parse currency $1,234.56",
+      "op": "parseCurrency",
+      "input": {
+        "value": "$1,234.56"
+      },
+      "expected": 123456
+    },
+    {
+      "name": "parse strict $1,234.56",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "$1,234.56"
+      },
+      "expected": 123456
+    },
+    {
+      "name": "on blur $1,234.56",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "$1,234.56"
+      },
+      "expected": "1234.56"
+    },
+    {
+      "name": "parse currency −$1.23",
+      "op": "parseCurrency",
+      "input": {
+        "value": "−$1.23"
+      },
+      "expected": -123
+    },
+    {
+      "name": "parse strict −$1.23",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "−$1.23"
+      },
+      "expected": -123
+    },
+    {
+      "name": "on blur −$1.23",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "−$1.23"
+      },
+      "expected": "−$1.23"
+    },
+    {
+      "name": "parse currency abc",
+      "op": "parseCurrency",
+      "input": {
+        "value": "abc"
+      },
+      "expected": 0
+    },
+    {
+      "name": "parse strict abc",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "abc"
+      },
+      "expected": null
+    },
+    {
+      "name": "on blur abc",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "abc"
+      },
+      "expected": "abc"
+    },
+    {
+      "name": "parse currency 1.005",
+      "op": "parseCurrency",
+      "input": {
+        "value": "1.005"
+      },
+      "expected": 100
+    },
+    {
+      "name": "parse strict 1.005",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "1.005"
+      },
+      "expected": 100
+    },
+    {
+      "name": "on blur 1.005",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "1.005"
+      },
+      "expected": "1.00"
+    },
+    {
+      "name": "parse currency 5.",
+      "op": "parseCurrency",
+      "input": {
+        "value": "5."
+      },
+      "expected": 500
+    },
+    {
+      "name": "parse strict 5.",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "5."
+      },
+      "expected": 500
+    },
+    {
+      "name": "on blur 5.",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "5."
+      },
+      "expected": "5.00"
+    },
+    {
+      "name": "parse currency .5",
+      "op": "parseCurrency",
+      "input": {
+        "value": ".5"
+      },
+      "expected": 50
+    },
+    {
+      "name": "parse strict .5",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": ".5"
+      },
+      "expected": 50
+    },
+    {
+      "name": "on blur .5",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": ".5"
+      },
+      "expected": "0.50"
+    },
+    {
+      "name": "parse currency 1+2",
+      "op": "parseCurrency",
+      "input": {
+        "value": "1+2"
+      },
+      "expected": 1200
+    },
+    {
+      "name": "parse strict 1+2",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "1+2"
+      },
+      "expected": null
+    },
+    {
+      "name": "on blur 1+2",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "1+2"
+      },
+      "expected": "3.00"
+    },
+    {
+      "name": "parse currency ",
+      "op": "parseCurrency",
+      "input": {
+        "value": ""
+      },
+      "expected": 0
+    },
+    {
+      "name": "parse strict ",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": ""
+      },
+      "expected": null
+    },
+    {
+      "name": "on blur ",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": ""
+      },
+      "expected": ""
+    },
+    {
+      "name": "parse currency -$3.50",
+      "op": "parseCurrency",
+      "input": {
+        "value": "-$3.50"
+      },
+      "expected": -350
+    },
+    {
+      "name": "parse strict -$3.50",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "-$3.50"
+      },
+      "expected": -350
+    },
+    {
+      "name": "on blur -$3.50",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "-$3.50"
+      },
+      "expected": "-3.50"
+    },
+    {
+      "name": "parse currency 0.125",
+      "op": "parseCurrency",
+      "input": {
+        "value": "0.125"
+      },
+      "expected": 13
+    },
+    {
+      "name": "parse strict 0.125",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "0.125"
+      },
+      "expected": 13
+    },
+    {
+      "name": "on blur 0.125",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "0.125"
+      },
+      "expected": "0.13"
+    },
+    {
+      "name": "parse currency 0.625",
+      "op": "parseCurrency",
+      "input": {
+        "value": "0.625"
+      },
+      "expected": 63
+    },
+    {
+      "name": "parse strict 0.625",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "0.625"
+      },
+      "expected": 63
+    },
+    {
+      "name": "on blur 0.625",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "0.625"
+      },
+      "expected": "0.63"
+    },
+    {
+      "name": "parse currency -0.125",
+      "op": "parseCurrency",
+      "input": {
+        "value": "-0.125"
+      },
+      "expected": -12
+    },
+    {
+      "name": "parse strict -0.125",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "-0.125"
+      },
+      "expected": -12
+    },
+    {
+      "name": "on blur -0.125",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "-0.125"
+      },
+      "expected": "-0.13"
+    },
+    {
+      "name": "parse currency 1.375",
+      "op": "parseCurrency",
+      "input": {
+        "value": "1.375"
+      },
+      "expected": 138
+    },
+    {
+      "name": "parse strict 1.375",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "1.375"
+      },
+      "expected": 138
+    },
+    {
+      "name": "on blur 1.375",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "1.375"
+      },
+      "expected": "1.38"
+    },
+    {
+      "name": "parse currency 2.675",
+      "op": "parseCurrency",
+      "input": {
+        "value": "2.675"
+      },
+      "expected": 268
+    },
+    {
+      "name": "parse strict 2.675",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "2.675"
+      },
+      "expected": 268
+    },
+    {
+      "name": "on blur 2.675",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "2.675"
+      },
+      "expected": "2.67"
+    },
+    {
+      "name": "parse currency 1/8",
+      "op": "parseCurrency",
+      "input": {
+        "value": "1/8"
+      },
+      "expected": 1800
+    },
+    {
+      "name": "parse strict 1/8",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "1/8"
+      },
+      "expected": null
+    },
+    {
+      "name": "on blur 1/8",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "1/8"
+      },
+      "expected": "0.13"
+    },
+    {
+      "name": "parse currency -0",
+      "op": "parseCurrency",
+      "input": {
+        "value": "-0"
+      },
+      "expected": 0
+    },
+    {
+      "name": "parse strict -0",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "-0"
+      },
+      "expected": 0
+    },
+    {
+      "name": "on blur -0",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "-0"
+      },
+      "expected": "0.00"
+    },
+    {
+      "name": "parse currency 0*-1",
+      "op": "parseCurrency",
+      "input": {
+        "value": "0*-1"
+      },
+      "expected": 0
+    },
+    {
+      "name": "parse strict 0*-1",
+      "op": "parseStrictCurrency",
+      "input": {
+        "value": "0*-1"
+      },
+      "expected": null
+    },
+    {
+      "name": "on blur 0*-1",
+      "op": "resolveAmountOnBlur",
+      "input": {
+        "value": "0*-1"
+      },
+      "expected": "0.00"
+    },
+    {
+      "name": "format date 0001-01-01",
+      "op": "formatDate",
+      "input": {
+        "value": "0001-01-01"
+      },
+      "expected": "Jan 1, 1"
+    },
+    {
+      "name": "format short 0001-01-01",
+      "op": "formatDateShort",
+      "input": {
+        "value": "0001-01-01"
+      },
+      "expected": "Jan 1"
+    },
+    {
+      "name": "formatter date validity 0001-01-01",
+      "op": "formatterValidDate",
+      "input": {
+        "value": "0001-01-01"
+      },
+      "expected": false
+    },
+    {
+      "name": "format date 0100-01-01",
+      "op": "formatDate",
+      "input": {
+        "value": "0100-01-01"
+      },
+      "expected": "Jan 1, 100"
+    },
+    {
+      "name": "format short 0100-01-01",
+      "op": "formatDateShort",
+      "input": {
+        "value": "0100-01-01"
+      },
+      "expected": "Jan 1"
+    },
+    {
+      "name": "formatter date validity 0100-01-01",
+      "op": "formatterValidDate",
+      "input": {
+        "value": "0100-01-01"
+      },
+      "expected": false
+    },
+    {
+      "name": "format date 2024-02-29",
+      "op": "formatDate",
+      "input": {
+        "value": "2024-02-29"
+      },
+      "expected": "Feb 29, 2024"
+    },
+    {
+      "name": "format short 2024-02-29",
+      "op": "formatDateShort",
+      "input": {
+        "value": "2024-02-29"
+      },
+      "expected": "Feb 29"
+    },
+    {
+      "name": "formatter date validity 2024-02-29",
+      "op": "formatterValidDate",
+      "input": {
+        "value": "2024-02-29"
+      },
+      "expected": true
+    },
+    {
+      "name": "format date 2026-09-25",
+      "op": "formatDate",
+      "input": {
+        "value": "2026-09-25"
+      },
+      "expected": "Sep 25, 2026"
+    },
+    {
+      "name": "format short 2026-09-25",
+      "op": "formatDateShort",
+      "input": {
+        "value": "2026-09-25"
+      },
+      "expected": "Sep 25"
+    },
+    {
+      "name": "formatter date validity 2026-09-25",
+      "op": "formatterValidDate",
+      "input": {
+        "value": "2026-09-25"
+      },
+      "expected": true
+    },
+    {
+      "name": "format date 2026-02-30",
+      "op": "formatDate",
+      "input": {
+        "value": "2026-02-30"
+      },
+      "expected": "Mar 2, 2026"
+    },
+    {
+      "name": "format short 2026-02-30",
+      "op": "formatDateShort",
+      "input": {
+        "value": "2026-02-30"
+      },
+      "expected": "Mar 2"
+    },
+    {
+      "name": "formatter date validity 2026-02-30",
+      "op": "formatterValidDate",
+      "input": {
+        "value": "2026-02-30"
+      },
+      "expected": false
+    },
+    {
+      "name": "format date 2025-04-31",
+      "op": "formatDate",
+      "input": {
+        "value": "2025-04-31"
+      },
+      "expected": "May 1, 2025"
+    },
+    {
+      "name": "format short 2025-04-31",
+      "op": "formatDateShort",
+      "input": {
+        "value": "2025-04-31"
+      },
+      "expected": "May 1"
+    },
+    {
+      "name": "formatter date validity 2025-04-31",
+      "op": "formatterValidDate",
+      "input": {
+        "value": "2025-04-31"
+      },
+      "expected": false
+    },
+    {
+      "name": "format date bad",
+      "op": "formatDate",
+      "input": {
+        "value": "bad"
+      },
+      "expected": {
+        "error": "Invalid time value"
+      }
+    },
+    {
+      "name": "format short bad",
+      "op": "formatDateShort",
+      "input": {
+        "value": "bad"
+      },
+      "expected": {
+        "error": "Invalid time value"
+      }
+    },
+    {
+      "name": "formatter date validity bad",
+      "op": "formatterValidDate",
+      "input": {
+        "value": "bad"
+      },
+      "expected": false
+    },
+    {
+      "name": "to date string 0001-01-01",
+      "op": "toDateString",
+      "input": {
+        "value": "0001-01-01"
+      },
+      "expected": "1-01-01"
+    },
+    {
+      "name": "to date string 0100-01-01",
+      "op": "toDateString",
+      "input": {
+        "value": "0100-01-01"
+      },
+      "expected": "100-01-01"
+    },
+    {
+      "name": "to date string 2024-02-29",
+      "op": "toDateString",
+      "input": {
+        "value": "2024-02-29"
+      },
+      "expected": "2024-02-29"
+    },
+    {
+      "name": "to date string 2026-09-25",
+      "op": "toDateString",
+      "input": {
+        "value": "2026-09-25"
+      },
+      "expected": "2026-09-25"
+    },
+    {
+      "name": "short name Parent:Child",
+      "op": "shortName",
+      "input": {
+        "value": "Parent:Child"
+      },
+      "expected": "Child"
+    },
+    {
+      "name": "short name Parent:Mid:Leaf",
+      "op": "shortName",
+      "input": {
+        "value": "Parent:Mid:Leaf"
+      },
+      "expected": "Leaf"
+    },
+    {
+      "name": "short name Plain",
+      "op": "shortName",
+      "input": {
+        "value": "Plain"
+      },
+      "expected": "Plain"
+    },
+    {
+      "name": "short name Trailing:",
+      "op": "shortName",
+      "input": {
+        "value": "Trailing:"
+      },
+      "expected": ""
+    },
+    {
+      "name": "short name ",
+      "op": "shortName",
+      "input": {
+        "value": ""
+      },
+      "expected": ""
+    },
+    {
+      "name": "age -100",
+      "op": "relativeAge",
+      "input": {
+        "ms": -100
+      },
+      "expected": "just now"
+    },
+    {
+      "name": "age 0",
+      "op": "relativeAge",
+      "input": {
+        "ms": 0
+      },
+      "expected": "just now"
+    },
+    {
+      "name": "age 59999",
+      "op": "relativeAge",
+      "input": {
+        "ms": 59999
+      },
+      "expected": "just now"
+    },
+    {
+      "name": "age 60000",
+      "op": "relativeAge",
+      "input": {
+        "ms": 60000
+      },
+      "expected": "1 min ago"
+    },
+    {
+      "name": "age 3600000",
+      "op": "relativeAge",
+      "input": {
+        "ms": 3600000
+      },
+      "expected": "1 hr ago"
+    },
+    {
+      "name": "age 86400000",
+      "op": "relativeAge",
+      "input": {
+        "ms": 86400000
+      },
+      "expected": "1 day ago"
+    },
+    {
+      "name": "age 172800000",
+      "op": "relativeAge",
+      "input": {
+        "ms": 172800000
+      },
+      "expected": "2 days ago"
+    },
+    {
+      "name": "price input 1000000",
+      "op": "priceMicrosInput",
+      "input": {
+        "priceMicros": 1000000
+      },
+      "expected": "1.00"
+    },
+    {
+      "name": "price input 1002500",
+      "op": "priceMicrosInput",
+      "input": {
+        "priceMicros": 1002500
+      },
+      "expected": "1.0025"
+    },
+    {
+      "name": "price input 1000001",
+      "op": "priceMicrosInput",
+      "input": {
+        "priceMicros": 1000001
+      },
+      "expected": "1.000001"
+    },
+    {
+      "name": "price input -2500000",
+      "op": "priceMicrosInput",
+      "input": {
+        "priceMicros": -2500000
+      },
+      "expected": "-2.50"
+    },
+    {
+      "name": "account grouping",
+      "op": "groupAccounts",
+      "input": {
+        "accounts": [
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": []
+          },
+          {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          }
+        ]
+      },
+      "expected": {
+        "expense": [
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": []
+          },
+          {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          }
+        ],
+        "asset": [
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          }
+        ]
+      }
+    },
+    {
+      "name": "account tree",
+      "op": "buildAccountTree",
+      "input": {
+        "accounts": [
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": []
+          },
+          {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": 3,
+          "name": "Apple",
+          "type": "asset",
+          "parentId": null,
+          "icon": null,
+          "children": []
+        },
+        {
+          "id": 1,
+          "name": "Zebra",
+          "type": "expense",
+          "parentId": null,
+          "icon": "🚗",
+          "children": [
+            {
+              "id": 2,
+              "name": "Zebra:Fuel",
+              "type": "expense",
+              "parentId": 1,
+              "icon": null,
+              "children": []
+            },
+            {
+              "id": 4,
+              "name": "Zebra:Repair",
+              "type": "expense",
+              "parentId": 1,
+              "icon": "🔧",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "account tree locale order",
+      "op": "buildAccountTree",
+      "input": {
+        "accounts": [
+          {
+            "id": 10,
+            "name": "Food",
+            "type": "expense",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 11,
+            "name": "Épargne",
+            "type": "expense",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 12,
+            "name": "Apple",
+            "type": "expense",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 13,
+            "name": "apple",
+            "type": "expense",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 14,
+            "name": "_Misc",
+            "type": "expense",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 15,
+            "name": "401k",
+            "type": "expense",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": 14,
+          "name": "_Misc",
+          "type": "expense",
+          "parentId": null,
+          "icon": null,
+          "children": []
+        },
+        {
+          "id": 15,
+          "name": "401k",
+          "type": "expense",
+          "parentId": null,
+          "icon": null,
+          "children": []
+        },
+        {
+          "id": 13,
+          "name": "apple",
+          "type": "expense",
+          "parentId": null,
+          "icon": null,
+          "children": []
+        },
+        {
+          "id": 12,
+          "name": "Apple",
+          "type": "expense",
+          "parentId": null,
+          "icon": null,
+          "children": []
+        },
+        {
+          "id": 11,
+          "name": "Épargne",
+          "type": "expense",
+          "parentId": null,
+          "icon": null,
+          "children": []
+        },
+        {
+          "id": 10,
+          "name": "Food",
+          "type": "expense",
+          "parentId": null,
+          "icon": null,
+          "children": []
+        }
+      ]
+    },
+    {
+      "name": "account child locale order",
+      "op": "buildAccountTree",
+      "input": {
+        "accounts": [
+          {
+            "id": 99,
+            "name": "Parent",
+            "type": "expense",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 10,
+            "name": "Food",
+            "type": "expense",
+            "parentId": 99,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 11,
+            "name": "Épargne",
+            "type": "expense",
+            "parentId": 99,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 12,
+            "name": "Apple",
+            "type": "expense",
+            "parentId": 99,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 13,
+            "name": "apple",
+            "type": "expense",
+            "parentId": 99,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 14,
+            "name": "_Misc",
+            "type": "expense",
+            "parentId": 99,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 15,
+            "name": "401k",
+            "type": "expense",
+            "parentId": 99,
+            "icon": null,
+            "children": []
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": 99,
+          "name": "Parent",
+          "type": "expense",
+          "parentId": null,
+          "icon": null,
+          "children": [
+            {
+              "id": 14,
+              "name": "_Misc",
+              "type": "expense",
+              "parentId": 99,
+              "icon": null,
+              "children": []
+            },
+            {
+              "id": 15,
+              "name": "401k",
+              "type": "expense",
+              "parentId": 99,
+              "icon": null,
+              "children": []
+            },
+            {
+              "id": 13,
+              "name": "apple",
+              "type": "expense",
+              "parentId": 99,
+              "icon": null,
+              "children": []
+            },
+            {
+              "id": 12,
+              "name": "Apple",
+              "type": "expense",
+              "parentId": 99,
+              "icon": null,
+              "children": []
+            },
+            {
+              "id": 11,
+              "name": "Épargne",
+              "type": "expense",
+              "parentId": 99,
+              "icon": null,
+              "children": []
+            },
+            {
+              "id": 10,
+              "name": "Food",
+              "type": "expense",
+              "parentId": 99,
+              "icon": null,
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "flatten tree",
+      "op": "flattenAccounts",
+      "input": {
+        "accounts": [
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": [
+              {
+                "id": 2,
+                "name": "Zebra:Fuel",
+                "type": "expense",
+                "parentId": 1,
+                "icon": null,
+                "children": []
+              },
+              {
+                "id": 4,
+                "name": "Zebra:Repair",
+                "type": "expense",
+                "parentId": 1,
+                "icon": "🔧",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": 3,
+          "name": "Apple",
+          "type": "asset",
+          "parentId": null,
+          "icon": null,
+          "children": []
+        },
+        {
+          "id": 1,
+          "name": "Zebra",
+          "type": "expense",
+          "parentId": null,
+          "icon": "🚗",
+          "children": []
+        },
+        {
+          "id": 2,
+          "name": "Zebra:Fuel",
+          "type": "expense",
+          "parentId": 1,
+          "icon": null,
+          "children": []
+        },
+        {
+          "id": 4,
+          "name": "Zebra:Repair",
+          "type": "expense",
+          "parentId": 1,
+          "icon": "🔧",
+          "children": []
+        }
+      ]
+    },
+    {
+      "name": "flatten with depth",
+      "op": "flattenWithDepth",
+      "input": {
+        "accounts": [
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": [
+              {
+                "id": 2,
+                "name": "Zebra:Fuel",
+                "type": "expense",
+                "parentId": 1,
+                "icon": null,
+                "children": []
+              },
+              {
+                "id": 4,
+                "name": "Zebra:Repair",
+                "type": "expense",
+                "parentId": 1,
+                "icon": "🔧",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      "expected": [
+        {
+          "account": {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          "depth": 0
+        },
+        {
+          "account": {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": [
+              {
+                "id": 2,
+                "name": "Zebra:Fuel",
+                "type": "expense",
+                "parentId": 1,
+                "icon": null,
+                "children": []
+              },
+              {
+                "id": 4,
+                "name": "Zebra:Repair",
+                "type": "expense",
+                "parentId": 1,
+                "icon": "🔧",
+                "children": []
+              }
+            ]
+          },
+          "depth": 0
+        },
+        {
+          "account": {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          "depth": 1
+        },
+        {
+          "account": {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          },
+          "depth": 1
+        }
+      ]
+    },
+    {
+      "name": "descendant",
+      "op": "isDescendant",
+      "input": {
+        "candidate": {
+          "id": 2,
+          "name": "Zebra:Fuel",
+          "type": "expense",
+          "parentId": 1,
+          "icon": null,
+          "children": []
+        },
+        "ancestorId": 1,
+        "accounts": [
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": []
+          },
+          {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "hierarchy",
+      "op": "hierarchyName",
+      "input": {
+        "account": {
+          "id": 2,
+          "name": "Zebra:Fuel",
+          "type": "expense",
+          "parentId": 1,
+          "icon": null,
+          "children": []
+        },
+        "accounts": [
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": []
+          },
+          {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          }
+        ]
+      },
+      "expected": "Zebra : Fuel"
+    },
+    {
+      "name": "inherited icon",
+      "op": "resolveIcon",
+      "input": {
+        "account": {
+          "id": 2,
+          "name": "Zebra:Fuel",
+          "type": "expense",
+          "parentId": 1,
+          "icon": null,
+          "children": []
+        },
+        "accounts": [
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": []
+          },
+          {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          }
+        ]
+      },
+      "expected": "🚗"
+    },
+    {
+      "name": "icon source",
+      "op": "resolveIconSource",
+      "input": {
+        "account": {
+          "id": 2,
+          "name": "Zebra:Fuel",
+          "type": "expense",
+          "parentId": 1,
+          "icon": null,
+          "children": []
+        },
+        "accounts": [
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": []
+          },
+          {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          }
+        ]
+      },
+      "expected": {
+        "icon": "🚗",
+        "sourceName": "Zebra"
+      }
+    },
+    {
+      "name": "category labels",
+      "op": "categoryLabels",
+      "input": {
+        "accounts": [
+          {
+            "id": 1,
+            "name": "Zebra",
+            "type": "expense",
+            "parentId": null,
+            "icon": "🚗",
+            "children": []
+          },
+          {
+            "id": 2,
+            "name": "Zebra:Fuel",
+            "type": "expense",
+            "parentId": 1,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 3,
+            "name": "Apple",
+            "type": "asset",
+            "parentId": null,
+            "icon": null,
+            "children": []
+          },
+          {
+            "id": 4,
+            "name": "Zebra:Repair",
+            "type": "expense",
+            "parentId": 1,
+            "icon": "🔧",
+            "children": []
+          }
+        ]
+      },
+      "expected": {
+        "1": {
+          "icon": "🚗",
+          "text": "Zebra",
+          "title": "Zebra"
+        },
+        "2": {
+          "icon": "🚗",
+          "text": "Fuel",
+          "title": "Zebra : Fuel"
+        },
+        "4": {
+          "icon": "🔧",
+          "text": "Repair",
+          "title": "Zebra : Repair"
+        }
+      }
+    },
+    {
+      "name": "next daily",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "daily",
+          "interval": 1
+        }
+      },
+      "expected": "2026-09-26"
+    },
+    {
+      "name": "initial daily",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-09-25",
+        "config": {
+          "frequency": "daily",
+          "interval": 1
+        }
+      },
+      "expected": "2026-09-25"
+    },
+    {
+      "name": "describe daily",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "daily",
+          "interval": 1
+        }
+      },
+      "expected": "Daily"
+    },
+    {
+      "name": "next weekly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3
+          ]
+        }
+      },
+      "expected": "2026-09-30"
+    },
+    {
+      "name": "initial weekly",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-09-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3
+          ]
+        }
+      },
+      "expected": "2026-09-28"
+    },
+    {
+      "name": "describe weekly",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3
+          ]
+        }
+      },
+      "expected": "Every 2nd week on Monday and Wednesday"
+    },
+    {
+      "name": "next monthly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-02-15"
+    },
+    {
+      "name": "initial monthly",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-01-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-01-31"
+    },
+    {
+      "name": "describe monthly",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "Monthly on the 15th and last day"
+    },
+    {
+      "name": "next yearly leap",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2025-03-01"
+    },
+    {
+      "name": "initial yearly leap",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2024-02-29",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2024-02-29"
+    },
+    {
+      "name": "describe yearly leap",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "Yearly"
+    },
+    {
+      "name": "next edge daily boundary",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "daily",
+          "interval": 3
+        }
+      },
+      "expected": "2027-01-03"
+    },
+    {
+      "name": "initial edge daily boundary",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-12-31",
+        "config": {
+          "frequency": "daily",
+          "interval": 3
+        }
+      },
+      "expected": "2026-12-31"
+    },
+    {
+      "name": "describe edge daily boundary",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "daily",
+          "interval": 3
+        }
+      },
+      "expected": "Every 3 days"
+    },
+    {
+      "name": "next edge weekly multiple",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2026-09-28"
+    },
+    {
+      "name": "initial edge weekly multiple",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-09-25",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2026-09-25"
+    },
+    {
+      "name": "describe edge weekly multiple",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "Every Monday and Wednesday and Friday"
+    },
+    {
+      "name": "next edge weekly nth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-14",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2026-10-12"
+    },
+    {
+      "name": "initial edge weekly nth",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-09-14",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2026-09-14"
+    },
+    {
+      "name": "describe edge weekly nth",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2nd Monday of each month"
+    },
+    {
+      "name": "next edge weekly last",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2026-10-30"
+    },
+    {
+      "name": "initial edge weekly last",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-09-25",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2026-09-25"
+    },
+    {
+      "name": "describe edge weekly last",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "Last Friday of each month"
+    },
+    {
+      "name": "next edge monthly clamp",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2026-02-28"
+    },
+    {
+      "name": "initial edge monthly clamp",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-01-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2026-01-31"
+    },
+    {
+      "name": "describe edge monthly clamp",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "Monthly on the 31st"
+    },
+    {
+      "name": "next edge monthly interval",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-09-30"
+    },
+    {
+      "name": "initial edge monthly interval",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-09-25",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-09-30"
+    },
+    {
+      "name": "describe edge monthly interval",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "Every other month on the 15th and last day"
+    },
+    {
+      "name": "next edge yearly leap",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2025-03-01"
+    },
+    {
+      "name": "initial edge yearly leap",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2024-02-29",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2024-02-29"
+    },
+    {
+      "name": "describe edge yearly leap",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "Yearly"
+    },
+    {
+      "name": "next edge weekly empty week of month",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            3
+          ],
+          "weekOfMonth": ""
+        }
+      },
+      "expected": "2026-09-30"
+    },
+    {
+      "name": "initial edge weekly empty week of month",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-09-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            3
+          ],
+          "weekOfMonth": ""
+        }
+      },
+      "expected": "2026-09-28"
+    },
+    {
+      "name": "describe edge weekly empty week of month",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            3
+          ],
+          "weekOfMonth": ""
+        }
+      },
+      "expected": "Every Monday and Wednesday"
+    },
+    {
+      "name": "next edge weekly invalid day label",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            7
+          ]
+        }
+      },
+      "expected": "2026-10-05"
+    },
+    {
+      "name": "initial edge weekly invalid day label",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2026-09-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            7
+          ]
+        }
+      },
+      "expected": "2026-09-28"
+    },
+    {
+      "name": "describe edge weekly invalid day label",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            7
+          ]
+        }
+      },
+      "expected": "Every Monday and "
+    },
+    {
+      "name": "next edge weekly nth padded",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2030-01-01",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": " 2 "
+        }
+      },
+      "expected": "2030-01-08"
+    },
+    {
+      "name": "initial edge weekly nth padded",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2030-01-01",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": " 2 "
+        }
+      },
+      "expected": "2030-01-08"
+    },
+    {
+      "name": "describe edge weekly nth padded",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": " 2 "
+        }
+      },
+      "expected": "2nd Tuesday of each month"
+    },
+    {
+      "name": "next edge weekly nth nbsp",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2030-01-01",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": " 3rd"
+        }
+      },
+      "expected": "2030-01-15"
+    },
+    {
+      "name": "initial edge weekly nth nbsp",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2030-01-01",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": " 3rd"
+        }
+      },
+      "expected": "2030-01-15"
+    },
+    {
+      "name": "describe edge weekly nth nbsp",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": " 3rd"
+        }
+      },
+      "expected": "3rd Tuesday of each month"
+    },
+    {
+      "name": "next edge weekly nth hex",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2030-01-08",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": "0x2"
+        }
+      },
+      "expected": "2030-02-12"
+    },
+    {
+      "name": "initial edge weekly nth hex",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2030-01-08",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": "0x2"
+        }
+      },
+      "expected": "2030-02-12"
+    },
+    {
+      "name": "describe edge weekly nth hex",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": "0x2"
+        }
+      },
+      "expected": "2nd Tuesday of each month"
+    },
+    {
+      "name": "next edge weekly nth zero",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2030-01-15",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": "0"
+        }
+      },
+      "expected": "2030-01-29"
+    },
+    {
+      "name": "initial edge weekly nth zero",
+      "op": "initialNextDate",
+      "input": {
+        "startDate": "2030-01-15",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": "0"
+        }
+      },
+      "expected": "2030-01-29"
+    },
+    {
+      "name": "describe edge weekly nth zero",
+      "op": "describeRecurrence",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            2
+          ],
+          "weekOfMonth": "0"
+        }
+      },
+      "expected": "0th Tuesday of each month"
+    },
+    {
+      "name": "next matrix 2024-02-28/daily2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-28",
+        "config": {
+          "frequency": "daily",
+          "interval": 2
+        }
+      },
+      "expected": "2024-03-01"
+    },
+    {
+      "name": "next matrix 2024-02-28/weekly1",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            2,
+            6
+          ]
+        }
+      },
+      "expected": "2024-03-02"
+    },
+    {
+      "name": "next matrix 2024-02-28/weekly2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2024-03-01"
+    },
+    {
+      "name": "next matrix 2024-02-28/weeklyNth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            5
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2024-03-08"
+    },
+    {
+      "name": "next matrix 2024-02-28/weeklyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2024-03-29"
+    },
+    {
+      "name": "next matrix 2024-02-28/monthly31",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-28",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2024-02-29"
+    },
+    {
+      "name": "next matrix 2024-02-28/monthlyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-28",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2024-02-29"
+    },
+    {
+      "name": "next matrix 2024-02-28/yearly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-28",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2025-02-28"
+    },
+    {
+      "name": "next matrix 2024-02-29/daily2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "daily",
+          "interval": 2
+        }
+      },
+      "expected": "2024-03-02"
+    },
+    {
+      "name": "next matrix 2024-02-29/weekly1",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            2,
+            6
+          ]
+        }
+      },
+      "expected": "2024-03-02"
+    },
+    {
+      "name": "next matrix 2024-02-29/weekly2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2024-03-01"
+    },
+    {
+      "name": "next matrix 2024-02-29/weeklyNth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            5
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2024-03-08"
+    },
+    {
+      "name": "next matrix 2024-02-29/weeklyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2024-03-29"
+    },
+    {
+      "name": "next matrix 2024-02-29/monthly31",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2024-03-31"
+    },
+    {
+      "name": "next matrix 2024-02-29/monthlyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2024-04-15"
+    },
+    {
+      "name": "next matrix 2024-02-29/yearly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2024-02-29",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2025-03-01"
+    },
+    {
+      "name": "next matrix 2025-12-31/daily2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2025-12-31",
+        "config": {
+          "frequency": "daily",
+          "interval": 2
+        }
+      },
+      "expected": "2026-01-02"
+    },
+    {
+      "name": "next matrix 2025-12-31/weekly1",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2025-12-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            2,
+            6
+          ]
+        }
+      },
+      "expected": "2026-01-03"
+    },
+    {
+      "name": "next matrix 2025-12-31/weekly2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2025-12-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2026-01-02"
+    },
+    {
+      "name": "next matrix 2025-12-31/weeklyNth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2025-12-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            5
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2026-01-09"
+    },
+    {
+      "name": "next matrix 2025-12-31/weeklyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2025-12-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2026-01-25"
+    },
+    {
+      "name": "next matrix 2025-12-31/monthly31",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2025-12-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2026-01-31"
+    },
+    {
+      "name": "next matrix 2025-12-31/monthlyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2025-12-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-02-15"
+    },
+    {
+      "name": "next matrix 2025-12-31/yearly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2025-12-31",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2026-12-31"
+    },
+    {
+      "name": "next matrix 2026-01-31/daily2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "daily",
+          "interval": 2
+        }
+      },
+      "expected": "2026-02-02"
+    },
+    {
+      "name": "next matrix 2026-01-31/weekly1",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            2,
+            6
+          ]
+        }
+      },
+      "expected": "2026-02-01"
+    },
+    {
+      "name": "next matrix 2026-01-31/weekly2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2026-02-09"
+    },
+    {
+      "name": "next matrix 2026-01-31/weeklyNth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            5
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2026-02-09"
+    },
+    {
+      "name": "next matrix 2026-01-31/weeklyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2026-02-22"
+    },
+    {
+      "name": "next matrix 2026-01-31/monthly31",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2026-02-28"
+    },
+    {
+      "name": "next matrix 2026-01-31/monthlyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-03-15"
+    },
+    {
+      "name": "next matrix 2026-01-31/yearly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-01-31",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2027-01-31"
+    },
+    {
+      "name": "next matrix 2026-02-28/daily2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-02-28",
+        "config": {
+          "frequency": "daily",
+          "interval": 2
+        }
+      },
+      "expected": "2026-03-02"
+    },
+    {
+      "name": "next matrix 2026-02-28/weekly1",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-02-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            2,
+            6
+          ]
+        }
+      },
+      "expected": "2026-03-01"
+    },
+    {
+      "name": "next matrix 2026-02-28/weekly2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-02-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2026-03-09"
+    },
+    {
+      "name": "next matrix 2026-02-28/weeklyNth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-02-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            5
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2026-03-09"
+    },
+    {
+      "name": "next matrix 2026-02-28/weeklyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-02-28",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2026-03-27"
+    },
+    {
+      "name": "next matrix 2026-02-28/monthly31",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-02-28",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2026-03-31"
+    },
+    {
+      "name": "next matrix 2026-02-28/monthlyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-02-28",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-04-15"
+    },
+    {
+      "name": "next matrix 2026-02-28/yearly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-02-28",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2027-02-28"
+    },
+    {
+      "name": "next matrix 2026-09-25/daily2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "daily",
+          "interval": 2
+        }
+      },
+      "expected": "2026-09-27"
+    },
+    {
+      "name": "next matrix 2026-09-25/weekly1",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            2,
+            6
+          ]
+        }
+      },
+      "expected": "2026-09-26"
+    },
+    {
+      "name": "next matrix 2026-09-25/weekly2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2026-10-05"
+    },
+    {
+      "name": "next matrix 2026-09-25/weeklyNth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            5
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2026-10-09"
+    },
+    {
+      "name": "next matrix 2026-09-25/weeklyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2026-09-27"
+    },
+    {
+      "name": "next matrix 2026-09-25/monthly31",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2026-09-30"
+    },
+    {
+      "name": "next matrix 2026-09-25/monthlyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-09-30"
+    },
+    {
+      "name": "next matrix 2026-09-25/yearly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-25",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2027-09-25"
+    },
+    {
+      "name": "next matrix 2026-09-27/daily2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-27",
+        "config": {
+          "frequency": "daily",
+          "interval": 2
+        }
+      },
+      "expected": "2026-09-29"
+    },
+    {
+      "name": "next matrix 2026-09-27/weekly1",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-27",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            2,
+            6
+          ]
+        }
+      },
+      "expected": "2026-09-29"
+    },
+    {
+      "name": "next matrix 2026-09-27/weekly2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-27",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2026-09-28"
+    },
+    {
+      "name": "next matrix 2026-09-27/weeklyNth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-27",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            5
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2026-10-09"
+    },
+    {
+      "name": "next matrix 2026-09-27/weeklyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-27",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2026-10-25"
+    },
+    {
+      "name": "next matrix 2026-09-27/monthly31",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-27",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2026-09-30"
+    },
+    {
+      "name": "next matrix 2026-09-27/monthlyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-27",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2026-09-30"
+    },
+    {
+      "name": "next matrix 2026-09-27/yearly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-09-27",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2027-09-27"
+    },
+    {
+      "name": "next matrix 2026-12-31/daily2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "daily",
+          "interval": 2
+        }
+      },
+      "expected": "2027-01-02"
+    },
+    {
+      "name": "next matrix 2026-12-31/weekly1",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            2,
+            6
+          ]
+        }
+      },
+      "expected": "2027-01-02"
+    },
+    {
+      "name": "next matrix 2026-12-31/weekly2",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3,
+            5
+          ]
+        }
+      },
+      "expected": "2027-01-01"
+    },
+    {
+      "name": "next matrix 2026-12-31/weeklyNth",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            1,
+            5
+          ],
+          "weekOfMonth": "2"
+        }
+      },
+      "expected": "2027-01-08"
+    },
+    {
+      "name": "next matrix 2026-12-31/weeklyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "weekly",
+          "interval": 1,
+          "daysOfWeek": [
+            0,
+            5
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "2027-01-29"
+    },
+    {
+      "name": "next matrix 2026-12-31/monthly31",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            31
+          ]
+        }
+      },
+      "expected": "2027-01-31"
+    },
+    {
+      "name": "next matrix 2026-12-31/monthlyLast",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "monthly",
+          "interval": 2,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "2027-02-15"
+    },
+    {
+      "name": "next matrix 2026-12-31/yearly",
+      "op": "nextDate",
+      "input": {
+        "currentDate": "2026-12-31",
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "2027-12-31"
+    },
+    {
+      "name": "advance {\"nextDate\":\"2026-09-26\",\"config\":{\"frequency\":\"daily\",\"interval\":1},\"today\":\"2026-09-28\",\"businessDaysOnly\":true}",
+      "op": "advanceNextDate",
+      "input": {
+        "nextDate": "2026-09-26",
+        "config": {
+          "frequency": "daily",
+          "interval": 1
+        },
+        "today": "2026-09-28",
+        "businessDaysOnly": true
+      },
+      "expected": "2026-09-26"
+    },
+    {
+      "name": "advance {\"nextDate\":\"2026-09-20\",\"config\":{\"frequency\":\"weekly\",\"interval\":2,\"daysOfWeek\":[1,3]},\"today\":\"2026-09-28\",\"businessDaysOnly\":false}",
+      "op": "advanceNextDate",
+      "input": {
+        "nextDate": "2026-09-20",
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3
+          ]
+        },
+        "today": "2026-09-28",
+        "businessDaysOnly": false
+      },
+      "expected": "2026-10-05"
+    },
+    {
+      "name": "occurrence 2026-09-26",
+      "op": "occurrenceDate",
+      "input": {
+        "value": "2026-09-26",
+        "businessDaysOnly": true
+      },
+      "expected": "2026-09-28"
+    },
+    {
+      "name": "due 2026-09-26",
+      "op": "isRuleDue",
+      "input": {
+        "value": "2026-09-26",
+        "today": "2026-09-27",
+        "leadDays": 1,
+        "businessDaysOnly": true
+      },
+      "expected": true
+    },
+    {
+      "name": "occurrence 2026-09-28",
+      "op": "occurrenceDate",
+      "input": {
+        "value": "2026-09-28",
+        "businessDaysOnly": true
+      },
+      "expected": "2026-09-28"
+    },
+    {
+      "name": "due 2026-09-28",
+      "op": "isRuleDue",
+      "input": {
+        "value": "2026-09-28",
+        "today": "2026-09-27",
+        "leadDays": 1,
+        "businessDaysOnly": true
+      },
+      "expected": true
+    },
+    {
+      "name": "schedule daily",
+      "op": "scheduleKey",
+      "input": {
+        "config": {
+          "frequency": "daily",
+          "interval": 1
+        }
+      },
+      "expected": "{\"frequency\":\"daily\",\"interval\":1,\"daysOfWeek\":\"\",\"weekOfMonth\":\"every\",\"daysOfMonth\":\"\"}"
+    },
+    {
+      "name": "preview daily",
+      "op": "preview",
+      "input": {
+        "config": {
+          "frequency": "daily",
+          "interval": 1
+        },
+        "startDate": "2026-09-25",
+        "today": "2026-09-25",
+        "count": 4
+      },
+      "expected": [
+        "2026-09-25",
+        "2026-09-26",
+        "2026-09-27",
+        "2026-09-28"
+      ]
+    },
+    {
+      "name": "schedule weekly",
+      "op": "scheduleKey",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3
+          ]
+        }
+      },
+      "expected": "{\"frequency\":\"weekly\",\"interval\":2,\"daysOfWeek\":\"1,3\",\"weekOfMonth\":\"every\",\"daysOfMonth\":\"\"}"
+    },
+    {
+      "name": "preview weekly",
+      "op": "preview",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3
+          ]
+        },
+        "startDate": "2026-09-25",
+        "today": "2026-09-25",
+        "count": 4
+      },
+      "expected": [
+        "2026-10-05",
+        "2026-10-07",
+        "2026-10-19",
+        "2026-10-21"
+      ]
+    },
+    {
+      "name": "schedule monthly",
+      "op": "scheduleKey",
+      "input": {
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        }
+      },
+      "expected": "{\"frequency\":\"monthly\",\"interval\":1,\"daysOfWeek\":\"\",\"weekOfMonth\":\"every\",\"daysOfMonth\":\"-1,15\"}"
+    },
+    {
+      "name": "preview monthly",
+      "op": "preview",
+      "input": {
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfMonth": [
+            15,
+            -1
+          ]
+        },
+        "startDate": "2026-09-25",
+        "today": "2026-09-25",
+        "count": 4
+      },
+      "expected": [
+        "2026-09-30",
+        "2026-10-15",
+        "2026-10-31",
+        "2026-11-15"
+      ]
+    },
+    {
+      "name": "schedule yearly",
+      "op": "scheduleKey",
+      "input": {
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        }
+      },
+      "expected": "{\"frequency\":\"yearly\",\"interval\":1,\"daysOfWeek\":\"\",\"weekOfMonth\":\"every\",\"daysOfMonth\":\"\"}"
+    },
+    {
+      "name": "preview yearly",
+      "op": "preview",
+      "input": {
+        "config": {
+          "frequency": "yearly",
+          "interval": 1
+        },
+        "startDate": "2026-09-25",
+        "today": "2026-09-25",
+        "count": 4
+      },
+      "expected": [
+        "2026-09-25",
+        "2027-09-25",
+        "2028-09-25",
+        "2029-09-25"
+      ]
+    },
+    {
+      "name": "rule config {\"frequency\":\"weekly\",\"interval\":null,\"daysOfWeek\":\"[1,3]\",\"weekOfMonth\":null,\"daysOfMonth\":\"bad\"}",
+      "op": "buildRuleConfig",
+      "input": {
+        "frequency": "weekly",
+        "interval": null,
+        "daysOfWeek": "[1,3]",
+        "weekOfMonth": null,
+        "daysOfMonth": "bad"
+      },
+      "expected": {
+        "frequency": "weekly",
+        "interval": 1,
+        "daysOfWeek": [
+          1,
+          3
+        ]
+      }
+    },
+    {
+      "name": "rule config {\"frequency\":\"monthly\",\"interval\":0,\"daysOfWeek\":null,\"weekOfMonth\":null,\"daysOfMonth\":\"[-1,15]\"}",
+      "op": "buildRuleConfig",
+      "input": {
+        "frequency": "monthly",
+        "interval": 0,
+        "daysOfWeek": null,
+        "weekOfMonth": null,
+        "daysOfMonth": "[-1,15]"
+      },
+      "expected": {
+        "frequency": "monthly",
+        "interval": 1,
+        "daysOfMonth": [
+          -1,
+          15
+        ]
+      }
+    },
+    {
+      "name": "lead undefined",
+      "op": "parseLead",
+      "input": {
+        "fallback": 4
+      },
+      "expected": 4
+    },
+    {
+      "name": "valid lead undefined",
+      "op": "validLead",
+      "input": {},
+      "expected": false
+    },
+    {
+      "name": "lead 0",
+      "op": "parseLead",
+      "input": {
+        "value": 0,
+        "fallback": 4
+      },
+      "expected": 0
+    },
+    {
+      "name": "valid lead 0",
+      "op": "validLead",
+      "input": {
+        "value": 0
+      },
+      "expected": true
+    },
+    {
+      "name": "lead 30",
+      "op": "parseLead",
+      "input": {
+        "value": 30,
+        "fallback": 4
+      },
+      "expected": 30
+    },
+    {
+      "name": "valid lead 30",
+      "op": "validLead",
+      "input": {
+        "value": 30
+      },
+      "expected": true
+    },
+    {
+      "name": "lead 31",
+      "op": "parseLead",
+      "input": {
+        "value": 31,
+        "fallback": 4
+      },
+      "expected": null
+    },
+    {
+      "name": "valid lead 31",
+      "op": "validLead",
+      "input": {
+        "value": 31
+      },
+      "expected": false
+    },
+    {
+      "name": "lead -1",
+      "op": "parseLead",
+      "input": {
+        "value": -1,
+        "fallback": 4
+      },
+      "expected": null
+    },
+    {
+      "name": "valid lead -1",
+      "op": "validLead",
+      "input": {
+        "value": -1
+      },
+      "expected": false
+    },
+    {
+      "name": "lead 1.5",
+      "op": "parseLead",
+      "input": {
+        "value": 1.5,
+        "fallback": 4
+      },
+      "expected": null
+    },
+    {
+      "name": "valid lead 1.5",
+      "op": "validLead",
+      "input": {
+        "value": 1.5
+      },
+      "expected": false
+    },
+    {
+      "name": "max interval daily",
+      "op": "maxInterval",
+      "input": {
+        "frequency": "daily"
+      },
+      "expected": 1461
+    },
+    {
+      "name": "max interval weekly",
+      "op": "maxInterval",
+      "input": {
+        "frequency": "weekly"
+      },
+      "expected": 260
+    },
+    {
+      "name": "max interval monthly",
+      "op": "maxInterval",
+      "input": {
+        "frequency": "monthly"
+      },
+      "expected": 120
+    },
+    {
+      "name": "max interval yearly",
+      "op": "maxInterval",
+      "input": {
+        "frequency": "yearly"
+      },
+      "expected": 20
+    },
+    {
+      "name": "add days 2026-12-31/1",
+      "op": "addDays",
+      "input": {
+        "value": "2026-12-31",
+        "days": 1
+      },
+      "expected": "2027-01-01"
+    },
+    {
+      "name": "add days 2024-02-28/1",
+      "op": "addDays",
+      "input": {
+        "value": "2024-02-28",
+        "days": 1
+      },
+      "expected": "2024-02-29"
+    },
+    {
+      "name": "add days 2026-09-25/-30",
+      "op": "addDays",
+      "input": {
+        "value": "2026-09-25",
+        "days": -30
+      },
+      "expected": "2026-08-26"
+    },
+    {
+      "name": "preview edge {\"config\":{\"frequency\":\"daily\",\"interval\":1},\"startDate\":\"2026-09-26\",\"today\":\"2026-09-25\",\"count\":4,\"businessDaysOnly\":true}",
+      "op": "preview",
+      "input": {
+        "config": {
+          "frequency": "daily",
+          "interval": 1
+        },
+        "startDate": "2026-09-26",
+        "today": "2026-09-25",
+        "count": 4,
+        "businessDaysOnly": true
+      },
+      "expected": [
+        "2026-09-28",
+        "2026-09-28",
+        "2026-09-28",
+        "2026-09-29"
+      ]
+    },
+    {
+      "name": "preview edge {\"config\":{\"frequency\":\"weekly\",\"interval\":2,\"daysOfWeek\":[1,3]},\"startDate\":\"2026-09-01\",\"today\":\"2026-09-25\",\"seed\":\"2026-09-28\",\"count\":3}",
+      "op": "preview",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            1,
+            3
+          ]
+        },
+        "startDate": "2026-09-01",
+        "today": "2026-09-25",
+        "seed": "2026-09-28",
+        "count": 3
+      },
+      "expected": [
+        "2026-09-28",
+        "2026-09-30",
+        "2026-10-12"
+      ]
+    },
+    {
+      "name": "schedule edge {\"frequency\":\"weekly\",\"interval\":2,\"daysOfWeek\":[5,1],\"weekOfMonth\":\"every\",\"daysOfMonth\":[12]}",
+      "op": "scheduleKey",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 2,
+          "daysOfWeek": [
+            5,
+            1
+          ],
+          "weekOfMonth": "every",
+          "daysOfMonth": [
+            12
+          ]
+        }
+      },
+      "expected": "{\"frequency\":\"weekly\",\"interval\":2,\"daysOfWeek\":\"1,5\",\"weekOfMonth\":\"every\",\"daysOfMonth\":\"\"}"
+    },
+    {
+      "name": "schedule edge {\"frequency\":\"weekly\",\"interval\":3,\"daysOfWeek\":[1],\"weekOfMonth\":\"last\"}",
+      "op": "scheduleKey",
+      "input": {
+        "config": {
+          "frequency": "weekly",
+          "interval": 3,
+          "daysOfWeek": [
+            1
+          ],
+          "weekOfMonth": "last"
+        }
+      },
+      "expected": "{\"frequency\":\"weekly\",\"interval\":1,\"daysOfWeek\":\"1\",\"weekOfMonth\":\"last\",\"daysOfMonth\":\"\"}"
+    },
+    {
+      "name": "schedule edge {\"frequency\":\"monthly\",\"interval\":1,\"daysOfWeek\":[3],\"daysOfMonth\":[-1,15]}",
+      "op": "scheduleKey",
+      "input": {
+        "config": {
+          "frequency": "monthly",
+          "interval": 1,
+          "daysOfWeek": [
+            3
+          ],
+          "daysOfMonth": [
+            -1,
+            15
+          ]
+        }
+      },
+      "expected": "{\"frequency\":\"monthly\",\"interval\":1,\"daysOfWeek\":\"\",\"weekOfMonth\":\"every\",\"daysOfMonth\":\"-1,15\"}"
+    },
+    {
+      "name": "schedule edge {\"frequency\":\"daily\",\"interval\":1,\"daysOfWeek\":[1]}",
+      "op": "scheduleKey",
+      "input": {
+        "config": {
+          "frequency": "daily",
+          "interval": 1,
+          "daysOfWeek": [
+            1
+          ]
+        }
+      },
+      "expected": "{\"frequency\":\"daily\",\"interval\":1,\"daysOfWeek\":\"\",\"weekOfMonth\":\"every\",\"daysOfMonth\":\"\"}"
+    },
+    {
+      "name": "lots empty",
+      "op": "replayLots",
+      "input": {
+        "splits": []
+      },
+      "expected": {
+        "lots": [],
+        "allocations": [],
+        "unallocated": []
+      }
+    },
+    {
+      "name": "lots buyWithFee",
+      "op": "replayLots",
+      "input": {
+        "splits": [
+          {
+            "investmentSplitId": 1,
+            "transactionId": 1,
+            "action": "buy",
+            "sharesMicros": 100000000,
+            "priceMicros": 10000000,
+            "feesCents": 500,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-01-01"
+          }
+        ]
+      },
+      "expected": {
+        "lots": [
+          {
+            "lotKey": 0,
+            "openedSplitId": 1,
+            "openedTransactionId": 1,
+            "acquiredDate": "2024-01-01",
+            "originalSharesMicros": 100000000,
+            "originalBasisCents": 100500,
+            "remainingSharesMicros": 100000000,
+            "remainingBasisCents": 100500,
+            "closedTransactionId": null
+          }
+        ],
+        "allocations": [],
+        "unallocated": []
+      }
+    },
+    {
+      "name": "lots fifo",
+      "op": "replayLots",
+      "input": {
+        "splits": [
+          {
+            "investmentSplitId": 1,
+            "transactionId": 1,
+            "action": "buy",
+            "sharesMicros": 7000000,
+            "priceMicros": 13570000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "investmentSplitId": 2,
+            "transactionId": 2,
+            "action": "buy",
+            "sharesMicros": 11000000,
+            "priceMicros": 9990000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-02-01"
+          },
+          {
+            "investmentSplitId": 3,
+            "transactionId": 3,
+            "action": "sell",
+            "sharesMicros": 13000000,
+            "priceMicros": 17770000,
+            "feesCents": 123,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-03-01"
+          }
+        ]
+      },
+      "expected": {
+        "lots": [
+          {
+            "lotKey": 0,
+            "openedSplitId": 1,
+            "openedTransactionId": 1,
+            "acquiredDate": "2024-01-01",
+            "originalSharesMicros": 7000000,
+            "originalBasisCents": 9499,
+            "remainingSharesMicros": 0,
+            "remainingBasisCents": 0,
+            "closedTransactionId": 3
+          },
+          {
+            "lotKey": 1,
+            "openedSplitId": 2,
+            "openedTransactionId": 2,
+            "acquiredDate": "2024-02-01",
+            "originalSharesMicros": 11000000,
+            "originalBasisCents": 10989,
+            "remainingSharesMicros": 5000000,
+            "remainingBasisCents": 4995,
+            "closedTransactionId": null
+          }
+        ],
+        "allocations": [
+          {
+            "lotKey": 0,
+            "sellSplitId": 3,
+            "transactionId": 3,
+            "sharesMicros": 7000000,
+            "basisCents": 9499,
+            "proceedsCents": 12373
+          },
+          {
+            "lotKey": 1,
+            "sellSplitId": 3,
+            "transactionId": 3,
+            "sharesMicros": 6000000,
+            "basisCents": 5994,
+            "proceedsCents": 10605
+          }
+        ],
+        "unallocated": []
+      }
+    },
+    {
+      "name": "lots stockSplit",
+      "op": "replayLots",
+      "input": {
+        "splits": [
+          {
+            "investmentSplitId": 1,
+            "transactionId": 1,
+            "action": "buy",
+            "sharesMicros": 10000000,
+            "priceMicros": 10000000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "investmentSplitId": 2,
+            "transactionId": 2,
+            "action": "split",
+            "sharesMicros": 0,
+            "priceMicros": 0,
+            "feesCents": 0,
+            "splitNumerator": 2,
+            "splitDenominator": 1,
+            "transactionDate": "2024-02-01"
+          },
+          {
+            "investmentSplitId": 3,
+            "transactionId": 3,
+            "action": "sell",
+            "sharesMicros": 15000000,
+            "priceMicros": 8000000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-03-01"
+          }
+        ]
+      },
+      "expected": {
+        "lots": [
+          {
+            "lotKey": 0,
+            "openedSplitId": 1,
+            "openedTransactionId": 1,
+            "acquiredDate": "2024-01-01",
+            "originalSharesMicros": 20000000,
+            "originalBasisCents": 10000,
+            "remainingSharesMicros": 5000000,
+            "remainingBasisCents": 2500,
+            "closedTransactionId": null
+          }
+        ],
+        "allocations": [
+          {
+            "lotKey": 0,
+            "sellSplitId": 3,
+            "transactionId": 3,
+            "sharesMicros": 15000000,
+            "basisCents": 7500,
+            "proceedsCents": 12000
+          }
+        ],
+        "unallocated": []
+      }
+    },
+    {
+      "name": "lots unallocated",
+      "op": "replayLots",
+      "input": {
+        "splits": [
+          {
+            "investmentSplitId": 1,
+            "transactionId": 1,
+            "action": "sell",
+            "sharesMicros": 1000000,
+            "priceMicros": 5000000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-01-01"
+          }
+        ]
+      },
+      "expected": {
+        "lots": [],
+        "allocations": [],
+        "unallocated": [
+          {
+            "sellSplitId": 1,
+            "sharesMicros": 1000000
+          }
+        ]
+      }
+    },
+    {
+      "name": "lots zeroPriceLoss",
+      "op": "replayLots",
+      "input": {
+        "splits": [
+          {
+            "investmentSplitId": 1,
+            "transactionId": 1,
+            "action": "buy",
+            "sharesMicros": 1000000,
+            "priceMicros": 9000000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "investmentSplitId": 2,
+            "transactionId": 2,
+            "action": "sell",
+            "sharesMicros": 1000000,
+            "priceMicros": 0,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-02-01"
+          }
+        ]
+      },
+      "expected": {
+        "lots": [
+          {
+            "lotKey": 0,
+            "openedSplitId": 1,
+            "openedTransactionId": 1,
+            "acquiredDate": "2024-01-01",
+            "originalSharesMicros": 1000000,
+            "originalBasisCents": 900,
+            "remainingSharesMicros": 0,
+            "remainingBasisCents": 0,
+            "closedTransactionId": 2
+          }
+        ],
+        "allocations": [
+          {
+            "lotKey": 0,
+            "sellSplitId": 2,
+            "transactionId": 2,
+            "sharesMicros": 1000000,
+            "basisCents": 900,
+            "proceedsCents": 0
+          }
+        ],
+        "unallocated": []
+      }
+    },
+    {
+      "name": "lots reverseSplit",
+      "op": "replayLots",
+      "input": {
+        "splits": [
+          {
+            "investmentSplitId": 1,
+            "transactionId": 1,
+            "action": "buy",
+            "sharesMicros": 9000000,
+            "priceMicros": 10000000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "investmentSplitId": 2,
+            "transactionId": 2,
+            "action": "split",
+            "sharesMicros": 0,
+            "priceMicros": 0,
+            "feesCents": 0,
+            "splitNumerator": 1,
+            "splitDenominator": 3,
+            "transactionDate": "2024-02-01"
+          }
+        ]
+      },
+      "expected": {
+        "lots": [
+          {
+            "lotKey": 0,
+            "openedSplitId": 1,
+            "openedTransactionId": 1,
+            "acquiredDate": "2024-01-01",
+            "originalSharesMicros": 3000000,
+            "originalBasisCents": 9000,
+            "remainingSharesMicros": 3000000,
+            "remainingBasisCents": 9000,
+            "closedTransactionId": null
+          }
+        ],
+        "allocations": [],
+        "unallocated": []
+      }
+    },
+    {
+      "name": "lots sameDayOrder",
+      "op": "replayLots",
+      "input": {
+        "splits": [
+          {
+            "investmentSplitId": 3,
+            "transactionId": 2,
+            "action": "sell",
+            "sharesMicros": 1000000,
+            "priceMicros": 20000000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "investmentSplitId": 2,
+            "transactionId": 1,
+            "action": "buy",
+            "sharesMicros": 1000000,
+            "priceMicros": 10000000,
+            "feesCents": 0,
+            "splitNumerator": null,
+            "splitDenominator": null,
+            "transactionDate": "2024-01-01"
+          }
+        ]
+      },
+      "expected": {
+        "lots": [
+          {
+            "lotKey": 0,
+            "openedSplitId": 2,
+            "openedTransactionId": 1,
+            "acquiredDate": "2024-01-01",
+            "originalSharesMicros": 1000000,
+            "originalBasisCents": 1000,
+            "remainingSharesMicros": 0,
+            "remainingBasisCents": 0,
+            "closedTransactionId": 2
+          }
+        ],
+        "allocations": [
+          {
+            "lotKey": 0,
+            "sellSplitId": 3,
+            "transactionId": 2,
+            "sharesMicros": 1000000,
+            "basisCents": 1000,
+            "proceedsCents": 2000
+          }
+        ],
+        "unallocated": []
+      }
+    },
+    {
+      "name": "positions split and sale",
+      "op": "aggregatePositions",
+      "input": {
+        "splits": [
+          {
+            "securityId": 1,
+            "action": "buy",
+            "sharesMicros": 10000000,
+            "priceMicros": 10000000,
+            "feesCents": 50,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "securityId": 1,
+            "action": "split",
+            "sharesMicros": 0,
+            "priceMicros": 0,
+            "feesCents": 0,
+            "splitNumerator": 2,
+            "splitDenominator": 1,
+            "transactionDate": "2024-02-01"
+          },
+          {
+            "securityId": 1,
+            "action": "sell",
+            "sharesMicros": 5000000,
+            "priceMicros": 15000000,
+            "feesCents": 25,
+            "transactionDate": "2024-03-01"
+          }
+        ],
+        "securities": [
+          {
+            "id": 1,
+            "name": "Example",
+            "symbol": "EX"
+          }
+        ],
+        "prices": [
+          {
+            "securityId": 1,
+            "priceMicros": 20000000,
+            "priceDate": "2024-04-01"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "securityId": 1,
+          "securityName": "Example",
+          "securitySymbol": "EX",
+          "sharesMicros": 15000000,
+          "costBasisCents": 7537,
+          "priceMicros": 20000000,
+          "priceDate": "2024-04-01",
+          "marketValueCents": 30000
+        }
+      ]
+    },
+    {
+      "name": "positions empty",
+      "op": "aggregatePositions",
+      "input": {
+        "splits": [],
+        "securities": [],
+        "prices": []
+      },
+      "expected": []
+    },
+    {
+      "name": "positions reverse split",
+      "op": "aggregatePositions",
+      "input": {
+        "splits": [
+          {
+            "securityId": 1,
+            "action": "buy",
+            "sharesMicros": 9000000,
+            "priceMicros": 10000000,
+            "feesCents": 0,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "securityId": 1,
+            "action": "split",
+            "sharesMicros": 0,
+            "priceMicros": 0,
+            "feesCents": 0,
+            "splitNumerator": 1,
+            "splitDenominator": 3,
+            "transactionDate": "2024-02-01"
+          }
+        ],
+        "securities": [
+          {
+            "id": 1,
+            "name": "Reverse",
+            "symbol": "REV"
+          }
+        ],
+        "prices": [
+          {
+            "securityId": 1,
+            "priceMicros": 20000000,
+            "priceDate": "2024-03-01"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "securityId": 1,
+          "securityName": "Reverse",
+          "securitySymbol": "REV",
+          "sharesMicros": 3000000,
+          "costBasisCents": 9000,
+          "priceMicros": 20000000,
+          "priceDate": "2024-03-01",
+          "marketValueCents": 6000
+        }
+      ]
+    },
+    {
+      "name": "positions equal-name stable order",
+      "op": "aggregatePositions",
+      "input": {
+        "splits": [
+          {
+            "securityId": 2,
+            "action": "buy",
+            "sharesMicros": 1000000,
+            "priceMicros": 5000000,
+            "feesCents": 0,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "securityId": 1,
+            "action": "buy",
+            "sharesMicros": 1000000,
+            "priceMicros": 6000000,
+            "feesCents": 0,
+            "transactionDate": "2024-01-01"
+          }
+        ],
+        "securities": [
+          {
+            "id": 1,
+            "name": "Same",
+            "symbol": "ONE"
+          },
+          {
+            "id": 2,
+            "name": "Same",
+            "symbol": "TWO"
+          }
+        ],
+        "prices": []
+      },
+      "expected": [
+        {
+          "securityId": 2,
+          "securityName": "Same",
+          "securitySymbol": "TWO",
+          "sharesMicros": 1000000,
+          "costBasisCents": 500,
+          "priceMicros": null,
+          "priceDate": null,
+          "marketValueCents": null
+        },
+        {
+          "securityId": 1,
+          "securityName": "Same",
+          "securitySymbol": "ONE",
+          "sharesMicros": 1000000,
+          "costBasisCents": 600,
+          "priceMicros": null,
+          "priceDate": null,
+          "marketValueCents": null
+        }
+      ]
+    },
+    {
+      "name": "positions locale order",
+      "op": "aggregatePositions",
+      "input": {
+        "splits": [
+          {
+            "securityId": 1,
+            "action": "buy",
+            "sharesMicros": 1000000,
+            "priceMicros": 1000000,
+            "feesCents": 0,
+            "transactionDate": "2024-01-01"
+          },
+          {
+            "securityId": 2,
+            "action": "buy",
+            "sharesMicros": 1000000,
+            "priceMicros": 1000000,
+            "feesCents": 0,
+            "transactionDate": "2024-01-01"
+          }
+        ],
+        "securities": [
+          {
+            "id": 1,
+            "name": "Vanguard Total",
+            "symbol": "V"
+          },
+          {
+            "id": 2,
+            "name": "iShares Core S&P 500",
+            "symbol": "I"
+          }
+        ],
+        "prices": []
+      },
+      "expected": [
+        {
+          "securityId": 2,
+          "securityName": "iShares Core S&P 500",
+          "securitySymbol": "I",
+          "sharesMicros": 1000000,
+          "costBasisCents": 100,
+          "priceMicros": null,
+          "priceDate": null,
+          "marketValueCents": null
+        },
+        {
+          "securityId": 1,
+          "securityName": "Vanguard Total",
+          "securitySymbol": "V",
+          "sharesMicros": 1000000,
+          "costBasisCents": 100,
+          "priceMicros": null,
+          "priceDate": null,
+          "marketValueCents": null
+        }
+      ]
+    },
+    {
+      "name": "market value global split",
+      "op": "aggregateMarketValues",
+      "input": {
+        "splits": [
+          {
+            "securityId": 1,
+            "action": "buy",
+            "sharesMicros": 10000000,
+            "priceMicros": 10000000,
+            "feesCents": 50,
+            "transactionDate": "2024-01-01",
+            "accountId": 1
+          },
+          {
+            "securityId": 1,
+            "action": "buy",
+            "sharesMicros": 10000000,
+            "priceMicros": 10000000,
+            "feesCents": 50,
+            "transactionDate": "2024-01-01",
+            "accountId": 2
+          },
+          {
+            "securityId": 1,
+            "action": "split",
+            "sharesMicros": 0,
+            "priceMicros": 0,
+            "feesCents": 0,
+            "splitNumerator": 2,
+            "splitDenominator": 1,
+            "transactionDate": "2024-02-01",
+            "accountId": null
+          },
+          {
+            "securityId": 1,
+            "action": "sell",
+            "sharesMicros": 5000000,
+            "priceMicros": 15000000,
+            "feesCents": 25,
+            "transactionDate": "2024-03-01",
+            "accountId": 1
+          }
+        ],
+        "prices": [
+          {
+            "securityId": 1,
+            "priceMicros": 20000000,
+            "priceDate": "2024-04-01"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "accountId": 1,
+          "marketValueCents": 30000
+        },
+        {
+          "accountId": 2,
+          "marketValueCents": 40000
+        }
+      ]
+    },
+    {
+      "name": "fixed price",
+      "op": "fixedPriceRow",
+      "input": {
+        "securityId": 1,
+        "fixedPriceMicros": 1002500,
+        "today": "2026-09-25"
+      },
+      "expected": {
+        "securityId": 1,
+        "priceMicros": 1002500,
+        "priceDate": "2026-09-25"
+      }
+    }
+  ]
+}

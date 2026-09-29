@@ -1,67 +1,36 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { setupTestDatabase, resetTestDatabase, createUser } from "@/tests/helpers/db-utils";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import {
+  setupTestDatabase, resetTestDatabase, createUser, createBook,
+} from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
+import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 import { getDb } from "@/db";
 import { books } from "@/db/schema";
 import { eq } from "drizzle-orm";
-import { createBook } from "@/lib/books";
 
-// Books are user-scoped, not book-scoped: every tool here calls requireAuth(),
-// never requireBookAuth(). Mock auth to the same userId the seeded test user
-// (tests/helpers/db-utils.ts) has, same pattern as mcp-account-tools.test.ts.
-vi.mock("@/mcp/auth", () => ({
-  getMcpAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  verifyBookAccess: vi.fn().mockResolvedValue(true),
-  requireAuth: vi.fn().mockReturnValue({ userId: 1, keyId: 1 }),
-  requireBookAuth: vi.fn().mockResolvedValue({ userId: 1, keyId: 1 }),
-}));
+let mcp: McpTestClient;
 
-vi.mock("@/db", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/db")>();
-  return { ...actual };
-});
-
-// Stub seedBook, same as tests/lib/books.test.ts. What create_demo_book adds
-// over its library test is the MCP wiring — auth, the tool result envelope,
-// the book that comes back — none of which depends on thousands of seeded
-// rows. The real seedBook is covered end to end by tests/api/books-demo.test.ts.
-vi.mock("@/db/seed", async (importActual) => {
-  const actual = await importActual<typeof import("@/db/seed")>();
-  return { ...actual, seedBook: vi.fn() };
-});
-
-let client: Client;
-let server: McpServer;
+/** A book of `userId`. A trigger adds the owner's membership. */
+const ownedBook = (userId: number, name: string) => createBook({ name, userId });
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
-  callMcpTool(client, name, args);
+  callMcpTool(mcp.client, name, args);
 
 describe("MCP Book Tools", () => {
-  const userId = 1; // matches the mocked requireAuth() above
+  const userId = 1; // the user of the test client's key
 
   beforeAll(async () => {
     await setupTestDatabase();
 
-    server = new McpServer({ name: "test", version: "0.0.1" });
-    const { registerBooksTools } = await import("@/mcp/tools/books");
-    registerBooksTools(server);
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(clientTransport);
-  });
+    mcp = await connectMcpTestClient();
+  }, 120_000);
 
   beforeEach(async () => {
     await resetTestDatabase();
   });
 
   afterAll(async () => {
-    await client.close();
-    await server.close();
+    await mcp.close();
   });
 
   describe("create_book", () => {
@@ -76,7 +45,7 @@ describe("MCP Book Tools", () => {
 
   describe("update_book", () => {
     it("renames a book the user owns", async () => {
-      const book = await createBook(getDb(), userId, { name: "Old Name" });
+      const book = await ownedBook(userId, "Old Name");
 
       const { data, isError } = await callTool("update_book", {
         bookId: book.id,
@@ -89,7 +58,7 @@ describe("MCP Book Tools", () => {
 
     it("returns an error for another user's book", async () => {
       const otherUser = await createUser({ username: "someone-else" });
-      const theirs = await createBook(getDb(), otherUser.id, { name: "Theirs" });
+      const theirs = await ownedBook(otherUser.id, "Theirs");
 
       const { data, isError } = await callTool("update_book", {
         bookId: theirs.id,
@@ -113,7 +82,7 @@ describe("MCP Book Tools", () => {
 
   describe("delete_book", () => {
     it("deletes when confirmBookName matches exactly", async () => {
-      const book = await createBook(getDb(), userId, { name: "Household" });
+      const book = await ownedBook(userId, "Household");
 
       const { data, isError } = await callTool("delete_book", {
         bookId: book.id,
@@ -128,7 +97,7 @@ describe("MCP Book Tools", () => {
     });
 
     it("refuses a mismatched confirmBookName and leaves the book present", async () => {
-      const book = await createBook(getDb(), userId, { name: "Household" });
+      const book = await ownedBook(userId, "Household");
 
       const { data, isError } = await callTool("delete_book", {
         bookId: book.id,
@@ -146,7 +115,7 @@ describe("MCP Book Tools", () => {
 
     it("returns an error for another user's book without revealing its name", async () => {
       const otherUser = await createUser({ username: "someone-else" });
-      const theirs = await createBook(getDb(), otherUser.id, { name: "Theirs" });
+      const theirs = await ownedBook(otherUser.id, "Theirs");
 
       const { data, isError } = await callTool("delete_book", {
         bookId: theirs.id,
@@ -158,6 +127,13 @@ describe("MCP Book Tools", () => {
 
       const rows = await getDb().select().from(books).where(eq(books.id, theirs.id));
       expect(rows).toHaveLength(1);
+    });
+  });
+
+  describe("list_books with shared books", () => {
+    it("returns the role of each book", async () => {
+      const { data } = await callTool("list_books");
+      expect(data).toEqual([expect.objectContaining({ id: 1, name: "Test Book", role: "owner" })]);
     });
   });
 });

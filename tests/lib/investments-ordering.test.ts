@@ -62,8 +62,8 @@ describe("same-date investment ordering", () => {
       priceMicros: 100_000_000,
     });
 
-    // The low-level helpers above bypass lib/transactions.ts's createTransaction(),
-    // which is what normally triggers rebuildLots after a write. Rebuild
+    // The low-level helpers above bypass the transaction write path, which is
+    // what normally rebuilds the lots after a write. Rebuild
     // explicitly so investment_lots reflects this account/security pair, same
     // as it would after a real write-path call.
     await rebuildLots(db, 1, brokerage.id, security.id);

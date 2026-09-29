@@ -3,15 +3,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { useBookId } from "@/hooks/useBookId";
 import { apiGet } from "@/lib/api-client";
-import { formatPriceMicrosInput, parseStrictCurrency } from "@/lib/formatters";
-import { evaluateExpression } from "@/lib/expression";
+import { formatPriceMicrosInput, parseStrictCurrency } from "@/lib/wasm-client";
+import { evaluateExpression } from "@/lib/wasm-client";
 import {
   buildBuySplits,
   buildCapGainSplits,
   buildDividendSplits,
   buildSellSplits,
   getInvestmentGrossAmountCents,
-} from "@/lib/accounting";
+} from "@/lib/wasm-client";
 import type {
   AccountWithBalance,
   InvestmentSplitInput,

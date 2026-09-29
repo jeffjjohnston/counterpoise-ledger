@@ -71,6 +71,15 @@ keywords = ["postgres://", "postgresql://"]
   # still reported 2 leaks; without it, 0.
   regexes = ['''counterpoise_app:secret@postgres:5432''']
 
+  # The Rust health failure test once used literal "unused" credentials on
+  # loopback port 1. Its test URL is credential-free now, but the PR scan reads
+  # the earlier commit as well. Match only that unreachable fixture's captured
+  # secret, so a different password or host still fails the scan. Spell the
+  # scheme as a regex here to avoid creating a fresh finding in this file.
+  [[rules.allowlists]]
+  description = "Historical unreachable Rust health-test URL on loopback port 1"
+  regexes = ['''^postgres(?:ql)?://unused:unused@127[.]0[.]0[.]1:1$''']
+
 [allowlist]
 description = "Global allowlist"
 # Path allowlists disable EVERY rule for a file, so they are reserved for files

@@ -2,15 +2,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import SecuritiesPage from "@/app/b/[bookId]/securities/page";
 
-vi.mock("next/navigation", () => ({
-  useParams: () => ({ bookId: "1" }),
-}));
+vi.mock("@/lib/navigation", async () =>
+  (await import("@/tests/helpers/navigation")).mockNavigation({
+    useParams: () => ({ bookId: "1" }),
+  })
+);
 
-vi.mock("next/link", () => ({
-  __esModule: true,
-  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
-    <a href={href}>{children}</a>
-  ),
+// The page reads the role from the book layout. Each test starts as an owner.
+const OWNER_ROLE = { canWrite: true, isOwner: true, role: "owner" };
+let bookRoleValue: { canWrite: boolean; isOwner: boolean; role: string } = OWNER_ROLE;
+
+vi.mock("@/components/BookRoleProvider", () => ({
+  useBookRole: () => bookRoleValue,
 }));
 
 const securitiesFixture = [
@@ -94,6 +97,24 @@ async function renderLoadedPage() {
 describe("SecuritiesPage", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    bookRoleValue = OWNER_ROLE;
+  });
+
+  it("shows Update Prices and Add Security to an owner", async () => {
+    await renderLoadedPage();
+
+    expect(screen.getByRole("button", { name: "Update Prices" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add Security" })).toBeInTheDocument();
+  });
+
+  it("hides Update Prices and Add Security from a viewer, but keeps Download CSV", async () => {
+    // Update Prices writes prices to the book. A viewer cannot write.
+    bookRoleValue = { canWrite: false, isOwner: false, role: "viewer" };
+    await renderLoadedPage();
+
+    expect(screen.queryByRole("button", { name: "Update Prices" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add Security" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download CSV" })).toBeInTheDocument();
   });
 
   it("links each security row to the detail page", async () => {

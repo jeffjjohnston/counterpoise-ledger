@@ -1,5 +1,5 @@
 // This file deliberately duplicates the harness (renderWithToast,
-// vi.mock("next/navigation", ...), mockAccounts, the fetchMock beforeEach/
+// vi.mock("@/lib/navigation", ...), mockAccounts, the fetchMock beforeEach/
 // afterEach, setup(), and enterInvestmentMode()) from
 // TransactionFormInvestment.test.tsx instead of importing it.
 //
@@ -43,9 +43,11 @@ import type { AccountWithBalance } from "@/types";
 const renderWithToast = (ui: React.ReactElement) =>
   render(<ToastProvider>{ui}</ToastProvider>);
 
-vi.mock("next/navigation", () => ({
+vi.mock("@/lib/navigation", () => ({
+  Link: ({ href, children }: { href: string; children: React.ReactNode }) => <a href={href}>{children}</a>,
+  useSearchParams: () => new URLSearchParams(),
   useParams: () => ({ bookId: "1" }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
   usePathname: () => "/b/1/transactions",
 }));
 

@@ -5,8 +5,8 @@ import { useBookId } from "@/hooks/useBookId";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { formatCurrency, toDateString, formatDate, resolveAmountOnBlur } from "@/lib/formatters";
-import { evaluateExpression } from "@/lib/expression";
+import { formatCurrency, toDateString, formatDate, resolveAmountOnBlur } from "@/lib/wasm-client";
+import { evaluateExpression } from "@/lib/wasm-client";
 import { apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 

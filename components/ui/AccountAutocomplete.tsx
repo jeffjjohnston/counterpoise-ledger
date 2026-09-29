@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useId, useMemo } from "react";
 import { cn } from "@/lib/utils";
-import { ACCOUNT_TYPE_LABELS, buildCategoryLabelMap } from "@/lib/accounting";
+import { ACCOUNT_TYPE_LABELS, buildCategoryLabelMap } from "@/lib/wasm-client";
 import { CategoryIcon } from "@/components/ui/CategoryIcon";
 import type { AccountWithBalance } from "@/types";
 

@@ -181,7 +181,9 @@ fn is_cross_origin_write(method: &Method, uri: &Uri, headers: &HeaderMap) -> boo
 /// The host that the browser used, which the `Origin` must name.
 ///
 /// Use `X-Forwarded-Host` first. A reverse proxy that replaces `Host` with the
-/// upstream address can put the browser's host there. To trust this header is
+/// upstream address can put the browser's host there. The header gets here
+/// only when the server trusts a proxy (`TRUST_PROXY`): else
+/// `client_ip::record` removes it. To trust this header is
 /// safe: a page on another site cannot set it. A custom header makes the
 /// browser send a CORS preflight first, and this server approves no
 /// preflight. A client that is not a browser can set any header, but it has
@@ -881,7 +883,7 @@ mod tests {
 
     fn real_app() -> Router {
         let state =
-            AppState::new("postgresql://127.0.0.1:1/unavailable", "UTC").expect("lazy pool");
+            AppState::new(std::path::Path::new("/nonexistent/counterpoise.db")).expect("lazy pool");
         protect(routes().with_state(state), no_pages(), false)
     }
 

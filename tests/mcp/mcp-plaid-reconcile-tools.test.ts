@@ -1,7 +1,4 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
-import { eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { transactions } from "@/db/schema";
 import {
   setupTestDatabase,
   resetTestDatabase,
@@ -13,6 +10,8 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
+import { rows } from "@/tests/helpers/sql";
+import type { Transaction } from "@/types/db";
 
 // The client sends a real key of user 1, who owns book 1.
 let mcp: McpTestClient;
@@ -220,9 +219,7 @@ describe("MCP Plaid reconcile tools", () => {
     expect(isError).toBe(false);
     expect(data.resolutionStatus).toBe("matched");
 
-    const stored = await getDb().query.transactions.findFirst({
-      where: eq(transactions.id, txn.id),
-    });
+    const [stored] = await rows<Transaction>("SELECT * FROM transactions WHERE id = $1", [txn.id]);
     expect(stored?.isReconciled).toBe(true);
   });
 

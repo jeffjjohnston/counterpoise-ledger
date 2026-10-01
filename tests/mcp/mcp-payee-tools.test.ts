@@ -8,9 +8,8 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { getDb } from "@/db";
-import { payees } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { count, rows } from "@/tests/helpers/sql";
+import type { Payee } from "@/types/db";
 
 let mcp: McpTestClient;
 
@@ -197,13 +196,12 @@ describe("MCP Payee Tools", () => {
         expect(content.text).toMatch(/^MCP error -32602: Input validation error: .*Name is required/s);
       }
 
-      const rows = await getDb().select().from(payees).where(eq(payees.bookId, bookId));
-      expect(rows).toHaveLength(0);
+      expect(await count("payees", "book_id = $1", [bookId])).toBe(0);
     });
 
     it("refuses an exact repeat rather than silently returning the existing row", async () => {
-      // payees has a unique index on (name, bookId) — db/schema.ts's
-      // payees_name_book_unique — so the tool literally cannot insert two
+      // payees has a unique index on (name, book_id) — the baseline
+      // migration's payees_name_book_unique — so the tool literally cannot insert two
       // rows for the identical name in one book; "always inserts a new
       // row" can't hold for THIS case the way it does for a case variant.
       // What must hold instead: the second call fails loudly rather than
@@ -217,8 +215,8 @@ describe("MCP Payee Tools", () => {
       expect(second.isError).toBe(true);
       expect(second.data.error).toMatch(/already exists/i);
 
-      const rows = await getDb().select().from(payees).where(eq(payees.bookId, bookId));
-      expect(rows.filter((p) => p.name === "Repeat Co")).toHaveLength(1);
+      const stored = await rows<Payee>("SELECT * FROM payees WHERE book_id = $1", [bookId]);
+      expect(stored.filter((p) => p.name === "Repeat Co")).toHaveLength(1);
     });
   });
 
@@ -244,8 +242,7 @@ describe("MCP Payee Tools", () => {
       expect(data.error).toMatch(/associated transactions/i);
 
       // The refused delete must not have partially applied.
-      const rows = await getDb().select().from(payees).where(eq(payees.id, payee.id));
-      expect(rows).toHaveLength(1);
+      expect(await count("payees", "id = $1", [payee.id])).toBe(1);
     });
 
     it("deletes an unused payee", async () => {
@@ -256,8 +253,7 @@ describe("MCP Payee Tools", () => {
       expect(isError).toBe(false);
       expect(data.success).toBe(true);
 
-      const rows = await getDb().select().from(payees).where(eq(payees.id, payee.id));
-      expect(rows).toHaveLength(0);
+      expect(await count("payees", "id = $1", [payee.id])).toBe(0);
     });
 
     it("returns an error for an unknown payee", async () => {

@@ -14,7 +14,7 @@ import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
-import type { Security } from "@/db/schema";
+import type { Security } from "@/types/db";
 
 const securityTypeLabels: Record<Security["securityType"], string> = {
   stock: "Stock",

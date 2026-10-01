@@ -1,121 +1,57 @@
-import postgres from "postgres";
-import { afterAll } from "vitest";
-import { ensureTestDatabase, leaseTestDatabase, workerDatabaseName, workerDatabaseUrl } from "./database-safety";
-import { sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/postgres-js";
-import { migrate } from "drizzle-orm/postgres-js/migrator";
-import { getDb, getSqlClient_raw } from "../../db";
-import {
-  accounts,
-  bookMembers,
-  transactions,
-  transactionSplits,
-  recurringRules,
-  recurringTemplateSplits,
-  securities,
-  investmentLots,
-  investmentSplits,
-  securityPrices,
-  payees,
-  plaidTokens,
-  plaidAccounts,
-  plaidTransactionReconciliation,
-  users,
-  books,
-} from "../../db/schema";
-import type { Account } from "../../db/schema";
-import { MIGRATIONS_FOLDER } from "../../db/create-book";
+import { createDatabase, workerDatabasePath } from "./test-database";
+import { insert, insertRows, script } from "./sql";
+import type {
+  AccountSubtype, AccountType, Account, Book, InvestmentLot, InvestmentSplit, Payee, PlaidAccount,
+  PlaidToken, PlaidTransactionReconciliation, RecurringRule, Security, SecurityPrice, Transaction, User,
+} from "../../types/db";
 
-const db = getDb();
+let didSetup = false;
 
-export { db };
+// The baseline rows: user 1 owns book 1. A trigger makes user 1 the owner.
+const BASELINE = `
+  INSERT INTO users (id, username, password_hash, created_at)
+  VALUES (1, 'testuser', 'unused', strftime('%Y-%m-%d %H:%M:%f', 'now'));
+  INSERT INTO books (id, user_id, name, created_at, updated_at)
+  VALUES (1, 1, 'Test Book', strftime('%Y-%m-%d %H:%M:%f', 'now'),
+          strftime('%Y-%m-%d %H:%M:%f', 'now'));
+`;
 
-let didMigrate = false;
-let releaseLease: (() => Promise<void>) | undefined;
-afterAll(async () => {
-  await releaseLease?.();
-  releaseLease = undefined;
-  didMigrate = false;
-});
-
-function createQuietSql(url: string) {
-  return postgres(url, {
-    onnotice: () => {},
-  });
-}
-
-async function resetMetaSequences() {
-  await db.execute(
-    sql`SELECT setval(pg_get_serial_sequence('users', 'id'), 1, true),
-               setval(pg_get_serial_sequence('books', 'id'), 1, true)`
-  );
-}
-
+/**
+ * Creates this worker's database from the migrations (`ledger-cli migrate`)
+ * with the baseline rows. Once per test file.
+ */
 export const setupTestDatabase = async () => {
-  if (didMigrate) return;
-
-  const url = workerDatabaseUrl();
-  const name = workerDatabaseName();
-  // This run's database does not exist until the first suite in this worker
-  // asks for it. Creating it costs about 25ms; the migrate below costs about
-  // 250ms and already ran per file under the old scheme, so nothing here is
-  // new work beyond the CREATE.
-  await ensureTestDatabase(url, name);
-  releaseLease ??= await leaseTestDatabase(url, name);
-
-  // Drop and recreate schema for clean slate (including drizzle migration metadata)
-  const setupSql = createQuietSql(process.env.DATABASE_URL!);
-  await setupSql`DROP SCHEMA IF EXISTS drizzle CASCADE`;
-  await setupSql`DROP SCHEMA IF EXISTS public CASCADE`;
-  await setupSql`CREATE SCHEMA public`;
-  await setupSql.end();
-
-  // Run migrations using a fresh connection
-  const migrationSql = createQuietSql(process.env.DATABASE_URL!);
-  await migrate(drizzle(migrationSql), { migrationsFolder: MIGRATIONS_FOLDER });
-  await migrationSql.end();
-
-  // Insert test user and book so foreign key constraints are satisfied
-  await db.insert(users).values({ id: 1, username: "testuser", passwordHash: "unused" });
-  await db.insert(books).values({ id: 1, userId: 1, name: "Test Book" });
-  await resetMetaSequences();
-
-  didMigrate = true;
+  if (didSetup) return;
+  createDatabase(workerDatabasePath());
+  await script(BASELINE);
+  didSetup = true;
 };
 
+/**
+ * Clears every row and restarts every ID sequence, then writes the baseline
+ * rows again. Every application table depends on users through books or a
+ * direct foreign key, so the cascade clears them without a table order.
+ */
 export const resetTestDatabase = async () => {
-  workerDatabaseUrl();
-  if (!releaseLease) throw new Error("Call setupTestDatabase before resetting test data");
-  // Every application table depends on users through books or a direct FK, so
-  // cascading deletes clear them without a hand-kept table order. Reset all
-  // public sequences, then advance the two explicit baseline ids. This entire
-  // reset and reseed uses one simple-protocol round trip.
-  await getSqlClient_raw()`
+  if (!didSetup) throw new Error("Call setupTestDatabase before resetting test data");
+  await script(`
     DELETE FROM users;
-    SELECT setval(format('%I.%I', schemaname, sequencename)::regclass, 1, false)
-    FROM pg_sequences WHERE schemaname = 'public';
-    INSERT INTO users (id, username, password_hash, created_at)
-    VALUES (1, 'testuser', 'unused', NOW());
-    INSERT INTO books (id, user_id, name, created_at, updated_at)
-    VALUES (1, 1, 'Test Book', NOW(), NOW());
-    SELECT setval(pg_get_serial_sequence('users', 'id'), 1, true),
-           setval(pg_get_serial_sequence('books', 'id'), 1, true);
-  `.simple();
+    DELETE FROM sqlite_sequence;
+    ${BASELINE}
+  `);
 };
 
 export const createAccount = async (data: {
   name: string;
-  type: Account["type"];
-  subtype?: Account["subtype"];
+  type: AccountType;
+  subtype?: AccountSubtype | null;
   parentId?: number | null;
   isActive?: boolean;
   isFavorite?: boolean;
   isInvestmentCash?: boolean;
   bookId?: number;
 }) => {
-  const [account] = await db
-    .insert(accounts)
-    .values({
+  const account = await insert<Account>("accounts", {
       bookId: data.bookId ?? 1,
       name: data.name,
       type: data.type,
@@ -124,20 +60,16 @@ export const createAccount = async (data: {
       isActive: data.isActive ?? true,
       isFavorite: data.isFavorite ?? false,
       isInvestmentCash: data.isInvestmentCash ?? false,
-    })
-    .returning();
+    });
 
   return account;
 };
 
 export const createUser = async (data: { username: string; passwordHash?: string }) => {
-  const [user] = await db
-    .insert(users)
-    .values({
+  const user = await insert<User>("users", {
       username: data.username,
       passwordHash: data.passwordHash ?? "test-hash-not-a-real-credential",
-    })
-    .returning();
+    });
 
   return user;
 };
@@ -146,13 +78,10 @@ export const createBook = async (data: {
   name: string;
   userId?: number;
 }) => {
-  const [book] = await db
-    .insert(books)
-    .values({
+  const book = await insert<Book>("books", {
       userId: data.userId ?? 1,
       name: data.name,
-    })
-    .returning();
+    });
 
   return book;
 };
@@ -162,7 +91,7 @@ export const addBookMember = async (data: {
   userId: number;
   role: "owner" | "editor" | "viewer";
 }) => {
-  await db.insert(bookMembers).values(data);
+  await insert("book_members", data);
 };
 
 export const createTransactionWithSplits = async (data: {
@@ -178,9 +107,7 @@ export const createTransactionWithSplits = async (data: {
   splits: Array<{ accountId: number; amount: number }>;
 }) => {
   const bookId = data.bookId ?? 1;
-  const [transaction] = await db
-    .insert(transactions)
-    .values({
+  const transaction = await insert<Transaction>("transactions", {
       bookId,
       date: data.date,
       description: data.description ?? null,
@@ -190,11 +117,9 @@ export const createTransactionWithSplits = async (data: {
       isFloating: data.isFloating ?? false,
       isReconciled: data.isReconciled ?? false,
       recurringRuleId: data.recurringRuleId ?? null,
-    })
-    .returning();
+    });
 
-  await db.insert(transactionSplits)
-    .values(
+  await insertRows("transaction_splits", 
       data.splits.map((split) => ({
         bookId,
         transactionId: transaction.id,
@@ -225,9 +150,7 @@ export const createRecurringRule = async (data: {
   templateSplits: Array<{ accountId: number; amount: number }>;
 }) => {
   const bookId = data.bookId ?? 1;
-  const [rule] = await db
-    .insert(recurringRules)
-    .values({
+  const rule = await insert<RecurringRule>("recurring_rules", {
       bookId,
       name: data.name,
       frequency: data.frequency,
@@ -249,10 +172,9 @@ export const createRecurringRule = async (data: {
       templateDescription: data.templateDescription ?? null,
       payeeId: data.payeeId ?? null,
       isActive: data.isActive ?? true,
-    })
-    .returning();
+    });
 
-  await db.insert(recurringTemplateSplits).values(
+  await insertRows("recurring_template_splits", 
     data.templateSplits.map((split) => ({
       bookId,
       recurringRuleId: rule.id,
@@ -265,13 +187,10 @@ export const createRecurringRule = async (data: {
 };
 
 export const createPayee = async (data: { name: string; bookId?: number }) => {
-  const [payee] = await db
-    .insert(payees)
-    .values({
+  const payee = await insert<Payee>("payees", {
       bookId: data.bookId ?? 1,
       name: data.name,
-    })
-    .returning();
+    });
 
   return payee;
 };
@@ -284,9 +203,7 @@ export const createSecurity = async (data: {
   fixedPriceMicros?: number | null;
   bookId?: number;
 }) => {
-  const [security] = await db
-    .insert(securities)
-    .values({
+  const security = await insert<Security>("securities", {
       bookId: data.bookId ?? 1,
       name: data.name,
       symbol: data.symbol,
@@ -295,8 +212,7 @@ export const createSecurity = async (data: {
       ...(data.fixedPriceMicros !== undefined
         ? { fixedPriceMicros: data.fixedPriceMicros }
         : {}),
-    })
-    .returning();
+    });
 
   return security;
 };
@@ -314,9 +230,7 @@ export const createInvestmentLot = async (data: {
   closedTransactionId?: number | null;
   bookId?: number;
 }) => {
-  const [lot] = await db
-    .insert(investmentLots)
-    .values({
+  const lot = await insert<InvestmentLot>("investment_lots", {
       bookId: data.bookId ?? 1,
       accountId: data.accountId,
       securityId: data.securityId,
@@ -328,8 +242,7 @@ export const createInvestmentLot = async (data: {
       openedSplitId: data.openedSplitId ?? null,
       openedTransactionId: data.openedTransactionId ?? null,
       closedTransactionId: data.closedTransactionId ?? null,
-    })
-    .returning();
+    });
 
   return lot;
 };
@@ -346,9 +259,7 @@ export const createInvestmentSplit = async (data: {
   splitDenominator?: number | null;
   bookId?: number;
 }) => {
-  const [split] = await db
-    .insert(investmentSplits)
-    .values({
+  const split = await insert<InvestmentSplit>("investment_splits", {
       bookId: data.bookId ?? 1,
       transactionId: data.transactionId,
       accountId: data.accountId ?? null,
@@ -359,8 +270,7 @@ export const createInvestmentSplit = async (data: {
       feesCents: data.feesCents ?? 0,
       splitNumerator: data.splitNumerator ?? null,
       splitDenominator: data.splitDenominator ?? null,
-    })
-    .returning();
+    });
 
   return split;
 };
@@ -372,16 +282,13 @@ export const createSecurityPrice = async (data: {
   source?: string | null;
   bookId?: number;
 }) => {
-  const [price] = await db
-    .insert(securityPrices)
-    .values({
+  const price = await insert<SecurityPrice>("security_prices", {
       bookId: data.bookId ?? 1,
       securityId: data.securityId,
       priceDate: data.priceDate,
       priceMicros: data.priceMicros,
       source: data.source ?? null,
-    })
-    .returning();
+    });
 
   return price;
 };
@@ -395,9 +302,7 @@ export const createPlaidToken = async (data: {
   bookId?: number;
   isDemo?: boolean;
 }) => {
-  const [token] = await db
-    .insert(plaidTokens)
-    .values({
+  const token = await insert<PlaidToken>("plaid_tokens", {
       bookId: data.bookId ?? 1,
       financialInstitution: data.financialInstitution,
       itemId: data.itemId,
@@ -405,8 +310,7 @@ export const createPlaidToken = async (data: {
       syncCursor: data.syncCursor ?? null,
       lastSyncedAt: data.lastSyncedAt ?? null,
       isDemo: data.isDemo ?? false,
-    })
-    .returning();
+    });
 
   return token;
 };
@@ -422,9 +326,7 @@ export const createPlaidAccount = async (data: {
   counterpoiseAccountId?: number | null;
   bookId?: number;
 }) => {
-  const [record] = await db
-    .insert(plaidAccounts)
-    .values({
+  const record = await insert<PlaidAccount>("plaid_accounts", {
       bookId: data.bookId ?? 1,
       tokenId: data.tokenId,
       plaidAccountId: data.plaidAccountId,
@@ -434,8 +336,7 @@ export const createPlaidAccount = async (data: {
       type: data.type,
       subtype: data.subtype ?? null,
       counterpoiseAccountId: data.counterpoiseAccountId ?? null,
-    })
-    .returning();
+    });
 
   return record;
 };
@@ -455,9 +356,7 @@ export const createPlaidReconciliation = async (data: {
   matchedTransactionId?: number | null;
   bookId?: number;
 }) => {
-  const [record] = await db
-    .insert(plaidTransactionReconciliation)
-    .values({
+  const record = await insert<PlaidTransactionReconciliation>("plaid_transaction_reconciliation", {
       bookId: data.bookId ?? 1,
       plaidAccountLinkId: data.plaidAccountLinkId,
       plaidTransactionId: data.plaidTransactionId,
@@ -478,8 +377,7 @@ export const createPlaidReconciliation = async (data: {
       reviewReason: data.reviewReason ?? null,
       reviewMetadataJson: null,
       matchedTransactionId: data.matchedTransactionId ?? null,
-    })
-    .returning();
+    });
 
   return record;
 };

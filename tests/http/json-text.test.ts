@@ -1,7 +1,6 @@
-import { asc } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { payees } from "../../db/schema";
-import { db, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { rows } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 /**
@@ -52,7 +51,7 @@ describe("JSON request bodies as UTF-8 text", () => {
     expect(replaced.status).toBe(200);
     expect(replaced.body).toMatchObject({ name: "A\uFFFDB\uFFFDC\uFFFD" });
 
-    expect((await db.select({ name: payees.name }).from(payees).orderBy(asc(payees.id))).map((row) => row.name))
+    expect((await rows<{ name: string }>("SELECT name FROM payees ORDER BY id")).map((row) => row.name))
       .toEqual(["Cafe", "Deli", "A\uFFFDB\uFFFDC\uFFFD"]);
   });
 
@@ -63,6 +62,6 @@ describe("JSON request bodies as UTF-8 text", () => {
     ]) {
       expect(await createPayee(body)).toEqual({ status: 500, body: { error: "Failed to create payee" } });
     }
-    expect(await db.select().from(payees)).toEqual([]);
+    expect(await rows("SELECT * FROM payees")).toEqual([]);
   });
 });

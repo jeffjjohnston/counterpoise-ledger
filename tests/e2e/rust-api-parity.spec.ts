@@ -1,9 +1,8 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import postgres from "postgres";
 import { emptyBookTest as test, expect } from "./fixtures";
-import { e2eDatabaseUrl } from "./database";
 import { hashApiKey } from "../helpers/api-keys";
+import { exec, insert, insertRows, scalar } from "../helpers/sql";
 import { API_CONTRACT } from "../../lib/api-contract";
 
 const packageVersion = (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string }).version;
@@ -30,16 +29,11 @@ test("version and account list preserve the HTTP contract", async ({ request, bo
   const rootId = (await root.json()).id as number;
   const expenseId = (await expense.json()).id as number;
 
-  const sql = postgres(e2eDatabaseUrl());
-  try {
-    const now = new Date();
-    const [transaction] = await sql`INSERT INTO transactions (book_id, date, created_at, updated_at)
-      VALUES (${bookId}, '2025-01-10', ${now}, ${now}) RETURNING id`;
-    await sql`INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount)
-      VALUES (${bookId}, ${transaction.id}, ${rootId}, -1250), (${bookId}, ${transaction.id}, ${expenseId}, 1250)`;
-  } finally {
-    await sql.end();
-  }
+  const transaction = await insert<{ id: number }>("transactions", { bookId, date: "2025-01-10" });
+  await insertRows("transaction_splits", [
+    { bookId, transactionId: transaction.id, accountId: rootId, amount: -1250 },
+    { bookId, transactionId: transaction.id, accountId: expenseId, amount: 1250 },
+  ]);
 
   const list = await request.get(`/api/b/${bookId}/accounts?type=asset&asOfDate=2025-12-31`);
   expect(list.status()).toBe(200);
@@ -107,13 +101,7 @@ test("version and account list preserve the HTTP contract", async ({ request, bo
   const protectedRow = await protectedFields.json() as { id: number; bookId: number; name: string };
   expect(protectedRow).toMatchObject({ bookId, name: "Protected" });
   expect(protectedRow.id).not.toBe(999999999);
-  const verificationSql = postgres(e2eDatabaseUrl());
-  try {
-    const [stored] = await verificationSql`SELECT book_id FROM accounts WHERE id = ${protectedRow.id}`;
-    expect(stored.book_id).toBe(bookId);
-  } finally {
-    await verificationSql.end();
-  }
+  expect(await scalar("SELECT book_id FROM accounts WHERE id = $1", [protectedRow.id])).toBe(bookId);
   const missing = await request.get("/api/b/999999/accounts");
   expect(missing.status()).toBe(404);
   expect(await missing.json()).toEqual({ error: "Book not found" });
@@ -127,7 +115,6 @@ test("version and account list preserve the HTTP contract", async ({ request, bo
 });
 
 test("cookie sessions and API keys honor book membership", async ({ request, bookId }) => {
-  const sql = postgres(e2eDatabaseUrl());
   const username = `viewer-${randomUUID()}`;
   const key = `cpk_${randomBytes(24).toString("hex")}`;
   let otherKey = `cpk_${randomBytes(24).toString("hex")}`;
@@ -136,16 +123,15 @@ test("cookie sessions and API keys honor book membership", async ({ request, boo
   }
   let viewerId: number | undefined;
   try {
-    const now = new Date();
-    const [viewer] = await sql`INSERT INTO users (username, password_hash, created_at)
-      VALUES (${username}, 'unused', ${now}) RETURNING id`;
-    viewerId = viewer.id as number;
-    await sql`INSERT INTO book_members (book_id, user_id, role, created_at)
-      VALUES (${bookId}, ${viewerId}, 'viewer', ${now})`;
-    await sql`INSERT INTO api_keys (user_id, name, key_hash, key_prefix, created_at)
-      VALUES (${viewerId}, 'rust-spike', ${await hashApiKey(key)}, ${key.slice(0, 8)}, ${now})`;
-    await sql`INSERT INTO api_keys (user_id, name, key_hash, key_prefix, created_at)
-      VALUES (${viewerId}, 'rust-spike-other', ${await hashApiKey(otherKey)}, ${otherKey.slice(0, 8)}, ${now})`;
+    const viewer = await insert<{ id: number }>("users", { username, passwordHash: "unused" });
+    viewerId = viewer.id;
+    await insert("book_members", { bookId, userId: viewerId, role: "viewer" });
+    await insert("api_keys", {
+      userId: viewerId, name: "rust-spike", keyHash: await hashApiKey(key), keyPrefix: key.slice(0, 8),
+    });
+    await insert("api_keys", {
+      userId: viewerId, name: "rust-spike-other", keyHash: await hashApiKey(otherKey), keyPrefix: otherKey.slice(0, 8),
+    });
 
     const own = await request.get(`/api/b/${bookId}/accounts`);
     expect(own.status()).toBe(200);
@@ -207,8 +193,7 @@ test("cookie sessions and API keys honor book membership", async ({ request, boo
     expect(otherPrefix.status).toBe(200);
     expect(await otherPrefix.json()).toEqual([]);
   } finally {
-    if (viewerId !== undefined) await sql`DELETE FROM users WHERE id = ${viewerId}`;
-    await sql.end();
+    if (viewerId !== undefined) await exec("DELETE FROM users WHERE id = $1", [viewerId]);
   }
 });
 

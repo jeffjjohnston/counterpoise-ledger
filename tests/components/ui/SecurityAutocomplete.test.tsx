@@ -99,4 +99,69 @@ describe("SecurityAutocomplete", () => {
     );
     expect(screen.getByText("Security")).toBeInTheDocument();
   });
+
+  // Issue report 40: the securities that the account holds come first.
+  describe("with held securities", () => {
+    const held = { label: "Held in Brokerage", ids: new Set([3, 2]) };
+
+    /** The options in display order, by symbol. */
+    const optionSymbols = () =>
+      screen
+        .getAllByRole("button")
+        .map((button) => button.querySelector(".font-medium")?.textContent)
+        .filter(Boolean);
+
+    it("lists the held securities first, under their own heading", () => {
+      render(
+        <SecurityAutocomplete securities={securities} value={null} onChange={vi.fn()} held={held} />
+      );
+      fireEvent.focus(screen.getByRole("textbox"));
+
+      // Held, by symbol; then the rest by type. A held security shows once.
+      expect(optionSymbols()).toEqual(["BND", "VXUS", "VTI"]);
+      const headings = screen
+        .getAllByText(/^(Held in Brokerage|ETF|Mutual Fund)$/)
+        .map((heading) => heading.textContent);
+      expect(headings).toEqual(["Held in Brokerage", "ETF"]);
+    });
+
+    it("highlights a held security first, so Enter selects it", () => {
+      const onChange = vi.fn();
+      render(
+        <SecurityAutocomplete securities={securities} value={null} onChange={onChange} held={held} />
+      );
+      const input = screen.getByRole("textbox");
+      fireEvent.focus(input);
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      expect(onChange).toHaveBeenCalledWith(3);
+    });
+
+    it("filters the held group with the search", () => {
+      render(
+        <SecurityAutocomplete securities={securities} value={null} onChange={vi.fn()} held={held} />
+      );
+      const input = screen.getByRole("textbox");
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "stock" } });
+
+      expect(optionSymbols()).toEqual(["VXUS", "VTI"]);
+      expect(screen.getByText("Held in Brokerage")).toBeInTheDocument();
+    });
+
+    it("shows no held heading when the account holds none of the matches", () => {
+      render(
+        <SecurityAutocomplete
+          securities={securities}
+          value={null}
+          onChange={vi.fn()}
+          held={{ label: "Held in Brokerage", ids: new Set() }}
+        />
+      );
+      fireEvent.focus(screen.getByRole("textbox"));
+
+      expect(screen.queryByText("Held in Brokerage")).not.toBeInTheDocument();
+      expect(optionSymbols()).toEqual(["VTI", "VXUS", "BND"]);
+    });
+  });
 });

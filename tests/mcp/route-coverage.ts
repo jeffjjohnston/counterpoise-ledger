@@ -87,6 +87,7 @@ export const ROUTE_TOOLS: Record<string, string[]> = {
 };
 
 export const ROUTE_WAIVERS: Record<string, string> = {
+  "GET /books/demo/datasets": "The create_demo_book schema lists the same dataset IDs, and a Rust test keeps them equal. The names and descriptions are for the books page.",
   "GET /b/[bookId]/events": "Browser-only SSE invalidation transport authenticated by session cookie. MCP writes already trigger the same database notifications; stdio tools return finite results and do not subscribe to browser view invalidations.",
   "GET /b/[bookId]/settings/typesafe": "Web experiment controls; MCP does not participate in this opt-in UI pilot.",
   "PATCH /b/[bookId]/settings/typesafe": "Explicit human opt-in to external transaction processing; not delegated to MCP.",

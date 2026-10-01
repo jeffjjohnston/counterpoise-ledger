@@ -1,15 +1,14 @@
-import { asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-  books, payees, plaidTransactionReconciliation, transactions, transactionSplits, typesafeDecisions,
-  typesafeEvaluations,
-} from "../../db/schema";
+import type {
+  PlaidTransactionReconciliation, Transaction, TransactionSplit, TypeSafeDecision, TypeSafeEvaluation,
+} from "../../types/db";
 import {
   addBookMember, createAccount, createBook, createInvestmentSplit, createPayee, createPlaidAccount,
-  createPlaidReconciliation, createPlaidToken, createSecurity, createTransactionWithSplits, createUser, db,
+  createPlaidReconciliation, createPlaidToken, createSecurity, createTransactionWithSplits, createUser,
   resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { count, exec, insert, row, rows, scalar, script } from "../helpers/sql";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 
@@ -63,13 +62,14 @@ async function fixture() {
   });
 
   const stage = async (linkId: number, plaidTransactionId: string, fields: Partial<Parameters<typeof createPlaidReconciliation>[0]>, seen: string) => {
-    const row = await createPlaidReconciliation({
+    const staged = await createPlaidReconciliation({
       plaidAccountLinkId: linkId, plaidTransactionId, date: "2025-03-10", amountCents: 100, name: plaidTransactionId, ...fields,
     });
-    await db.update(plaidTransactionReconciliation)
-      .set({ firstSeenAt: new Date("2025-03-01T00:00:00.000Z"), lastSeenAt: new Date(seen), rawJson: "{}" })
-      .where(eq(plaidTransactionReconciliation.id, row.id));
-    return row;
+    await exec(
+      "UPDATE plaid_transaction_reconciliation SET first_seen_at = $1, last_seen_at = $2, raw_json = $3 WHERE id = $4",
+      [new Date("2025-03-01T00:00:00.000Z"), new Date(seen), "{}", staged.id],
+    );
+    return staged;
   };
   const coffeeRow = await stage(checkingLink.id, "coffee", { amountCents: 450, name: "SQ *BLUE BOTTLE", merchantName: "Blue Bottle", authorizedDate: "2025-03-09" }, "2025-03-10T10:00:00.000Z");
   const rentRow = await stage(checkingLink.id, "rent", { amountCents: 150500, name: "LANDLORD LLC", merchantName: "Landlord", date: "2025-03-02" }, "2025-03-11T10:00:00.000Z");
@@ -186,7 +186,7 @@ describe("Plaid reconciliation HTTP parity", () => {
     const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
     const item = await ok(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: f.coffeeSameDay.id }));
     expect(item).toMatchSnapshot("matched item");
-    const [local] = await db.select().from(transactions).where(eq(transactions.id, f.coffeeSameDay.id));
+    const local = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [f.coffeeSameDay.id]);
     expect(local).toMatchObject({ isReconciled: true, date: "2025-03-09", updatedBy: 1 });
     await expectError(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: f.coffeeLater.id }), 400, `This bank transaction is already linked to transaction #${f.coffeeSameDay.id} — unlink it first`);
     await expectError(client, path, json("POST", { reconciliationId: f.rentRow.id, action: "match", transactionId: f.coffeeSameDay.id }), 400, "This transaction is already linked to a different Plaid transaction for the same account");
@@ -201,7 +201,7 @@ describe("Plaid reconciliation HTTP parity", () => {
     const f = await fixture();
     const floating = await createTransactionWithSplits({ date: "2025-01-15", isFloating: true, splits: [{ accountId: f.checking.id, amount: -2500 }, { accountId: f.food.id, amount: 2500 }] });
     await ok(client, `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`, json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: floating.id }));
-    const [local] = await db.select().from(transactions).where(eq(transactions.id, floating.id));
+    const local = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [floating.id]);
     expect(local).toMatchObject({ isReconciled: true, isFloating: false, date: "2025-03-09" });
   });
 
@@ -222,8 +222,29 @@ describe("Plaid reconciliation HTTP parity", () => {
     await expectError(client, path, body(offAccount.id), 400, "Selected transaction does not include the linked account");
 
     expect(await ok(client, path, body(f.rentPaid.id))).toMatchSnapshot("amount updated item");
-    const splits = await db.select().from(transactionSplits).where(eq(transactionSplits.transactionId, f.rentPaid.id)).orderBy(asc(transactionSplits.id));
+    const splits = await rows<TransactionSplit>("SELECT * FROM transaction_splits WHERE transaction_id = $1 ORDER BY id", [f.rentPaid.id]);
     expect(splits.map((split) => [split.accountId, split.amount])).toEqual([[f.checking.id, -150500], [f.rent.id, 150500]]);
+  });
+
+  it("refuses a bank amount whose negation does not fit a split, before any write", async () => {
+    const f = await fixture();
+    const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+    const error = "The bank amount is out of range for a transaction split";
+    // -2147483648 fits a 32-bit integer; its negation does not. SQLite would
+    // store it, and every later read of the split would fail.
+    await exec("UPDATE plaid_transaction_reconciliation SET amount_cents = $1 WHERE id IN ($2, $3)", [-2147483648, f.coffeeRow.id, f.rentRow.id]);
+    const transactions = await count("transactions");
+    const splitsBefore = await rows<TransactionSplit>("SELECT * FROM transaction_splits ORDER BY id");
+
+    await expectError(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "create", counterAccountId: f.food.id }), 400, error);
+    await expectError(client, path, json("POST", { reconciliationId: f.rentRow.id, action: "match_update_amount", transactionId: f.rentPaid.id }), 400, error);
+
+    expect(await count("transactions")).toBe(transactions);
+    expect(await rows<TransactionSplit>("SELECT * FROM transaction_splits ORDER BY id")).toEqual(splitsBefore);
+    const staged = await rows<PlaidTransactionReconciliation>("SELECT * FROM plaid_transaction_reconciliation WHERE id IN ($1, $2) ORDER BY id", [f.coffeeRow.id, f.rentRow.id]);
+    expect(staged.map((item) => [item.resolutionStatus, item.matchedTransactionId])).toEqual([["pending", null], ["pending", null]]);
+    // The register of the account still reads.
+    await ok(client, `/api/b/1/transactions?accountId=${f.checking.id}`);
   });
 
   it("creates a transaction with a resolved or new payee", async () => {
@@ -234,30 +255,46 @@ describe("Plaid reconciliation HTTP parity", () => {
 
     const created = await ok(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "create", counterAccountId: f.food.id, payeeName: "  blue   BOTTLE " }));
     expect(created).toMatchSnapshot("created item");
-    const [local] = await db.select().from(transactions).where(eq(transactions.id, created.matchedTransactionId));
+    const local = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [created.matchedTransactionId]);
     expect(local).toMatchObject({ date: "2025-03-09", description: "SQ *BLUE BOTTLE", payeeId: f.coffee.id, isReconciled: true, isFloating: false, createdBy: 1, updatedBy: 1 });
-    const splits = await db.select().from(transactionSplits).where(eq(transactionSplits.transactionId, local.id)).orderBy(asc(transactionSplits.id));
+    const splits = await rows<TransactionSplit>("SELECT * FROM transaction_splits WHERE transaction_id = $1 ORDER BY id", [local.id]);
     expect(splits.map((split) => [split.accountId, split.amount])).toEqual([[f.checking.id, -450], [f.food.id, 450]]);
 
     // A payee name that is not a string falls back to the bank's name.
     const refund = await ok(client, `/api/b/1/sync/accounts/${f.cardLink.id}/reconcile`, json("POST", { reconciliationId: f.cardRow.id, action: "create", counterAccountId: f.food.id, payeeName: 5 }));
-    const [refundTxn] = await db.select().from(transactions).where(eq(transactions.id, refund.matchedTransactionId));
-    const [newPayee] = await db.select().from(payees).where(eq(payees.id, refundTxn.payeeId!));
-    expect([refundTxn.date, newPayee.name]).toEqual(["2025-03-08", "REFUND"]);
+    const refundTxn = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [refund.matchedTransactionId]);
+    const newPayee = await scalar("SELECT name FROM payees WHERE id = $1", [refundTxn.payeeId]);
+    expect([refundTxn.date, newPayee]).toEqual(["2025-03-08", "REFUND"]);
   });
 
-  it("rolls back a create when the new payee collides with a name that lowercases differently", async () => {
+  it("rolls back a create when a write after the new transaction fails", async () => {
     const f = await fixture();
-    // JavaScript lowercases the final sigma as ς and PostgreSQL as σ, so the
-    // case-insensitive match misses the payee and the insert hits the unique index.
-    await createPayee({ name: "ΟΔΟΣ" });
-    await db.update(plaidTransactionReconciliation).set({ merchantName: "ΟΔΟΣ" }).where(eq(plaidTransactionReconciliation.id, f.coffeeRow.id));
-    const before = await db.select().from(transactions);
-    const response = await client.request(`/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`, json("POST", { reconciliationId: f.coffeeRow.id, action: "create", counterAccountId: f.food.id }));
-    expect(response.status).toBe(500);
-    expect(await db.select().from(transactions)).toHaveLength(before.length);
-    const [row] = await db.select().from(plaidTransactionReconciliation).where(eq(plaidTransactionReconciliation.id, f.coffeeRow.id));
-    expect(row).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
+    // The resolution update comes after the transaction insert. Make it fail.
+    await script(`CREATE TRIGGER fail_resolution BEFORE UPDATE ON plaid_transaction_reconciliation
+      WHEN NEW.resolution_status = 'created' BEGIN SELECT RAISE(ABORT, 'resolution refused'); END;`);
+    try {
+      const before = await count("transactions");
+      const response = await client.request(`/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`, json("POST", { reconciliationId: f.coffeeRow.id, action: "create", counterAccountId: f.food.id }));
+      expect(response.status).toBe(500);
+      expect(await count("transactions")).toBe(before);
+      const stored = await row<PlaidTransactionReconciliation>("SELECT * FROM plaid_transaction_reconciliation WHERE id = $1", [f.coffeeRow.id]);
+      expect(stored).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
+    } finally {
+      await script("DROP TRIGGER fail_resolution");
+    }
+  });
+
+  it("reuses a payee whose name differs only in a final sigma", async () => {
+    const f = await fixture();
+    // PostgreSQL lowercased the final sigma as σ and JavaScript as ς, so the
+    // lookup missed the payee and the insert hit the unique index. SQL lower()
+    // is now the Rust lowercase, so the lookup finds it.
+    const payee = await createPayee({ name: "ΟΔΟΣ" });
+    await exec("UPDATE plaid_transaction_reconciliation SET merchant_name = $1 WHERE id = $2", ["ΟΔΟΣ", f.coffeeRow.id]);
+    const created = await ok(client, `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`, json("POST", { reconciliationId: f.coffeeRow.id, action: "create", counterAccountId: f.food.id }));
+    const transaction = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [created.matchedTransactionId]);
+    expect(transaction.payeeId).toBe(payee.id);
+    expect(await count("payees", "name = $1", ["ΟΔΟΣ"])).toBe(1);
   });
 
   it("ignores a row, keeps the local side of a review, and unlinks", async () => {
@@ -270,9 +307,9 @@ describe("Plaid reconciliation HTTP parity", () => {
     // A transfer matched on both links stays reconciled until both unlink.
     const savingsLink = await createPlaidAccount({ tokenId: f.token.id, plaidAccountId: "pa-savings", name: "S", type: "depository", counterpoiseAccountId: f.savings.id });
     const incoming = await createPlaidReconciliation({ plaidAccountLinkId: savingsLink.id, plaidTransactionId: "in", date: "2025-03-10", amountCents: -5000, name: "in", resolutionStatus: "matched", matchedTransactionId: f.transfer.id });
-    await db.update(plaidTransactionReconciliation).set({ resolutionStatus: "pending" }).where(eq(plaidTransactionReconciliation.id, f.transferRow.id));
+    await exec("UPDATE plaid_transaction_reconciliation SET resolution_status = $1 WHERE id = $2", ["pending", f.transferRow.id]);
     await ok(client, checkingPath, json("POST", { reconciliationId: f.transferRow.id, action: "match", transactionId: f.transfer.id }));
-    const reconciled = async () => (await db.select().from(transactions).where(eq(transactions.id, f.transfer.id)))[0].isReconciled;
+    const reconciled = async () => (await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [f.transfer.id])).isReconciled;
     expect(await reconciled()).toBe(true);
     const unlinked = await ok(client, checkingPath, json("POST", { reconciliationId: f.transferRow.id, action: "unlink" }));
     expect(unlinked).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null, reviewReason: null });
@@ -283,17 +320,17 @@ describe("Plaid reconciliation HTTP parity", () => {
 
   it("records the TypeSafe observation of a decision", async () => {
     const f = await fixture();
-    await db.update(books).set({ typesafeReconciliationEnabled: true, typesafeRevision: 3 }).where(eq(books.id, 1));
+    await exec("UPDATE books SET typesafe_reconciliation_enabled = $1, typesafe_revision = $2 WHERE id = $3", [true, 3, 1]);
     const shown = new Date("2025-03-10T00:00:00.000Z");
-    const evaluation = async (reconciliationId: number, fingerprint: string, revision = 3) => (await db.insert(typesafeEvaluations).values({
+    const evaluation = async (reconciliationId: number, fingerprint: string, revision = 3) => insert<TypeSafeEvaluation>("typesafe_evaluations", {
       bookId: 1, reconciliationId, linkId: f.checkingLink.id, revision, fingerprint, attempt: fingerprint, status: "ready",
       startedAt: shown, completedAt: shown, displayedAt: shown,
       snapshot: {
         payeeOptions: [{ label: "P1", payeeId: f.coffee.id, name: "Blue Bottle", source: "existing" }],
         categoryOptions: [{ label: "C1", accountId: f.food.id, name: "Food", kind: "expense" }],
-      } as never,
+      },
       answers: { match: { choice: "none", probabilities: {}, confidence: 1 }, payee: { choice: "P1", probabilities: {}, confidence: 1 }, category: { choice: "C1", probabilities: {}, confidence: 1 } },
-    }).returning())[0];
+    });
     const coffeeEvaluation = await evaluation(f.coffeeRow.id, "coffee");
     await evaluation(f.coffeeRow.id, "old-revision", 2);
     const transferEvaluation = await evaluation(f.transferRow.id, "transfer");
@@ -308,7 +345,7 @@ describe("Plaid reconciliation HTTP parity", () => {
     }));
     // No evaluation of this row: nothing to record.
     await ok(client, path, json("POST", { reconciliationId: f.rentRow.id, action: "ignore" }));
-    const decisions = await db.select().from(typesafeDecisions).orderBy(asc(typesafeDecisions.id));
+    const decisions = await rows<TypeSafeDecision>("SELECT * FROM typesafe_decisions ORDER BY id");
     expect(decisions.map(({ decidedAt, ...decision }) => ({ ...decision, recent: Math.abs(decidedAt.getTime() - Date.now()) < 60_000 }))).toEqual([
       {
         id: 1, bookId: 1, reconciliationId: f.coffeeRow.id, evaluationId: coffeeEvaluation.id, action: "create", transactionId: null,

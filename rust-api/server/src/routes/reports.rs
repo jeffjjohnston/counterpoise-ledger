@@ -9,9 +9,10 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
 };
+use ledger_db::engine::{Db, DbPool};
 use serde::Serialize;
 use serde_json::{json, to_value};
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::QueryBuilder;
 
 /// One row of `getReportSplits()`. The data route does not send the
 /// description; the MCP tool `get_report_data` does.
@@ -58,7 +59,7 @@ pub(crate) struct IncomeRow {
 /// with their account and payee. With `limit`, only the first rows, and the
 /// count of all the rows that match; without it, every row and their count.
 pub(crate) async fn report_splits(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     start_date: Option<&str>,
     end_date: Option<&str>,
@@ -67,7 +68,7 @@ pub(crate) async fn report_splits(
     limit: Option<i64>,
 ) -> Result<(Vec<ReportSplit>, i64), sqlx::Error> {
     let today = local_today();
-    let push_filters = |query: &mut QueryBuilder<'_, Postgres>| {
+    let push_filters = |query: &mut QueryBuilder<'_, Db>| {
         if let Some(start) = start_date {
             query.push(" AND date >= ").push_bind(start.to_owned());
         }
@@ -96,7 +97,7 @@ pub(crate) async fn report_splits(
         }
     };
     let rows_sql = |select: &str| {
-        let mut query = QueryBuilder::<Postgres>::new(
+        let mut query = QueryBuilder::<Db>::new(
             "WITH report_rows AS (SELECT s.id AS split_id, t.id AS transaction_id,
                 CASE WHEN t.is_floating THEN ",
         );
@@ -173,7 +174,7 @@ pub(crate) async fn report_data(
     .await
     .map_err(|cause| internal_error(cause, "Failed to fetch report data"))?;
     let accounts: Vec<ReportAccount> = sqlx::query_as(
-        "SELECT id, name, type AS account_type, parent_id FROM accounts WHERE book_id = $1",
+        "SELECT id, name, type AS account_type, parent_id FROM accounts WHERE book_id = $1 ORDER BY id",
     )
     .bind(book.book_id)
     .fetch_all(&state.pool)
@@ -195,17 +196,35 @@ pub(crate) async fn report_data(
 /// its splits in the effective-date range, or of all its splits without
 /// one, ordered by type and name.
 pub(crate) async fn income_rows(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     range: Option<(&str, &str)>,
     include_inactive: bool,
 ) -> Result<Vec<IncomeRow>, sqlx::Error> {
-    let today = local_today();
-    let mut query = QueryBuilder::<Postgres>::new(
+    let mut query = QueryBuilder::<Db>::new("");
+    push_income_query(&mut query, book_id, range, include_inactive);
+    query.build_query_as().fetch_all(pool).await
+}
+
+/// Pushes the query of [`income_rows`].
+///
+/// `s.book_id = a.book_id` changes no row: the foreign key
+/// (book_id, account_id) -> accounts (book_id, id) keeps a split in the book
+/// of its account. It lets SQLite find the splits of each account in the
+/// index idx_transaction_splits_book_account, without the split rows. Only
+/// the date range reads the transaction.
+fn push_income_query(
+    query: &mut QueryBuilder<'_, Db>,
+    book_id: i32,
+    range: Option<(&str, &str)>,
+    include_inactive: bool,
+) {
+    query.push(
         "SELECT a.id AS account_id, a.name, a.type AS account_type,
                 CAST(COALESCE(SUM(",
     );
     if let Some((start, end)) = range {
+        let today = local_today();
         query
             .push("CASE WHEN (CASE WHEN t.is_floating THEN ")
             .push_bind(today.clone())
@@ -219,20 +238,22 @@ pub(crate) async fn income_rows(
     } else {
         query.push("s.amount");
     }
+    query.push(
+        "), 0) AS integer) AS balance
+         FROM accounts a
+         LEFT JOIN transaction_splits s ON s.book_id = a.book_id AND s.account_id = a.id",
+    );
+    if range.is_some() {
+        query.push(" LEFT JOIN transactions t ON t.id = s.transaction_id");
+    }
     query
-        .push(
-            "), 0) AS integer) AS balance
-         FROM accounts a LEFT JOIN transaction_splits s ON s.account_id = a.id
-         LEFT JOIN transactions t ON t.id = s.transaction_id
-         WHERE a.book_id = ",
-        )
+        .push(" WHERE a.book_id = ")
         .push_bind(book_id)
         .push(" AND a.type IN ('income', 'expense')");
     if !include_inactive {
         query.push(" AND a.is_active");
     }
     query.push(" GROUP BY a.id ORDER BY a.type, a.name");
-    query.build_query_as().fetch_all(pool).await
 }
 
 pub(crate) async fn income_statement(
@@ -288,4 +309,75 @@ pub(crate) async fn income_statement(
     Ok(Json(
         json!({ "accounts": rows, "totals": { "income": income, "expense": expense } }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{income_rows, push_income_query};
+    use crate::routes::accounts::tests::{balance_fixture, plan};
+
+    async fn totals(
+        pool: &ledger_db::engine::DbPool,
+        range: Option<(&str, &str)>,
+        include_inactive: bool,
+    ) -> Vec<(i32, String, i32)> {
+        income_rows(pool, 1, range, include_inactive)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.account_id, row.name, row.balance))
+            .collect()
+    }
+
+    /// Without a range, the query does not read the transactions, and a
+    /// range that holds every transaction (the floating one included) gives
+    /// the same totals. The splits of another book never count.
+    #[tokio::test]
+    async fn totals_with_and_without_a_range_agree() {
+        let database = balance_fixture().await;
+        let pool = database.pool();
+        let active = vec![
+            (3, "Groceries".to_owned(), 1_934),
+            (2, "Salary".to_owned(), -500_000),
+        ];
+        assert_eq!(totals(pool, None, false).await, active);
+        assert_eq!(
+            totals(pool, Some(("0000-01-01", "9999-12-31")), false).await,
+            active
+        );
+        let every = vec![
+            (3, "Groceries".to_owned(), 1_934),
+            (4, "Old".to_owned(), 100),
+            (2, "Salary".to_owned(), -500_000),
+        ];
+        assert_eq!(totals(pool, None, true).await, every);
+        // The floating transaction is dated today, after this range.
+        assert_eq!(
+            totals(pool, Some(("2025-01-01", "2025-12-31")), false).await,
+            vec![
+                (3, "Groceries".to_owned(), 1_234),
+                (2, "Salary".to_owned(), -500_000)
+            ]
+        );
+    }
+
+    /// Without a range, the query finds the splits of each account in the
+    /// covering index of migration 0002: no split row and no transaction.
+    #[tokio::test]
+    async fn totals_without_a_range_read_only_the_covering_index() {
+        let database = balance_fixture().await;
+        let steps = plan(database.pool(), |query| {
+            push_income_query(query, 1, None, false);
+        })
+        .await;
+        assert!(
+            steps.contains(
+                &"SEARCH s USING COVERING INDEX idx_transaction_splits_book_account \
+                  (book_id=? AND account_id=?) LEFT-JOIN"
+                    .to_owned()
+            ),
+            "{steps:?}"
+        );
+        assert!(!steps.iter().any(|step| step.contains(" t ")), "{steps:?}");
+    }
 }

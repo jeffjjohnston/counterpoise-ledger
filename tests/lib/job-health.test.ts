@@ -125,6 +125,22 @@ describe("evaluateJobHealth", () => {
     expect(result.jobs.find((j) => j.job === "backup")?.state).toBe("unverified");
   });
 
+  it("reports not_configured for a job with no secret, without attention", () => {
+    const entries = allHealthy().map((e) =>
+      e.job === "plaid-sync"
+        ? { ...e, notConfigured: true, detail: "not configured: PLAID_SECRET is not set" }
+        : e
+    );
+
+    const result = evaluateJobHealth(entries, NOW);
+
+    expect(result.overall).toBe("ok");
+    expect(result.jobs.find((j) => j.job === "plaid-sync")).toMatchObject({
+      state: "not_configured",
+      lastOk: null,
+    });
+  });
+
   it("does not let price-sync alarm over its legitimate weekend gap", () => {
     // Saturday 6am run, evaluated Monday noon — the gap that a naive 24h rule
     // would flag every single week.

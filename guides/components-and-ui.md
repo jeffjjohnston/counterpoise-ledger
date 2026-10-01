@@ -27,7 +27,7 @@ Organized by domain:
 - `/components/securities/` - Security management (SecurityForm, PriceHistoryEditForm, StockSplitEditForm, UpdatePricesModal)
 - `/components/reports/` - Financial reports (ReportConfigPanel, ReportTable)
 - `/components/sync/` - Plaid sync (ReconciliationModal)
-- `/components/layout/` - Navigation (Navbar, BookNavbar, PriceEntryPill) and LastPostgresNotice, the dismissible notice on the book pages that names [upgrade-to-sqlite.md](upgrade-to-sqlite.md)
+- `/components/layout/` - Navigation (Navbar, BookNavbar, PriceEntryPill)
 - `/components/ThemeProvider.tsx` - Root theme provider
 - `/components/KeyboardShortcutProvider.tsx` + `/components/ui/KeyboardShortcutOverlay.tsx` - Global keyboard shortcut system. Register shortcuts in client components via `useRegisterShortcuts()` from `/hooks/useRegisterShortcuts.ts`; press `?` to view the overlay.
   - A shortcut's `category` is typed from `SHORTCUT_CATEGORIES` in the provider, which is also the order the overlay lists categories in. **One list, on purpose.** The overlay used to keep a second ordering array and *filter* through it, so a category registered but not listed there lost its shortcuts with no error — the price entry pill's `P` never appeared in the overlay for that reason. Adding a category means adding it to `SHORTCUT_CATEGORIES`; nothing else compiles until you do.

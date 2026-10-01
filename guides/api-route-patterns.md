@@ -73,11 +73,13 @@ pub(crate) async fn list_payees(
   before use. A validator proves the shape of an ID, not that it is yours.
   `require_account_parent()` in `validation.rs` checks `id` **and** `book_id`;
   follow that pattern.
-- **SQL**: `sqlx::query!` and `sqlx::query_as!` check the query against the
-  schema at build time, from the metadata in `rust-api/.sqlx/`. After you
-  change such a query, run `cargo sqlx prepare` (see
-  [testing.md](testing.md)). `sqlx::query()` and `sqlx::query_as()` are not
-  checked at build time.
+- **SQL**: use `sqlx::query()`, `query_as()` and `query_scalar()`. Do not
+  use the `query!` macros: they need a database or query metadata at build
+  time. Use the helpers of `ledger_db::sql` (`today!()`, `EFFECTIVE_DATE`,
+  `in_integers`, `json`) and the rules in
+  [database-management.md](database-management.md#sql-rules). Open a write
+  transaction with `ledger_db::locks::begin` or `begin_pool`. The HTTP tests
+  are what check a query.
 
 ## Access Levels
 
@@ -176,13 +178,14 @@ They keep these Node rules:
   Rust's `trim` or `str::parse`. For a value that Node reads with `Number()`
   or `z.coerce.number()`, use `parse_js_number`, which also refuses the `inf`
   and `nan` words that Rust's `f64` parser accepts.
-- A path or body ID that is NaN or outside the int4 range makes the Node query
+- A path or body ID that is NaN or outside the int4 range made the Node query
   fail. Rust returns the same 500 message and does not report "not found".
 - The payee name uses JavaScript whitespace for trim and collapse. Rust's
   `char::is_whitespace` differs at U+0085 and U+FEFF, so use
   `is_js_whitespace` in `validation.rs`.
 - `POST /payees` returns the stored payee for a case variant. It lowercases
-  the name in Rust and compares with PostgreSQL `lower()`, as Node does.
+  the name in Rust and compares it with SQL `lower()`, which folds Unicode
+  case (`ledger_db::functions`).
 
 The investment and security routes are in
 `rust-api/server/src/routes/{investments,securities,realized_gains}.rs`:
@@ -202,7 +205,8 @@ The price routes are in `rust-api/server/src/routes/security_prices.rs`:
 They keep these Node rules:
 
 - `PUT` refuses a NaN ID first, then reads and validates the body. An ID
-  outside the int4 range then fails at the database with the 500 message.
+  outside the int4 range then gets the 500 message, as it did when PostgreSQL
+  refused it.
   A new `priceDate` moves the entry, and a move onto an occupied date is 409.
 - `source` is not validated. A value that is not a string or null is stored
   as JavaScript `String(value)`, which `js_string` in `validation.rs` gives.
@@ -260,9 +264,8 @@ recurrence math is `ledger_core::recurring`. The routes keep these Node rules:
 - The schema declares `interval`, `daysOfWeek`, `weekOfMonth`, `daysOfMonth`,
   `templateDescription`, `payeeId`, and `payeeName` with `z.any()` or
   `z.unknown()`. Rust keeps each value as sent. A text column stores
-  JavaScript `String(value)`, as Drizzle writes it. A day list stores
-  `JSON.stringify(value)`. The interval is bound as text and cast in SQL, so
-  PostgreSQL accepts and refuses the same values as it does for Node.
+  JavaScript `String(value)`, as the Node route wrote it. A day list stores
+  `JSON.stringify(value)`. The interval is bound as text, as Node sent it.
 - A write validates first. Then one database transaction resolves the payee
   and writes the rule and its template splits. A payee that `payeeName`
   creates rolls back with a failed write.
@@ -347,12 +350,13 @@ The routes keep these Node rules:
   transaction commits, as `recordTypeSafeUnlink` does. A failure there is
   logged and does not change the response. The route sends
   `sync_transaction_unlinked`.
-- A sync holds the session advisory lock `(1000001, token ID)` on one
-  reserved connection and runs every query on it. A second sync of the
-  connection gets 409 and does not wait. A demo connection is refused before
-  the step that records `last_error`; every later failure is recorded there.
-  An ID outside the int4 range gets the PostgreSQL message of the lock query
-  with a 502, as in Node.
+- A sync holds the session lock `SessionLock::plaid_sync(token ID)` (a file
+  lock under `<database>.locks/`) on one reserved connection and runs every
+  query on it. A second sync of the connection gets 409 and does not wait. A
+  demo connection is refused before the step that records `last_error`;
+  every later failure is recorded there. An ID outside the int4 range gets
+  the message that the PostgreSQL lock query gave (`parse_pg_int4`), with a
+  502, as in Node.
 - The sync stores `raw_json` as `JSON.stringify(item)` writes it. The server
   crate turns on serde_json's `preserve_order`, and `js_stringify()` lists
   array-index keys first, as a JavaScript object does. `amount_cents` is
@@ -365,10 +369,10 @@ The routes keep these Node rules:
   review metadata leaves the key out. Rust keeps the three cases apart for
   the six optional fields (`KEPT_WHEN_MISSING` in `plaid_sync.rs`).
 - The `create` decision inserts a new payee without a conflict clause, as
-  Node does. JavaScript and PostgreSQL lowercase a final sigma differently,
-  so the case-insensitive match can miss a payee of the same name. The
-  insert then fails on the unique index, and the decision rolls back with a
-  500.
+  Node does. It matches a payee with `lower(name)` against the name that Rust
+  lowercases. Both sides use Rust's `str::to_lowercase`, so they agree, also
+  on a final sigma. When the insert fails on the unique index, the decision
+  rolls back with a 500.
 - A mutation during pagination restarts the whole fetch from the stored
   cursor, at most twice. The first request of an initial sync asks for seven
   days, and the initial sync drops items older than seven local days.
@@ -378,7 +382,8 @@ The routes keep these Node rules:
   `sync_transaction_auto_matched` per match to the book owner.
 - The reconcile POST checks the link before it reads the body. The schema
   runs the action rule only on a body without field issues. The resolver
-  reads the staged row `FOR UPDATE`. A floating transaction that is matched
+  reads the staged row inside a `BEGIN IMMEDIATE` transaction, which holds
+  the write lock. A floating transaction that is matched
   is settled with `pickMatchedDate`; another transaction keeps its date.
   After the commit, the route records the TypeSafe decision, as
   `recordTypeSafeDecision` does, and sends the event of the action.
@@ -392,7 +397,7 @@ page does not send:
 - A mask that splits a UTF-16 surrogate pair has U+FFFD in Rust. Node writes
   the lone surrogate as a JSON escape.
 - A Plaid body that is not JSON, and a database failure during a refresh, get
-  different messages. Node reports the V8 SyntaxError or the Drizzle "Failed
+  different messages. Node reported the V8 SyntaxError or the Drizzle "Failed
   query" text.
 - A Plaid account field that is an object or an array is stored as
   JavaScript `String(value)`.
@@ -402,7 +407,7 @@ page does not send:
   them in ID order. The pending list is then sorted by date, newest first,
   with a stable sort in both.
 - A database failure in a sync or in the reconciliation routes gets the
-  PostgreSQL message in Rust. Node reports the Drizzle "Failed query" text,
+  SQLite message in Rust. Node reported the Drizzle "Failed query" text,
   and the per-link queue and the reconcile POST repeat it. A reconcile body
   that is not JSON is a 500 with the route's message; Node repeats the V8
   SyntaxError.
@@ -415,9 +420,9 @@ and give the server its URL in `PLAID_API_URL`.
 `tests/http/plaid-reconcile.test.ts` compares the queues and the resolved
 items with snapshots.
 
-The `counterpoise_changes` triggers fire on all of these writes, because they
-are database triggers. `tests/http/account-writes.test.ts` listens on that
-channel to prove that live updates still see a Rust write.
+The `*_mark` triggers count all of these writes in `change_marks`, because
+they are database triggers. `tests/http/account-writes.test.ts` reads the
+live-update stream of the book to prove that a Rust write sends a hint.
 
 `/api/books` CRUD, `POST /api/books/demo`, and `/api/issue-reports` use the
 authenticated principal without a book scope. The Rust demo route runs the seed
@@ -430,11 +435,18 @@ when the database probe fails. The deploy check reads it. `/health` answers
 the `rust-api` container's healthcheck with an empty 200 or 503. `/api/system/status`
 requires authentication and reads the scheduler status directory with the same
 missing, failed, stale, unverified, and unreadable states as the Node handler.
+A Plaid sync or price sync with no secret writes `notConfigured: true` and the
+missing setting in `detail`. `evaluate` gives that job the state
+`not_configured`. It does not cause `overall: "attention"`. A manual
+`/api/cron/*` run writes the same status record as a scheduled run.
+`ledger-cli backup` writes the record only when the backup goes to the
+scheduler's own backup directory. That means no `--dir`, or the same directory
+(`ledger_db::job_status`).
 
-For any route writing a `timestamp without time zone` column, follow the UTC
-storage rule in [the schema guide](schema.md#timezones-and-timestamp-columns).
-The app's `TZ` and PostgreSQL session `TimeZone` define calendar dates, not
-the representation of stored instants.
+For any route that writes a timestamp column, follow the UTC storage rule in
+[the schema guide](schema.md#timezones-and-timestamp-columns). The app's `TZ`
+(through `cp_today()`) defines calendar dates, not the representation of
+stored instants.
 
 The API gate in `security.rs` applies the common cookie gate before the
 router. A request without a cookie or a bearer header is rejected there with
@@ -446,33 +458,24 @@ that reaches a route but has no valid session or API key.
 `GET /api/b/[bookId]/events` runs in `routes/events.rs`. It authenticates with
 `AccessLevel::Read` before it subscribes. Every 500 from that step becomes 503
 `Live updates unavailable`, because the Node route answers every thrown error
-with 503. The frames, the headers, the 10-second wait for LISTEN, the
-25-second heartbeat and the five-minute lifetime are the same as in Node.
+with 503. The frames, the headers, the 10-second startup wait, the 25-second
+heartbeat and the five-minute lifetime are the same as in Node.
 
-The differences that remain:
+The hub reads `change_marks` (see [architecture.md](architecture.md#live-book-updates)).
+A new stream waits until the hub has read the counts of its book, then sends
+`ready`. When the counts cannot be read in 10 seconds, the route answers 503.
+The counts cannot be lost, so the hub never sends `reset`.
 
-- A new stream waits until the hub has a live LISTEN. Node waits only for the
-  first LISTEN, so during a reconnect Node opens the stream at once and Rust
-  waits for the new LISTEN.
-- The hub drops a subscriber whose queue of eight frames is full. Node drops a
-  stream whose queue is full. The effect is the same: the stream ends after
-  the frames already queued, and the browser reconnects.
-- Node's postgres.js sent a TCP keepalive on its LISTEN socket every 60
-  seconds. SQLx has no keepalive setting, so Rust probes instead: after 60 seconds with
-  no message, the hub sends `SELECT 1` on the LISTEN connection. With no
-  answer in 10 seconds, it connects again and sends `reset`. A network device
-  that drops the idle connection without a FIN or RST therefore stops hints
-  for about 70 seconds. Each LISTEN connection has its own
-  one-connection pool: a dropped `PgListener` runs `UNLISTEN *` before it
-  gives its connection back, and on a dead socket that waits until TCP gives
-  up.
+The hub drops a subscriber whose queue of eight frames is full. Node dropped
+a stream whose queue was full. The effect is the same: the stream ends after
+the frames already queued, and the browser reconnects.
 
 `tests/http/book-events.test.ts` covers access, the frames, per-book
-filtering, the windows, and `reset` after it terminates the LISTEN backend.
-The Rust unit tests in `book_changes.rs` and `routes/events.rs` cover the
-stalled reader, the heartbeat, the lifetime and the shutdown with paused time.
-With `COUNTERPOISE_RUST_TEST_DATABASE_URL` set, a test in `book_changes.rs`
-silences the LISTEN connection behind a TCP proxy and expects `reset`.
+filtering, the windows, a write that rolls back (no hint), and one hint to
+every stream of a book. The Rust unit tests in `book_changes.rs` and
+`routes/events.rs` cover the triggers of each change table, writes from
+another connection, the stalled reader, the heartbeat, the lifetime and the
+shutdown with paused time.
 
 ### Rust request validation and references
 
@@ -521,13 +524,24 @@ A route must not read `X-Forwarded-For` for a rate-limit key. A client that
 connects directly can write any value in it and get a new IP bucket for each
 attempt. `rust-api/server/src/client_ip.rs` runs before every route: it
 removes a client's `x-counterpoise-client-ip` and writes the address to use.
-Read it with `client_ip::from_headers()`. The address is the rightmost
-`X-Forwarded-For` entry only when `TRUST_PROXY=true`, or when `TRUST_PROXY` is
-unset and the published address (`APP_BIND`, else the host of `RUST_BIND`) is
-loopback. In all other cases it is the TCP peer address from `ConnectInfo`,
-which is why `serve()` uses `client_ip::service()`. A server without that
+Read it with `client_ip::from_headers()`. The value is the rightmost
+`X-Forwarded-For` entry only when `TRUST_PROXY=true`. It is also that entry
+when `TRUST_PROXY` is unset and the published address is loopback. The
+published address is `APP_BIND`, or else the host of `RUST_BIND`. In all other
+cases the value is the TCP peer address from `ConnectInfo`. This is why
+`serve()` uses `client_ip::service()`.
+
+The value is a rate-limit key, not the address of the client.
+`client_ip::rate_limit_key()` keeps an IPv4 address. It maps an IPv4-mapped
+IPv6 address to its IPv4 address. It cuts any other IPv6 address to its /64
+prefix. A client with a /64 cannot get a new bucket by changing the last 64
+bits. Do not log the value. Do not store it as the address of the client.
+
+A server without that
 layer, as in a unit test, gives no address, and only the username bucket
-applies. The API key authenticator already uses it with an
+applies. With the same decision, the layer removes `X-Forwarded-Host` and
+`X-Forwarded-Proto` when it does not trust a proxy, so a route can read them
+without a check of its own. The API key authenticator already uses it with an
 IP-and-key-prefix bucket, so a revoked key does not lock out its replacement.
 Rust caches a verified key digest for five minutes, coalesces concurrent
 verification, and still checks the key row on every cache hit so revocation
@@ -543,7 +557,8 @@ identity, password changes, and API-key management. Password changes and key
 management require a cookie session; a bearer key cannot mint another key.
 The `/api/auth/registration-open` GET exposes the registration gate to the
 login and register pages, while registration itself checks the gate again
-under a PostgreSQL transaction advisory lock.
+inside a `BEGIN IMMEDIATE` transaction, so two first registrations cannot
+both see no user.
 
 ### Rust cron auth, analytics, and database scopes
 
@@ -558,12 +573,14 @@ All four cron routes run in Rust: `rust-api/server/src/routes/cron.rs` serves
 `rust-api/server/src/routes/typesafe.rs` serves `typesafe-cleanup`. Each one
 writes on every call.
 
-A cron route reports a failure of one token, symbol, or book in its body with
-status 200, as the Node route does. The `scheduler` container records job
-health from the HTTP status alone, so such a failure does not mark the job
-failed. `GET /api/system/status` reads those status files in
-`rust-api/server/src/routes/system.rs`; the server that ran the job does not
-change it.
+The server runs these jobs on their schedule (`rust-api/server/src/scheduler.rs`);
+a route runs one now. One lock per job (`JobLocks` in `state.rs`) keeps two
+runs of a job apart. A job reports a failure of one token, symbol, or book in
+its body and still succeeds, as the Node route did, so such a failure does not
+mark the job failed. A scheduled run writes a status record. A manual
+`/api/cron/*` run writes the same record. `ledger-cli backup` writes it only
+into the scheduler's backup directory. `GET /api/system/status` reads the
+status files in `rust-api/server/src/routes/system.rs`.
 
 `rust-api/server/src/analytics.rs` is the server capture helper. It is a no-op
 without `NEXT_PUBLIC_POSTHOG_KEY`; otherwise it sends the user ID as the
@@ -571,19 +588,19 @@ PostHog distinct ID, the unchanged event name, and the route's property object.
 Call it after a successful write as the Node handler does. Analytics failures
 are logged and do not change the route response.
 
-`rust-api/server/src/db_scope.rs` provides `with_advisory_lock` and
-`with_transaction`. The advisory lock reserves one SQLx connection for its
-whole callback, tries the two-int PostgreSQL session lock without waiting, and
-unlocks before closing the connection. Cancellation closes the connection too,
-so a session lock cannot leak into the pool. The transaction helper uses a
-SQLx transaction on the caller's connection, so a transaction inside a lock
-stays on that same connection and rolls back on cancellation.
+`ledger_db::locks::with_session_lock` and `with_transaction` in
+`rust-api/server/src/db_scope.rs` are the database scopes. The session lock
+takes a file lock under `<database>.locks/` without waiting, then reserves
+one SQLx connection for its whole callback. Dropping the file releases the
+lock, also on cancellation. The transaction helper opens `BEGIN IMMEDIATE`
+on the caller's connection, so a transaction inside a lock stays on that
+same connection and rolls back on cancellation.
 Pass the callback's connection into every query and nested helper; borrowing
 the pool while holding a lock can deadlock when enough holders occupy it.
 
 The Rust HTTP contract adapters in `server/src/http_contract_tests.rs` exercise
-these helpers against a local PostgreSQL connection without publishing a test
-route. `tests/e2e/rust-api-parity.spec.ts` checks the HTTP contract through
+these helpers against a temporary SQLite database
+(`ledger_db::testing::TempDatabase`) without publishing a test route. `tests/e2e/rust-api-parity.spec.ts` checks the HTTP contract through
 the Rust server that serves the E2E client build.
 
 ## Transaction Creation Pattern

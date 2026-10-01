@@ -41,13 +41,21 @@ function createJsonResponse(data: unknown, ok = true, status = 200) {
   } as Response;
 }
 
+type DemoDatasetRow = { id: string; name: string; description: string };
+
+const DATASETS: DemoDatasetRow[] = [
+  { id: "household", name: "Household", description: "A married couple in New Jersey." },
+  { id: "single", name: "Single homeowner", description: "One homeowner in Colorado." },
+];
+
 // `demoHook` lets a test own the /api/books/demo response — to hold it open
 // while asserting the pending state, or to fail it. Without one, the stub
 // behaves like the real route and returns a created book.
 function stubFetch(
   initialBooks: Book[],
   initialIssues: IssueReport[] = [],
-  demoHook?: () => Promise<Response>
+  demoHook?: () => Promise<Response>,
+  datasets: DemoDatasetRow[] | "fail" = DATASETS
 ) {
   const books = initialBooks.map((b) => ({ ...b }));
   const issues = initialIssues.map((i) => ({ ...i }));
@@ -79,11 +87,16 @@ function stubFetch(
     if (url === "/api/books" && method === "POST") {
       return createJsonResponse({ error: "Unexpected create call in test" }, false, 500);
     }
+    if (url === "/api/books/demo/datasets" && method === "GET") {
+      if (datasets === "fail") return createJsonResponse({ error: "Failed" }, false, 500);
+      return createJsonResponse(datasets);
+    }
     if (url === "/api/books/demo" && method === "POST") {
       if (demoHook) return demoHook();
+      const body = init?.body ? (JSON.parse(init.body as string) as { dataset?: string }) : {};
       const created = {
         id: Math.max(0, ...books.map((item) => item.id)) + 1,
-        name: "Demo Book",
+        name: body.dataset === "single" ? "Demo Book - Single" : "Demo Book",
         createdAt: "2026-03-01T00:00:00.000Z",
         updatedAt: "2026-03-01T00:00:00.000Z",
       };
@@ -235,10 +248,10 @@ describe("BookSelectorPage", () => {
       render(<BookSelectorPage />);
 
       await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Add demo book" })).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Add Household demo book" })).toBeInTheDocument();
       });
 
-      fireEvent.click(screen.getByRole("button", { name: "Add demo book" }));
+      fireEvent.click(screen.getByRole("button", { name: "Add Household demo book" }));
 
       await waitFor(() => {
         expect(screen.getByRole("heading", { name: "Demo Book" })).toBeInTheDocument();
@@ -258,14 +271,15 @@ describe("BookSelectorPage", () => {
       render(<BookSelectorPage />);
 
       await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Add demo book" })).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Add Household demo book" })).toBeInTheDocument();
       });
 
-      fireEvent.click(screen.getByRole("button", { name: "Add demo book" }));
+      fireEvent.click(screen.getByRole("button", { name: "Add Household demo book" }));
 
       await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Creating demo book..." })).toBeDisabled();
+        expect(screen.getByRole("button", { name: "Add Household demo book" })).toBeDisabled();
       });
+      expect(screen.getByText("Creating...")).toBeInTheDocument();
       expect(screen.getByPlaceholderText("Book name")).toBeDisabled();
 
       release(
@@ -278,7 +292,7 @@ describe("BookSelectorPage", () => {
       );
 
       await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Add demo book" })).toBeEnabled();
+        expect(screen.getByRole("button", { name: "Add Household demo book" })).toBeEnabled();
       });
       expect(screen.getByPlaceholderText("Book name")).toBeEnabled();
     });
@@ -291,15 +305,79 @@ describe("BookSelectorPage", () => {
       render(<BookSelectorPage />);
 
       await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Add demo book" })).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Add Household demo book" })).toBeInTheDocument();
       });
 
-      fireEvent.click(screen.getByRole("button", { name: "Add demo book" }));
+      fireEvent.click(screen.getByRole("button", { name: "Add Household demo book" }));
 
       await waitFor(() => {
         expect(screen.getByText("Failed to create demo book")).toBeInTheDocument();
       });
-      expect(screen.getByRole("button", { name: "Add demo book" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Add Household demo book" })).toBeEnabled();
+    });
+
+    it("shows each dataset with its description", async () => {
+      stubFetch([]);
+      render(<BookSelectorPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Add Single homeowner demo book" })).toBeInTheDocument();
+      });
+      expect(screen.getByText("One homeowner in Colorado.")).toBeInTheDocument();
+      expect(screen.getByText("A married couple in New Jersey.")).toBeInTheDocument();
+    });
+
+    it("sends the dataset of the clicked row", async () => {
+      const fetchMock = stubFetch([]);
+      render(<BookSelectorPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Add Single homeowner demo book" })).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Add Single homeowner demo book" }));
+
+      await waitFor(() => {
+        expect(screen.getByRole("heading", { name: "Demo Book - Single" })).toBeInTheDocument();
+      });
+      const demoCall = fetchMock.mock.calls.find(([url]) => url === "/api/books/demo");
+      expect(JSON.parse((demoCall?.[1] as RequestInit).body as string)).toEqual({ dataset: "single" });
+    });
+
+    it("disables every dataset button while one demo book is created", async () => {
+      let release!: (value: Response) => void;
+      stubFetch([], [], () => new Promise<Response>((resolve) => { release = resolve; }));
+      render(<BookSelectorPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Add Household demo book" })).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Add Household demo book" }));
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Add Single homeowner demo book" })).toBeDisabled();
+      });
+      release(createJsonResponse({
+        id: 7, name: "Demo Book", createdAt: "2026-03-01T00:00:00.000Z", updatedAt: "2026-03-01T00:00:00.000Z",
+      }));
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Add Single homeowner demo book" })).toBeEnabled();
+      });
+    });
+
+    it("falls back to one button with no body when the list fails", async () => {
+      const fetchMock = stubFetch([], [], undefined, "fail");
+      render(<BookSelectorPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Add demo book" })).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Add demo book" }));
+
+      await waitFor(() => {
+        expect(screen.getByRole("heading", { name: "Demo Book" })).toBeInTheDocument();
+      });
+      const demoCall = fetchMock.mock.calls.find(([url]) => url === "/api/books/demo");
+      expect((demoCall?.[1] as RequestInit).body).toBeUndefined();
     });
   });
 

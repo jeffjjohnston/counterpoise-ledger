@@ -5,12 +5,12 @@
 # in your fork, remove the ".example" suffix from the file name.
 #
 # It is adapted from the upstream CI, which is not published. This version runs
-# on GitHub's hosted runners. It
-# checks lint, types, the OpenAPI contract, the Rust workspace, the production
-# build (with no database), and the unit and integration tests against PostgreSQL. It does not
-# run the end-to-end tests. To add them, install the Playwright browsers
-# (`npx playwright install --with-deps`) and run `npm run test:e2e` against the
-# same PostgreSQL service.
+# on GitHub's hosted runners. It checks lint, types, the OpenAPI contract, the
+# Rust workspace, the production build (with no database), and the unit and
+# integration tests. The tests use SQLite files, so no database service is
+# needed. It does not run the end-to-end tests. To add them, install the
+# Playwright browsers (`npx playwright install --with-deps`) and run
+# `npm run test:e2e`.
 name: CI
 
 on:
@@ -27,21 +27,6 @@ jobs:
   rust-workspace:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: counterpoise
-          POSTGRES_PASSWORD: counterpoise
-          POSTGRES_DB: counterpoise
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U counterpoise"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
 
     steps:
       - uses: actions/checkout@v7
@@ -64,16 +49,6 @@ jobs:
 
       - run: npm ci
 
-      - name: Migrate SQLx schema
-        run: npx tsx db/migrate.ts
-        env:
-          DATABASE_URL: postgresql://counterpoise:counterpoise@localhost:5432/counterpoise
-
-      - name: Install SQLx CLI
-        run: |
-          cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features rustls,postgres --root "$RUNNER_TEMP/sqlx-cli"
-          echo "$RUNNER_TEMP/sqlx-cli/bin" >> "$GITHUB_PATH"
-
       - name: Check Rust formatting
         run: cargo fmt --all --check --manifest-path rust-api/Cargo.toml
 
@@ -89,12 +64,6 @@ jobs:
 
       - name: Build pure core for WebAssembly
         run: cargo build -p ledger-core --target wasm32-unknown-unknown --manifest-path rust-api/Cargo.toml
-
-      - name: Check SQLx query cache
-        run: cargo sqlx prepare --check --workspace
-        working-directory: rust-api
-        env:
-          DATABASE_URL: postgresql://counterpoise:counterpoise@localhost:5432/counterpoise
 
       - name: Build Rust HTTP server and CLI for parity tests
         run: cargo build --locked -p counterpoise-rust-api -p ledger-cli --manifest-path rust-api/Cargo.toml
@@ -186,21 +155,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: counterpoise
-          POSTGRES_PASSWORD: counterpoise
-          POSTGRES_DB: counterpoise
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U counterpoise"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v7
 
@@ -220,10 +174,9 @@ jobs:
 
       - run: npm ci
 
-      - name: Create test databases
-        run: npm run db:create-test-dbs
-        env:
-          DATABASE_URL: postgresql://counterpoise:counterpoise@localhost:5432/counterpoise
+      # Each Vitest worker makes its SQLite file with `ledger-cli migrate`.
+      - name: Build ledger-cli for the test databases
+        run: cargo build --locked -p ledger-cli --manifest-path rust-api/Cargo.toml
 
       - name: Run unit and integration tests with coverage
         run: npm run test:coverage

@@ -14,3 +14,11 @@ another port. The Rust API server needs its own port too: start it with
 `RUST_BIND=127.0.0.1:<port>`, and start Vite with
 `RUST_API_URL=http://127.0.0.1:<port>`, or the Vite proxy sends the API
 requests to another checkout's server on the default port 4000.
+
+Each worktree has its own development database: the default `DATABASE_PATH`
+is `data/counterpoise.db`, relative to the checkout. A new worktree starts
+with no database. Run `npm run db:seed` there, with no server running, for the
+sample data. Two worktrees never share a file, so their servers do not stop
+each other with the server lock. Build `ledger-cli` in each worktree before
+`npm test` (`cargo build --manifest-path rust-api/Cargo.toml -p ledger-cli`):
+the database tests run `rust-api/target/debug/ledger-cli` of this checkout.

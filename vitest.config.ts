@@ -1,7 +1,7 @@
 import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import path from "path";
-import { newTestRunId } from "./db/test-db-name";
+import { newTestRunId } from "./tests/helpers/test-database";
 
 // ONE RUN ID FOR THE WHOLE RUN, generated here because this file is evaluated
 // once, in the main process. A worker cannot generate it: vitest rebuilds the
@@ -24,26 +24,16 @@ const rustMcpTests = [
   "tests/mcp/rust-transport.test.ts",
 ];
 
-// New persistence suites belong in this list. Pure calculations
-// and schemas stay runnable without PostgreSQL.
+// New persistence suites belong in this list. They need a SQLite file that
+// `ledger-cli migrate` makes (tests/helpers/test-database.ts). Pure
+// calculations and schemas stay runnable without it.
 const databaseTests = [
-  "tests/db/book-change-notifications.test.ts",
+  "tests/db/book-change-marks.test.ts",
   "tests/db/book-members.test.ts",
   "tests/db/reset-test-database.test.ts",
-  "tests/db/session-hash-migration.test.ts",
-  "tests/db/database-lease.test.ts",
-  "tests/db/concurrent-runs.test.ts",
-  "tests/db/backfill-dividend-account-ids.test.ts",
   "tests/db/book-scoped-composite-fks.test.ts",
-  "tests/db/list-books-script.test.ts",
   "tests/db/lot-schema.test.ts",
-  "tests/db/timezone.test.ts",
-  "tests/lib/investments-latest-prices.test.ts",
-  "tests/lib/investments-ordering.test.ts",
-  "tests/lib/lots-backfill.test.ts",
-  "tests/lib/lots-db.test.ts",
-  "tests/lib/payees.test.ts",
-  "tests/scripts/sweep-test-databases.test.ts",
+  "tests/db/typesafe-report.test.ts",
   ...(process.env.COUNTERPOISE_HTTP_SERVER ? ["tests/http/**/*.test.ts"] : []),
   ...(process.env.COUNTERPOISE_MCP_TRANSPORT ? rustMcpTests : []),
 ];
@@ -69,6 +59,7 @@ export default defineConfig({
     testTimeout: 30_000,
     hookTimeout: 30_000,
     setupFiles: ["./tests/setup.ts"],
+    globalSetup: ["./tests/global-setup.ts"],
     projects: [
       { extends: true, test: {
         name: "node", environment: "node",
@@ -89,14 +80,12 @@ export default defineConfig({
       include: [
         "app/**/*.{ts,tsx}",
         "components/**/*.{ts,tsx}",
-        "db/**/*.ts",
         "lib/**/*.ts",
         "scripts/**/*.ts",
       ],
       exclude: [
         "app/**/*.test.{ts,tsx}",
         "components/**/*.test.{ts,tsx}",
-        "db/migrations/**",
         "tests/**",
       ],
     },

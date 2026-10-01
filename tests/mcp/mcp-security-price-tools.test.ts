@@ -4,9 +4,8 @@ import type { AddressInfo } from "node:net";
 import { setupTestDatabase, resetTestDatabase, createBook, createSecurity } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { getDb } from "@/db";
-import { securityPrices } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { count, rows } from "@/tests/helpers/sql";
+import type { SecurityPrice } from "@/types/db";
 
 let mcp: McpTestClient;
 
@@ -78,8 +77,7 @@ describe("MCP Security Price Tools", () => {
         { securityId: sec.id, priceMicros: 1_000_000, priceDate: "2026-01-15" },
       ]);
 
-      const rows = await getDb().select().from(securityPrices);
-      expect(rows).toHaveLength(1);
+      expect(await count("security_prices")).toBe(1);
     });
   });
 
@@ -125,7 +123,7 @@ describe("MCP Security Price Tools", () => {
 
     expect(isError).toBe(true);
     expect(data.error).toBe("One or more securities do not belong to this book");
-    expect(await getDb().select().from(securityPrices)).toHaveLength(0);
+    expect(await count("security_prices")).toBe(0);
   });
 
   describe("update_security_price", () => {
@@ -142,9 +140,9 @@ describe("MCP Security Price Tools", () => {
       });
 
       expect(isError).toBe(false);
-      const rows = await getDb().select().from(securityPrices).where(eq(securityPrices.securityId, sec.id));
-      expect(rows).toHaveLength(1);
-      expect(rows[0].priceDate).toBe("2026-01-20");
+      const stored = await rows<SecurityPrice>("SELECT * FROM security_prices WHERE security_id = $1", [sec.id]);
+      expect(stored).toHaveLength(1);
+      expect(stored[0].priceDate).toBe("2026-01-20");
     });
   });
 
@@ -163,8 +161,7 @@ describe("MCP Security Price Tools", () => {
       expect(isError).toBe(true);
       // The library names the date; the HTTP route does not.
       expect(data.error).toBe("Price entry for 2026-01-20 not found");
-      const rows = await getDb().select().from(securityPrices).where(eq(securityPrices.securityId, sec.id));
-      expect(rows).toHaveLength(1);
+      expect(await count("security_prices", "security_id = $1", [sec.id])).toBe(1);
     });
 
     it("rejects a malformed date rather than passing it to the database", async () => {

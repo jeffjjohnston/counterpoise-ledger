@@ -186,7 +186,8 @@ describe("BookNavbar", () => {
     // the base of the bar if the link is as tall as the bar. Any wrapper in
     // between that sizes to its content collapses the row to text height, which
     // floats the underline mid-bar and halves the touch target. Height propagates
-    // only when each wrapper either stretches itself or is stretched by its parent.
+    // only when each wrapper stretches itself, is stretched by its parent, or
+    // takes the full height of its parent.
     const fetchMock = vi.fn(async () => ({
       ok: true,
       json: async () => [{ id: 1, name: "Primary Book" }],
@@ -204,7 +205,9 @@ describe("BookNavbar", () => {
       const parent = el.parentElement;
       if (!parent) break;
       const stretches =
-        /\bself-stretch\b/.test(el.className) || /\bitems-stretch\b/.test(parent.className);
+        /\bself-stretch\b/.test(el.className) ||
+        /\bh-full\b/.test(el.className) ||
+        /\bitems-stretch\b/.test(parent.className);
       if (!stretches) collapsingWrappers.push(el.className.trim());
       el = parent;
     }

@@ -9,7 +9,7 @@ import { IconPicker } from "@/components/accounts/IconPicker";
 import { CategoryIcon } from "@/components/ui/CategoryIcon";
 import { buildCategoryLabelMap, descendantAccountIds, resolveAccountIconSource } from "@/lib/wasm-client";
 import { getAccountShortName } from "@/lib/wasm-client";
-import type { Account } from "@/db/schema";
+import type { Account } from "@/types/db";
 import type { AccountWithBalance } from "@/types";
 
 interface AccountFormProps {

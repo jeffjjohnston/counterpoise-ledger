@@ -1,8 +1,10 @@
-import { assertTestDatabaseUrl } from "../helpers/database-safety";
+import { resolve } from "node:path";
 
-export function e2eDatabaseUrl() {
-  const url = process.env.E2E_DATABASE_URL ??
-    "postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_e2e";
-  assertTestDatabaseUrl(url, "counterpoise_e2e");
-  return url;
+/**
+ * The database file of the browser tests: `.e2e/counterpoise.db`, which the
+ * Playwright web server creates and migrates when it starts. Not under
+ * `test-results/`, which Playwright empties while the server runs.
+ */
+export function e2eDatabasePath(): string {
+  return process.env.E2E_DATABASE_PATH ?? resolve(".e2e/counterpoise.db");
 }

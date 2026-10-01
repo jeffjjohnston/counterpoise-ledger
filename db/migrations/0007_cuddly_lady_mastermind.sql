@@ -1,1 +1,0 @@
-ALTER TABLE "transactions" ADD COLUMN "is_floating" boolean DEFAULT false NOT NULL;

@@ -1,7 +1,5 @@
-import { sql } from "drizzle-orm";
 import type { AccountWithBalance } from "@/types";
 import { toDateString, getAccountShortName } from "@/lib/formatters";
-import { transactions } from "@/db/schema";
 import { getInvestmentGrossAmountCents } from "@/lib/investment-arithmetic";
 export { getInvestmentGrossAmountCents } from "@/lib/investment-arithmetic";
 
@@ -298,12 +296,6 @@ export function getEffectiveDate(transaction: { date: string; isFloating: boolea
   if (transaction.isFloating) return toDateString(new Date());
   return transaction.date;
 }
-
-/**
- * SQL expression that resolves to CURRENT_DATE for floating transactions, otherwise the stored date.
- * Use this in place of `transactions.date` in balance, ordering, and filtering queries.
- */
-export const effectiveDateSql = sql<string>`CASE WHEN ${transactions.isFloating} THEN CURRENT_DATE::text ELSE ${transactions.date} END`;
 
 /**
  * Returns the next business day (Mon–Fri) strictly after the given YYYY-MM-DD date.

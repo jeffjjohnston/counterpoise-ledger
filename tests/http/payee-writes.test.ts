@@ -1,10 +1,10 @@
-import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { payees } from "../../db/schema";
 import {
   addBookMember, createAccount, createBook, createPayee, createTransactionWithSplits, createUser,
-  db, resetTestDatabase, setupTestDatabase,
+  resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
+import { rows } from "../helpers/sql";
+import type { Payee } from "../../types/db";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { contract } from "../helpers/contract";
 
@@ -49,7 +49,7 @@ describe("payee write HTTP parity", () => {
     expect(Math.abs(Date.parse(created.createdAt) - Date.now())).toBeLessThan(60_000);
     // U+0085 is whitespace to Rust but not to JavaScript.
     expect((await post("\u0085Cafe")).name).toBe("\u0085Cafe");
-    const stored = await db.select().from(payees).where(eq(payees.bookId, 1));
+    const stored = await rows<Payee>("SELECT * FROM payees WHERE book_id = $1", [1]);
     expect(stored.map((row) => row.name).sort()).toEqual(["Bob's IKEA", "\u0085Cafe"]);
   });
 
@@ -62,7 +62,7 @@ describe("payee write HTTP parity", () => {
     const otherBook = await createBook({ name: "Other" });
     await createPayee({ name: "Elsewhere", bookId: otherBook.id });
     expect((await post("elsewhere")).bookId).toBe(1);
-    expect(await db.select().from(payees).where(eq(payees.bookId, 1))).toHaveLength(2);
+    expect(await rows("SELECT * FROM payees WHERE book_id = $1", [1])).toHaveLength(2);
   });
 
   it("rejects payee-create input with the Node status and message", async () => {
@@ -95,7 +95,7 @@ describe("payee write HTTP parity", () => {
     const response = await client.request(`/api/b/1/payees/${unused.id}`, { method: "DELETE" });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ success: true });
-    expect((await db.select().from(payees)).map((row) => row.id).sort()).toEqual(
+    expect((await rows<Payee>("SELECT * FROM payees")).map((row) => row.id).sort()).toEqual(
       [used.id, foreign.id].sort()
     );
   });

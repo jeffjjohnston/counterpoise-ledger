@@ -21,3 +21,10 @@ strip = "none"
 opt-level = "s"
 lto = true
 strip = true
+
+# Proc-macros and build scripts use this profile. rustc loads them while it
+# compiles, and on macOS a stripped sqlx-macros does not load ("mis-aligned
+# LINKEDIT string pool"), as in the dev profile above. They are not part of
+# the server binary, so the binary stays stripped.
+[profile.release.build-override]
+strip = false

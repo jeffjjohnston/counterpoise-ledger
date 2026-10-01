@@ -227,10 +227,16 @@
   {
     "name": "create_demo_book",
     "title": "Create Demo Book",
-    "description": "Create a new book and fill it with realistic sample data — about three years of transactions across dozens of accounts, payees and securities — for exploring Counterpoise. Named 'Demo Book', or 'Demo Book 2', 'Demo Book 3', etc. if that name is already taken. This writes thousands of rows and can take several seconds.",
+    "description": "Create a new book and fill it with realistic sample data for exploring Counterpoise. The dates end today. `dataset` selects the sample: 'household' (the default) is a married couple with about three years of transactions across dozens of accounts, payees and securities; 'single' is one homeowner with a mortgage, a car lease and one credit card, with about two years of transactions. The book is named 'Demo Book' or 'Demo Book - Single', with ' 2', ' 3' and so on when that name is taken. This writes thousands of rows and can take several seconds.",
     "inputSchema": {
       "type": "object",
-      "properties": {},
+      "properties": {
+        "dataset": {
+          "type": "string",
+          "enum": ["household", "single"],
+          "description": "The sample dataset. Default: household."
+        }
+      },
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "annotations": {
@@ -1518,7 +1524,7 @@
   {
     "name": "get_system_status",
     "title": "Get System Status",
-    "description": "Report the health of Counterpoise's background jobs: database backup, backup pruning, hourly recurring-transaction processing, bank sync, security price sync, and search reindex. Each job reports one of ok, stale, unverified, failed, missing, or unknown (no status directory mounted — the normal case in local development). Overall is 'attention' if any job needs it.",
+    "description": "Report the health of Counterpoise's background jobs: database backup, backup pruning, hourly recurring-transaction processing, bank sync, security price sync, and the monthly database compaction (the job named reindex). Each job reports one of ok, stale, unverified, failed, missing, not_configured (Plaid sync or price sync with no secret set — normal, and the detail names the missing setting), or unknown (no status directory mounted — the normal case in local development). Overall is 'attention' if any job needs it; not_configured and unknown never cause it.",
     "inputSchema": {
       "type": "object",
       "properties": {},

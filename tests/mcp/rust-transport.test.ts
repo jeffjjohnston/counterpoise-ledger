@@ -2,9 +2,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { apiKeys, sessions } from "@/db/schema";
 import { generateApiKey, getKeyPrefix, hashApiKey } from "@/tests/helpers/api-keys";
-import { db, resetTestDatabase, setupTestDatabase } from "@/tests/helpers/db-utils";
+import { resetTestDatabase, setupTestDatabase } from "@/tests/helpers/db-utils";
+import { exec, insert } from "@/tests/helpers/sql";
 import { startHttpTestServer } from "@/tests/helpers/http-parity";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { mcpTestTransport } from "@/tests/helpers/mcp-client";
@@ -37,7 +37,7 @@ describe.skipIf(mcpTestTransport() !== "http")("Rust MCP transport", () => {
   beforeEach(async () => {
     await resetTestDatabase();
     key = generateApiKey();
-    await db.insert(apiKeys).values({ userId: 1, name: "t", keyHash: await hashApiKey(key), keyPrefix: getKeyPrefix(key) });
+    await insert("api_keys", { userId: 1, name: "t", keyHash: await hashApiKey(key), keyPrefix: getKeyPrefix(key) });
   });
 
   afterAll(async () => {
@@ -58,13 +58,13 @@ describe.skipIf(mcpTestTransport() !== "http")("Rust MCP transport", () => {
 
   it("refuses an unknown key and a revoked key", async () => {
     expect((await post({ authorization: `Bearer ${generateApiKey()}` })).status).toBe(401);
-    await db.delete(apiKeys);
+    await exec("DELETE FROM api_keys");
     expect((await post({ authorization: `Bearer ${key}` })).status).toBe(401);
   });
 
   it("refuses a session cookie", async () => {
     const token = randomBytes(32).toString("hex");
-    await db.insert(sessions).values({
+    await insert("sessions", {
       userId: 1,
       tokenHash: createHash("sha256").update(token).digest("hex"),
       expiresAt: new Date(Date.now() + 60 * 60 * 1000),
@@ -93,7 +93,7 @@ describe.skipIf(mcpTestTransport() !== "http")("Rust MCP transport", () => {
     );
     try {
       expect((await callMcpTool(client, "list_books")).isError).toBe(false);
-      await db.delete(apiKeys);
+      await exec("DELETE FROM api_keys");
       await expect(callMcpTool(client, "list_books")).rejects.toThrow();
     } finally {
       await client.close();

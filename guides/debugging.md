@@ -8,15 +8,19 @@ The Rust server logs through `tracing`, and `RUST_LOG` sets the filter (the
 default is `info`). SQLx logs each statement at the `debug` level, so start
 the server with `RUST_LOG=info,sqlx=debug` to see the SQL of each request.
 
-In a TypeScript script or test, Drizzle doesn't log by default. `.toSQL()`
-renders the statement and its parameters without running anything:
-```typescript
-const query = db.select().from(transactions).where(eq(transactions.bookId, 1));
-console.log(query.toSQL()); // { sql: "select ...", params: [1] }
+To run a query by hand, open the development file with the SQLite shell:
 
-// For the rows, await it — an un-awaited builder logs the builder, not results.
-console.log("Query result:", await query);
+```bash
+sqlite3 data/counterpoise.db "SELECT id, name FROM books"
 ```
+
+The shell does not have the app's SQL functions (`cp_today()`,
+`cp_merchant_key()`, and the Unicode `lower()` and case-sensitive `LIKE`).
+A query that uses them can give a different answer in the shell. See
+[database-management.md](database-management.md#functions-registered-on-each-connection).
+
+In a test, `tests/helpers/sql.ts` runs SQL on the worker's file with
+`node:sqlite`: `rows()`, `scalar()` and `script()`.
 
 ## Check Split Balance
 A transaction write whose splits do not sum to zero gets 400 `Transaction

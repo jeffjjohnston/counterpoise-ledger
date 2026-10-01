@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useBookId } from "@/hooks/useBookId";
+import { useBookChanges } from "@/components/BookChangesProvider";
 import { apiGet } from "@/lib/api-client";
 import { formatPriceMicrosInput, parseStrictCurrency } from "@/lib/wasm-client";
 import { evaluateExpression } from "@/lib/wasm-client";
@@ -38,6 +39,8 @@ export type InvestmentAction =
 export interface InvestmentEntry {
   // state + setters the section renders from
   securities: Security[];
+  /** The securities with shares in the investment account, for the Security list. */
+  heldSecurityIds: ReadonlySet<number>;
   investmentAccountId: number | null;
   setInvestmentAccountId: (id: number | null) => void;
   investmentIncomeAccountId: number | null;
@@ -93,6 +96,12 @@ export function useInvestmentEntry(args: {
   const bookId = useBookId();
 
   const [securities, setSecurities] = useState<Security[]>([]);
+  // With the account that it is for, so that a switch to another account
+  // does not show the previous account's list under the new name.
+  const [held, setHeld] = useState<{ accountId: number; ids: ReadonlySet<number> } | null>(
+    null
+  );
+  const [positionsVersion, setPositionsVersion] = useState(0);
   const [investmentAccountId, setInvestmentAccountId] = useState<number | null>(null);
   const [investmentIncomeAccountId, setInvestmentIncomeAccountId] = useState<number | null>(
     null
@@ -173,6 +182,43 @@ export function useInvestmentEntry(args: {
 
     void loadSecurities();
   }, [bookId]);
+
+  // A write that adds or removes shares changes what the account holds.
+  useBookChanges((change) => {
+    if (change.type === "reset" || change.tables.includes("investment_splits")) {
+      setPositionsVersion((version) => version + 1);
+    }
+  });
+
+  useEffect(() => {
+    if (!investmentAccountId) return;
+    let current = true;
+    const loadHeld = async () => {
+      try {
+        const positions = await apiGet<unknown>(
+          `/api/b/${bookId}/investments/positions?accountId=${investmentAccountId}`
+        );
+        const ids = Array.isArray(positions)
+          ? positions
+              .map((position: { securityId?: unknown }) => position?.securityId)
+              .filter((id): id is number => typeof id === "number")
+          : [];
+        if (current) setHeld({ accountId: investmentAccountId, ids: new Set(ids) });
+      } catch {
+        // The held list only orders the Security list. Without it, the list
+        // shows all securities by type, as before.
+        if (current) setHeld(null);
+      }
+    };
+    void loadHeld();
+    return () => {
+      current = false;
+    };
+  }, [bookId, investmentAccountId, positionsVersion]);
+  const heldSecurityIds = useMemo<ReadonlySet<number>>(
+    () => (held && held.accountId === investmentAccountId ? held.ids : new Set()),
+    [held, investmentAccountId]
+  );
 
   useEffect(() => {
     const investmentAccounts = accounts.filter(
@@ -456,6 +502,7 @@ export function useInvestmentEntry(args: {
 
   return {
     securities,
+    heldSecurityIds,
     investmentAccountId,
     setInvestmentAccountId,
     investmentIncomeAccountId,

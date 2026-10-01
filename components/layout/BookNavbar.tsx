@@ -205,9 +205,11 @@ export function BookNavbar() {
 
   return (
     <>
-      <nav className="bg-surface border-b border-border">
-        <div className="px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-14 lg:h-16">
+      {/* The height includes the bottom border. The register and the mobile
+          drawers use 3.5rem and 4rem as the navbar height. */}
+      <nav className="h-14 lg:h-16 bg-surface border-b border-border">
+        <div className="h-full px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-full">
             <div className="flex items-center">
               <Link href="/" className="flex items-center gap-2 shrink-0">
                 <img src={logoSrc} alt="" className="w-7 h-7 lg:w-8 lg:h-8" />

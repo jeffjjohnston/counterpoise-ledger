@@ -10,6 +10,15 @@
 //! read the address with [`from_headers`]. They do not read
 //! `X-Forwarded-For`.
 //!
+//! The address is a rate-limit key: [`rate_limit_key`] maps an IPv6 address to
+//! its /64 prefix and an IPv4-mapped address to its IPv4 address.
+//!
+//! The same rule applies to [`PROXY_HEADERS`], `X-Forwarded-Host` and
+//! `X-Forwarded-Proto`. They give the host that the cross-origin checks
+//! compare with `Origin`, and the scheme of the Secure-cookie warning. When
+//! the server does not trust a proxy, [`record`] removes them, so that a
+//! client that connects directly cannot choose the host of the origin check.
+//!
 //! `TRUST_PROXY` sets the rule (see [`trust_proxy`]):
 //!
 //! | `TRUST_PROXY` | Rule |
@@ -30,11 +39,17 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-/// The header that [`record`] writes. It is not a public contract: the server
-/// removes the value that a client sends.
+/// The header that [`record`] writes. Its value is the rate-limit key of the
+/// client, not the client's address. An IPv6 address is cut to its /64 prefix.
+/// An IPv4-mapped IPv6 address becomes an IPv4 address. It is not a public
+/// contract: the server removes the value that a client sends.
 pub(crate) const CLIENT_IP_HEADER: &str = "x-counterpoise-client-ip";
+
+/// The proxy headers other than `X-Forwarded-For` that the server reads.
+/// [`record`] removes them when the server does not trust a proxy.
+const PROXY_HEADERS: [&str; 2] = ["x-forwarded-host", "x-forwarded-proto"];
 
 /// The result of [`trust_proxy`], with the reason for the log line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,18 +121,40 @@ fn rightmost_forwarded(headers: &HeaderMap) -> Option<&str> {
         })
 }
 
-/// The client address for a request: the rightmost `X-Forwarded-For` entry
-/// when `trusted` and the header has one, else the peer address.
-pub(crate) fn resolve(trusted: bool, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<String> {
-    if trusted && let Some(forwarded) = rightmost_forwarded(headers) {
-        return Some(forwarded.to_string());
+/// The rate-limit key for a client address.
+///
+/// An IPv4 address is its own key. An IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`) gives the embedded IPv4 address, so it shares the IPv4
+/// bucket. Any other IPv6 address gives its /64 prefix, because one client
+/// usually holds a whole /64 and can use a new address for each attempt. Text
+/// that is not an IP address stays as it is.
+pub(crate) fn rate_limit_key(address: &str) -> String {
+    match address.parse::<IpAddr>() {
+        Ok(ip) => match ip.to_canonical() {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => {
+                let mut segments = v6.segments();
+                segments[4..].fill(0);
+                Ipv6Addr::from(segments).to_string()
+            }
+        },
+        Err(_) => address.to_string(),
     }
-    // A dual-stack listener shows an IPv4 client as `::ffff:a.b.c.d`.
-    peer.map(|ip| ip.to_canonical().to_string())
 }
 
-/// The middleware that writes [`CLIENT_IP_HEADER`]. `State` is the result of
-/// [`trust_proxy`].
+/// The client key for a request: the rightmost `X-Forwarded-For` entry when
+/// `trusted` and the header has one, else the peer address. Both go through
+/// [`rate_limit_key`].
+pub(crate) fn resolve(trusted: bool, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<String> {
+    if trusted && let Some(forwarded) = rightmost_forwarded(headers) {
+        return Some(rate_limit_key(forwarded));
+    }
+    peer.map(|ip| rate_limit_key(&ip.to_string()))
+}
+
+/// The middleware that writes [`CLIENT_IP_HEADER`], and that removes
+/// [`PROXY_HEADERS`] when the server does not trust a proxy. `State` is the
+/// result of [`trust_proxy`].
 pub(crate) async fn record(
     State(trusted): State<bool>,
     mut request: Request,
@@ -130,13 +167,21 @@ pub(crate) async fn record(
     let client = resolve(trusted, request.headers(), peer);
     let headers = request.headers_mut();
     headers.remove(CLIENT_IP_HEADER);
+    if !trusted {
+        for name in PROXY_HEADERS {
+            headers.remove(name);
+        }
+    }
     if let Some(value) = client.and_then(|client| HeaderValue::from_str(&client).ok()) {
         headers.insert(CLIENT_IP_HEADER, value);
     }
     next.run(request).await
 }
 
-/// The client address that [`record`] wrote, or `None` when it found none.
+/// The rate-limit key that [`record`] wrote, or `None` when it found none.
+/// This is not the client's address. An IPv6 address is cut to its /64 prefix.
+/// An IPv4-mapped IPv6 address is an IPv4 address. Do not log it. Do not store
+/// it as the address of the client.
 pub(crate) fn from_headers(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(CLIENT_IP_HEADER)
@@ -187,6 +232,44 @@ mod tests {
         assert_eq!(
             resolve(true, &headers, PEER).as_deref(),
             Some("198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn ipv6_clients_share_a_key_per_64_prefix() {
+        let key = rate_limit_key;
+        assert_eq!(
+            key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"),
+            key("2001:db8:1:2::1")
+        );
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::");
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:2:2::1"));
+    }
+
+    #[test]
+    fn mapped_ipv6_shares_the_ipv4_key_and_ipv4_is_unchanged() {
+        assert_eq!(
+            rate_limit_key("::ffff:192.0.2.1"),
+            rate_limit_key("192.0.2.1")
+        );
+        assert_eq!(rate_limit_key("192.0.2.1"), "192.0.2.1");
+        assert_eq!(rate_limit_key("172.18.0.1"), "172.18.0.1");
+        assert_eq!(rate_limit_key("not an address"), "not an address");
+    }
+
+    #[test]
+    fn resolve_gives_the_64_key_for_peer_and_forwarded_entry() {
+        let peer: IpAddr = "2001:db8:1:2::9".parse().unwrap();
+        let headers = HeaderMap::new();
+        assert_eq!(
+            resolve(false, &headers, Some(peer)).as_deref(),
+            Some("2001:db8:1:2::")
+        );
+        let headers = forwarded(&["2001:db8:1:2:f::1"]);
+        assert_eq!(
+            resolve(true, &headers, PEER).as_deref(),
+            Some("2001:db8:1:2::")
         );
     }
 
@@ -296,5 +379,82 @@ mod tests {
             echo_client_ip(true, &[(CLIENT_IP_HEADER, "203.0.113.6")]).await,
             "127.0.0.1"
         );
+    }
+
+    /// Sends one request through [`service`] on a real listener.
+    async fn send(
+        app: Router,
+        trusted: bool,
+        method: reqwest::Method,
+        headers: &[(&str, &str)],
+    ) -> (u16, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server =
+            tokio::spawn(
+                async move { axum::serve(listener, service(app, trusted)).await.unwrap() },
+            );
+        let mut request = reqwest::Client::new().request(method, format!("{base}/api/write"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap();
+        server.abort();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn untrusted_service_removes_the_forwarded_host_and_proto() {
+        let echo = Router::new().route(
+            "/api/write",
+            get(|headers: HeaderMap| async move {
+                let value = |name| {
+                    headers
+                        .get(name)
+                        .and_then(|value: &HeaderValue| value.to_str().ok())
+                        .unwrap_or("none")
+                        .to_string()
+                };
+                format!(
+                    "{} {}",
+                    value("x-forwarded-host"),
+                    value("x-forwarded-proto")
+                )
+            }),
+        );
+        let forwarded = [
+            ("x-forwarded-host", "books.example"),
+            ("x-forwarded-proto", "https"),
+        ];
+        let get = reqwest::Method::GET;
+        assert_eq!(
+            send(echo.clone(), false, get.clone(), &forwarded).await.1,
+            "none none"
+        );
+        assert_eq!(
+            send(echo, true, get, &forwarded).await.1,
+            "books.example https"
+        );
+    }
+
+    /// A client that connects directly must not choose the host that the
+    /// cross-origin write check compares with `Origin`.
+    #[tokio::test]
+    async fn untrusted_forwarded_host_cannot_pass_the_origin_check() {
+        let app = || {
+            let api = Router::new().route("/api/write", axum::routing::post(|| async { "ok" }));
+            crate::security::protect(api, crate::security::no_pages(), false)
+        };
+        let post = reqwest::Method::POST;
+        let forged = [
+            ("origin", "https://attacker.example"),
+            ("x-forwarded-host", "attacker.example"),
+            ("authorization", "Bearer cpk_test"),
+        ];
+        assert_eq!(send(app(), false, post.clone(), &forged).await.0, 403);
+        // Behind a trusted proxy, the proxy writes the header.
+        assert_eq!(send(app(), true, post, &forged).await.0, 200);
     }
 }

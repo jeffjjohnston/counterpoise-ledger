@@ -1,10 +1,15 @@
 use crate::client_ip::{ProxyTrust, trust_proxy};
 use std::{env, path::PathBuf};
 
+/// The upgrade guide that a PostgreSQL install must follow first.
+pub(crate) const UPGRADE_GUIDE: &str =
+    "https://github.com/jeffjjohnston/counterpoise-ledger/blob/main/guides/upgrade-to-sqlite.md";
+
 pub(crate) struct Config {
-    pub(crate) database_url: String,
+    /// The SQLite database file (`DATABASE_PATH`, default
+    /// `data/counterpoise.db`; the image sets `/data/counterpoise.db`).
+    pub(crate) database_path: PathBuf,
     pub(crate) bind: String,
-    pub(crate) time_zone: String,
     /// Send `Strict-Transport-Security` when `ENABLE_HSTS=true`.
     pub(crate) enable_hsts: bool,
     /// The client build (`vite build` writes it to `build/`). The server
@@ -25,17 +30,32 @@ impl Config {
             &bind,
         )?;
         Ok(Self {
-            database_url: env::var("DATABASE_URL")?,
+            database_path: env::var_os("DATABASE_PATH")
+                .filter(|path| !path.is_empty())
+                .map_or_else(|| PathBuf::from("data/counterpoise.db"), PathBuf::from),
             bind,
-            time_zone: match env::var("TZ") {
-                Ok(zone) if !zone.is_empty() => zone,
-                _ => iana_time_zone::get_timezone()?,
-            },
             enable_hsts: env::var("ENABLE_HSTS").is_ok_and(|value| value == "true"),
             static_dir: env::var_os("COUNTERPOISE_STATIC_DIR")
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
             trust_proxy,
         })
+    }
+
+    /// Refuses to start an install that has not converted its PostgreSQL
+    /// data. Such an install still sets `DATABASE_URL`, and it has no
+    /// database file yet. Without this refusal it would start with an empty
+    /// database, and the user could think that the data is lost.
+    pub(crate) fn refuse_unconverted_install(&self) -> Result<(), String> {
+        let postgres = env::var("DATABASE_URL").is_ok_and(|url| !url.is_empty());
+        if postgres && !self.database_path.exists() {
+            return Err(format!(
+                "DATABASE_URL is set, and there is no database at {}. This release \
+                 stores its data in SQLite. Convert the PostgreSQL data first: see {UPGRADE_GUIDE}. \
+                 Remove DATABASE_URL only for a new, empty install.",
+                self.database_path.display()
+            ));
+        }
+        Ok(())
     }
 }

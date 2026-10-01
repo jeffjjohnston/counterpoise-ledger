@@ -9,6 +9,7 @@
 //! snapshot proves, at display and at confirmation, that nothing it read has
 //! changed.
 
+use crate::typesafe::read_json_column;
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
     error::{ApiError, error, error_owned},
@@ -35,9 +36,12 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{NaiveDateTime, TimeDelta};
+use chrono::{Days, Local, NaiveDateTime, TimeDelta};
+use ledger_db::engine::{DbConnection, DbExecutor, DbPool};
+use ledger_db::locks::{FOR_SHARE, FOR_UPDATE};
+use ledger_db::sql::{self, MERCHANT_KEY};
 use serde_json::{Map, Value, json};
-use sqlx::{FromRow, PgConnection, PgPool};
+use sqlx::FromRow;
 
 const LEASE: TimeDelta = TimeDelta::seconds(30);
 const RETRY: TimeDelta = TimeDelta::seconds(60);
@@ -47,13 +51,6 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 const UNAVAILABLE: &str = "TypeSafe is temporarily unavailable";
 const STALE_REVIEW: &str =
     "This TypeSafe suggestion is stale. Refresh and review the transaction again.";
-
-/// Quote characters that `normalizePayeeName()` changes to an apostrophe.
-const CURLY_QUOTES: &str = "\u{2018}\u{2019}\u{201A}\u{201B}\u{2032}\u{0060}\u{00B4}";
-
-/// The merchant key of a staged row in SQL, as `merchantKeySql`: the rule of
-/// `normalizePayeeName()`, then lowercase.
-const MERCHANT_KEY: &str = "lower(btrim(regexp_replace(translate(coalesce(r.merchant_name, r.name), $2, $3), $4, ' ', 'g')))";
 
 /// The errors of `typeSafeHttpError`.
 enum Failure {
@@ -115,11 +112,11 @@ fn stale(message: &'static str) -> Failure {
 }
 
 /// `lockTypeSafeBook`: the enabled flag and revision, under the row lock.
-async fn lock_book(connection: &mut PgConnection, book_id: i32) -> Result<(bool, i32)> {
-    let book: Option<(bool, i32)> = sqlx::query_as(
+async fn lock_book(connection: &mut DbConnection, book_id: i32) -> Result<(bool, i32)> {
+    let book: Option<(bool, i32)> = sqlx::query_as(&format!(
         "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books
-         WHERE id = $1 FOR UPDATE",
-    )
+         WHERE id = $1{FOR_UPDATE}"
+    ))
     .bind(book_id)
     .fetch_optional(&mut *connection)
     .await?;
@@ -127,7 +124,7 @@ async fn lock_book(connection: &mut PgConnection, book_id: i32) -> Result<(bool,
 }
 
 /// `getTypeSafeSettings`: enabled and revision, without a lock.
-async fn settings<'e, E: sqlx::PgExecutor<'e>>(executor: E, book_id: i32) -> Result<(bool, i32)> {
+async fn settings<'e, E: DbExecutor<'e>>(executor: E, book_id: i32) -> Result<(bool, i32)> {
     let book: Option<(bool, i32)> = sqlx::query_as(
         "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books WHERE id = $1",
     )
@@ -145,7 +142,7 @@ fn merchant_key(row: &crate::routes::reconcile::ReconRow) -> String {
 /// object literal, so that its fingerprint is the Node fingerprint. `None`
 /// means that no request applies.
 async fn snapshot(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     link_id: i64,
     reconciliation_id: i64,
@@ -194,16 +191,12 @@ async fn snapshot(
     .await?;
     let candidates = match_candidates(connection, &row, link.account_id).await?;
     let key = merchant_key(&row);
-    let quotes = "'".repeat(CURLY_QUOTES.chars().count());
     let seen_before: Option<i32> = sqlx::query_scalar(&format!(
         "SELECT r.id FROM plaid_transaction_reconciliation r
-         WHERE r.book_id = $1 AND r.resolution_status = 'matched' AND {MERCHANT_KEY} = $5
+         WHERE r.book_id = $1 AND r.resolution_status = 'matched' AND {MERCHANT_KEY} = $2
          LIMIT 1"
     ))
     .bind(book_id)
-    .bind(CURLY_QUOTES)
-    .bind(&quotes)
-    .bind("\\s+")
     .bind(&key)
     .fetch_optional(&mut *connection)
     .await?;
@@ -217,14 +210,17 @@ async fn snapshot(
     let totals: Vec<(i32, i64)> = if candidates.is_empty() {
         Vec::new()
     } else {
-        sqlx::query_as(
-            "SELECT transaction_id, sum(amount)::bigint FROM transaction_splits
-             WHERE book_id = $1 AND account_id = $2 AND transaction_id = ANY($3)
+        sqlx::query_as(&format!(
+            "SELECT transaction_id, CAST(sum(amount) AS bigint) FROM transaction_splits
+             WHERE book_id = $1 AND account_id = $2 AND transaction_id {}
              GROUP BY transaction_id",
-        )
+            sql::in_integers("$3")
+        ))
         .bind(book_id)
         .bind(link.account_id)
-        .bind(candidates.iter().map(candidate_id).collect::<Vec<_>>())
+        .bind(sql::json_array(
+            &candidates.iter().map(candidate_id).collect::<Vec<_>>(),
+        ))
         .fetch_all(&mut *connection)
         .await?
     };
@@ -244,36 +240,40 @@ async fn snapshot(
     let counterparts: Vec<(i32, String, String)> = if eligible.is_empty() {
         Vec::new()
     } else {
-        sqlx::query_as(
+        sqlx::query_as(&format!(
             "SELECT DISTINCT s.transaction_id, a.name, a.type
              FROM transaction_splits s
              JOIN transactions t ON t.id = s.transaction_id AND t.book_id = $1
              JOIN accounts a ON a.id = s.account_id AND a.book_id = $1
-             WHERE s.book_id = $1 AND s.transaction_id = ANY($2)
+             WHERE s.book_id = $1 AND s.transaction_id {}
                AND a.type IN ('income', 'expense')",
-        )
+            sql::in_integers("$2")
+        ))
         .bind(book_id)
-        .bind(eligible.iter().map(|c| candidate_id(c)).collect::<Vec<_>>())
+        .bind(sql::json_array(
+            &eligible.iter().map(|c| candidate_id(c)).collect::<Vec<_>>(),
+        ))
         .fetch_all(&mut *connection)
         .await?
     };
-    let day: String = sqlx::query_scalar("SELECT current_date::text FROM books WHERE id = $1")
-        .bind(book_id)
-        .fetch_one(&mut *connection)
-        .await?;
+    let day: String = sqlx::query_scalar(concat!(
+        "SELECT ",
+        ledger_db::today!(),
+        " FROM books WHERE id = $1"
+    ))
+    .bind(book_id)
+    .fetch_one(&mut *connection)
+    .await?;
     // The payee that earlier resolved rows for this merchant used most.
     let merchant_payee: Option<(i32, String)> = sqlx::query_as(&format!(
         "SELECT p.id, p.name FROM plaid_transaction_reconciliation r
          JOIN transactions t ON t.id = r.matched_transaction_id
          JOIN payees p ON p.id = t.payee_id
          WHERE r.book_id = $1 AND t.book_id = $1
-           AND r.resolution_status IN ('matched', 'created') AND {MERCHANT_KEY} = $5
+           AND r.resolution_status IN ('matched', 'created') AND {MERCHANT_KEY} = $2
          GROUP BY p.id, p.name ORDER BY count(*) DESC, p.id LIMIT 1"
     ))
     .bind(book_id)
-    .bind(CURLY_QUOTES)
-    .bind(&quotes)
-    .bind("\\s+")
     .bind(&key)
     .fetch_optional(&mut *connection)
     .await?;
@@ -281,7 +281,7 @@ async fn snapshot(
         None => Vec::new(),
         Some((payee_id, _)) => {
             sqlx::query_as(
-                "SELECT a.name, count(*)::int FROM transaction_splits s
+                "SELECT a.name, CAST(count(*) AS integer) FROM transaction_splits s
                  JOIN transactions t ON t.id = s.transaction_id
                  JOIN accounts a ON a.id = s.account_id
                  WHERE t.book_id = $1 AND t.payee_id = $2 AND a.type IN ('income', 'expense')
@@ -308,11 +308,12 @@ async fn snapshot(
         "SELECT a.id, a.name, a.type FROM accounts a
          LEFT JOIN transaction_splits s ON s.account_id = a.id
          LEFT JOIN transactions t ON t.id = s.transaction_id
-           AND {EFFECTIVE_DATE} >= (current_date - 365)::text
+           AND {EFFECTIVE_DATE} >= $2
          WHERE a.book_id = $1 AND a.is_active = true AND a.type IN ('income', 'expense')
          GROUP BY a.id, a.name, a.type ORDER BY count(t.id) DESC, a.name LIMIT 254"
     ))
     .bind(book_id)
+    .bind((Local::now().date_naive() - Days::new(365)).to_string())
     .fetch_all(&mut *connection)
     .await?;
     // Code-unit order, not locale order, so that the fingerprint is stable.
@@ -386,8 +387,8 @@ async fn snapshot(
     })))
 }
 
-/// An evaluation row. Its jsonb columns are read as text, so that they keep
-/// the key order that Node reads from PostgreSQL.
+/// An evaluation row. Its JSON columns are read as text, then put in jsonb
+/// key order by `read_json_column`, as the PostgreSQL release returned them.
 #[derive(FromRow)]
 struct StoredEvaluation {
     id: i32,
@@ -404,7 +405,8 @@ struct StoredEvaluation {
 }
 
 const EVALUATION_COLUMNS: &str = "id, reconciliation_id, revision, fingerprint, attempt, status,
-    started_at, displayed_at, choice, snapshot::text AS snapshot, answers::text AS answers";
+    started_at, displayed_at, choice, CAST(snapshot AS TEXT) AS snapshot,
+    CAST(answers AS TEXT) AS answers";
 
 struct Evaluation {
     row: StoredEvaluation,
@@ -414,8 +416,7 @@ struct Evaluation {
 
 impl Evaluation {
     fn read(row: StoredEvaluation) -> Result<Self> {
-        let parse =
-            |text: &str| serde_json::from_str::<Value>(text).map_err(|_| Failure::Unavailable);
+        let parse = |text: &str| read_json_column(text).map_err(|_| Failure::Unavailable);
         Ok(Self {
             snapshot: parse(&row.snapshot)?,
             answers: row.answers.as_deref().map(parse).transpose()?,
@@ -512,7 +513,7 @@ enum Claim {
 /// The first transaction of `requestMatchSuggestion`: take the lease, or
 /// answer from what is stored.
 async fn claim(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     link_id: i64,
     reconciliation_id: i64,
@@ -579,12 +580,13 @@ async fn claim(
     let revision = property(Some(&input), "revision")
         .and_then(Value::as_i64)
         .unwrap_or_default();
+    let snapshot_json = sql::json("$6");
     let record: StoredEvaluation = sqlx::query_as(&format!(
         "INSERT INTO typesafe_evaluations
            (book_id, link_id, reconciliation_id, revision, fingerprint, snapshot, attempt, status,
             started_at, completed_at, error_code, choice, probabilities, confidence, usage, answers,
             displayed_at, latency_ms)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, NULL,
+         VALUES ($1, $2, $3, $4, $5, {snapshot_json}, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, NULL,
                  NULL, NULL, NULL)
          ON CONFLICT (book_id, fingerprint) DO UPDATE SET
            book_id = excluded.book_id, link_id = excluded.link_id,
@@ -614,10 +616,10 @@ async fn claim(
 
 /// Runs `work` in one transaction: commit on success, roll back on failure.
 async fn in_transaction<T>(
-    pool: &PgPool,
-    work: impl AsyncFnOnce(&mut PgConnection) -> Result<T>,
+    pool: &DbPool,
+    work: impl AsyncFnOnce(&mut DbConnection) -> Result<T>,
 ) -> Result<T> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = ledger_db::locks::begin_pool(pool).await?;
     let result = work(transaction.as_mut()).await;
     match result {
         Ok(value) => {
@@ -633,7 +635,7 @@ async fn in_transaction<T>(
 
 /// `requestMatchSuggestion`.
 async fn request_suggestion(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     link_id: i64,
     reconciliation_id: i64,
@@ -721,11 +723,17 @@ async fn request_suggestion(
                 .as_ref()
                 .map(js_stringify)
         });
+        let (probabilities, confidence, answers, usage_json) = (
+            sql::json("$8"),
+            sql::json("$9"),
+            sql::json("$10"),
+            sql::json("$12"),
+        );
         let updated: StoredEvaluation = sqlx::query_as(&format!(
             "UPDATE typesafe_evaluations SET status = $3, completed_at = $4, latency_ms = $5,
-               error_code = $6, choice = $7, probabilities = $8::jsonb, confidence = $9::jsonb,
-               answers = $10::jsonb,
-               usage = CASE WHEN $11 THEN $12::jsonb ELSE usage END
+               error_code = $6, choice = $7, probabilities = {probabilities},
+               confidence = {confidence}, answers = {answers},
+               usage = CASE WHEN $11 THEN {usage_json} ELSE usage END
              WHERE id = $1 AND attempt = $2
              RETURNING {EVALUATION_COLUMNS}"
         ))
@@ -757,7 +765,7 @@ async fn request_suggestion(
 /// `validEvaluation`: a ready evaluation whose snapshot still has the same
 /// fingerprint. Anything else is stale.
 async fn valid_evaluation(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     link_id: i64,
     evaluation_id: i64,
@@ -791,7 +799,7 @@ async fn valid_evaluation(
 
 /// `markSuggestionDisplayed`.
 async fn mark_displayed(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     link_id: i64,
     evaluation_id: i64,
@@ -814,18 +822,22 @@ async fn mark_displayed(
 /// `lockConfirmation`: locks what a confirmation reads until the resolver
 /// commits, in a fixed order.
 async fn lock_confirmation(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     link_id: i64,
     record: &Evaluation,
 ) -> Result<()> {
-    sqlx::query("SELECT id FROM plaid_accounts WHERE id = $1 FOR UPDATE")
-        .bind(column(link_id)?)
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query("SELECT id FROM plaid_transaction_reconciliation WHERE id = $1 FOR UPDATE")
-        .bind(record.row.reconciliation_id)
-        .execute(&mut *connection)
-        .await?;
+    sqlx::query(&format!(
+        "SELECT id FROM plaid_accounts WHERE id = $1{FOR_UPDATE}"
+    ))
+    .bind(column(link_id)?)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(&format!(
+        "SELECT id FROM plaid_transaction_reconciliation WHERE id = $1{FOR_UPDATE}"
+    ))
+    .bind(record.row.reconciliation_id)
+    .execute(&mut *connection)
+    .await?;
     let mut ids: Vec<i32> = match property(Some(&record.snapshot), "candidates") {
         Some(Value::Array(candidates)) => candidates
             .iter()
@@ -840,24 +852,31 @@ async fn lock_confirmation(
     };
     ids.sort_unstable();
     if !ids.is_empty() {
-        let payee_ids: Vec<Option<i32>> = sqlx::query_scalar(
-            "SELECT payee_id FROM transactions WHERE id = ANY($1) ORDER BY id FOR UPDATE",
-        )
-        .bind(&ids)
+        let payee_ids: Vec<Option<i32>> = sqlx::query_scalar(&format!(
+            "SELECT payee_id FROM transactions WHERE id {} ORDER BY id{FOR_UPDATE}",
+            sql::in_integers("$1")
+        ))
+        .bind(sql::json_array(&ids))
         .fetch_all(&mut *connection)
         .await?;
-        sqlx::query("SELECT id FROM transaction_splits WHERE transaction_id = ANY($1) ORDER BY id FOR UPDATE")
-            .bind(&ids)
-            .execute(&mut *connection)
-            .await?;
+        sqlx::query(&format!(
+            "SELECT id FROM transaction_splits WHERE transaction_id {} ORDER BY id{FOR_UPDATE}",
+            sql::in_integers("$1")
+        ))
+        .bind(sql::json_array(&ids))
+        .execute(&mut *connection)
+        .await?;
         let mut payee_ids: Vec<i32> = payee_ids.into_iter().flatten().collect();
         payee_ids.sort_unstable();
         payee_ids.dedup();
         if !payee_ids.is_empty() {
-            sqlx::query("SELECT id FROM payees WHERE id = ANY($1) ORDER BY id FOR SHARE")
-                .bind(&payee_ids)
-                .execute(&mut *connection)
-                .await?;
+            sqlx::query(&format!(
+                "SELECT id FROM payees WHERE id {} ORDER BY id{FOR_SHARE}",
+                sql::in_integers("$1")
+            ))
+            .bind(sql::json_array(&payee_ids))
+            .execute(&mut *connection)
+            .await?;
         }
     }
     if let Some(proposal) = record.proposal()? {
@@ -868,13 +887,13 @@ async fn lock_confirmation(
                 .transpose()
         };
         if let Some(account_id) = id(["category", "accountId"])? {
-            sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR SHARE")
+            sqlx::query(&format!("SELECT id FROM accounts WHERE id = $1{FOR_SHARE}"))
                 .bind(account_id)
                 .execute(&mut *connection)
                 .await?;
         }
         if let Some(payee_id) = id(["payee", "payeeId"])? {
-            sqlx::query("SELECT id FROM payees WHERE id = $1 FOR SHARE")
+            sqlx::query(&format!("SELECT id FROM payees WHERE id = $1{FOR_SHARE}"))
                 .bind(payee_id)
                 .execute(&mut *connection)
                 .await?;
@@ -893,7 +912,7 @@ enum Kind {
 /// resolver runs in the same transaction as the checks. Returns the
 /// resolved item and the decision it applied.
 async fn confirm(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     link_id: i64,
     evaluation_id: i64,
@@ -1137,4 +1156,41 @@ pub(crate) async fn confirm_route(
     )
     .await;
     Ok(Json(item))
+}
+
+#[cfg(test)]
+mod merchant_key_tests {
+    use super::MERCHANT_KEY;
+    use crate::routes::payees::normalize_name;
+
+    /// The SQL merchant key and the Rust merchant key must agree, or a
+    /// learned payee is not found again. The engine must keep this.
+    #[tokio::test]
+    async fn sql_merchant_key_equals_the_rust_key() {
+        let database = ledger_db::testing::TempDatabase::new(1).await;
+        let pool = database.pool().clone();
+        let cases: [(Option<&str>, &str); 8] = [
+            (Some("  Blue\u{2019}s   CAFE "), "ignored"),
+            (None, "\tCRÈME\n BRÛLÉE  Co"),
+            (Some("ÉCLAIR \u{2018}Bakery\u{2019}"), "x"),
+            (Some(""), "the name is not used"),
+            (Some("a`b\u{00B4}c\u{2032}d\u{201A}e\u{201B}"), "x"),
+            (None, "ÄÖÜ straße"),
+            (None, "ONE  two\r\nTHREE"),
+            (Some("  "), "x"),
+        ];
+        for (merchant, name) in cases {
+            let sql: String = sqlx::query_scalar(&format!(
+                "SELECT {MERCHANT_KEY} FROM (SELECT CAST($1 AS text) AS merchant_name,
+                 CAST($2 AS text) AS name) r"
+            ))
+            .bind(merchant)
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let rust = normalize_name(merchant.unwrap_or(name)).to_lowercase();
+            assert_eq!(sql, rust, "merchant {merchant:?}, name {name:?}");
+        }
+    }
 }

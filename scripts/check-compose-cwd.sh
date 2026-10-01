@@ -10,7 +10,7 @@
 #
 # Verified: the same `--env-file .env` reads a different file from each
 # directory it is run in. A run from the wrong place therefore interpolates
-# TZ, POSTGRES_PASSWORD and COUNTERPOISE_BACKUPS_DIR from the wrong file,
+# TZ, APP_BIND and COUNTERPOISE_BACKUPS_DIR from the wrong file,
 # while the containers being recreated are production's. A file that is simply
 # ABSENT is not the danger: Compose exits 1 with "couldn't find env file".
 # The danger is a file that exists and says something else.
@@ -24,10 +24,9 @@
 #
 # WHY A SEPARATE SCRIPT
 #
-# scripts/check-db-credential.sh is the precedent: one question, one refusal,
-# exit 1, and a message that names the remedy. That guard runs in the app
-# container, where the host working directory cannot be seen, so this question
-# needs its own guard on the host. scripts/deploy.sh runs it before it reads
+# One question, one refusal, exit 1, and a message that names the remedy. A
+# guard in the app container cannot see the host working directory, so this
+# question needs its own guard on the host. scripts/deploy.sh runs it before it reads
 # anything else, and an operator can run it by hand before a manual
 # `docker compose` command.
 #

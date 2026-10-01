@@ -26,6 +26,12 @@ interface IssueReport {
   createdAt: string;
 }
 
+interface DemoDataset {
+  id: string;
+  name: string;
+  description: string;
+}
+
 const BOOK_COLORS = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b", "#ef4444"];
 
 export default function BookSelectorPage() {
@@ -35,7 +41,11 @@ export default function BookSelectorPage() {
   const [loading, setLoading] = useState(true);
   const [newBookName, setNewBookName] = useState("");
   const [creating, setCreating] = useState(false);
-  const [creatingDemo, setCreatingDemo] = useState(false);
+  // The dataset whose demo book is being created ("" for the fallback
+  // button), or null when none is.
+  const [creatingDemo, setCreatingDemo] = useState<string | null>(null);
+  // null while the list loads; [] when it failed, which shows the fallback.
+  const [datasets, setDatasets] = useState<DemoDataset[] | null>(null);
   const [editingBook, setEditingBook] = useState<Book | null>(null);
   const [editingBookName, setEditingBookName] = useState("");
   const [savingBook, setSavingBook] = useState(false);
@@ -77,11 +87,22 @@ export default function BookSelectorPage() {
     }
   }, []);
 
+  const fetchDatasets = useCallback(async () => {
+    try {
+      setDatasets(await apiGet<DemoDataset[]>("/api/books/demo/datasets"));
+    } catch {
+      // The fallback button creates the default dataset, so the page stays
+      // useful without the list.
+      setDatasets([]);
+    }
+  }, []);
+
   useEffect(() => {
-    // Both fetch functions handle their own errors internally.
+    // Each fetch function handles its own errors internally.
     void fetchBooks();
     void fetchIssues();
-  }, [fetchBooks, fetchIssues]);
+    void fetchDatasets();
+  }, [fetchBooks, fetchIssues, fetchDatasets]);
 
   const handleCreateBook = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -103,20 +124,22 @@ export default function BookSelectorPage() {
   };
 
   // The request runs the full seed on the server and takes seconds, not
-  // milliseconds. `creatingDemo` disables both actions in this panel for its
+  // milliseconds. `creatingDemo` disables every action in this panel for its
   // whole duration, so the wait reads as work in progress rather than a dead
-  // button. The route takes no body — the book it seeds is the one it creates.
-  const handleCreateDemoBook = async () => {
-    setCreatingDemo(true);
+  // button. The body names only the dataset — the book it seeds is the one
+  // it creates. The fallback button sends no body: the route then uses the
+  // default dataset.
+  const handleCreateDemoBook = async (dataset?: string) => {
+    setCreatingDemo(dataset ?? "");
     setError("");
 
     try {
-      const book = await apiPost<Book>("/api/books/demo");
+      const book = await apiPost<Book>("/api/books/demo", dataset ? { dataset } : undefined);
       setBooks((prev) => [...prev, book]);
     } catch (err) {
       setError(toMessage(err, "Failed to create demo book"));
     } finally {
-      setCreatingDemo(false);
+      setCreatingDemo(null);
     }
   };
 
@@ -374,32 +397,54 @@ export default function BookSelectorPage() {
             onChange={(e) => setNewBookName(e.target.value)}
             placeholder="Book name"
             className="flex-1 rounded-lg border border-border bg-surface-inset px-4 py-2 text-sm text-fg placeholder:text-fg-tertiary focus:outline-hidden focus:ring-2 focus:ring-border-focus focus:border-transparent"
-            disabled={creating || creatingDemo}
+            disabled={creating || creatingDemo !== null}
           />
           <button
             type="submit"
-            disabled={creating || creatingDemo || !newBookName.trim()}
+            disabled={creating || creatingDemo !== null || !newBookName.trim()}
             className="rounded-lg bg-accent px-5 py-2 text-sm font-medium text-fg-on-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {creating ? "Creating..." : "Create"}
           </button>
         </form>
 
-        <div className="mt-5 pt-5 border-t border-border flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <p className="text-sm font-medium text-fg">Or explore with sample data</p>
-            <p className="text-xs text-fg-tertiary mt-0.5">
-              Three years of transactions, accounts, and investments. Takes a few seconds.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={handleCreateDemoBook}
-            disabled={creating || creatingDemo}
-            className="shrink-0 rounded-lg border border-border px-4 py-2 text-sm font-medium text-fg-secondary hover:bg-surface-tertiary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-          >
-            {creatingDemo ? "Creating demo book..." : "Add demo book"}
-          </button>
+        <div className="mt-5 pt-5 border-t border-border">
+          <p className="text-sm font-medium text-fg">Or explore with sample data</p>
+          <p className="text-xs text-fg-tertiary mt-0.5">
+            The dates end today. Each takes a few seconds.
+          </p>
+          {datasets && datasets.length > 0 ? (
+            <ul className="mt-3 space-y-3">
+              {datasets.map((dataset) => (
+                <li key={dataset.id} className="flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-sm text-fg">{dataset.name}</p>
+                    <p className="text-xs text-fg-tertiary mt-0.5">{dataset.description}</p>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label={`Add ${dataset.name} demo book`}
+                    onClick={() => void handleCreateDemoBook(dataset.id)}
+                    disabled={creating || creatingDemo !== null}
+                    className="shrink-0 rounded-lg border border-border px-4 py-2 text-sm font-medium text-fg-secondary hover:bg-surface-tertiary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {creatingDemo === dataset.id ? "Creating..." : "Add"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : datasets ? (
+            <div className="mt-3 flex justify-end">
+              <button
+                type="button"
+                onClick={() => void handleCreateDemoBook()}
+                disabled={creating || creatingDemo !== null}
+                className="shrink-0 rounded-lg border border-border px-4 py-2 text-sm font-medium text-fg-secondary hover:bg-surface-tertiary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {creatingDemo === "" ? "Creating demo book..." : "Add demo book"}
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
 

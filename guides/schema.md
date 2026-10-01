@@ -6,25 +6,31 @@ among them — and says when to come here.
 
 ## Core Tables
 
+The entries below use the camelCase names of the API and the client. The SQL
+tables and columns use snake_case (`investmentSplits.sharesMicros` is
+`investment_splits.shares_micros`).
+
 ### Timezones and timestamp columns
 
-The database's `timestamp without time zone` columns hold **UTC wall-clock
-values**. A JavaScript `Date` that Drizzle writes is stored as UTC, and the
-Rust server must match it: bind `Utc::now().naive_utc()` for new rows and
-updates. When reading a naive
-timestamp in Rust, `.and_utc()` is correct only because the stored value is
-already UTC. Do not insert `NOW()` or `CURRENT_TIMESTAMP` directly into a
-naive timestamp column: PostgreSQL converts that `timestamptz` to the session
-`TimeZone` first, then drops the zone. For SQL-side timestamps, use
-`CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` explicitly.
+The schema is the SQL in `rust-api/db/migrations/`. See
+[database-management.md](database-management.md) for the type rules.
 
-The app sets each database session's `TimeZone` from `TZ` so SQL calendar
-operations such as `CURRENT_DATE` follow the app's local day. That setting
-does **not** change the UTC storage convention. A non-UTC session can otherwise
-shift an inserted timestamp by hours, change `ORDER BY created_at`, and make a
-UTC API response report the wrong instant. The `books` insert trigger also
-copies `books.created_at` into the creator's `book_members.created_at`, so a
-bad book timestamp propagates to membership ordering.
+A timestamp column is `TEXT` that holds a **UTC wall-clock value**
+(`YYYY-MM-DD HH:MM:SS[.fff]`). The Rust code always binds it: use
+`Utc::now().naive_utc()` for new rows and updates. When you read one in Rust,
+`.and_utc()` is correct only because the stored value is already UTC. No
+column has a SQL default for a timestamp. Do not write one from SQL
+(`CURRENT_TIMESTAMP`, `datetime('now')`) either: bind the value from Rust, as
+every write path does.
+
+A calendar date is `TEXT` `YYYY-MM-DD` in the app's local day. In SQL, use
+`cp_today()` (the `today!()` macro in `ledger_db::sql`), which gives today in
+`TZ`. SQLite's own `CURRENT_DATE` and `date('now')` give the UTC date, which
+is a different day for some hours of each day. A wrong date moves a floating
+transaction, a recurring rule or a cleanup cutoff by one day. The `books`
+insert trigger also copies `books.created_at` into the creator's
+`book_members.created_at`, so a bad book timestamp propagates to membership
+ordering.
 
 Test timestamp writes with the server set to an explicit non-UTC zone such as
 `America/New_York`. Assert the returned instant falls between timestamps
@@ -51,13 +57,14 @@ can pass while the conversion is wrong.
   role in each book. An index on `userId` serves the book list query.
 
   An `AFTER INSERT` trigger on `books` adds the creator as owner. The trigger
-  is `book_creator_owner`, from migration `0027`. Thus no path that inserts a
+  is `book_creator_owner`, in `0001_baseline.sql`. Thus no path that inserts a
   book can make a book without an owner row. This applies to a route, an MCP
   tool, the seed, the importer, and raw SQL.
 
-  `book_members` also has the `counterpoise_changes` NOTIFY trigger. The
-  table is in `CHANGE_TABLES` in `rust-api/server/src/book_changes.rs`. Thus
-  an open page sees a role change.
+  `book_members` also has the `*_mark` triggers that count changes in
+  `change_marks`. The table is in `CHANGE_TABLES` in
+  `rust-api/server/src/book_changes.rs`. Thus an open page sees a role
+  change.
 
   Each book must keep one owner or more. The member routes enforce this rule
   in `rust-api/server/src/routes/members.rs` ("A book must keep at least one
@@ -92,6 +99,14 @@ can pass while the conversion is wrong.
 - **transactionSplits**: Double-entry splits (debits/credits)
   - Positive amounts = debits, negative = credits
   - Must sum to zero per transaction
+  - `idx_transaction_splits_book_account` (book_id, account_id,
+    transaction_id, amount) covers the balance sums of the account list and
+    the income statement. Those queries join `transactions` only when a date
+    filter needs it: the join reads each transaction row, and it made the
+    account list five times slower on a large book. The income statement
+    joins with `s.book_id = a.book_id AND s.account_id = a.id` so that it can
+    use this index. Tests in `routes/accounts.rs` and `routes/reports.rs`
+    assert the query plans
 
 - **securities**: Investment securities (stocks, ETFs, mutual funds)
   - Fields: name, symbol, securityType (etf/mutual_fund/stock), fetchPrices, fixedPriceMicros

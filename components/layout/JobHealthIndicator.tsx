@@ -68,7 +68,8 @@ export function JobHealthIndicator({ className }: { className?: string }) {
   if (!status || status.overall !== "attention") return null;
 
   const unhealthy = status.jobs.filter(
-    (j) => j.state !== "ok" && j.state !== "unknown"
+    (j) =>
+      j.state !== "ok" && j.state !== "unknown" && j.state !== "not_configured"
   );
 
   // One phrase for both the visible label and the accessible name, so they

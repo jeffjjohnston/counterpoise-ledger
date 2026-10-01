@@ -12,9 +12,10 @@ use axum::{
 };
 use chrono::{Datelike, NaiveDate};
 use ledger_core::accounting::gross_amount_cents;
+use ledger_db::engine::{Db, DbPool};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
+use sqlx::{FromRow, QueryBuilder};
 
 const FAILURE: &str = "Failed to generate realized gains report";
 
@@ -119,7 +120,7 @@ fn parse_filters(raw_query: Option<&str>) -> Result<Filters, ApiError> {
 }
 
 fn push_filters(
-    query: &mut QueryBuilder<'_, Postgres>,
+    query: &mut QueryBuilder<'_, Db>,
     filters: &Filters,
     account_column: &str,
     account_id: Option<i32>,
@@ -144,12 +145,12 @@ fn push_filters(
 /// Sell shares that no lot could satisfy. They are reported with an unknown
 /// basis, because a dropped disposal would understate a gain.
 async fn unallocated_rows(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     filters: &Filters,
     account_id: Option<i32>,
 ) -> Result<Vec<GainRow>, sqlx::Error> {
-    let mut query = QueryBuilder::<Postgres>::new(format!(
+    let mut query = QueryBuilder::<Db>::new(format!(
         "SELECT {EFFECTIVE_DATE} AS sell_date, s.transaction_id, s.security_id,
                 sec.symbol AS security_symbol, sec.name AS security_name, s.account_id,
                 a.name AS account_name, s.shares_micros, s.price_micros, s.fees_cents,
@@ -201,12 +202,12 @@ async fn unallocated_rows(
 /// The route calls this after its query checks; the MCP tool calls it with
 /// its own arguments.
 pub(crate) async fn report(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     filters: &Filters,
     account_id: Option<i32>,
 ) -> Result<Value, sqlx::Error> {
-    let mut query = QueryBuilder::<Postgres>::new(format!(
+    let mut query = QueryBuilder::<Db>::new(format!(
         "SELECT {EFFECTIVE_DATE} AS sell_date, al.transaction_id, l.security_id,
                 sec.symbol AS security_symbol, sec.name AS security_name, l.account_id,
                 a.name AS account_name, al.shares_micros, l.acquired_date, al.proceeds_cents,

@@ -1,6 +1,7 @@
 //! The pure builders of the TypeSafe request, as `lib/typesafe/questions.ts`
-//! writes them. They have no I/O. The snapshot they read is a JSON value, so
-//! that a snapshot read back from jsonb keeps the key order that Node sees.
+//! writes them. They have no I/O. The snapshot they read is a JSON value
+//! that `read_json_column` puts in jsonb key order, so the request text and
+//! its fingerprint are the same as before the move to SQLite.
 
 use crate::{
     routes::payees::normalize_name,

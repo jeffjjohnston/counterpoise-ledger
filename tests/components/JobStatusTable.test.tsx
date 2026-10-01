@@ -163,6 +163,30 @@ describe("JobStatusTable", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows a job with no secret as Not configured, with its detail", async () => {
+    mockStatus({
+      overall: "ok",
+      jobs: [
+        job({
+          job: "plaid-sync",
+          label: "Bank sync",
+          state: "not_configured",
+          lastOk: null,
+          ageMs: null,
+          detail: "not configured: PLAID_SECRET is not set",
+        }),
+      ],
+    });
+
+    render(<JobStatusTable />);
+
+    expect(await screen.findByText("Not configured")).toBeInTheDocument();
+    expect(screen.queryByText("not_configured")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("not configured: PLAID_SECRET is not set")
+    ).toBeInTheDocument();
+  });
+
   it("suppresses the detail of a healthy job", async () => {
     // The crontab records a detail on success too: `recurring`, `plaid-sync`
     // and `price-sync` all write "HTTP 200". Rendering it unconditionally puts

@@ -1,14 +1,13 @@
-import postgres from "postgres";
-import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { accounts } from "../../db/schema";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
-  addBookMember, createAccount, createBook, createTransactionWithSplits, createUser, db,
+  addBookMember, createAccount, createBook, createTransactionWithSplits, createUser,
   resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
-import { workerDatabaseUrl } from "../helpers/database-safety";
+import { row, rows } from "../helpers/sql";
+import type { Account } from "../../types/db";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { contract, type Contract } from "../helpers/contract";
+import { changeFrame, frameReader, settle } from "../helpers/sse-frames";
 
 const accountNodeSchema = contract("AccountNode");
 const accountWithChildrenSchema = contract("AccountWithChildren");
@@ -27,34 +26,36 @@ describe("account write HTTP parity", () => {
   let baseUrl: string;
   let stop: () => Promise<void>;
   let client: Client;
-  let listener: ReturnType<typeof postgres>;
-  let changes: unknown[] = [];
-  let reached: (() => void) | undefined;
-
-  // A notification on the listening connection is a delivery barrier: every
-  // change the server committed before it arrives first.
-  async function barrier() {
-    const delivered = new Promise<void>((resolve) => { reached = resolve; });
-    await listener.notify("test_account_write_barrier", "barrier");
-    await delivered;
-  }
+  let frames: ReturnType<typeof frameReader>;
 
   beforeAll(async () => {
     await setupTestDatabase();
     ({ baseUrl, stop } = await startHttpTestServer());
-    listener = postgres(workerDatabaseUrl(), { max: 1 });
-    await listener.listen("counterpoise_changes", (payload) => changes.push(JSON.parse(payload)));
-    await listener.listen("test_account_write_barrier", () => reached?.());
   }, 120_000);
 
+  // Each test reads the live-update stream of book 1. A fixture write sends
+  // a hint too, so a test calls `quiet()` after its fixtures. The next
+  // change frame then comes from the write that the test checks.
   beforeEach(async () => {
     await resetTestDatabase();
     client = await sessionHttpClient(baseUrl);
-    await barrier();
-    changes = [];
+    frames = frameReader(await client.request("/api/b/1/events"));
+    expect(await frames.next()).toEqual({ event: "ready", data: "{}" });
   });
 
-  afterAll(async () => { await Promise.all([stop?.(), listener?.end()]); });
+  afterEach(async () => { await frames?.cancel(); });
+
+  afterAll(async () => { await stop?.(); });
+
+  /** Waits until the hints of the earlier writes have arrived. */
+  async function quiet() {
+    await settle(frames);
+  }
+
+  /** The next frame is one hint for the accounts table of book 1. */
+  async function expectAccountsHint() {
+    expect(await frames.next()).toEqual(changeFrame("accounts"));
+  }
 
   async function expectError(path: string, init: RequestInit, status: number, error: string) {
     const response = await client.request(path, init);
@@ -63,6 +64,7 @@ describe("account write HTTP parity", () => {
   }
 
   it("creates a book-scoped account with an empty node shape and notifies the book", async () => {
+    await quiet();
     const response = await client.request("/api/b/1/accounts", json("POST", {
       name: "Groceries", type: "expense", icon: " 🛒 ", bookId: 999, id: 888, isFavorite: true,
     }));
@@ -77,8 +79,7 @@ describe("account write HTTP parity", () => {
     expect(body.id).not.toBe(888);
     expect(body.createdAt).toBe(body.updatedAt);
     expect(Math.abs(Date.parse(body.createdAt) - Date.now())).toBeLessThan(60_000);
-    await barrier();
-    expect(changes).toEqual([{ bookId: 1, table: "accounts" }]);
+    await expectAccountsHint();
   });
 
   it("creates the paired cash sub-account for an investment account in one write", async () => {
@@ -90,7 +91,7 @@ describe("account write HTTP parity", () => {
     const body = await response.json();
     expectShape(accountNodeSchema, body);
     expect(body).toMatchObject({ parentId: parent.id, subtype: "investment", children: [] });
-    const cash = await db.select().from(accounts).where(eq(accounts.parentId, body.id));
+    const cash = await rows<Account>("SELECT * FROM accounts WHERE parent_id = $1", [body.id]);
     expect(cash).toMatchObject([{
       name: "Brokerage Cash", type: "asset", subtype: "cash", isActive: true,
       isInvestmentCash: true, bookId: 1,
@@ -118,14 +119,13 @@ describe("account write HTTP parity", () => {
       await expectError("/api/b/1/accounts", json("POST", body), status, error);
     }
     await expectError("/api/b/1/accounts", { method: "POST", body: "{" }, 500, "Failed to create account");
-    expect(await db.select().from(accounts).where(eq(accounts.bookId, 1))).toHaveLength(1);
+    expect(await rows("SELECT * FROM accounts WHERE book_id = $1", [1])).toHaveLength(1);
   });
 
   it("updates only the sent fields and returns the row with raw children", async () => {
     const account = await createAccount({ name: "Checking", type: "asset", subtype: "bank", isFavorite: true });
     const child = await createAccount({ name: "Envelope", type: "asset", parentId: account.id });
-    await barrier();
-    changes = [];
+    await quiet();
     const response = await client.request(`/api/b/${1}/accounts/${account.id}`, json("PUT", {
       name: "Main Checking", subtype: null, icon: "", type: "expense", bookId: 999,
     }));
@@ -139,8 +139,7 @@ describe("account write HTTP parity", () => {
     expect(body.children.map((row: { id: number }) => row.id)).toEqual([child.id]);
     expect(Date.parse(body.updatedAt)).toBeGreaterThan(account.updatedAt.getTime());
     expect(body.createdAt).toBe(account.createdAt.toISOString());
-    await barrier();
-    expect(changes).toEqual([{ bookId: 1, table: "accounts" }]);
+    await expectAccountsHint();
   });
 
   it("keeps the investment cash sub-account in step on rename and deactivation", async () => {
@@ -201,7 +200,7 @@ describe("account write HTTP parity", () => {
     await expectError(`/api/b/1/accounts/${foreign.id}`, json("PUT", { name: "X" }), 404, "Account not found");
     await expectError("/api/b/1/accounts/abc", json("PUT", { name: "X" }), 500, "Failed to update account");
     await expectError("/api/b/1/accounts/abc", json("PUT", { name: 5 }), 400, "Invalid input: expected string, received number");
-    const [unchanged] = await db.select().from(accounts).where(eq(accounts.id, account.id));
+    const unchanged = await row<Account>("SELECT * FROM accounts WHERE id = $1", [account.id]);
     expect(unchanged).toMatchObject({ name: "Checking", parentId: null });
   });
 
@@ -223,16 +222,14 @@ describe("account write HTTP parity", () => {
     await expectError(`/api/b/1/accounts/${foreign.id}`, { method: "DELETE" }, 404, "Account not found");
     await expectError("/api/b/1/accounts/abc", { method: "DELETE" }, 500, "Failed to delete account");
     await expectError("/api/b/1/accounts/3000000000", { method: "DELETE" }, 500, "Failed to delete account");
-    await barrier();
-    changes = [];
+    await quiet();
 
     const response = await client.request(`/api/b/1/accounts/${unused.id}`, { method: "DELETE" });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ success: true });
-    expect(await db.select().from(accounts).where(and(eq(accounts.id, unused.id)))).toEqual([]);
-    expect(await db.select().from(accounts).where(eq(accounts.id, foreign.id))).toHaveLength(1);
-    await barrier();
-    expect(changes).toEqual([{ bookId: 1, table: "accounts" }]);
+    expect(await rows("SELECT * FROM accounts WHERE id = $1", [unused.id])).toEqual([]);
+    expect(await rows("SELECT * FROM accounts WHERE id = $1", [foreign.id])).toHaveLength(1);
+    await expectAccountsHint();
   });
 
   it("reads path IDs with JavaScript parseInt, including hex and its whitespace set", async () => {
@@ -256,7 +253,7 @@ describe("account write HTTP parity", () => {
     await expectError(`/api/b/1/accounts/${nel}`, json("PUT", { name: "Nel" }), 500, "Failed to update account");
     await expectError("/api/b/1/accounts/0x", json("PUT", { name: "Nel" }), 500, "Failed to update account");
     await expectError(`/api/b/1/accounts/${nel}`, { method: "DELETE" }, 500, "Failed to delete account");
-    const [stored] = await db.select().from(accounts).where(eq(accounts.id, account.id));
+    const stored = await row<Account>("SELECT * FROM accounts WHERE id = $1", [account.id]);
     expect(stored.name).toBe("Bom");
 
     // Book IDs use parseInt(id, 10): hex reads as 0, and U+0085 is NaN.
@@ -267,7 +264,7 @@ describe("account write HTTP parity", () => {
 
     const deleted = await client.request(`/api/b/1/accounts/${hex}`, { method: "DELETE" });
     expect(deleted.status).toBe(200);
-    expect(await db.select().from(accounts).where(eq(accounts.id, account.id))).toEqual([]);
+    expect(await rows("SELECT * FROM accounts WHERE id = $1", [account.id])).toEqual([]);
   });
 
   it("denies viewers and non-members before reading the body", async () => {

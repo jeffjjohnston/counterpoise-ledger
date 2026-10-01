@@ -1,12 +1,11 @@
 //! HTTP adapters used only by tests while the dependent route ports are
 //! blocked on this shared layer. They exercise the same helpers those routes
-//! will call, through Axum and a real PostgreSQL connection.
+//! will call, through Axum and a real SQLite database file (`TempDatabase`).
 
 use crate::{
     analytics::PostHogCapture,
     book_auth::{AccessLevel, authenticate_book},
     cron_auth::require_cron_secret,
-    db_scope::with_advisory_lock,
     error::{ApiError, error, internal_error},
     rate_limit::{Keys, RateLimiter, Scope},
     state::AppState,
@@ -19,8 +18,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use ledger_db::engine::DbPool;
+use ledger_db::locks::{SessionLock, with_session_lock};
 use serde_json::{Value, json};
-use sqlx::postgres::PgPoolOptions;
 use std::{sync::Arc, time::Instant};
 
 async fn read_book(
@@ -115,10 +115,12 @@ async fn limited_login(State(limiter): State<Arc<RateLimiter>>) -> axum::respons
     ))
 }
 
-async fn lock_probe(State(pool): State<sqlx::PgPool>) -> Result<StatusCode, ApiError> {
-    let result = with_advisory_lock(&pool, 1_000_004, std::process::id() as i32, |_| {
-        Box::pin(async { Ok(()) })
-    })
+async fn lock_probe(State(pool): State<DbPool>) -> Result<StatusCode, ApiError> {
+    let result = with_session_lock(
+        &pool,
+        SessionLock::new(1_000_004, std::process::id() as i32),
+        |_| Box::pin(async { Ok(()) }),
+    )
     .await
     .map_err(|cause| internal_error(cause, "Failed to sync token"))?;
     if result.is_some() {
@@ -149,14 +151,8 @@ async fn spawn(app: Router) -> (String, tokio::task::JoinHandle<()>) {
 
 #[tokio::test]
 async fn book_and_body_denials_match_node_http_contract() {
-    let Some(url) = crate::state::test_database_url() else {
-        return;
-    };
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .unwrap();
+    let database = ledger_db::testing::TempDatabase::new(1).await;
+    let pool = database.pool().clone();
     sqlx::query(
         "CREATE TEMP TABLE sessions (token_hash text, user_id integer, expires_at timestamp)",
     )
@@ -171,7 +167,7 @@ async fn book_and_body_denials_match_node_http_contract() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("CREATE TEMP TABLE accounts (id integer GENERATED ALWAYS AS IDENTITY, book_id integer, name text, type text)").execute(&pool).await.unwrap();
+    sqlx::query("CREATE TEMP TABLE accounts (id INTEGER PRIMARY KEY, book_id integer, name text, type text)").execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO books VALUES (7), (8)")
         .execute(&pool)
         .await
@@ -184,9 +180,13 @@ async fn book_and_body_denials_match_node_http_contract() {
     .unwrap();
     for (token, user_id) in [("owner", 1), ("editor", 2), ("viewer", 3)] {
         use sha2::{Digest, Sha256};
-        sqlx::query("INSERT INTO sessions VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') + INTERVAL '1 hour')")
-            .bind(hex::encode(Sha256::digest(token.as_bytes()))).bind(user_id)
-            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions VALUES ($1, $2, $3)")
+            .bind(hex::encode(Sha256::digest(token.as_bytes())))
+            .bind(user_id)
+            .bind((chrono::Utc::now() + chrono::Duration::hours(1)).naive_utc())
+            .execute(&pool)
+            .await
+            .unwrap();
     }
     sqlx::query("INSERT INTO accounts (book_id, name, type) VALUES (8, 'Other Parent', 'asset')")
         .execute(&pool)
@@ -196,7 +196,10 @@ async fn book_and_body_denials_match_node_http_contract() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let mut state = AppState::new(&url, "UTC").unwrap();
+    let mut state = AppState::with_pool(
+        pool.clone(),
+        crate::book_changes::BookChangeHub::new(pool.clone()),
+    );
     state.pool = pool.clone();
     let app = Router::new()
         .route("/book/{id}/read", get(read_book))
@@ -357,25 +360,23 @@ async fn cron_and_rate_limit_denials_match_node_http_contract() {
 
 #[tokio::test]
 async fn advisory_lock_busy_maps_to_the_node_conflict_body() {
-    let Some(url) = crate::state::test_database_url() else {
-        return;
-    };
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
+    let database = ledger_db::testing::TempDatabase::new(2).await;
+    let pool = database.pool().clone();
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let holder_pool = pool.clone();
     let holder = tokio::spawn(async move {
-        with_advisory_lock(&holder_pool, 1_000_004, std::process::id() as i32, |_| {
-            Box::pin(async move {
-                held_tx.send(()).unwrap();
-                release_rx.await.unwrap();
-                Ok(())
-            })
-        })
+        with_session_lock(
+            &holder_pool,
+            SessionLock::new(1_000_004, std::process::id() as i32),
+            |_| {
+                Box::pin(async move {
+                    held_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap()
     });

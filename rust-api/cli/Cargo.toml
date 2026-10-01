@@ -9,8 +9,7 @@ ledger-db = { path = "../db" }
 chrono = "0.4"
 getrandom = "0.4"
 hex = "0.4"
-iana-time-zone = "0.1"
 scrypt = "0.11"
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "chrono"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

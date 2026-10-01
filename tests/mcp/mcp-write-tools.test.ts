@@ -8,9 +8,8 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { getDb } from "@/db";
-import { transactions } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { count, row } from "@/tests/helpers/sql";
+import type { Transaction } from "@/types/db";
 
 let mcp: McpTestClient;
 
@@ -109,11 +108,8 @@ describe("MCP Write Transaction Tools", () => {
       expect(isError).toBe(false);
       expect(data.isReconciled).toBe(true);
 
-      const [row] = await getDb()
-        .select()
-        .from(transactions)
-        .where(eq(transactions.id, data.id));
-      expect(row.isReconciled).toBe(true);
+      const stored = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [data.id]);
+      expect(stored.isReconciled).toBe(true);
     });
 
     it("creates transaction with payee", async () => {
@@ -230,11 +226,8 @@ describe("MCP Write Transaction Tools", () => {
       expect(isError).toBe(false);
       expect(updated.isReconciled).toBe(true);
 
-      const [row] = await getDb()
-        .select()
-        .from(transactions)
-        .where(eq(transactions.id, created.id));
-      expect(row.isReconciled).toBe(true);
+      const stored = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [created.id]);
+      expect(stored.isReconciled).toBe(true);
     });
   });
 
@@ -290,11 +283,7 @@ describe("MCP Write Transaction Tools", () => {
       expect(isError).toBe(false);
       expect(data.success).toBe(true);
 
-      const rows = await getDb()
-        .select()
-        .from(transactions)
-        .where(eq(transactions.id, txn.id));
-      expect(rows).toHaveLength(0);
+      expect(await count("transactions", "id = $1", [txn.id])).toBe(0);
     });
 
     it("returns an error for an unknown transaction", async () => {
@@ -324,8 +313,7 @@ describe("MCP Write Transaction Tools", () => {
     }
 
     async function rowExists(id: number) {
-      const rows = await getDb().select().from(transactions).where(eq(transactions.id, id));
-      return rows.length === 1;
+      return (await count("transactions", "id = $1", [id])) === 1;
     }
 
     it("deletes when expectedUpdatedAt matches the row", async () => {

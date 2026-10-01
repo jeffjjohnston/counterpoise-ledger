@@ -299,7 +299,8 @@ fn unauthorized() -> Response {
 ///
 /// The public host is `X-Forwarded-Host` when it is present, as in
 /// `security.rs`: a reverse proxy that replaces `Host` can put the browser's
-/// host there. The key
+/// host there. When the server does not trust a proxy, `client_ip::record`
+/// removes the header before it gets here. The key
 /// is a bearer header, never a cookie, so a page cannot borrow a user's
 /// credentials here in any case: this check is a second line.
 fn is_cross_origin(headers: &HeaderMap) -> bool {
@@ -441,6 +442,31 @@ mod tests {
             headers.insert(*name, HeaderValue::from_static(value));
         }
         headers
+    }
+
+    #[test]
+    fn create_demo_book_lists_every_dataset() {
+        let manifest: Vec<Value> =
+            serde_json::from_str(include_str!("../../mcp-tools.json")).expect("manifest");
+        let tool = manifest
+            .iter()
+            .find(|entry| entry["name"] == "create_demo_book")
+            .expect("create_demo_book");
+        let listed: Vec<&str> = tool["inputSchema"]["properties"]["dataset"]["enum"]
+            .as_array()
+            .expect("a dataset enum")
+            .iter()
+            .map(|id| id.as_str().expect("a string ID"))
+            .collect();
+        let ids: Vec<&str> = ledger_db::seed::DemoDataset::ALL
+            .iter()
+            .map(|dataset| dataset.id())
+            .collect();
+        assert_eq!(listed, ids);
+        let validator = &registry().validators["create_demo_book"];
+        assert!(validator.is_valid(&json!({})));
+        assert!(validator.is_valid(&json!({"dataset": "single"})));
+        assert!(!validator.is_valid(&json!({"dataset": "nope"})));
     }
 
     #[test]

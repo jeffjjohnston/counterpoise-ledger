@@ -4,9 +4,7 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { getDb } from "@/db";
-import { books } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { count } from "@/tests/helpers/sql";
 
 let mcp: McpTestClient;
 
@@ -78,6 +76,25 @@ describe("MCP Book Tools", () => {
       expect(data.name).toBe("Demo Book");
       expect(data.userId).toBe(userId);
     });
+
+    it("creates the dataset that the dataset parameter names", async () => {
+      const { data, isError } = await callTool("create_demo_book", { dataset: "single" });
+
+      expect(isError).toBe(false);
+      expect(data.name).toBe("Demo Book - Single");
+      expect(await count("accounts", "book_id = $1 AND name = $2", [data.id, "Mortgage"])).toBe(1);
+    }, 120_000);
+
+    it("refuses an unknown dataset", async () => {
+      // The schema check fails with a non-JSON error result, so read it raw.
+      const result = await mcp.client.callTool({
+        name: "create_demo_book",
+        arguments: { dataset: "nope" },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(await count("books", "name LIKE $1", ["Demo Book%"])).toBe(0);
+    });
   });
 
   describe("delete_book", () => {
@@ -92,8 +109,7 @@ describe("MCP Book Tools", () => {
       expect(isError).toBe(false);
       expect(data.success).toBe(true);
 
-      const rows = await getDb().select().from(books).where(eq(books.id, book.id));
-      expect(rows).toHaveLength(0);
+      expect(await count("books", "id = $1", [book.id])).toBe(0);
     });
 
     it("refuses a mismatched confirmBookName and leaves the book present", async () => {
@@ -109,8 +125,7 @@ describe("MCP Book Tools", () => {
 
       // The guard actually guards: the book must still be there, not merely
       // that the call reported an error.
-      const rows = await getDb().select().from(books).where(eq(books.id, book.id));
-      expect(rows).toHaveLength(1);
+      expect(await count("books", "id = $1", [book.id])).toBe(1);
     });
 
     it("returns an error for another user's book without revealing its name", async () => {
@@ -125,8 +140,7 @@ describe("MCP Book Tools", () => {
       expect(isError).toBe(true);
       expect(data.error).toMatch(/not found/i);
 
-      const rows = await getDb().select().from(books).where(eq(books.id, theirs.id));
-      expect(rows).toHaveLength(1);
+      expect(await count("books", "id = $1", [theirs.id])).toBe(1);
     });
   });
 

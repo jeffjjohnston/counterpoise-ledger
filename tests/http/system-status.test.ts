@@ -73,4 +73,25 @@ describe("system status HTTP parity", () => {
     expect(degraded.jobs[0].state).toBe("stale");
     expect(degraded.jobs[1].state).toBe("unverified");
   });
+
+  it("reports a job with no secret as not configured, and not as attention", async () => {
+    await mkdir(statusDir);
+    const names = ["backup", "recurring", "plaid-sync", "price-sync", "prune", "reindex"];
+    const current = new Date().toISOString();
+    for (const job of names) {
+      const record = { job, lastRun: current, lastOk: current, verified: null, bytes: null, detail: null };
+      const none = job === "plaid-sync" || job === "price-sync"
+        ? { notConfigured: true, detail: "not configured: PLAID_SECRET is not set" }
+        : {};
+      await writeFile(join(statusDir, `${job}.json`), JSON.stringify({ ...record, ...none }));
+    }
+    const result = await (await client.request("/api/system/status")).json();
+    expect(result.overall).toBe("ok");
+    expect(result.jobs[2]).toMatchObject({
+      job: "plaid-sync", state: "not_configured", lastOk: null, ageMs: null,
+      detail: "not configured: PLAID_SECRET is not set",
+    });
+    expect(result.jobs[3].state).toBe("not_configured");
+    expect(result.jobs[0].state).toBe("ok");
+  });
 });

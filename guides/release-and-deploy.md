@@ -23,8 +23,8 @@ MERGE the PR (a merge commit)   ← never squash: the release commits have to st
     ▼
 ./scripts/deploy.sh --ref <the merge commit>
     │                          ← publishes tag vX.Y.Z once, at that commit, then
-    │                            builds the image and restarts the containers;
-    │                            the app entrypoint runs the migrations
+    │                            builds the image and restarts the container;
+    │                            the server applies the migrations as it starts
     ▼
 PR: main → dev, merged (not squashed)   ← carries the bump and any release fix
                                           back without rewriting dev
@@ -83,12 +83,25 @@ problem that squash-merging a long-running branch produces:
   point. If `.git/DEPLOY_FORK_POINT` exists, it refuses: that file marks a deploy
   that expects a `dev` rebase, which this script does not perform.
 - **Production owns its checkout and configuration.** Builds and production
-  Compose run in a separate checkout on `main` — `~/prod/counterpoise` by
-  default, or wherever `COUNTERPOISE_BUILD_DIR` points. It must already be a clone
-  of the same origin with its own `.env.production.local` and `backups/`.
-  No credentials are copied from development. The dev checkout uses only
-  `docker-compose.dev.yml`; production uses `docker-compose.yml` and publishes
-  no PostgreSQL host port.
+  Compose run in a separate checkout on `main`. The default is
+  `~/counterpoise-production`. `COUNTERPOISE_BUILD_DIR` can name another
+  directory. Set it in the environment. Or set it in the gitignored
+  `.env.deploy.local` at the dev checkout root, in one line:
+  `COUNTERPOISE_BUILD_DIR=~/path`. The environment wins. The directory must
+  already be a clone of the same origin. It must have its own
+  `.env.production.local` and `backups/`.
+  No credentials are copied from development. Development needs no Docker;
+  production uses `docker-compose.yml`, with its data in the external volume
+  `counterpoise_data`.
+- **The deploy refuses an install that has not converted to SQLite.** It
+  refuses when the `counterpoise_data` volume does not exist, and when
+  `.env.production.local` still sets `DATABASE_URL` and the volume holds no
+  `counterpoise.db` (the test of `scripts/upgrade-to-sqlite.sh`). The check
+  runs before the production checkout moves and before the tag is published,
+  so a refusal changes nothing. Run `scripts/upgrade-to-sqlite.sh` in the
+  production checkout first (see [upgrade-to-sqlite.md](upgrade-to-sqlite.md)).
+  A new install creates the volume once with
+  `docker volume create counterpoise_data`.
 - **The requested SHA must fast-forward production's `main`.** The deploy
   validates that the SHA landed on `origin/main`, then fast-forwards to that
   exact commit. It refuses another branch, a rewind or divergent history.
@@ -99,8 +112,10 @@ problem that squash-merging a long-running branch produces:
   destructive clean. A missing or invalid production configuration stops the
   deploy before a version tag is published or containers are restarted.
 - **Backups default to the production checkout's `backups/`.** The deploy passes
-  the resolved absolute path to the Rust API and scheduler services. The Rust
-  API mounts it read-only for job status; the scheduler writes to it.
+  the resolved absolute path to the `rust-api` service, which mounts it
+  read-write at `/backups`. The server writes the hourly snapshots
+  (`counterpoise-*.db`) there, and the job status records in `status/`. The
+  directory must be writable by uid 1000, the user of the image.
   `COUNTERPOISE_BACKUPS_DIR` can
   name another existing absolute directory; a missing directory is refused so
   Docker cannot silently create an empty backup destination.
@@ -128,7 +143,7 @@ problem that squash-merging a long-running branch produces:
   `gh repo view --json mergeCommitAllowed` reports it.
 - **CI** (the workflow file itself is maintainer tooling and is not published;
   a fork supplies its own). It runs on every PR to **main
-  and to dev** — lint, type-check, tests against a PostgreSQL service container,
+  and to dev** — lint, type-check, the tests (each on its own SQLite files),
   and a `production-build` job that runs `npm run build` (the Vite client
   build) with **no database service**, as `docker build` does. The job was
   added when a page that queried the database at build time passed E2E (which
@@ -178,6 +193,11 @@ problem that squash-merging a long-running branch produces:
   longer exists and returns 500. For example, after `sessions.token` became
   `token_hash`, the old image failed every authenticated request. Roll back with
   a forward migration or a fix-forward deploy.
+- **The move to SQLite is not undone by a revert.** After an install converts,
+  its data is in `counterpoise_data`. A release of the PostgreSQL code would
+  start on the old `counterpoise_pgdata` volume, without the changes made
+  since. Fix forward instead. The owner of an install can still go back by
+  hand, as [upgrade-to-sqlite.md](upgrade-to-sqlite.md) says.
 - **A bad release is undone by a new release, not by a redeploy.**
   `scripts/deploy.sh` only fast-forwards production's `main`, so it refuses
   an older commit. Revert the release's changes on `dev` with `git revert`
@@ -200,19 +220,21 @@ problem that squash-merging a long-running branch produces:
   the same release. With every entry removed, the whole API except
   `/api/mcp` and WebMCP, which have no Next handler, runs on Node, and the
   reverted health gate lets the app start while Rust is down.
-- **The deploy fails unless the migrations succeed and every server comes up
+- **The deploy fails unless the migrations succeed and the server comes up
   healthy.** `deploy.sh` runs `docker compose up -d --wait --wait-timeout 300
-  --build --force-recreate --remove-orphans rust-api scheduler`. The
-  `rust-api` entrypoint checks the credential, applies the Drizzle migrations
-  and rebuilds the lots before it starts the server. A failed migration stops
-  the container, and `up --wait` exits 1, so a new server never runs against
-  the old schema. A Rust server that does not answer `/health` also fails the
-  deploy step. After the step, check `/api/health` before you report the
+  --build --force-recreate --remove-orphans rust-api`. The image has no
+  entrypoint script: the server takes the server lock, applies the embedded
+  migrations and runs the lot backfill guard before it serves. A failed
+  migration stops the process, and `up --wait` exits 1, so a new server never
+  runs against the old schema. The healthcheck (`counterpoise-rust-api
+  health`, which calls `/health`) also fails the deploy step when the server
+  does not answer. After the step, check `/api/health` before you report the
   release as a success.
-- **`rust-api` is the only web service.** It serves the UI, the API and MCP,
-  and publishes `${APP_BIND:-127.0.0.1}:3000:4000`. The host port is still
-  3000, so a reverse proxy needs no change. The scheduler calls
-  `http://rust-api:4000/api/cron/...`. `--remove-orphans` removes the
-  container of a service that the compose file no longer has. The first
-  deploy with this layout removes the old `counterpoise-app-1` container,
-  which held host port 3000.
+- **`rust-api` is the only service.** One image, one container, one process.
+  It serves the UI, the API and MCP, and publishes
+  `${APP_BIND:-127.0.0.1}:3000:4000`. The host port is still 3000, so a
+  reverse proxy needs no change. The server runs every scheduled job itself,
+  the backups included. `--remove-orphans` removes the container of a service
+  that the compose file no longer has: the Next `app` service before, and the
+  `postgres` and `scheduler` services since the move to SQLite. Their volumes
+  stay.

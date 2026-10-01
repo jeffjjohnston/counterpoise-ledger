@@ -1,6 +1,6 @@
 //! Phase 2 (payees) and phase 3 (standard transactions).
 
-use sqlx::{Connection, PgConnection};
+use ledger_db::engine::DbConnection;
 
 use super::values::{
     Item, convert_date, field, int, is_transaction_reconciled, normalize_name,
@@ -34,7 +34,7 @@ fn payee_names(transactions: &[&Item]) -> Vec<String> {
 }
 
 pub async fn import_payees(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     transactions: &[&Item],
 ) -> Result<PayeeStats, sqlx::Error> {
@@ -54,7 +54,7 @@ pub async fn import_payees(
         stats.imported = names.len();
     } else {
         for (count, name) in names.iter().enumerate() {
-            let mut savepoint = connection.begin().await?;
+            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
             let outcome = sqlx::query_scalar::<_, i32>(
                 "INSERT INTO payees (book_id, name, created_at) VALUES ($1, $2, $3) RETURNING id",
             )
@@ -178,7 +178,7 @@ pub struct TransactionStats {
 }
 
 pub async fn import_transactions(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     transactions: &[&Item],
 ) -> Result<TransactionStats, sqlx::Error> {
@@ -249,7 +249,7 @@ pub async fn import_transactions(
                 payee_id: payee_of(context, transaction),
                 is_reconciled: is_transaction_reconciled(transaction),
             };
-            let mut savepoint = connection.begin().await?;
+            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
             let outcome = write_transaction(
                 &mut savepoint,
                 context,
@@ -300,7 +300,7 @@ pub async fn import_transactions(
 /// `pamt` values, then one split per numbered split from its `samt`. Returns
 /// the count of splits.
 async fn write_transaction(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &ImportContext,
     transaction: &Item,
     new_transaction: &NewTransaction,

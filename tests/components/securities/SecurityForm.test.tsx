@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { SecurityForm } from "@/components/securities/SecurityForm";
-import type { Security } from "@/db/schema";
+import type { Security } from "@/types/db";
 
 describe("SecurityForm", () => {
   it("renders empty fields by default", () => {

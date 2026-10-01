@@ -19,9 +19,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::{Days, Local, NaiveDateTime, SecondsFormat};
+use ledger_db::engine::Db;
+use ledger_db::sql;
 use serde::Serialize;
 use serde_json::{Map, Value, json, to_value};
 use sqlx::FromRow;
+use sqlx::QueryBuilder;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) fn bad_request(message: &'static str) -> ApiError {
@@ -355,7 +358,9 @@ pub(crate) async fn clear_sync_data(
         return Err(error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND));
     }
     let database = |cause| internal_error(cause, FAILURE);
-    let mut transaction = state.pool.begin().await.map_err(database)?;
+    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
+        .await
+        .map_err(database)?;
     sqlx::query(
         "DELETE FROM plaid_transaction_reconciliation
          WHERE resolution_status = 'pending'
@@ -453,45 +458,50 @@ async fn refresh_accounts(
     };
     let incoming_ids = column("account_id");
     let now = now_millis();
-    let mut transaction = state
-        .pool
-        .begin()
+    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
         .await
         .map_err(|cause| cause.to_string())?;
     if !accounts.is_empty() {
-        sqlx::query(
+        let columns = [
+            column("name"),
+            column("official_name"),
+            column("mask"),
+            column("type"),
+            column("subtype"),
+        ];
+        let mut insert = QueryBuilder::<Db>::new(
             "INSERT INTO plaid_accounts (book_id, token_id, plaid_account_id, name, official_name,
-                                         mask, type, subtype, created_at, updated_at)
-             SELECT $1, $2, account.id, account.name, account.official_name, account.mask,
-                    account.kind, account.subtype, $9, $9
-             FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[])
-                  WITH ORDINALITY AS account(id, name, official_name, mask, kind, subtype, ordinal)
-             ORDER BY account.ordinal
-             ON CONFLICT (plaid_account_id) DO UPDATE SET
-               token_id = $2, name = excluded.name, official_name = excluded.official_name,
-               mask = excluded.mask, type = excluded.type, subtype = excluded.subtype,
-               updated_at = $9",
-        )
-        .bind(book_id)
-        .bind(token_id)
-        .bind(&incoming_ids)
-        .bind(column("name"))
-        .bind(column("official_name"))
-        .bind(column("mask"))
-        .bind(column("type"))
-        .bind(column("subtype"))
-        .bind(now)
-        .execute(transaction.as_mut())
-        .await
-        .map_err(|cause| cause.to_string())?;
+                                         mask, type, subtype, created_at, updated_at) ",
+        );
+        insert.push_values(incoming_ids.iter().enumerate(), |mut row, (index, id)| {
+            row.push_bind(book_id)
+                .push_bind(token_id)
+                .push_bind(id.clone());
+            for values in &columns {
+                row.push_bind(values[index].clone());
+            }
+            row.push_bind(now).push_bind(now);
+        });
+        insert.push(
+            " ON CONFLICT (plaid_account_id) DO UPDATE SET
+               token_id = excluded.token_id, name = excluded.name,
+               official_name = excluded.official_name, mask = excluded.mask,
+               type = excluded.type, subtype = excluded.subtype,
+               updated_at = excluded.updated_at",
+        );
+        insert
+            .build()
+            .execute(transaction.as_mut())
+            .await
+            .map_err(|cause| cause.to_string())?;
     }
     // `NOT IN` a list that holds a null matches no row, as `<> ALL` does.
-    sqlx::query(
-        "DELETE FROM plaid_accounts
-         WHERE token_id = $1 AND (cardinality($2::text[]) = 0 OR plaid_account_id <> ALL($2))",
-    )
+    sqlx::query(&format!(
+        "DELETE FROM plaid_accounts WHERE token_id = $1 AND plaid_account_id NOT {}",
+        sql::in_texts("$2")
+    ))
     .bind(token_id)
-    .bind(&incoming_ids)
+    .bind(sql::json_array(&incoming_ids))
     .execute(transaction.as_mut())
     .await
     .map_err(|cause| cause.to_string())?;
@@ -643,13 +653,15 @@ pub(crate) async fn set_token_accounts(
         .map(|id| database_id(id, FAILURE))
         .collect::<Result<Vec<i32>, _>>()?;
     if !requested.is_empty() {
-        let types: Vec<String> =
-            sqlx::query_scalar("SELECT type FROM accounts WHERE book_id = $1 AND id = ANY($2)")
-                .bind(book.book_id)
-                .bind(&requested)
-                .fetch_all(&state.pool)
-                .await
-                .map_err(|cause| internal_error(cause, FAILURE))?;
+        let types: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT type FROM accounts WHERE book_id = $1 AND id {in2}",
+            in2 = sql::in_integers("$2")
+        ))
+        .bind(book.book_id)
+        .bind(sql::json_array(&requested))
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|cause| internal_error(cause, FAILURE))?;
         if types.len() != requested.len() {
             return Err(bad_request(
                 "One or more counterpoiseAccountId values are invalid",
@@ -663,12 +675,14 @@ pub(crate) async fn set_token_accounts(
         {
             return Err(bad_request(ONLY_ASSET_OR_LIABILITY));
         }
-        let conflict: bool = sqlx::query_scalar(
+        let conflict: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS (SELECT 1 FROM plaid_accounts
-                            WHERE counterpoise_account_id = ANY($1) AND plaid_account_id <> ALL($2))",
-        )
-        .bind(&requested)
-        .bind(&plaid_ids)
+                            WHERE counterpoise_account_id {in1} AND plaid_account_id NOT {in2})",
+            in1 = sql::in_integers("$1"),
+            in2 = sql::in_texts("$2")
+        ))
+        .bind(sql::json_array(&requested))
+        .bind(sql::json_array(&plaid_ids))
         .fetch_one(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -684,14 +698,17 @@ pub(crate) async fn set_token_accounts(
     // would otherwise collide with the mapping that it is about to move.
     let database = |cause| internal_error(cause, FAILURE);
     let now = now_millis();
-    let mut transaction = state.pool.begin().await.map_err(database)?;
+    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
+        .await
+        .map_err(database)?;
     if !plaid_ids.is_empty() {
-        sqlx::query(
+        sqlx::query(&format!(
             "UPDATE plaid_accounts SET counterpoise_account_id = NULL, updated_at = $3
-             WHERE token_id = $1 AND plaid_account_id = ANY($2)",
-        )
+             WHERE token_id = $1 AND plaid_account_id {in2}",
+            in2 = sql::in_texts("$2")
+        ))
         .bind(token_id)
-        .bind(&plaid_ids)
+        .bind(sql::json_array(&plaid_ids))
         .bind(now)
         .execute(transaction.as_mut())
         .await
@@ -829,7 +846,7 @@ pub(crate) async fn stale_unmatched(
              WHERE r.book_id = $1 AND r.plaid_account_link_id = pa.id
                AND r.matched_transaction_id = t.id)
          GROUP BY a.id, a.name
-         ORDER BY a.name",
+         ORDER BY a.name, a.id",
     )
     .bind(book.book_id)
     .bind(local_days_ago(STALE_AGE_DAYS))
@@ -917,7 +934,7 @@ pub(crate) async fn pending_transactions(
          JOIN plaid_accounts pa ON r.plaid_account_link_id = pa.id AND pa.book_id = $1
          JOIN accounts a ON pa.counterpoise_account_id = a.id AND a.book_id = $1
          WHERE r.book_id = $1 AND r.resolution_status = 'pending' AND r.review_reason IS NULL
-           AND ($2::integer IS NULL OR a.id = $2)
+           AND ($2 IS NULL OR a.id = $2)
          ORDER BY r.id",
     )
     .bind(book.book_id)
@@ -926,12 +943,13 @@ pub(crate) async fn pending_transactions(
     .await
     .map_err(|cause| internal_error(cause, FAILURE))?;
     let account_ids: Vec<i32> = rows.iter().map(|row| row.account_id).collect();
-    let accounts: Vec<AccountRow> = sqlx::query_as(
+    let accounts: Vec<AccountRow> = sqlx::query_as(&format!(
         "SELECT id, book_id, name, type AS account_type, subtype, parent_id, is_active,
                 is_favorite, is_investment_cash, icon, created_at, updated_at
-         FROM accounts WHERE id = ANY($1)",
-    )
-    .bind(&account_ids)
+         FROM accounts WHERE id {in1}",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&account_ids))
     .fetch_all(&state.pool)
     .await
     .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -1064,14 +1082,17 @@ pub(crate) async fn unlink_transaction(
         return Err(error(StatusCode::NOT_FOUND, "No Plaid link found"));
     }
     let now = now_millis();
-    let mut transaction = state.pool.begin().await.map_err(database)?;
-    sqlx::query(
+    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
+        .await
+        .map_err(database)?;
+    sqlx::query(&format!(
         "UPDATE plaid_transaction_reconciliation
          SET resolution_status = 'pending', matched_transaction_id = NULL, review_reason = NULL,
              review_metadata_json = NULL, resolved_at = NULL, updated_at = $3
-         WHERE id = ANY($1) AND book_id = $2",
-    )
-    .bind(&linked)
+         WHERE id {in1} AND book_id = $2",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&linked))
     .bind(book.book_id)
     .bind(now)
     .execute(transaction.as_mut())

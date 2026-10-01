@@ -4,14 +4,14 @@
 //! life, so the scheduled sync and a manual sync cannot fetch the same Plaid
 //! pages twice. Every query of the sync runs on that connection.
 
+use crate::validation::{parse_pg_int4, pg_float8_to_int4};
 use crate::{
     analytics::PostHogCapture,
     book_auth::{AccessLevel, authenticate_book},
-    db_scope::{with_advisory_lock, with_transaction},
+    db_scope::with_transaction,
     error::{ApiResult, error, error_owned},
     plaid::{Plaid, is_configuration_error},
     routes::{
-        payees::normalize_name,
         sync::{finite_path_id, iso_timestamp},
         transactions::now_millis,
     },
@@ -24,13 +24,14 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::{Days, Local, NaiveDate, NaiveDateTime};
+use ledger_db::engine::{Db, DbArguments, DbConnection};
+use ledger_db::locks::{SessionLock, with_session_lock};
+use ledger_db::sql;
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgConnection};
+use sqlx::FromRow;
 use std::collections::{HashMap, HashSet};
 
-/// The namespace of the two-int4 advisory lock, as `PLAID_SYNC_LOCK_NAMESPACE`.
-pub(crate) const PLAID_SYNC_LOCK_NAMESPACE: i32 = 1_000_001;
 const MAX_SYNC_RETRIES: u32 = 2;
 const SYNC_PAGE_SIZE: u32 = 250;
 const INITIAL_SYNC_DAYS: u32 = 7;
@@ -53,8 +54,13 @@ impl SyncError {
     }
 }
 
-/// The message of a database error, as the PostgreSQL error carries it.
+/// The message of a database error, as the PostgreSQL error carries it. A
+/// protocol error carries the message of a check that the Rust code does
+/// for the database, as `parse_pg_int4`.
 fn database_message(cause: &sqlx::Error) -> String {
+    if let sqlx::Error::Protocol(message) = cause {
+        return message.clone();
+    }
     cause
         .as_database_error()
         .map(|error| error.message().to_owned())
@@ -98,10 +104,9 @@ pub(crate) async fn sync_token(
 ) -> Result<SyncResult, SyncError> {
     let plaid = state.plaid.clone();
     let analytics = state.analytics.clone();
-    let outcome = with_advisory_lock(
+    let outcome = with_session_lock(
         &state.pool,
-        PLAID_SYNC_LOCK_NAMESPACE,
-        token_id,
+        SessionLock::plaid_sync(token_id),
         move |connection| {
             Box::pin(async move {
                 Ok(sync_locked(connection, &plaid, &analytics, book_id, token_id).await)
@@ -122,7 +127,7 @@ pub(crate) async fn sync_token(
 /// The sync inside the lock. A demo connection is refused before the step
 /// that records `last_error`: it is not a failed connection.
 async fn sync_locked(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     plaid: &Plaid,
     analytics: &PostHogCapture,
     book_id: i32,
@@ -247,7 +252,7 @@ fn is_pending(item: &Value) -> bool {
 }
 
 async fn sync_steps(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     plaid: &Plaid,
     analytics: &PostHogCapture,
     book_id: i32,
@@ -315,14 +320,16 @@ async fn sync_steps(
         }
     }
     if !removed.is_empty() {
-        let matches: Vec<(i32, String)> = sqlx::query_as(
+        let matches: Vec<(i32, String)> = sqlx::query_as(&format!(
             "SELECT plaid_account_link_id, plaid_transaction_id
              FROM plaid_transaction_reconciliation
-             WHERE plaid_account_link_id = ANY($1) AND plaid_transaction_id = ANY($2)
+             WHERE plaid_account_link_id {in1} AND plaid_transaction_id {in2}
              ORDER BY id",
-        )
-        .bind(&link_ids)
-        .bind(&removed)
+            in1 = sql::in_integers("$1"),
+            in2 = sql::in_texts("$2")
+        ))
+        .bind(sql::json_array(&link_ids))
+        .bind(sql::json_array(&removed))
         .fetch_all(&mut *connection)
         .await
         .map_err(failed)?;
@@ -348,14 +355,15 @@ async fn sync_steps(
     let auto_matched = auto_match(connection, analytics, book_id, &link_ids)
         .await
         .map_err(failed)?;
-    let (pending_count, review_count): (i32, i32) = sqlx::query_as(
+    let (pending_count, review_count): (i32, i32) = sqlx::query_as(&format!(
         "SELECT
            CAST(COALESCE(SUM(CASE WHEN resolution_status = 'pending' AND review_reason IS NULL
                                   THEN 1 ELSE 0 END), 0) AS integer),
            CAST(COALESCE(SUM(CASE WHEN review_reason IS NOT NULL THEN 1 ELSE 0 END), 0) AS integer)
-         FROM plaid_transaction_reconciliation WHERE plaid_account_link_id = ANY($1)",
-    )
-    .bind(&link_ids)
+         FROM plaid_transaction_reconciliation WHERE plaid_account_link_id {in1}",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&link_ids))
     .fetch_one(&mut *connection)
     .await
     .map_err(failed)?;
@@ -528,23 +536,29 @@ const STAGED_COLUMNS: &str = "book_id, plaid_account_link_id, plaid_transaction_
     pending_transaction_id, iso_currency_code, unofficial_currency_code, category_primary,
     category_detailed, raw_json, resolution_status, first_seen_at, last_seen_at, created_at,
     updated_at";
-const STAGED_VALUES: &str = "$1, $2, $3, $4, $5, $6::float8::int4, $7, $8, $9, $10, $11, $12, $13,
+const STAGED_VALUES: &str = "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
     $14, $15, $16, 'pending', $17, $17, $17, $17";
 
+/// The amount as the `integer` column stores it. Node sent a float for
+/// PostgreSQL to cast.
+fn amount_column(staged: &Staged) -> Result<i32, sqlx::Error> {
+    pg_float8_to_int4(staged.amount_cents).map_err(sqlx::Error::Protocol)
+}
+
 fn bind_staged<'q>(
-    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    query: sqlx::query::Query<'q, Db, DbArguments<'q>>,
     book_id: i32,
     link_id: i32,
     staged: &'q Staged,
     now: NaiveDateTime,
-) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    query
+) -> Result<sqlx::query::Query<'q, Db, DbArguments<'q>>, sqlx::Error> {
+    Ok(query
         .bind(book_id)
         .bind(link_id)
         .bind(&staged.plaid_transaction_id)
         .bind(&staged.date)
         .bind(staged.authorized_date.clone().flatten())
-        .bind(staged.amount_cents)
+        .bind(amount_column(staged)?)
         .bind(&staged.name)
         .bind(staged.merchant_name.clone().flatten())
         .bind(staged.original_description.clone().flatten())
@@ -555,13 +569,13 @@ fn bind_staged<'q>(
         .bind(&staged.category_primary)
         .bind(&staged.category_detailed)
         .bind(&staged.raw_json)
-        .bind(now)
+        .bind(now))
 }
 
 /// `stageAddedTransactions` for one item. A row already resolved keeps its
 /// resolution; any review flag is cleared.
 async fn stage_added(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     link_id: i32,
     item: &Value,
@@ -584,7 +598,7 @@ async fn stage_added(
                               THEN r.resolved_at ELSE NULL END,
            last_seen_at = $17, updated_at = $17"
     );
-    let mut query = bind_staged(sqlx::query(&sql), book_id, link_id, &staged, now);
+    let mut query = bind_staged(sqlx::query(&sql), book_id, link_id, &staged, now)?;
     for present in staged.present() {
         query = query.bind(present);
     }
@@ -628,7 +642,7 @@ struct ReviewFields<'a> {
 /// already matched or created is flagged for review with the values before
 /// and after it.
 async fn stage_modified(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     link_id: i32,
     item: &Value,
@@ -650,7 +664,7 @@ async fn stage_modified(
             "INSERT INTO plaid_transaction_reconciliation ({STAGED_COLUMNS})
              VALUES ({STAGED_VALUES})"
         );
-        bind_staged(sqlx::query(&sql), book_id, link_id, &staged, now)
+        bind_staged(sqlx::query(&sql), book_id, link_id, &staged, now)?
             .execute(&mut *connection)
             .await?;
         return Ok(());
@@ -698,7 +712,7 @@ async fn stage_modified(
     });
     let sql = format!(
         "UPDATE plaid_transaction_reconciliation SET
-           date = $2, amount_cents = $3::float8::int4, name = $4, pending = $5,
+           date = $2, amount_cents = $3, name = $4, pending = $5,
            category_primary = $6, category_detailed = $7, raw_json = $8, review_reason = $9,
            review_metadata_json = $10, last_seen_at = $11, updated_at = $11, {optional_columns}
          WHERE id = $1"
@@ -706,7 +720,7 @@ async fn stage_modified(
     let mut query = sqlx::query(&sql)
         .bind(existing.id)
         .bind(&staged.date)
-        .bind(staged.amount_cents)
+        .bind(amount_column(&staged)?)
         .bind(&staged.name)
         .bind(staged.pending)
         .bind(&staged.category_primary)
@@ -736,7 +750,7 @@ async fn stage_modified(
 /// that is pending, matched, or created is flagged for review; an ignored
 /// row is left alone.
 async fn stage_removed(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     link_id: i32,
     plaid_transaction_id: &str,
     now: NaiveDateTime,
@@ -792,9 +806,7 @@ pub(crate) fn pick_matched_date<'a>(
 
 /// `normalizePayeeName(merchant ?? name).toLowerCase()`: the key of the
 /// learned payee map.
-pub(crate) fn merchant_key(merchant_name: Option<&str>, name: &str) -> String {
-    normalize_name(merchant_name.unwrap_or(name)).to_lowercase()
-}
+pub(crate) use ledger_core::names::merchant_key;
 
 #[derive(FromRow)]
 struct PendingRow {
@@ -811,7 +823,7 @@ struct PendingRow {
 /// transactions through the payees of earlier matches. Returns the number
 /// of matches.
 async fn auto_match(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     analytics: &PostHogCapture,
     book_id: i32,
     link_ids: &[i32],
@@ -839,24 +851,26 @@ async fn auto_match(
         return Ok(0);
     }
 
-    let pending: Vec<PendingRow> = sqlx::query_as(
+    let pending: Vec<PendingRow> = sqlx::query_as(&format!(
         "SELECT id, plaid_account_link_id, date, authorized_date, amount_cents, name, merchant_name
          FROM plaid_transaction_reconciliation
-         WHERE book_id = $1 AND plaid_account_link_id = ANY($2)
+         WHERE book_id = $1 AND plaid_account_link_id {in2}
            AND resolution_status = 'pending' AND review_reason IS NULL
          ORDER BY id",
-    )
+        in2 = sql::in_integers("$2")
+    ))
     .bind(book_id)
-    .bind(link_ids)
+    .bind(sql::json_array(link_ids))
     .fetch_all(&mut *connection)
     .await?;
     if pending.is_empty() {
         return Ok(0);
     }
-    let accounts: HashMap<i32, i32> = sqlx::query_as::<_, (i32, Option<i32>)>(
-        "SELECT id, counterpoise_account_id FROM plaid_accounts WHERE id = ANY($1)",
-    )
-    .bind(link_ids)
+    let accounts: HashMap<i32, i32> = sqlx::query_as::<_, (i32, Option<i32>)>(&format!(
+        "SELECT id, counterpoise_account_id FROM plaid_accounts WHERE id {}",
+        sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(link_ids))
     .fetch_all(&mut *connection)
     .await?
     .into_iter()
@@ -864,12 +878,13 @@ async fn auto_match(
     .collect();
     // Uniqueness is per link, so a transfer can match on both of its links.
     let mut linked: HashMap<i32, HashSet<i32>> = HashMap::new();
-    for (link_id, transaction_id) in sqlx::query_as::<_, (i32, i32)>(
+    for (link_id, transaction_id) in sqlx::query_as::<_, (i32, i32)>(&format!(
         "SELECT plaid_account_link_id, matched_transaction_id
          FROM plaid_transaction_reconciliation
-         WHERE plaid_account_link_id = ANY($1) AND matched_transaction_id IS NOT NULL",
-    )
-    .bind(link_ids)
+         WHERE plaid_account_link_id {} AND matched_transaction_id IS NOT NULL",
+        sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(link_ids))
     .fetch_all(&mut *connection)
     .await?
     {
@@ -889,16 +904,18 @@ async fn auto_match(
         let payee_ids: Vec<i32> = payee_ids.iter().copied().collect();
         // A candidate within one day of the posted date or of the
         // authorization date. Ordered by date and ID.
-        let candidates: Vec<(i32, String)> = sqlx::query_as(
-            "SELECT t.id, CASE WHEN t.is_floating THEN CURRENT_DATE::text ELSE t.date END AS date
+        let candidates: Vec<(i32, String)> = sqlx::query_as(&format!(
+            "SELECT t.id, {} AS date
              FROM transaction_splits s JOIN transactions t ON s.transaction_id = t.id
-             WHERE s.account_id = $1 AND s.amount = $2 AND t.book_id = $3 AND t.payee_id = ANY($4)
+             WHERE s.account_id = $1 AND s.amount = $2 AND t.book_id = $3 AND t.payee_id {in4}
              ORDER BY 2, t.id",
-        )
+            sql::EFFECTIVE_DATE,
+            in4 = sql::in_integers("$4")
+        ))
         .bind(account_id)
         .bind(-i64::from(row.amount_cents))
         .bind(book_id)
-        .bind(&payee_ids)
+        .bind(sql::json_array(&payee_ids))
         .fetch_all(&mut *connection)
         .await?;
         let already = linked.entry(row.plaid_account_link_id).or_default();
@@ -1007,17 +1024,13 @@ pub(crate) async fn sync_now(
     )
     .await?;
     let token_id = finite_path_id(&raw_id, "Invalid token id")?;
-    // Node binds the ID into the lock query as text. PostgreSQL refuses a
-    // value outside the int4 range, and the route repeats its message.
+    // The PostgreSQL release refused an ID outside the int4 range. The route
+    // keeps that refusal and its message.
     let token_id = match i32::try_from(token_id as i64) {
         Ok(id) if f64::from(id) == token_id => id,
         _ => {
-            let refused = sqlx::query("SELECT $1::text::int4")
-                .bind(js_number_string(token_id))
-                .execute(&state.pool)
-                .await
+            let refused = parse_pg_int4(&js_number_string(token_id))
                 .err()
-                .map(|cause| database_message(&cause))
                 .unwrap_or_else(|| "Failed to sync token".to_owned());
             return Err(error_owned(StatusCode::BAD_GATEWAY, refused));
         }

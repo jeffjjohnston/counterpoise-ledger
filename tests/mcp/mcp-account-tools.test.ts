@@ -7,9 +7,8 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { getDb } from "@/db";
-import { accounts } from "@/db/schema";
-import { and, eq } from "drizzle-orm";
+import { count, rows } from "@/tests/helpers/sql";
+import type { Account } from "@/types/db";
 import { toDateString } from "@/lib/formatters";
 
 let mcp: McpTestClient;
@@ -375,8 +374,7 @@ describe("MCP Account Tools", () => {
         expect(isError).toBe(true);
         expect(text).toMatch(/^MCP error -32602: Input validation error: .*Icon must be a single character/s);
       }
-      const rows = await getDb().select().from(accounts).where(eq(accounts.bookId, bookId));
-      expect(rows).toHaveLength(0);
+      expect(await count("accounts", "book_id = $1", [bookId])).toBe(0);
     });
 
     it("trims the icon, and stores a blank icon as null", async () => {
@@ -407,10 +405,10 @@ describe("MCP Account Tools", () => {
 
       expect(isError).toBe(false);
 
-      const children = await getDb()
-        .select()
-        .from(accounts)
-        .where(and(eq(accounts.parentId, data.id), eq(accounts.bookId, bookId)));
+      const children = await rows<Account>(
+        "SELECT * FROM accounts WHERE parent_id = $1 AND book_id = $2",
+        [data.id, bookId]
+      );
       expect(children).toHaveLength(1);
       expect(children[0].isInvestmentCash).toBe(true);
       expect(children[0].name).toBe("Brokerage Cash");
@@ -526,8 +524,7 @@ describe("MCP Account Tools", () => {
       expect(isError).toBe(false);
       expect(data.success).toBe(true);
 
-      const rows = await getDb().select().from(accounts).where(eq(accounts.id, spare.id));
-      expect(rows).toHaveLength(0);
+      expect(await count("accounts", "id = $1", [spare.id])).toBe(0);
     });
 
     it("returns an error for an unknown account", async () => {

@@ -11,7 +11,7 @@ import type {
   InvestmentSplit,
   PlaidToken,
   PlaidAccount,
-} from "@/db/schema";
+} from "@/types/db";
 
 export type AccountWithBalance = Account & {
   balance: number;

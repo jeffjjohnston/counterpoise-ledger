@@ -39,3 +39,18 @@ for (const width of [1024, 1440]) {
     expect(button!.width).toBeLessThan(field!.width);
   });
 }
+
+// The register sizes itself as the viewport minus the navbar height. When the
+// navbar was 1px taller than that height, the document could scroll: a wheel
+// over the sidebar moved on to the page when the sidebar reached its end.
+for (const width of [390, 1440]) {
+  test(`register page fills the viewport without a document scroll at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await page.goto("/b/1");
+    await page.getByRole("link", { name: "Checking", exact: true }).first().click();
+    await expect(page).toHaveURL(/\/b\/1\/transactions\?accountId=\d+/);
+    await expect(page.getByRole("heading", { name: "Checking", exact: true })).toBeVisible();
+    const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+    expect(scrollHeight).toBeLessThanOrEqual(800);
+  });
+}

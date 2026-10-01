@@ -78,12 +78,37 @@ canonical_path() {
 }
 SOURCE_ROOT=$(canonical_path "$(git rev-parse --show-toplevel)")
 BUILD_DIR="${COUNTERPOISE_BUILD_DIR:-}"
+BUILD_DIR_SOURCE="the COUNTERPOISE_BUILD_DIR environment variable"
+# The owner can keep the directory in a gitignored file at the checkout root.
+# Read only that one key. Do not source the file. An environment value wins.
+DEPLOY_LOCAL_FILE="$SOURCE_ROOT/.env.deploy.local"
+if [[ -z "$BUILD_DIR" && -f "$DEPLOY_LOCAL_FILE" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*COUNTERPOISE_BUILD_DIR=(.*)$ ]] || continue
+    BUILD_DIR="${BASH_REMATCH[1]}"
+    BUILD_DIR_SOURCE="$DEPLOY_LOCAL_FILE"
+    BUILD_DIR="${BUILD_DIR#"${BUILD_DIR%%[![:space:]]*}"}"
+    BUILD_DIR="${BUILD_DIR%"${BUILD_DIR##*[![:space:]]}"}"
+    if [[ "$BUILD_DIR" =~ ^\"(.*)\"$ || "$BUILD_DIR" =~ ^\'(.*)\'$ ]]; then
+      BUILD_DIR="${BASH_REMATCH[1]}"
+    fi
+  done <"$DEPLOY_LOCAL_FILE"
+  if [[ "$BUILD_DIR" == "~/"* ]]; then
+    [[ -n "${HOME:-}" ]] || {
+      echo "Error: $DEPLOY_LOCAL_FILE uses ~/ but HOME is not set." >&2
+      exit 1
+    }
+    BUILD_DIR="$HOME/${BUILD_DIR#"~/"}"
+  fi
+fi
 if [[ -z "$BUILD_DIR" ]]; then
   [[ -n "${HOME:-}" ]] || {
     echo "Error: neither COUNTERPOISE_BUILD_DIR nor HOME names a production directory." >&2
     exit 1
   }
-  BUILD_DIR="$HOME/prod/counterpoise"
+  BUILD_DIR="$HOME/counterpoise-production"
+  BUILD_DIR_SOURCE="the built-in default"
 fi
 [[ "$BUILD_DIR" == /* ]] || {
   echo "Error: COUNTERPOISE_BUILD_DIR '$BUILD_DIR' is not an absolute path." >&2
@@ -96,6 +121,8 @@ if [[ "$BUILD_DIR" == "$SOURCE_ROOT"/* ]]; then
 fi
 [[ -d "$BUILD_DIR/.git" ]] || {
   echo "Error: '$BUILD_DIR' must be an existing production clone on main, with $ENV_FILE and backups/." >&2
+  echo "The directory came from $BUILD_DIR_SOURCE." >&2
+  echo "To use another directory, set COUNTERPOISE_BUILD_DIR in .env.deploy.local at the root of this checkout." >&2
   exit 1
 }
 ORIGIN_URL=$(git remote get-url origin)
@@ -236,6 +263,51 @@ for existing in "$LOCAL_TAG_AT" "$REMOTE_TAG_AT"; do
   fi
 done
 
+# The database volume is external. Without it, `up` below fails, but only
+# after the tag is published. An install that still holds its data in
+# PostgreSQL has no such volume: it must run the one-time upgrade first.
+#
+# CHECKED BEFORE THE PRODUCTION CHECKOUT MOVES, so that a refusal changes
+# nothing. An earlier version checked after the fast-forward, and a refusal
+# left production on the new commit with the old containers still running.
+STAGE="check the database volume"
+# The upgrade script is in the release, not in the checkout that production
+# runs now. So the production checkout moves to the release commit first (a
+# fast-forward, as this script does), then the script runs there, then this
+# deploy runs again and finds the checkout already at the commit.
+upgrade_first() {
+  echo "The data is still in PostgreSQL. Convert it once, then run this deploy again:" >&2
+  echo "  git -C $BUILD_DIR fetch origin" >&2
+  echo "  git -C $BUILD_DIR merge --ff-only $DEPLOY_SHA" >&2
+  echo "  (cd $BUILD_DIR && scripts/upgrade-to-sqlite.sh)" >&2
+  echo "See guides/upgrade-to-sqlite.md." >&2
+}
+docker volume inspect counterpoise_data >/dev/null 2>&1 || {
+  echo "Error: the volume counterpoise_data does not exist." >&2
+  upgrade_first
+  echo "A new install, with no PostgreSQL data, creates the volume instead:" >&2
+  echo "  docker volume create counterpoise_data" >&2
+  exit 1
+}
+# The same test as scripts/upgrade-to-sqlite.sh: an environment file that
+# still names the PostgreSQL database, and a volume with no SQLite file, is
+# an install that has not converted. The new server would create an empty
+# database there.
+if grep -q '^DATABASE_URL=.' "$BUILD_DIR/$ENV_FILE"; then
+  # `|| ...` and not `set +e`: the ERR trap fires without errexit too.
+  DB_STATUS=0
+  docker run --rm -v counterpoise_data:/data alpine:3.22 test -e /data/counterpoise.db || DB_STATUS=$?
+  if [[ $DB_STATUS == 1 ]]; then
+    echo "Error: $ENV_FILE sets DATABASE_URL, and the volume counterpoise_data holds no counterpoise.db." >&2
+    upgrade_first
+    exit 1
+  elif [[ $DB_STATUS != 0 ]]; then
+    echo "Error: cannot look for counterpoise.db in the volume counterpoise_data (docker exit $DB_STATUS)." >&2
+    echo "Nothing was changed." >&2
+    exit 1
+  fi
+fi
+
 STAGE="confirm"
 # A re-deploy restarts the live application and can re-run migrations, so it is
 # confirmed rather than assumed. The tag being already published is what makes
@@ -296,16 +368,16 @@ TAG_PUBLISHED=1
 STAGE="build image"
 echo "==> Deploying $DEPLOY_TAG from $BUILD_DIR on main..."
 cd "$BUILD_DIR"
-# Recreate bind-mounting services so changed paths cannot retain deleted inodes.
-# The rust-api entrypoint runs the migrations before the server starts. --wait
-# makes this command fail unless every service is running and each healthcheck
-# passes, so a release whose migration fails or whose server does not come up
-# fails the deploy here.
+# Recreate the service so a changed bind path cannot retain deleted inodes.
+# The server applies the migrations before it serves. --wait makes this
+# command fail unless the service is running and its healthcheck passes, so a
+# release whose migration fails or whose server does not come up fails the
+# deploy here.
 #
 # --remove-orphans removes the container of a service that the compose file no
-# longer has. The Next `app` service was one: its container held host port
-# 3000, which rust-api now takes.
-docker compose -f docker-compose.yml --env-file "$ENV_FILE" up -d --wait --wait-timeout 300 --build --force-recreate --remove-orphans rust-api scheduler
+# longer has: the Next `app` service before, and the `postgres` and
+# `scheduler` services since the move to SQLite. Their volumes stay.
+docker compose -f docker-compose.yml --env-file "$ENV_FILE" up -d --wait --wait-timeout 300 --build --force-recreate --remove-orphans rust-api
 
 trap - ERR
 echo "Deployed $DEPLOY_TAG (${DEPLOY_SHA:0:7}); verify /api/health before reporting release success."

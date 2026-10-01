@@ -25,15 +25,17 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::{Days, NaiveDate, NaiveDateTime, Utc};
+use ledger_db::engine::{DbConnection, DbExecutor, DbPool};
+use ledger_db::locks::FOR_UPDATE;
+use ledger_db::sql;
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgConnection, PgPool};
+use sqlx::FromRow;
 use std::collections::{HashMap, HashSet};
 
 const INVALID_LINK_ID: &str = "Invalid linked account id";
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// `effectiveDateSql` for the transaction alias `t`.
-pub(crate) const EFFECTIVE_DATE: &str =
-    "(CASE WHEN t.is_floating THEN CURRENT_DATE::text ELSE t.date END)";
+pub(crate) const EFFECTIVE_DATE: &str = sql::EFFECTIVE_DATE;
 
 /// A reconciliation failure. Each route maps these to its own responses.
 pub(crate) enum ReconcileError {
@@ -65,6 +67,8 @@ impl ReconcileError {
     }
 }
 
+const AMOUNT_OUT_OF_RANGE: &str = "The bank amount is out of range for a transaction split";
+
 fn invalid(message: &str) -> ReconcileError {
     ReconcileError::Invalid(message.to_owned())
 }
@@ -78,7 +82,7 @@ pub(crate) struct Link {
 }
 
 /// `getReconcilableLink`.
-pub(crate) async fn reconcilable_link<'e, E: sqlx::PgExecutor<'e>>(
+pub(crate) async fn reconcilable_link<'e, E: DbExecutor<'e>>(
     pool: E,
     book_id: i32,
     link_id: i32,
@@ -143,13 +147,13 @@ impl ReconRow {
 
 /// `loadReconciliationRow`: the row with this ID on this link in this book.
 pub(crate) async fn load_row(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     link_id: i32,
     reconciliation_id: i32,
     book_id: i32,
     for_update: bool,
 ) -> Result<Option<ReconRow>, sqlx::Error> {
-    let lock = if for_update { " FOR UPDATE" } else { "" };
+    let lock = if for_update { FOR_UPDATE } else { "" };
     sqlx::query_as(&format!(
         "SELECT {ROW_COLUMNS} FROM plaid_transaction_reconciliation r
          WHERE r.id = $1 AND r.plaid_account_link_id = $2 AND r.book_id = $3 LIMIT 1{lock}"
@@ -251,7 +255,7 @@ struct CandidateRow {
 /// `findMatchCandidates`: the five best transactions on the mapped account
 /// within seven days of the bank date.
 pub(crate) async fn match_candidates(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     row: &ReconRow,
     mapped_account_id: i32,
 ) -> Result<Vec<Value>, ReconcileError> {
@@ -285,16 +289,17 @@ pub(crate) async fn match_candidates(
         return Ok(Vec::new());
     }
     let ids: Vec<i32> = rows.iter().map(|row| row.transaction_id).collect();
-    let splits: Vec<(i32, i32, String)> = sqlx::query_as(
+    let splits: Vec<(i32, i32, String)> = sqlx::query_as(&format!(
         "SELECT s.transaction_id, s.account_id, a.name
          FROM transaction_splits s
          JOIN transactions t ON t.id = s.transaction_id
          JOIN accounts a ON a.id = s.account_id
-         WHERE t.book_id = $1 AND t.id = ANY($2)
+         WHERE t.book_id = $1 AND t.id {in2}
          ORDER BY s.id",
-    )
+        in2 = sql::in_integers("$2")
+    ))
     .bind(row.book_id)
-    .bind(&ids)
+    .bind(sql::json_array(&ids))
     .fetch_all(&mut *connection)
     .await?;
     let mut details: HashMap<i32, Vec<(i32, String)>> = HashMap::new();
@@ -304,13 +309,14 @@ pub(crate) async fn match_candidates(
             .or_default()
             .push((account_id, name));
     }
-    let linked: HashSet<i32> = sqlx::query_scalar::<_, i32>(
+    let linked: HashSet<i32> = sqlx::query_scalar::<_, i32>(&format!(
         "SELECT matched_transaction_id FROM plaid_transaction_reconciliation
          WHERE plaid_account_link_id = $1 AND matched_transaction_id IS NOT NULL
-           AND matched_transaction_id = ANY($2) AND id <> $3",
-    )
+           AND matched_transaction_id {in2} AND id <> $3",
+        in2 = sql::in_integers("$2")
+    ))
     .bind(row.plaid_account_link_id)
-    .bind(&ids)
+    .bind(sql::json_array(&ids))
     .bind(row.id)
     .fetch_all(&mut *connection)
     .await?
@@ -373,7 +379,7 @@ pub(crate) async fn match_candidates(
 /// `suggestCounterAccountId`: the counter account from the history of the
 /// payee that has the bank's merchant name.
 pub(crate) async fn suggest_counter_account(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     row: &ReconRow,
     mapped_account_id: i32,
     book_id: i32,
@@ -402,13 +408,14 @@ pub(crate) async fn suggest_counter_account(
     if transaction_ids.is_empty() {
         return Ok(None);
     }
-    let counterparts: Vec<(i32, i32)> = sqlx::query_as(
+    let counterparts: Vec<(i32, i32)> = sqlx::query_as(&format!(
         "SELECT account_id, amount FROM transaction_splits
-         WHERE book_id = $1 AND transaction_id = ANY($2) AND account_id <> $3
+         WHERE book_id = $1 AND transaction_id {in2} AND account_id <> $3
          ORDER BY transaction_id DESC, id",
-    )
+        in2 = sql::in_integers("$2")
+    ))
     .bind(book_id)
-    .bind(&transaction_ids)
+    .bind(sql::json_array(&transaction_ids))
     .bind(mapped_account_id)
     .fetch_all(&mut *connection)
     .await?;
@@ -437,7 +444,7 @@ pub(crate) async fn suggest_counter_account(
 
 /// `loadReconciliationItem`: the row with its candidates and suggestion.
 pub(crate) async fn load_item(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     row: &ReconRow,
     mapped_account_id: i32,
     book_id: i32,
@@ -524,7 +531,7 @@ pub(crate) async fn link_queue(
             "SELECT {ROW_COLUMNS} FROM plaid_transaction_reconciliation r WHERE {queue}
              ORDER BY CASE WHEN r.review_reason IS NOT NULL THEN 1 ELSE 0 END DESC,
                       r.last_seen_at DESC, r.id DESC
-             LIMIT $2 OFFSET $3"
+             LIMIT COALESCE($2, -1) OFFSET COALESCE($3, 0)"
         ))
         .bind(link.link_id)
         .bind(limit as i64)
@@ -580,7 +587,7 @@ pub(crate) async fn book_queue(
         let mut connection = state.pool.acquire().await?;
         let queue = "r.book_id = $1 AND pa.book_id = $1 AND a.book_id = $1
                      AND a.type IN ('asset', 'liability')
-                     AND ($2::integer IS NULL OR pa.id = $2)
+                     AND ($2 IS NULL OR pa.id = $2)
                      AND (r.resolution_status = 'pending' OR r.review_reason IS NOT NULL)";
         let joins = "FROM plaid_transaction_reconciliation r
                      JOIN plaid_accounts pa ON r.plaid_account_link_id = pa.id
@@ -589,7 +596,7 @@ pub(crate) async fn book_queue(
             "SELECT r.id, a.id {joins} WHERE {queue}
              ORDER BY CASE WHEN r.review_reason IS NOT NULL THEN 1 ELSE 0 END DESC,
                       COALESCE(r.authorized_date, r.date) DESC, r.id DESC
-             LIMIT $3 OFFSET $4"
+             LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)"
         ))
         .bind(book.book_id)
         .bind(link_id)
@@ -743,12 +750,10 @@ fn validate_reconcile(body: &Value) -> Result<ReconcileInput, ApiError> {
 
 /// The payee of a created transaction: a case-insensitive match, or a new
 /// payee. The insert has no conflict clause, as in the former TypeScript
-/// resolver. JavaScript
-/// and PostgreSQL can lowercase a name differently (a final sigma), so the
-/// match can miss a payee with the same name; the insert then fails on the
-/// unique index and the decision rolls back.
+/// resolver. If the match misses a payee with the same name, the insert fails
+/// on the unique index and the decision rolls back.
 async fn resolve_payee(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     payee_name: &str,
 ) -> Result<Option<i32>, sqlx::Error> {
@@ -789,7 +794,7 @@ fn body_id(value: f64) -> Result<i32, ReconcileError> {
 /// floating transaction's stored date is its entry date, so it gets the
 /// matched date in the same write. Another transaction keeps its date.
 async fn mark_matched(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     transaction_id: i32,
     row: &ReconRow,
@@ -825,7 +830,7 @@ async fn mark_matched(
 
 /// Sets the resolution of the row, and clears its review flag.
 async fn resolve_row(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     row: &ReconRow,
     status: &str,
     matched_transaction_id: Option<i32>,
@@ -849,7 +854,7 @@ async fn resolve_row(
 
 /// Another staged row on this link is already matched to the transaction.
 async fn linked_elsewhere(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     link: Link,
     transaction_id: i32,
     row: &ReconRow,
@@ -872,7 +877,7 @@ const LINKED_ELSEWHERE: &str =
 
 /// The decision inside its database transaction. Returns the row ID.
 pub(crate) async fn apply(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     link: Link,
     input: &ReconcileInput,
@@ -894,6 +899,15 @@ pub(crate) async fn apply(
         return Err(ReconcileError::Invalid(format!(
             "This bank transaction is already linked to transaction #{matched} — unlink it first"
         )));
+    }
+    // The two split amounts are the bank amount and its negation. SQLite
+    // stores any 64-bit value, and every reader decodes a split amount as a
+    // 32-bit integer. The negation of i32::MIN does not fit, so refuse it
+    // before any write, as PostgreSQL refused it at the insert.
+    if matches!(input.action, Action::MatchUpdateAmount | Action::Create)
+        && row.amount_cents.checked_neg().is_none()
+    {
+        return Err(invalid(AMOUNT_OUT_OF_RANGE));
     }
     let amount = i64::from(row.amount_cents);
     match input.action {
@@ -1091,14 +1105,14 @@ pub(crate) async fn apply(
 /// `resolveReconciliation`: applies one decision and returns the row as it
 /// now stands, with its candidates.
 pub(crate) async fn resolve(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     link: Link,
     input: &ReconcileInput,
     actor: i32,
 ) -> Result<Value, ReconcileError> {
     let now = now_millis();
-    let mut transaction = pool.begin().await?;
+    let mut transaction = ledger_db::locks::begin_pool(pool).await?;
     let row_id = match apply(transaction.as_mut(), book_id, link, input, actor, now).await {
         Ok(row_id) => {
             transaction.commit().await?;

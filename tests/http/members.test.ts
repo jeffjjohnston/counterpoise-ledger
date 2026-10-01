@@ -1,9 +1,8 @@
+import { createHash, randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { bookMembers } from "../../db/schema";
-import { createUser, db, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { createUser, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
-import { holdTransaction, waitForBlockedQueries } from "../helpers/locks";
+import { insert } from "../helpers/sql";
 import { contract } from "../helpers/contract";
 
 type MemberBody = { userId: number; username: string; role: string; createdAt: string; [field: string]: unknown };
@@ -79,27 +78,60 @@ describe("book member HTTP parity", () => {
     expect(removed.status).toBe(200);
   });
 
+  /** A real session for another user, as sessionHttpClient makes for user 1. */
+  async function sessionFor(userId: number) {
+    const token = randomBytes(32).toString("hex");
+    await insert("sessions", {
+      userId,
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    return (path: string, init: RequestInit = {}) => {
+      const headers = new Headers(init.headers);
+      headers.set("cookie", `counterpoise_session=${token}`);
+      return fetch(new URL(path, baseUrl), { ...init, headers });
+    };
+  }
+
+  async function owners(request: Client["request"]) {
+    const listed = await request("/api/books/1/members");
+    expect(listed.status).toBe(200);
+    return bookMemberListSchema.parse(await listed.json())
+      .filter((member) => member.role === "owner")
+      .map((member) => member.userId);
+  }
+
   it("serializes concurrent owner demotions so one owner remains", async () => {
     const user = await createUser({ username: "second-owner" });
+    const second = await sessionFor(user.id);
     const added = await client.request("/api/books/1/members", body("POST", { username: "second-owner", role: "owner" }));
     expect(added.status).toBe(200);
-    const holder = await holdTransaction(db, (tx) =>
-      tx.select().from(bookMembers).where(eq(bookMembers.bookId, 1)).for("update")
-    );
-    let pending: Promise<[Response, Response]>;
-    try {
-      pending = Promise.all([
+    // Each owner demotes itself, so each actor is still an owner when its
+    // request starts. The server runs the two writes one after the other,
+    // so the second write sees one owner and refuses. Several rounds make
+    // it likely that the two requests overlap at least once.
+    for (let round = 0; round < 5; round += 1) {
+      expect(await owners(client.request)).toEqual([1, user.id]);
+      const responses = await Promise.all([
         client.request("/api/books/1/members/1", body("PUT", { role: "viewer" })),
-        client.request(`/api/books/1/members/${user.id}`, body("PUT", { role: "viewer" })),
+        second(`/api/books/1/members/${user.id}`, body("PUT", { role: "viewer" })),
       ]);
-      await waitForBlockedQueries(db, "%book_members%for update%", 2);
-    } finally {
-      holder.release();
-      await holder.done;
+      const results = await Promise.all(
+        responses.map(async (response) => ({ status: response.status, body: await response.json() }))
+      );
+      const accepted = results.filter((result) => result.status === 200);
+      expect(accepted, JSON.stringify(results)).toHaveLength(1);
+      expect(results.filter((result) => result.status !== 200)).toEqual([
+        { status: 400, body: { error: "A book must keep at least one owner" } },
+      ]);
+
+      // The actor that won is now a viewer. The other one is the only owner,
+      // and it makes the winner an owner again for the next round.
+      const winner = accepted[0].body.userId as number;
+      const [remaining, restore] = winner === 1 ? [user.id, second] : [1, client.request];
+      expect(await owners(restore)).toEqual([remaining]);
+      const restored = await restore(`/api/books/1/members/${winner}`, body("PUT", { role: "owner" }));
+      expect(restored.status).toBe(200);
     }
-    const [first, second] = await pending;
-    expect([first.status, second.status].filter((status) => status === 200)).toHaveLength(1);
-    const listed = await client.request("/api/books/1/members");
-    expect(bookMemberListSchema.parse(await listed.json()).filter((member) => member.role === "owner")).toHaveLength(1);
   });
 });

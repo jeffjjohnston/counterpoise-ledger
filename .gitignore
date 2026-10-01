@@ -20,6 +20,8 @@ backups/
 .env.development.local
 .env.test.local
 .env.production.local
+.env.deploy.local
+openai-key.txt
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -33,6 +35,7 @@ Thumbs.db
 next-env.d.ts
 .vercel
 test-results/
+.e2e/
 .claude/settings.local.json
 moneydance_exports/
 screenshots/

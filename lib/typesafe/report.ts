@@ -1,17 +1,17 @@
-import type { AppDb } from "@/db";
-import {
-  typesafeAggregates,
-  typesafeDecisions,
-  typesafeEvaluations,
-  typesafeQuotas,
-} from "@/db/schema";
-import { and, asc, eq, gt, inArray, lt } from "drizzle-orm";
-import { lockTypeSafeBook } from "./settings";
+/**
+ * The operator report over the TypeSafe records (`npm run typesafe:report`).
+ * It reads the SQLite database of the server and opens it read-only. The
+ * server does the hourly cleanup and keeps the archived counts; see
+ * guides/typesafe-experiment.md.
+ */
+import { DatabaseSync } from "node:sqlite";
+import type { TypeSafeDecision, TypeSafeEvaluation } from "@/types/db";
 import { proposalFor } from "./questions";
 
-type Evaluation = typeof typesafeEvaluations.$inferSelect;
-type Decision = typeof typesafeDecisions.$inferSelect;
+type Evaluation = TypeSafeEvaluation;
+type Decision = TypeSafeDecision;
 type Counts = Record<string, number>;
+type RawRow = Record<string, unknown>;
 
 function merge(a: Counts, b: Counts) {
   for (const [key, value] of Object.entries(b)) a[key] = (a[key] ?? 0) + value;
@@ -123,107 +123,113 @@ export function summarizeTypeSafe(
   return counts;
 }
 
-export async function typeSafeReport(db: AppDb, bookId: number) {
-  return db.transaction(
-    async (tx) => {
-      const [archived] = await tx
-        .select()
-        .from(typesafeAggregates)
-        .where(eq(typesafeAggregates.bookId, bookId));
-      const counts = { ...archived?.counts };
-      let after = 0;
-      for (;;) {
-        const rows = await tx
-          .select()
-          .from(typesafeEvaluations)
-          .where(
-            and(
-              eq(typesafeEvaluations.bookId, bookId),
-              gt(typesafeEvaluations.id, after),
-            ),
-          )
-          .orderBy(asc(typesafeEvaluations.id))
-          .limit(1000);
-        if (!rows.length) break;
-        const decisions = await tx
-          .select()
-          .from(typesafeDecisions)
-          .where(
-            inArray(
-              typesafeDecisions.evaluationId,
-              rows.map((r) => r.id),
-            ),
-          );
-        merge(counts, summarizeTypeSafe(rows, decisions));
-        after = rows[rows.length - 1].id;
-      }
-      return {
-        bookId,
-        counts,
-        interpretation:
-          "User agreement and acceptance are assisted-use signals, not independently verified accuracy. Archived counts include records whose details expired after 30 days.",
-      };
-    },
-    { isolationLevel: "repeatable read", accessMode: "read only" },
-  );
+/** The database file that the server uses: `DATABASE_PATH`, default `data/counterpoise.db`. */
+export function reportDatabasePath(env: Record<string, string | undefined> = process.env): string {
+  return env.DATABASE_PATH || "data/counterpoise.db";
 }
 
-/** One bounded batch; scheduled hourly, including when TypeSafe is disabled. */
-export async function cleanupTypeSafe(db: AppDb, now = new Date()) {
-  const cutoff = new Date(now.getTime() - 30 * 86_400_000);
-  const batch = await db
-    .select({ id: typesafeEvaluations.id, bookId: typesafeEvaluations.bookId })
-    .from(typesafeEvaluations)
-    .where(lt(typesafeEvaluations.startedAt, cutoff))
-    .orderBy(asc(typesafeEvaluations.id))
-    .limit(1000);
-  let deleted = 0;
-  for (const bookId of [...new Set(batch.map((r) => r.bookId))]) {
-    deleted += await db.transaction(async (tx) => {
-      await lockTypeSafeBook(tx, bookId);
-      const rows = await tx
-        .select()
-        .from(typesafeEvaluations)
-        .where(
-          and(
-            eq(typesafeEvaluations.bookId, bookId),
-            inArray(
-              typesafeEvaluations.id,
-              batch.filter((r) => r.bookId === bookId).map((r) => r.id),
-            ),
-            lt(typesafeEvaluations.startedAt, cutoff),
-          ),
-        );
-      if (!rows.length) return 0;
-      const ids = rows.map((r) => r.id);
-      const decisions = await tx
-        .select()
-        .from(typesafeDecisions)
-        .where(inArray(typesafeDecisions.evaluationId, ids));
-      const [archived] = await tx
-        .select()
-        .from(typesafeAggregates)
-        .where(eq(typesafeAggregates.bookId, bookId));
-      const counts = merge(
-        { ...archived?.counts },
-        summarizeTypeSafe(rows, decisions),
-      );
-      await tx
-        .insert(typesafeAggregates)
-        .values({ bookId, counts })
-        .onConflictDoUpdate({
-          target: typesafeAggregates.bookId,
-          set: { counts },
-        });
-      await tx
-        .delete(typesafeEvaluations)
-        .where(inArray(typesafeEvaluations.id, ids));
-      return rows.length;
-    });
+/** Opens the database read-only. The report never writes. */
+export function openReportDatabase(path: string): DatabaseSync {
+  const db = new DatabaseSync(path, { readOnly: true });
+  // The server can write at the same time. Wait for its lock, do not fail.
+  db.exec("PRAGMA busy_timeout = 5000");
+  return db;
+}
+
+/** A naive timestamp column holds a UTC wall-clock value. */
+function utc(value: unknown): Date | null {
+  return typeof value === "string" ? new Date(`${value.replace(" ", "T")}Z`) : null;
+}
+
+function json<T>(value: unknown): T | null {
+  return typeof value === "string" ? (JSON.parse(value) as T) : null;
+}
+
+function flag(value: unknown): boolean | null {
+  return value === null || value === undefined ? null : Boolean(Number(value));
+}
+
+function integer(value: unknown): number | null {
+  return value === null || value === undefined ? null : Number(value);
+}
+
+/** One `typesafe_evaluations` row as the summary reads it. */
+export function evaluationFromRow(row: RawRow): Evaluation {
+  return {
+    id: Number(row.id),
+    bookId: Number(row.book_id),
+    reconciliationId: Number(row.reconciliation_id),
+    linkId: Number(row.link_id),
+    revision: Number(row.revision),
+    fingerprint: String(row.fingerprint),
+    attempt: String(row.attempt),
+    snapshot: json<Evaluation["snapshot"]>(row.snapshot)!,
+    status: row.status as Evaluation["status"],
+    choice: (row.choice as string | null) ?? null,
+    probabilities: json<Record<string, number>>(row.probabilities),
+    confidence: json<number>(row.confidence),
+    usage: json<Evaluation["usage"]>(row.usage),
+    answers: json<Evaluation["answers"]>(row.answers),
+    errorCode: (row.error_code as string | null) ?? null,
+    startedAt: utc(row.started_at)!,
+    completedAt: utc(row.completed_at),
+    displayedAt: utc(row.displayed_at),
+    latencyMs: integer(row.latency_ms),
+  };
+}
+
+/** One `typesafe_decisions` row as the summary reads it. */
+export function decisionFromRow(row: RawRow): Decision {
+  return {
+    id: Number(row.id),
+    bookId: Number(row.book_id),
+    reconciliationId: Number(row.reconciliation_id),
+    evaluationId: integer(row.evaluation_id),
+    action: String(row.action),
+    transactionId: integer(row.transaction_id),
+    suggestionVisible: flag(row.suggestion_visible) ?? false,
+    acceptedSuggestion: flag(row.accepted_suggestion) ?? false,
+    proposalPayeeKept: flag(row.proposal_payee_kept),
+    proposalCategoryKept: flag(row.proposal_category_kept),
+    activeReviewMs: integer(row.active_review_ms),
+    decidedAt: utc(row.decided_at)!,
+  };
+}
+
+/**
+ * The counts of one book: the archived counts plus a summary of the records
+ * that are still there. It reads in one transaction, so a cleanup that the
+ * server runs at the same time cannot count a record twice or lose it.
+ */
+export function typeSafeReport(db: DatabaseSync, bookId: number) {
+  db.exec("BEGIN");
+  try {
+    const archived = db
+      .prepare("SELECT counts FROM typesafe_aggregates WHERE book_id = ?")
+      .get(bookId) as { counts: string } | undefined;
+    const counts: Counts = { ...json<Counts>(archived?.counts) };
+    const page = db.prepare(
+      "SELECT * FROM typesafe_evaluations WHERE book_id = ? AND id > ? ORDER BY id LIMIT 1000",
+    );
+    const decisionsOf = db.prepare(
+      "SELECT d.* FROM typesafe_decisions d JOIN json_each(?) e ON d.evaluation_id = e.value",
+    );
+    let after = 0;
+    for (;;) {
+      const rows = (page.all(bookId, after) as RawRow[]).map(evaluationFromRow);
+      if (!rows.length) break;
+      const ids = JSON.stringify(rows.map((r) => r.id));
+      const decisions = (decisionsOf.all(ids) as RawRow[]).map(decisionFromRow);
+      merge(counts, summarizeTypeSafe(rows, decisions));
+      after = rows[rows.length - 1].id;
+    }
+    return {
+      bookId,
+      counts,
+      interpretation:
+        "User agreement and acceptance are assisted-use signals, not independently verified accuracy. Archived counts include records whose details expired after 30 days.",
+    };
+  } finally {
+    db.exec("COMMIT");
   }
-  // Quotas carry no transaction data. Retain today's quota across clear-data.
-  await db
-    .delete(typesafeQuotas)
-    .where(lt(typesafeQuotas.day, cutoff.toISOString().slice(0, 10)));
-  return { deleted, batchLimit: 1000 };
 }

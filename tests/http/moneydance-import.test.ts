@@ -1,17 +1,16 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { sql } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   createAccount,
   createBook,
   createTransactionWithSplits,
-  db,
   resetTestDatabase,
   setupTestDatabase,
 } from "../helpers/db-utils";
-import { workerDatabaseUrl } from "../helpers/database-safety";
+import { count as countWhere, rows, script } from "../helpers/sql";
+import { workerDatabasePath } from "../helpers/test-database";
 import { dumpTables } from "../helpers/table-dump";
 
 const run = promisify(execFile);
@@ -28,17 +27,15 @@ async function rustImport(...args: string[]) {
   return run(CLI, ["import-moneydance", ...args], {
     env: {
       ...process.env,
-      DATABASE_URL: workerDatabaseUrl(),
+      DATABASE_PATH: workerDatabasePath(),
+      DATABASE_URL: "",
       TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
     },
   });
 }
 
 async function count(table: string, bookId: number) {
-  const [row] = await db.execute<{ count: number }>(
-    sql.raw(`select cast(count(*) as integer) as count from "${table}" where book_id = ${bookId}`)
-  );
-  return row.count;
+  return countWhere(table, "book_id = $1", [bookId]);
 }
 
 /** The row count of each table. */
@@ -84,20 +81,23 @@ describe("Moneydance import with the Rust CLI", () => {
 
   it("covers the edge cases that the fixture sets up", async () => {
     await rustImport(fixturePath("moneydance-edge-cases.json"), "--book-id", "1");
-    const names = (await db.execute<{ name: string }>(sql`select name from accounts order by id`)).map((row) => row.name);
+    const names = (await rows<{ name: string }>("SELECT name FROM accounts ORDER BY id")).map((row) => row.name);
     expect(names).toEqual(expect.arrayContaining(["Auto:Fuel", "Legacy:Dues", "Brokerage - Cash", "Imported Balance"]));
     expect(names).not.toContain("Unknown Type");
-    const payees = (await db.execute<{ name: string }>(sql`select name from payees order by id`)).map((row) => row.name);
+    const payees = (await rows<{ name: string }>("SELECT name FROM payees ORDER BY id")).map((row) => row.name);
     expect(payees).toEqual(expect.arrayContaining(["Employer's Payroll", "City Garage", "Bad Date Store"]));
     // Two security accounts hold AAA, so it is one security.
-    const symbols = (await db.execute<{ symbol: string }>(sql`select symbol from securities order by id`)).map((row) => row.symbol);
+    const symbols = (await rows<{ symbol: string }>("SELECT symbol FROM securities ORDER BY id")).map((row) => row.symbol);
     expect(symbols).toEqual(["AAA", "BBB", "Gamma Growth", "DDD"]);
-    const reinvested = await db.execute(sql`select 1 from transactions where description in ('AAA Dividend (Dividend)', 'AAA Dividend (Reinvestment)')`);
-    expect(reinvested).toHaveLength(2);
-    const ratios = await db.execute<{ n: number; d: number }>(
-      sql`select split_numerator as n, split_denominator as d from investment_splits where action = 'split' order by id`
+    const reinvested = await rows(
+      "SELECT id FROM transactions WHERE description IN ($1, $2)",
+      ["AAA Dividend (Dividend)", "AAA Dividend (Reinvestment)"],
     );
-    expect([...ratios]).toEqual([{ n: 2, d: 1 }, { n: 2, d: 1 }, { n: 1, d: 2 }]);
+    expect(reinvested).toHaveLength(2);
+    const ratios = await rows<{ n: number; d: number }>(
+      "SELECT split_numerator AS n, split_denominator AS d FROM investment_splits WHERE action = $1 ORDER BY id", ["split"]
+    );
+    expect(ratios).toEqual([{ n: 2, d: 1 }, { n: 2, d: 1 }, { n: 1, d: 2 }]);
     // Every reminder with a known frequency and imported accounts, and no bad date.
     expect(await count("recurring_rules", 1)).toBe(5);
   }, TIMEOUT);
@@ -136,16 +136,16 @@ describe("Moneydance import with the Rust CLI", () => {
         { accountId: otherCash.id, amount: -100 },
       ],
     });
-    const before = await db.execute(sql`select * from transaction_splits where book_id = ${other.id} order by id`);
+    const before = await rows("SELECT * FROM transaction_splits WHERE book_id = $1 ORDER BY id", [other.id]);
 
     await rustImport(fixturePath("moneydance-sample.json"), "--book-id", "1");
 
-    const offsets = await db.execute<{ book_id: number }>(sql`
-      select a.book_id from transaction_splits s join accounts a on a.id = s.account_id
-      where a.name = 'Imported Balance' and s.book_id = 1`);
+    const offsets = await rows<{ bookId: number }>(`
+      SELECT a.book_id FROM transaction_splits s JOIN accounts a ON a.id = s.account_id
+      WHERE a.name = $1 AND s.book_id = $2`, ["Imported Balance", 1]);
     expect(offsets.length).toBeGreaterThan(0);
-    expect(offsets.every((row) => row.book_id === 1)).toBe(true);
-    expect(await db.execute(sql`select * from transaction_splits where book_id = ${other.id} order by id`)).toEqual(before);
+    expect(offsets.every((row) => row.bookId === 1)).toBe(true);
+    expect(await rows("SELECT * FROM transaction_splits WHERE book_id = $1 ORDER BY id", [other.id])).toEqual(before);
     expect(await count("accounts", other.id)).toBe(2);
   }, TIMEOUT);
 
@@ -178,19 +178,14 @@ describe("Moneydance import with the Rust CLI", () => {
   it("exits 1 and keeps the book as it was when the lot rebuild fails", async () => {
     await createAccount({ name: "Before the import", type: "asset" });
     // The lot rebuild runs after every transaction, so it fails the run late.
-    await db.execute(sql.raw(`
-      create function refuse_import_lot() returns trigger language plpgsql as $$
-      begin raise exception 'refused for the test'; end $$;
-      create trigger refuse_import_lot before insert on investment_lots
-        for each row execute function refuse_import_lot();`));
+    await script(`CREATE TRIGGER refuse_import_lot BEFORE INSERT ON investment_lots
+      BEGIN SELECT RAISE(ABORT, 'refused for the test'); END;`);
     try {
       await expect(
         rustImport(fixturePath("moneydance-sample.json"), "--book-id", "1", "--overwrite")
       ).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Fatal error") });
     } finally {
-      await db.execute(sql.raw(`
-        drop trigger refuse_import_lot on investment_lots;
-        drop function refuse_import_lot();`));
+      await script("DROP TRIGGER IF EXISTS refuse_import_lot");
     }
     expect(await count("transactions", 1)).toBe(0);
     expect(await count("accounts", 1)).toBe(1);

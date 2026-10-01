@@ -65,13 +65,16 @@ A local checkout, over stdio. `npm run mcp:dev` runs the same command, and
       "args": ["run", "--quiet", "--manifest-path", "rust-api/Cargo.toml", "-p", "counterpoise-rust-api", "--", "mcp"],
       "cwd": "/path/to/counterpoise",
       "env": {
-        "DATABASE_URL": "postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev",
         "COUNTERPOISE_API_KEY": "cpk_..."
       }
     }
   }
 }
 ```
+
+The process uses the file that `DATABASE_PATH` names (default
+`data/counterpoise.db`, relative to `cwd`). It does not create the file:
+start the server once first.
 
 ## Docker MCP Client Configuration
 
@@ -95,7 +98,10 @@ key passed by `-e`:
 - The `rust-api` container must be running
   (`docker compose --env-file .env.production.local up -d` — the service-level
   `env_file` does not feed the compose file's own `${VAR}` interpolation). The
-  container already has `DATABASE_URL` and `TZ`.
+  container already has `DATABASE_PATH` and `TZ`.
+- The MCP process opens the same database file as the server, beside it. It
+  does not take the server lock. Its writes also send live-update hints,
+  because the `change_marks` triggers run for every writer.
 - Each user provides their own API key in the MCP client config — no container rebuild needed
 
 Or connect over HTTP, with no container access:
@@ -110,7 +116,7 @@ claude mcp add --transport http counterpoise https://<host>/api/mcp \
 | Variable | Purpose |
 | -------- | ------- |
 | `COUNTERPOISE_API_KEY` | User API key, for the stdio transport |
-| `DATABASE_URL` | PostgreSQL connection string (required) |
+| `DATABASE_PATH` | The SQLite database file. Default `data/counterpoise.db`; the image sets `/data/counterpoise.db` |
 | `TZ` | The app time zone for calendar dates; the system zone when unset |
 
 ## Transports and Internals
@@ -126,7 +132,8 @@ unit test fails when it differs from the manifest.
 - **Origin:** a request whose `Origin` names another host gets 403. That stops
   a web page on another site from calling it. A request without `Origin`
   passes, as in the cross-origin write check of `security.rs`. The host is
-  `X-Forwarded-Host` when a reverse proxy sets it, and `Host` when not. The key is a
+  `X-Forwarded-Host` when a trusted reverse proxy sets it (see `TRUST_PROXY`),
+  and `Host` when not. The key is a
   bearer header, never a cookie, so this check is a second line of defense.
 - **HTTP is stateless:** no session IDs. Each request gets a new handler, and
   the tools send no notifications.
@@ -233,7 +240,7 @@ unit test fails when it differs from the manifest.
   mock does not reach the Rust process: `mcp-usage-tools.test.ts` fakes the
   PostHog Query API. `tests/mcp/rust-transport.test.ts` covers the HTTP gate.
 - **Stdio:** `counterpoise-rust-api mcp` serves the same registry over stdio.
-  It reads `DATABASE_URL`, `TZ` and `COUNTERPOISE_API_KEY`, and sends the key
+  It reads `DATABASE_PATH`, `TZ` and `COUNTERPOISE_API_KEY`, and sends the key
   as the bearer header of each tool's route requests. A missing or unknown key
   does not stop the server; each tool answers with the auth error. Each call
   checks the key again, so a revoked key stops working without a restart.
@@ -274,7 +281,7 @@ open book. The Rust server serves its endpoint from the same registry as
 - `list_books` — List every book the authenticated user is a member of, each with the user's role
 - `create_book` — Create a new accounting book
 - `update_book` — Rename a book, and optionally change its recurring-transaction projection window. `name` is always required; resend the current name to leave it unchanged
-- `create_demo_book` — Create a new book pre-filled with realistic sample data (about three years of transactions)
+- `create_demo_book` — Create a new book pre-filled with realistic sample data. The optional `dataset` parameter is `household` (the default, about three years of transactions) or `single` (about two years). The dates end today
 - `delete_book` — Permanently delete a book and all of its data; requires `confirmBookName` to match the book's exact name
 
 **Book members** (require `bookId`):
@@ -340,7 +347,7 @@ open book. The Rust server serves its endpoint from the same registry as
 - `delete_issue_report` — Delete an issue report
 
 **System:**
-- `get_system_status` — Report the health of Counterpoise's background jobs (backup, backup pruning, recurring processing, bank sync, security price sync, search reindex)
+- `get_system_status` — Report the health of Counterpoise's background jobs (backup, backup pruning, recurring processing, bank sync, security price sync, the monthly database compaction named reindex)
 
 **Analytics:**
 - `analyze_usage` — Query PostHog for the caller's own event summaries (requires PostHog env vars)

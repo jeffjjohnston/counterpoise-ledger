@@ -9,8 +9,9 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::HeaderMap,
 };
+use ledger_db::engine::{Db, DbPool};
 use serde_json::{Value, json};
-use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+use sqlx::{QueryBuilder, Row};
 use std::collections::HashMap;
 
 fn float_prefix(value: &str) -> Option<f64> {
@@ -79,7 +80,7 @@ fn bucket(items: Vec<Value>, total: i32) -> Value {
 }
 
 async fn transaction_results(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     query: &str,
     pattern: &str,
@@ -87,7 +88,7 @@ async fn transaction_results(
     end: Option<&str>,
     today: &str,
 ) -> Result<Vec<Value>, sqlx::Error> {
-    let mut ids_query = QueryBuilder::<Postgres>::new(
+    let mut ids_query = QueryBuilder::<Db>::new(
         "WITH matches AS (SELECT DISTINCT t.id, CASE WHEN t.is_floating THEN ",
     );
     ids_query
@@ -133,7 +134,7 @@ async fn transaction_results(
         return Ok(Vec::new());
     }
 
-    let mut details = QueryBuilder::<Postgres>::new("SELECT t.id, CASE WHEN t.is_floating THEN ");
+    let mut details = QueryBuilder::<Db>::new("SELECT t.id, CASE WHEN t.is_floating THEN ");
     details
         .push_bind(today.to_owned())
         .push(
@@ -203,7 +204,7 @@ enum Kind {
 }
 
 async fn named_bucket(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     lower: &str,
     pattern: &str,
@@ -317,7 +318,7 @@ pub(crate) async fn search(
 /// and the accounts, payees and recurring rules whose name contains it.
 /// The query is trimmed; an empty one finds nothing.
 pub(crate) async fn search_book(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     query: &str,
     start: Option<&str>,

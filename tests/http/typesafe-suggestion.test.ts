@@ -1,15 +1,12 @@
 import { createServer, type Server } from "node:http";
-import { asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  books, payees, plaidTransactionReconciliation, transactions, transactionSplits, typesafeDecisions,
-  typesafeEvaluations, typesafeQuotas,
-} from "../../db/schema";
+import type { Transaction, TransactionSplit, TypeSafeEvaluation } from "../../types/db";
 import {
   addBookMember, createAccount, createBook, createPayee, createPlaidAccount, createPlaidReconciliation,
-  createPlaidToken, createTransactionWithSplits, createUser, db, resetTestDatabase, setupTestDatabase,
+  createPlaidToken, createTransactionWithSplits, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { exec, insert, row, rows, scalar } from "../helpers/sql";
 import { typesafeReply } from "../helpers/typesafe";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
@@ -65,7 +62,7 @@ async function expectError(client: Client, path: string, init: RequestInit, stat
  * Every date is fixed, so the request bodies are the same on each run.
  */
 async function fixture() {
-  await db.update(books).set({ typesafeReconciliationEnabled: true, typesafeRevision: 2 }).where(eq(books.id, 1));
+  await exec("UPDATE books SET typesafe_reconciliation_enabled = $1, typesafe_revision = $2 WHERE id = $3", [true, 2, 1]);
   const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank" });
   const food = await createAccount({ name: "Food", type: "expense" });
   const dining = await createAccount({ name: "Food:Dining", type: "expense" });
@@ -145,7 +142,7 @@ describe("TypeSafe suggestion HTTP parity", () => {
     expect(mock.requests[0].contentType).toBe("application/json");
     expect(mock.requests[0].body).toMatchSnapshot();
 
-    const [stored] = await db.select().from(typesafeEvaluations);
+    const [stored] = await rows<TypeSafeEvaluation>("SELECT * FROM typesafe_evaluations ORDER BY id");
     expect(stored).toMatchObject({
       status: "ready", choice: "candidate_1", errorCode: null, revision: 2, reconciliationId: data.matchRow.id,
       confidence: 1, usage: { input_tokens: 100, output_tokens: 3 },
@@ -154,7 +151,7 @@ describe("TypeSafe suggestion HTTP parity", () => {
     });
     expect(stored.latencyMs).toEqual(expect.any(Number));
     expect(stored.snapshot).toMatchSnapshot({ effectiveDay: expect.any(String) });
-    const [quota] = await db.select().from(typesafeQuotas);
+    const [quota] = await rows<{ attempts: number }>("SELECT * FROM typesafe_quotas ORDER BY book_id, day");
     expect(quota.attempts).toBe(1);
 
     // The same input answers from the store, without a second request.
@@ -177,19 +174,18 @@ describe("TypeSafe suggestion HTTP parity", () => {
     const shown = await client.request(path(), json("PATCH", { evaluationId }));
     expect(shown.status).toBe(200);
     expect(await shown.json()).toEqual(made);
-    const [displayed] = await db.select().from(typesafeEvaluations);
+    const [displayed] = await rows<TypeSafeEvaluation>("SELECT * FROM typesafe_evaluations ORDER BY id");
     expect(displayed.displayedAt).toBeInstanceOf(Date);
 
     const confirmed = await client.request(path(), json("PUT", { evaluationId, kind: "create", activeReviewMs: 4200 }));
     expect(confirmed.status).toBe(200);
     const item = await confirmed.json();
     expect(item).toMatchObject({ id: data.newRow.id, resolutionStatus: "created", matchedTransactionId: expect.any(Number) });
-    const created = await db.select().from(transactions).where(eq(transactions.id, item.matchedTransactionId));
-    const [payee] = await db.select().from(payees).where(eq(payees.id, created[0].payeeId!));
-    expect(payee.name).toBe("Zelle to jane@example.com CONF 99887766");
-    const splits = await db.select().from(transactionSplits).where(eq(transactionSplits.transactionId, item.matchedTransactionId)).orderBy(asc(transactionSplits.accountId));
+    const created = await rows<Transaction>("SELECT * FROM transactions WHERE id = $1", [item.matchedTransactionId]);
+    expect(await scalar("SELECT name FROM payees WHERE id = $1", [created[0].payeeId])).toBe("Zelle to jane@example.com CONF 99887766");
+    const splits = await rows<TransactionSplit>("SELECT * FROM transaction_splits WHERE transaction_id = $1 ORDER BY account_id", [item.matchedTransactionId]);
     expect(splits.map((s) => [s.accountId, s.amount])).toEqual([[data.checking.id, -2500], [data.dining.id, 2500]]);
-    expect(await db.select().from(typesafeDecisions)).toMatchObject([{
+    expect(await rows("SELECT * FROM typesafe_decisions ORDER BY id")).toMatchObject([{
       action: "create", evaluationId, reconciliationId: data.newRow.id, transactionId: item.matchedTransactionId,
       suggestionVisible: true, acceptedSuggestion: true, proposalPayeeKept: true, proposalCategoryKept: true, activeReviewMs: 4200,
     }]);
@@ -200,9 +196,9 @@ describe("TypeSafe suggestion HTTP parity", () => {
     const confirmed = await client.request(path(), json("PUT", { evaluationId }));
     expect(confirmed.status).toBe(200);
     expect(await confirmed.json()).toMatchObject({ id: data.matchRow.id, resolutionStatus: "matched", matchedTransactionId: data.exact.id });
-    const [evaluation] = await db.select().from(typesafeEvaluations);
+    const evaluation = await row<TypeSafeEvaluation>("SELECT * FROM typesafe_evaluations");
     expect(evaluation.displayedAt).toBeInstanceOf(Date);
-    expect(await db.select().from(typesafeDecisions)).toMatchObject([{
+    expect(await rows("SELECT * FROM typesafe_decisions ORDER BY id")).toMatchObject([{
       action: "match", transactionId: data.exact.id, suggestionVisible: true, acceptedSuggestion: true,
       proposalPayeeKept: null, proposalCategoryKept: null, activeReviewMs: null,
     }]);
@@ -217,8 +213,8 @@ describe("TypeSafe suggestion HTTP parity", () => {
     expect(await client.request(path(), json("POST", { reconciliationId: data.matchRow.id })).then((r) => r.json()))
       .toEqual(limited);
     expect(mock.requests).toHaveLength(1);
-    const [row] = await db.select().from(typesafeEvaluations);
-    expect(row).toMatchObject({ status: "error", errorCode: "rate_limited", choice: null, answers: null, usage: null });
+    const stored = await row<TypeSafeEvaluation>("SELECT * FROM typesafe_evaluations");
+    expect(stored).toMatchObject({ status: "error", errorCode: "rate_limited", choice: null, answers: null, usage: null });
 
     for (const [reply, code] of [
       [() => ({ status: 200, body: JSON.stringify({ model: "other", answers: {} }) }), "invalid_response"],
@@ -226,11 +222,11 @@ describe("TypeSafe suggestion HTTP parity", () => {
       [() => ({ status: 500, body: "{}" }), "provider_error"],
       [(text: string) => typesafeReply({ body: text }).text().then((body) => ({ status: 200, body: body.replace('"none":0', '"none":0.5') })), "invalid_response"],
     ] as [Reply, string][]) {
-      await db.update(typesafeEvaluations).set({ startedAt: new Date(Date.now() - 61_000) });
+      await exec("UPDATE typesafe_evaluations SET started_at = $1", [new Date(Date.now() - 61_000)]);
       mock.replies.push(reply);
       const result = await (await client.request(path(), json("POST", { reconciliationId: data.matchRow.id }))).json();
-      expect(result).toEqual({ status: "unavailable", evaluationId: row.id });
-      const [again] = await db.select().from(typesafeEvaluations);
+      expect(result).toEqual({ status: "unavailable", evaluationId: stored.id });
+      const again = await row<TypeSafeEvaluation>("SELECT * FROM typesafe_evaluations");
       expect(again, code).toMatchObject({ status: "error", errorCode: code, answers: null });
     }
   });
@@ -239,15 +235,15 @@ describe("TypeSafe suggestion HTTP parity", () => {
     const ask = async (reconciliationId: number) =>
       (await client.request(path(), json("POST", { reconciliationId }))).json();
     expect(await ask(data.reviewRow.id)).toEqual({ status: "skipped" });
-    await db.insert(typesafeEvaluations).values({
+    await insert("typesafe_evaluations", {
       bookId: 1, reconciliationId: data.newRow.id, linkId: data.link.id, revision: 2, fingerprint: "other",
-      attempt: "a", snapshot: {} as never, status: "pending", startedAt: new Date(),
+      attempt: "a", snapshot: {}, status: "pending", startedAt: new Date(),
     });
     expect(await ask(data.matchRow.id)).toEqual({ status: "busy" });
-    await db.delete(typesafeEvaluations);
-    await db.insert(typesafeQuotas).values({ bookId: 1, day: new Date().toISOString().slice(0, 10), attempts: 100 });
+    await exec("DELETE FROM typesafe_evaluations");
+    await insert("typesafe_quotas", { bookId: 1, day: new Date().toISOString().slice(0, 10), attempts: 100 });
     expect(await ask(data.matchRow.id)).toEqual({ status: "limited" });
-    await db.update(books).set({ typesafeReconciliationEnabled: false }).where(eq(books.id, 1));
+    await exec("UPDATE books SET typesafe_reconciliation_enabled = $1 WHERE id = $2", [false, 1]);
     expect(await ask(data.matchRow.id)).toEqual({ status: "disabled" });
     expect(mock.requests).toHaveLength(0);
   });
@@ -278,7 +274,7 @@ describe("TypeSafe suggestion HTTP parity", () => {
     // A match evaluation has no proposal to create; a changed row makes it stale.
     const { evaluationId } = await (await client.request(path(), json("POST", { reconciliationId: data.matchRow.id }))).json();
     await expectError(client, path(), json("PUT", { evaluationId, kind: "create" }), 409, "This TypeSafe suggestion has no new transaction to create.");
-    await db.update(plaidTransactionReconciliation).set({ name: "Changed name" }).where(eq(plaidTransactionReconciliation.id, data.matchRow.id));
+    await exec("UPDATE plaid_transaction_reconciliation SET name = $1 WHERE id = $2", ["Changed name", data.matchRow.id]);
     await expectError(client, path(), json("PATCH", { evaluationId }), 409, "This TypeSafe suggestion is stale. Refresh and review the transaction again.");
 
     const owner = await createUser({ username: "owner" });

@@ -1,9 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { plaidAccounts, plaidTokens, transactions } from "@/db/schema";
 import {
   setupTestDatabase,
   resetTestDatabase,
@@ -16,6 +13,8 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
+import { count, row } from "@/tests/helpers/sql";
+import type { PlaidAccount, PlaidToken, Transaction } from "@/types/db";
 
 let mcp: McpTestClient;
 
@@ -149,9 +148,8 @@ describe("MCP Plaid Tools", () => {
       expect(isError).toBe(true);
       expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
 
-      const db = getDb();
-      const [row] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, theirs.id));
-      expect(row.financialInstitution).toBe("Theirs");
+      const stored = await row<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [theirs.id]);
+      expect(stored.financialInstitution).toBe("Theirs");
     });
 
     // Proof for item 2: accessToken must not exist on this tool's published
@@ -177,9 +175,8 @@ describe("MCP Plaid Tools", () => {
       expect(isError).toBe(false);
       expect(data.financialInstitution).toBe("Renamed Bank");
 
-      const db = getDb();
-      const [row] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, token.id));
-      expect(row.accessToken).toBe("access-sandbox-original");
+      const stored = await row<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
+      expect(stored.accessToken).toBe("access-sandbox-original");
     });
   });
 
@@ -208,12 +205,8 @@ describe("MCP Plaid Tools", () => {
       expect(isError).toBe(true);
       expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
 
-      const db = getDb();
-      const [row] = await db
-        .select()
-        .from(plaidAccounts)
-        .where(eq(plaidAccounts.id, theirLink.id));
-      expect(row.counterpoiseAccountId).toBeNull();
+      const stored = await row<PlaidAccount>("SELECT * FROM plaid_accounts WHERE id = $1", [theirLink.id]);
+      expect(stored.counterpoiseAccountId).toBeNull();
     });
   });
 
@@ -314,9 +307,7 @@ describe("MCP Plaid Tools", () => {
       expect(isError).toBe(true);
       expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
 
-      const db = getDb();
-      const rows = await db.select().from(plaidTokens).where(eq(plaidTokens.id, theirs.id));
-      expect(rows).toHaveLength(1);
+      expect(await count("plaid_tokens", "id = $1", [theirs.id])).toBe(1);
     });
   });
 
@@ -386,9 +377,8 @@ describe("MCP Plaid Tools", () => {
       expect(isError).toBe(true);
       expect(data.error).toBe(`Plaid token ${theirs.id} not found`);
 
-      const db = getDb();
-      const [row] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, theirs.id));
-      expect(row.syncCursor).toBe("cursor-theirs");
+      const stored = await row<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [theirs.id]);
+      expect(stored.syncCursor).toBe("cursor-theirs");
     });
   });
 
@@ -498,9 +488,8 @@ describe("MCP Plaid Tools", () => {
       expect(isError).toBe(true);
       expect(data.error).toContain("No Plaid link found");
 
-      const db = getDb();
-      const [row] = await db.select().from(transactions).where(eq(transactions.id, theirTxn.id));
-      expect(row.isReconciled).toBe(true);
+      const stored = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [theirTxn.id]);
+      expect(stored.isReconciled).toBe(true);
     });
   });
 });

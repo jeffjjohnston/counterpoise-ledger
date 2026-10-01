@@ -1,11 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { accounts, sessions } from "../../db/schema";
 import manifest from "../../rust-api/server/mcp-tools.json";
 import {
-  addBookMember, createUser, db, resetTestDatabase, setupTestDatabase,
+  addBookMember, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
+import { insert, row, rows } from "../helpers/sql";
+import type { Account } from "../../types/db";
 import { startHttpTestServer } from "../helpers/http-parity";
 
 /**
@@ -76,7 +76,7 @@ describe("WebMCP", () => {
   /** A session cookie for a user, as the browser sends it. */
   async function cookieFor(userId: number): Promise<string> {
     const token = randomBytes(32).toString("hex");
-    await db.insert(sessions).values({
+    await insert("sessions", {
       userId,
       tokenHash: createHash("sha256").update(token).digest("hex"),
       expiresAt: new Date(Date.now() + 60 * 60 * 1000),
@@ -156,8 +156,8 @@ describe("WebMCP", () => {
       expect(response.status).toBe(200);
       const account = await response.json();
       expect(account).toMatchObject({ name: "Cash", type: "asset" });
-      const [row] = await db.select().from(accounts).where(eq(accounts.id, account.id));
-      expect(row.bookId).toBe(1);
+      const stored = await row<Account>("SELECT * FROM accounts WHERE id = $1", [account.id]);
+      expect(stored.bookId).toBe(1);
     });
 
     it("gives a read tool's JSON", async () => {
@@ -177,7 +177,7 @@ describe("WebMCP", () => {
       });
       expect(refused.status).toBe(400);
       expect(await refused.json()).toEqual({ error: "You have read-only access to this book" });
-      expect(await db.select().from(accounts).where(eq(accounts.name, "Cash"))).toEqual([]);
+      expect(await rows("SELECT * FROM accounts WHERE name = $1", ["Cash"])).toEqual([]);
     });
 
     it("refuses to run a withheld or unknown tool, not merely to list it", async () => {

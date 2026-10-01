@@ -1,7 +1,7 @@
 pub(crate) mod accounts;
 mod auth;
 mod books;
-mod cron;
+pub(crate) mod cron;
 mod events;
 pub(crate) mod investments;
 mod issue_reports;
@@ -18,7 +18,7 @@ pub(crate) mod security_prices;
 pub(crate) mod sync;
 pub(crate) mod system;
 pub(crate) mod transactions;
-mod typesafe;
+pub(crate) mod typesafe;
 mod typesafe_suggestion;
 
 use self::{
@@ -27,7 +27,9 @@ use self::{
         change_password, create_key, delete_key, list_keys, login, logout, me, register,
         registration_status,
     },
-    books::{create_book, create_demo_book, delete_book, list_books, update_book},
+    books::{
+        create_book, create_demo_book, delete_book, list_books, list_demo_datasets, update_book,
+    },
     cron::{
         plaid_sync as plaid_sync_cron, price_sync as price_sync_cron, recurring as recurring_cron,
     },
@@ -108,6 +110,9 @@ pub(crate) fn routes() -> Router<AppState> {
             }
             ("POST", "/api/books/demo", "books.demo") => {
                 router.route(&route.path, axum::routing::post(create_demo_book))
+            }
+            ("GET", "/api/books/demo/datasets", "books.datasets") => {
+                router.route(&route.path, get(list_demo_datasets))
             }
             ("PUT", "/api/books/[bookId]", "books.update") => {
                 router.route("/api/books/{book_id}", axum::routing::put(update_book))

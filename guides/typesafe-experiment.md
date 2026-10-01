@@ -10,7 +10,8 @@ the ordinary Create form.
 
 ## Enable or disable
 
-1. Apply the normal Drizzle migrations, including `0022_broken_meggan.sql`.
+1. Run a release whose schema has the TypeSafe tables. The SQLite baseline
+   (`rust-api/db/migrations/0001_baseline.sql`) has them.
 2. Set server-only `TYPESAFE_API_KEY` and `TYPESAFE_ENABLED=true` in the relevant
    deployment's environment, then restart that app. Neither variable is public.
 3. In the current book's **Settings → TypeSafe AI — Experimental**, enable
@@ -121,10 +122,11 @@ file.
 
 `GET /api/cron/typesafe-cleanup`, protected by `CRON_SECRET`, archives counts and
 deletes details older than 30 days in batches of at most 1,000 evaluations.
-The existing Docker scheduler calls it hourly at :15, even with TypeSafe
-disabled. The retention window is therefore 30 days plus the next cleanup; a large backlog
-may need more than one batch. Deployments without that scheduler must call the
-endpoint on an equivalent schedule. Book deletion cascades through experiment
+The server runs the same job hourly at :15 (`rust-api/server/src/scheduler.rs`),
+even with TypeSafe disabled. The retention window is therefore 30 days plus
+the next cleanup; a large backlog may need more than one batch. A server with
+`COUNTERPOISE_SCHEDULER` off must have something else call the endpoint on an
+equivalent schedule. Book deletion cascades through experiment
 tables. Existing database backups retain their normal independent lifecycle.
 
 For the first 100–200 decisions, compare cases where Jev differs from the
@@ -151,7 +153,8 @@ that the report depends on must change both sides. The MCP tools do not call
 TypeSafe. The fingerprint is the SHA-256 of `JSON.stringify(snapshot)`, so the
 Rust snapshot keeps the key order that the Node object literal had, and stored
 fingerprints stay valid. The state and the questions are built from the
-snapshot as jsonb returns it, in the key order that PostgreSQL gives.
+snapshot as the database returns it: the JSON columns are read as text, so
+the key order is the stored order.
 `TYPESAFE_API_URL` replaces the TypeSafe origin, so the HTTP tests use a local
 mock. `tests/http/typesafe-suggestion.test.ts` checks the request body against
 a snapshot. It also displays and confirms, through the Rust routes, an

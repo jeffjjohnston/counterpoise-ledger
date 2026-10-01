@@ -4,6 +4,7 @@
   { "method": "GET", "path": "/api/books", "handler": "books.list" },
   { "method": "POST", "path": "/api/books", "handler": "books.create" },
   { "method": "POST", "path": "/api/books/demo", "handler": "books.demo" },
+  { "method": "GET", "path": "/api/books/demo/datasets", "handler": "books.datasets" },
   { "method": "PUT", "path": "/api/books/[bookId]", "handler": "books.update" },
   { "method": "DELETE", "path": "/api/books/[bookId]", "handler": "books.delete" },
   { "method": "GET", "path": "/api/books/[bookId]/members", "handler": "members.list" },

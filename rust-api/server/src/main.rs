@@ -9,6 +9,7 @@ mod config;
 mod cron_auth;
 mod db_scope;
 mod error;
+mod health_probe;
 #[cfg(test)]
 mod http_contract_tests;
 mod mcp;
@@ -18,6 +19,7 @@ mod posthog_query;
 mod rate_limit;
 mod recurring_input;
 mod routes;
+mod scheduler;
 mod security;
 mod state;
 mod static_pages;
@@ -60,11 +62,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => serve().await,
         Some("mcp") => mcp_stdio().await,
         Some("openapi") => openapi::command(&args[1..]),
+        Some("health") => health(),
         Some(other) => Err(format!(
-            "Unknown command: {other}. Usage: counterpoise-rust-api [mcp | openapi [--check] [--out <path>]]"
+            "Unknown command: {other}. Usage: counterpoise-rust-api [mcp | health | openapi [--check] [--out <path>]]"
         )
         .into()),
     }
+}
+
+/// `counterpoise-rust-api health`: the container healthcheck (see
+/// `health_probe`).
+fn health() -> Result<(), Box<dyn Error>> {
+    let config = Config::from_env()?;
+    let status = health_probe::probe(health_probe::probe_address(&config.bind)?)?;
+    println!("{status}");
+    Ok(())
 }
 
 /// `counterpoise-rust-api mcp`: the MCP tools over stdio, for a client that
@@ -73,25 +85,64 @@ async fn mcp_stdio() -> Result<(), Box<dyn Error>> {
     tracing_setup::init_stderr();
     validate_version_metadata();
     let config = Config::from_env()?;
-    let state = AppState::new(&config.database_url, &config.time_zone)?;
+    config.refuse_unconverted_install()?;
+    // The server owns the file and applies the migrations. This process
+    // opens it as a second writer, as `ledger-cli` does.
+    if !config.database_path.exists() {
+        return Err(format!(
+            "no database at {}; start the server once to create it",
+            config.database_path.display()
+        )
+        .into());
+    }
+    let state = AppState::new(&config.database_path)?;
     let key = std::env::var("COUNTERPOISE_API_KEY").ok();
     mcp::stdio(state, key.as_deref()).await
 }
-
-/// The server logs this warning one time at startup. This release is the last
-/// release that uses PostgreSQL. The next release needs a one-time conversion
-/// to SQLite. The book pages show the same text (`LastPostgresNotice.tsx`).
-const LAST_POSTGRES_NOTICE: &str = "This is the last Counterpoise release that uses PostgreSQL. \
-The next release moves your data to SQLite. That upgrade needs a one-time conversion. \
-Read the upgrade guide (guides/upgrade-to-sqlite.md) before you upgrade.";
 
 /// The HTTP server.
 async fn serve() -> Result<(), Box<dyn Error>> {
     tracing_setup::init();
     validate_version_metadata();
     let config = Config::from_env()?;
-    let state = AppState::new(&config.database_url, &config.time_zone)?;
+    config.refuse_unconverted_install()?;
+    if let Some(parent) = config
+        .database_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Held until the process ends: a second server on this file refuses to
+    // start, and its scheduler and change hints would miss this one's. The
+    // HTTP tests start more than one server on a file with other settings;
+    // only they set COUNTERPOISE_TEST_SHARED_DATABASE.
+    let _server_lock = if std::env::var("COUNTERPOISE_TEST_SHARED_DATABASE").is_ok_and(|v| v == "1")
+    {
+        tracing::warn!("COUNTERPOISE_TEST_SHARED_DATABASE=1: the server lock is off (tests only)");
+        None
+    } else {
+        Some(ledger_db::lock_server(&config.database_path)?)
+    };
+    let pool = ledger_db::connect(&config.database_path, true)?;
+    ledger_db::migrate(&pool).await?;
+    // Lots are derived state. The rebuild runs only when the file has
+    // splits and no lots (a converted or restored database). A failure
+    // stops the start: the server would otherwise show no cost basis.
+    let lots = ledger_db::lots::backfill_lots(&pool, false).await?;
+    if !lots.skipped {
+        tracing::info!(
+            pairs = lots.pairs_rebuilt,
+            books = lots.books_processed,
+            "Lots rebuilt"
+        );
+    }
+    pool.close().await;
+    let state = AppState::new(&config.database_path)?;
     let book_changes = state.book_changes.clone();
+    if scheduler::enabled() {
+        scheduler::start(state.clone());
+    }
     let api = routes().with_state(state);
     let app = match &config.static_dir {
         Some(dir) => {
@@ -103,7 +154,6 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     let app = compression::compress(app);
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!(address = %config.bind, "Rust API listening");
-    tracing::warn!("{LAST_POSTGRES_NOTICE}");
     tracing::info!(
         trust_proxy = config.trust_proxy.trusted,
         reason = config.trust_proxy.reason,
@@ -125,16 +175,4 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     })
     .await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod last_postgres_notice_tests {
-    use super::LAST_POSTGRES_NOTICE;
-
-    #[test]
-    fn is_one_line_that_names_the_guide() {
-        assert!(!LAST_POSTGRES_NOTICE.contains('\n'));
-        assert!(LAST_POSTGRES_NOTICE.contains("guides/upgrade-to-sqlite.md"));
-        assert!(LAST_POSTGRES_NOTICE.contains("last Counterpoise release that uses PostgreSQL"));
-    }
 }

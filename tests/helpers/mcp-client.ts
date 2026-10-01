@@ -1,13 +1,11 @@
-import { eq } from "drizzle-orm";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { resolve } from "node:path";
-import { apiKeys } from "../../db/schema";
 import { generateApiKey, getKeyPrefix, hashApiKey } from "./api-keys";
-import { db } from "./db-utils";
+import { count, insert } from "./sql";
 import { startHttpTestServer } from "./http-parity";
-import { workerDatabaseUrl } from "./database-safety";
+import { workerDatabasePath } from "./test-database";
 import { callMcpTool, type McpCallResult } from "./mcp";
 
 /** The text and error flag of a tool result, undecoded. */
@@ -43,7 +41,8 @@ export function stdioServerParameters(
     args: ["mcp"],
     env: {
       ...(process.env as Record<string, string>),
-      DATABASE_URL: workerDatabaseUrl(),
+      DATABASE_PATH: workerDatabasePath(),
+      DATABASE_URL: "",
       NODE_ENV: "production",
       ...(key === undefined ? {} : { COUNTERPOISE_API_KEY: key }),
       ...env,
@@ -85,9 +84,8 @@ export async function connectMcpTestClient(
     const key = generateApiKey();
     const keyHash = await hashApiKey(key);
     const ensureKey = async () => {
-      const [existing] = await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.keyHash, keyHash));
-      if (!existing) {
-        await db.insert(apiKeys).values({ userId, name: "MCP test", keyHash, keyPrefix: getKeyPrefix(key) });
+      if (await count("api_keys", "key_hash = $1", [keyHash]) === 0) {
+        await insert("api_keys", { userId, name: "MCP test", keyHash, keyPrefix: getKeyPrefix(key) });
       }
     };
     if (stdio) {

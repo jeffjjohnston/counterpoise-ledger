@@ -1,13 +1,13 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { plaidAccounts, plaidTokens, plaidTransactionReconciliation } from "../../db/schema";
+import type { PlaidAccount, PlaidToken, PlaidTransactionReconciliation } from "../../types/db";
 import {
   addBookMember, createAccount, createBook, createPlaidAccount, createPlaidReconciliation,
-  createPlaidToken, createUser, db, resetTestDatabase, setupTestDatabase,
+  createPlaidToken, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { exec, rows } from "../helpers/sql";
 
 function json(method: string, body: unknown): RequestInit {
   return { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
@@ -142,7 +142,7 @@ describe("Plaid connection HTTP parity", () => {
     const created = await ok(client, "/api/b/1/sync/tokens", json("POST", {
       financialInstitution: "  Chase ", itemId: "\titem-1\n", accessToken: " access-sandbox-123456789 ", bookId: 7,
     }));
-    const [stored] = await db.select().from(plaidTokens);
+    const [stored] = await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id");
     expect(stored).toMatchObject({ bookId: 1, financialInstitution: "Chase", itemId: "item-1", accessToken: "access-sandbox-123456789", isDemo: false });
     expect(created).toEqual({
       id: stored.id, financialInstitution: "Chase", itemId: "item-1",
@@ -170,7 +170,7 @@ describe("Plaid connection HTTP parity", () => {
       await expectError(client, "/api/b/1/sync/tokens", post(body), 400, required);
     }
     await expectError(client, "/api/b/1/sync/tokens", { method: "POST", body: "{" }, 500, "Failed to create sync token");
-    expect(await db.select().from(plaidTokens).where(eq(plaidTokens.bookId, 1))).toHaveLength(1);
+    expect(await rows("SELECT * FROM plaid_tokens WHERE book_id = $1", [1])).toHaveLength(1);
   });
 
   it("updates a connection and keeps the access token unless a new one is sent", async () => {
@@ -179,7 +179,7 @@ describe("Plaid connection HTTP parity", () => {
     const path = `/api/b/1/sync/tokens/${token.id}`;
 
     const kept = await ok(client, path, json("PUT", { financialInstitution: " New Bank ", itemId: "item-new", accessToken: "  " }));
-    let [stored] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, token.id));
+    let [stored] = await rows<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
     expect(stored).toMatchObject({ financialInstitution: "New Bank", itemId: "item-new", accessToken: "old-access-token" });
     expect(kept).toEqual({
       id: token.id, financialInstitution: "New Bank", itemId: "item-new", accessTokenMasked: "old-********oken",
@@ -191,7 +191,7 @@ describe("Plaid connection HTTP parity", () => {
       await ok(client, path, json("PUT", { financialInstitution: "New Bank", itemId: "item-new", accessToken }));
     }
     await ok(client, path, json("PUT", { financialInstitution: "New Bank", itemId: "item-new", accessToken: " replaced-token " }));
-    [stored] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, token.id));
+    [stored] = await rows<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
     expect(stored.accessToken).toBe("replaced-token");
 
     await expectError(client, path, json("PUT", { financialInstitution: "A", itemId: "item-b" }), 409, "A token with this itemId already exists");
@@ -220,8 +220,8 @@ describe("Plaid connection HTTP parity", () => {
     await createPlaidReconciliation({ plaidAccountLinkId: link.id, plaidTransactionId: "t1", date: "2025-01-01", amountCents: 1, name: "X" });
     const path = `/api/b/1/sync/tokens/${token.id}`;
     expect(await ok(client, path, { method: "DELETE" })).toEqual({ success: true });
-    expect(await db.select().from(plaidAccounts)).toEqual([]);
-    expect(await db.select().from(plaidTransactionReconciliation)).toEqual([]);
+    expect(await rows("SELECT * FROM plaid_accounts ORDER BY id")).toEqual([]);
+    expect(await rows("SELECT * FROM plaid_transaction_reconciliation ORDER BY id")).toEqual([]);
     await expectError(client, path, { method: "DELETE" }, 404, "Token not found");
     await expectError(client, "/api/b/1/sync/tokens/x1", { method: "DELETE" }, 400, "Invalid token id");
     await expectError(client, "/api/b/1/sync/tokens/-3000000000", { method: "DELETE" }, 500, "Failed to delete sync token");
@@ -267,10 +267,10 @@ describe("Plaid connection HTTP parity", () => {
       path: "/accounts/get",
       body: { client_id: "client-id", secret: "plaid-secret", access_token: "access-refresh" },
     }]);
-    const stored = await db.select().from(plaidAccounts).orderBy(asc(plaidAccounts.plaidAccountId));
+    const stored = await rows<PlaidAccount>("SELECT * FROM plaid_accounts ORDER BY plaid_account_id");
     expect(stored.map((row) => [row.plaidAccountId, row.bookId, row.tokenId])).toEqual([["keep", 1, token.id], ["new", 1, token.id]]);
 
-    await db.update(plaidTokens).set({ accessToken: "access-empty" }).where(eq(plaidTokens.id, token.id));
+    await exec("UPDATE plaid_tokens SET access_token = $1 WHERE id = $2", ["access-empty", token.id]);
     expect(await ok(client, `${path}?refresh=true`)).toEqual([]);
 
     const other = await createBook({ name: "Other" });
@@ -292,10 +292,10 @@ describe("Plaid connection HTTP parity", () => {
       ["access-null-body", "Cannot read properties of null (reading 'accounts')"],
       ["access-null-account", "Cannot read properties of null (reading 'account_id')"],
     ]) {
-      await db.update(plaidTokens).set({ accessToken }).where(eq(plaidTokens.id, token.id));
+      await exec("UPDATE plaid_tokens SET access_token = $1 WHERE id = $2", [accessToken, token.id]);
       await expectError(client, path, {}, 502, error);
     }
-    expect((await db.select().from(plaidAccounts)).map((row) => row.plaidAccountId)).toEqual(["stays"]);
+    expect((await rows<PlaidAccount>("SELECT * FROM plaid_accounts ORDER BY id")).map((row) => row.plaidAccountId)).toEqual(["stays"]);
   });
 
   it("maps the accounts of a connection, swaps two mappings, and clears one", async () => {
@@ -386,13 +386,13 @@ describe("Plaid connection HTTP parity", () => {
     await expectError(client, `/api/b/1/sync/tokens/${token.id + 100}/accounts`, put("x"), 400, "assignments must be an array");
     await expectError(client, `/api/b/1/sync/tokens/${token.id + 100}/accounts`, put([]), 404, "Token not found");
     await expectError(client, "/api/b/1/sync/tokens/nope/accounts", put("x"), 400, "Invalid token id");
-    const [stored] = await db.select().from(plaidAccounts).where(eq(plaidAccounts.id, link.id));
+    const [stored] = await rows<PlaidAccount>("SELECT * FROM plaid_accounts WHERE id = $1", [link.id]);
     expect(stored.counterpoiseAccountId).toBeNull();
   });
 
   it("clears the staged rows and the cursor of one connection", async () => {
     const token = await createPlaidToken({ financialInstitution: "Chase", itemId: "item-clear", accessToken: "t", syncCursor: "cursor-1", lastSyncedAt: new Date("2025-01-02T03:04:05.678Z") });
-    await db.update(plaidTokens).set({ lastError: "previous failure" }).where(eq(plaidTokens.id, token.id));
+    await exec("UPDATE plaid_tokens SET last_error = $1 WHERE id = $2", ["previous failure", token.id]);
     const otherToken = await createPlaidToken({ financialInstitution: "Other", itemId: "item-other", accessToken: "t", syncCursor: "cursor-2" });
     const link = await createPlaidAccount({ tokenId: token.id, plaidAccountId: "pa-1", name: "Checking", type: "depository" });
     const otherLink = await createPlaidAccount({ tokenId: otherToken.id, plaidAccountId: "pa-2", name: "Other", type: "depository" });
@@ -404,9 +404,9 @@ describe("Plaid connection HTTP parity", () => {
     }
     const path = `/api/b/1/sync/tokens/${token.id}/sync`;
     expect(await ok(client, path, { method: "DELETE" })).toEqual({ success: true });
-    const staged = await db.select().from(plaidTransactionReconciliation).orderBy(asc(plaidTransactionReconciliation.plaidTransactionId));
+    const staged = await rows<PlaidTransactionReconciliation>("SELECT * FROM plaid_transaction_reconciliation ORDER BY plaid_transaction_id");
     expect(staged.map((row) => row.plaidTransactionId)).toEqual(["ignored", "matched", "other-pending"]);
-    const tokens = await db.select().from(plaidTokens).orderBy(asc(plaidTokens.id));
+    const tokens = await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id");
     expect(tokens.map(({ syncCursor, lastSyncedAt, lastError }) => ({ syncCursor, lastSyncedAt, lastError }))).toEqual([
       { syncCursor: null, lastSyncedAt: null, lastError: null },
       { syncCursor: "cursor-2", lastSyncedAt: null, lastError: null },

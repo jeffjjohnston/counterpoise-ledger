@@ -2,7 +2,7 @@
 
 use chrono::NaiveDate;
 use ledger_core::{formatters::to_date_string, recurring::RecurrenceConfig};
-use sqlx::{Connection, PgConnection};
+use ledger_db::engine::{Db, DbConnection};
 
 use super::values::{
     Item, convert_date, field, int, int_or_zero, int4, integer_text, normalize_name, text,
@@ -145,7 +145,7 @@ pub struct ReminderStats {
 }
 
 pub async fn import_reminders(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     reminders: &[&Item],
     today: NaiveDate,
@@ -237,7 +237,7 @@ pub async fn import_reminders(
             let outcome = match dates {
                 Err(message) => Err(message),
                 Ok((start, next)) => {
-                    let mut savepoint = connection.begin().await?;
+                    let mut savepoint = ledger_db::locks::savepoint(connection).await?;
                     let rule = NewRule {
                         name: text(reminder, "desc").map(|name| name.into_owned()),
                         frequency: &frequency,
@@ -294,7 +294,7 @@ struct NewRule<'a> {
 /// Inserts the rule and its template splits together, so a failure cannot
 /// leave a rule with too few splits.
 async fn insert_rule(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &ImportContext,
     rule: &NewRule<'_>,
     splits: &[(i32, f64)],
@@ -328,7 +328,7 @@ async fn insert_rule(
         .iter()
         .map(|(account_id, amount)| Ok((*account_id, int4(*amount)?)))
         .collect::<Result<Vec<_>, RowError>>()?;
-    let mut insert: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+    let mut insert: sqlx::QueryBuilder<Db> = sqlx::QueryBuilder::new(
         "INSERT INTO recurring_template_splits (book_id, recurring_rule_id, account_id, amount) ",
     );
     insert.push_values(amounts, |mut row, (account_id, amount)| {

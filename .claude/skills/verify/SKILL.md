@@ -13,20 +13,22 @@ description: Build/launch/drive recipe for verifying Counterpoise UI changes end
 When the **production Docker container** (`counterpoise-rust-api-1`) is running locally, it holds host port 3000 and serves deployed code — not your working tree. Always run the dev servers on other ports so the two can't be confused. Run two processes, both in the background:
 
 ```bash
+# 0. Once, with no server running on the file: the sample data
+npm run db:seed
+
 # 1. The Rust API server, on its own port
-DATABASE_URL=postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev \
-  RUST_BIND=127.0.0.1:4100 \
+RUST_BIND=127.0.0.1:4100 \
   cargo run --manifest-path rust-api/Cargo.toml -p counterpoise-rust-api   # ready when /health returns 200
 
 # 2. The Vite dev server, which proxies /api to that Rust server
 RUST_API_URL=http://127.0.0.1:4100 npm run dev -- --port 3001   # ready when /login returns 200
 ```
 
-The Vite port is strict: if 3001 is in use, Vite stops with an error. Pick another port. The Rust server uses the `counterpoise_dev` PostgreSQL database (start the dedicated dev database with `docker compose -f docker-compose.dev.yml up -d --wait`; no production environment file is needed). Rust code changes need a restart of the Rust server; client changes reload in the browser.
+The Vite port is strict: if 3001 is in use, Vite stops with an error. Pick another port. The Rust server uses the SQLite file `data/counterpoise.db` in this checkout (set `DATABASE_PATH` for another file). It needs no Docker and no production environment file. Only one server can use a file: a second one stops with "another server uses ...". `npm run db:seed` also refuses while a server holds the file, so seed before you start the server. Rust code changes need a restart of the Rust server; client changes reload in the browser.
 
 ## Login
 
-Seeded dev credentials: username `admin`, password `password` (created by `npm run db:seed`). Log in at `/login`, then navigate to `/b/1/transactions` (seed book id is 1, "Family Finances").
+Seeded dev credentials: username `admin`, password `password` (created by `npm run db:seed`). Log in at `/login`, then navigate to `/b/1/transactions` (seed book id is 1; the household seed names it "Family Finances"). The seed dates end today. Add `-- --today YYYY-MM-DD` to `npm run db:seed` to pin them, and `-- --dataset single` for the single-homeowner dataset. A full single seed names its book "Demo Book - Single".
 
 ## Drive
 
@@ -40,10 +42,10 @@ Seeded dev credentials: username `admin`, password `password` (created by `npm r
 Pick target rows by querying the dev DB directly:
 
 ```bash
-PGPASSWORD=counterpoise psql -h localhost -U counterpoise -d counterpoise_dev
+sqlite3 data/counterpoise.db
 ```
 
-Dev data is disposable seed data, but restore any rows you mutate (UPDATE back to original values) so repeat runs stay deterministic. Note: `.env.production.local` credentials + database `counterpoise` (no `_dev`) is the **production** DB — don't mutate it during verification.
+The shell does not have the app's SQL functions (Unicode `lower()`, case-sensitive `LIKE`, `cp_today()`), so a text search there can differ from the app. Dev data is disposable seed data, but restore any rows you mutate (UPDATE back to original values) so repeat runs stay deterministic. The volume `counterpoise_data` holds the **production** database — don't open it during verification.
 
 ## Cleanup
 

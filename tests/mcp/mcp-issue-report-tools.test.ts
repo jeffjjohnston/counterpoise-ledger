@@ -2,20 +2,17 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import { setupTestDatabase, resetTestDatabase, createUser } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { getDb } from "@/db";
-import { issueReports } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { count, insert, rows } from "@/tests/helpers/sql";
+import type { IssueReport } from "@/types/db";
 
 let mcp: McpTestClient;
 
 /** An issue report row, as the create route writes it. */
 async function createIssueReport(
-  db: ReturnType<typeof getDb>,
   userId: number,
   input: { description: string; type: "bug" | "improvement" | "other"; page: string }
 ) {
-  const [report] = await db.insert(issueReports).values({ userId, ...input }).returning();
-  return report;
+  return insert<IssueReport>("issue_reports", { userId, ...input });
 }
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
@@ -79,7 +76,7 @@ describe("MCP Issue Report Tools", () => {
       expect(result.isError).toBe(true);
       const [content] = result.content as Array<{ type: string; text: string }>;
       expect(content.text).toMatch(/^MCP error -32602: Input validation error: .*Description is required/s);
-      expect(await getDb().select().from(issueReports)).toHaveLength(0);
+      expect(await count("issue_reports")).toBe(0);
     });
 
     it("stores the description trimmed", async () => {
@@ -95,8 +92,8 @@ describe("MCP Issue Report Tools", () => {
   describe("list_issue_reports", () => {
     it("lists only the authenticated user's reports", async () => {
       const otherUser = await createUser({ username: "someone-else" });
-      await createIssueReport(getDb(), userId, { description: "Mine", type: "bug", page: "/b/1" });
-      await createIssueReport(getDb(), otherUser.id, {
+      await createIssueReport(userId, { description: "Mine", type: "bug", page: "/b/1" });
+      await createIssueReport(otherUser.id, {
         description: "Theirs",
         type: "bug",
         page: "/b/1",
@@ -112,7 +109,7 @@ describe("MCP Issue Report Tools", () => {
 
   describe("update_issue_report", () => {
     it("updates a report the user owns", async () => {
-      const report = await createIssueReport(getDb(), userId, {
+      const report = await createIssueReport(userId, {
         description: "Mine",
         type: "bug",
         page: "/b/1",
@@ -129,7 +126,7 @@ describe("MCP Issue Report Tools", () => {
 
     it("returns an error for another user's report", async () => {
       const otherUser = await createUser({ username: "someone-else" });
-      const theirs = await createIssueReport(getDb(), otherUser.id, {
+      const theirs = await createIssueReport(otherUser.id, {
         description: "Theirs",
         type: "bug",
         page: "/b/1",
@@ -145,12 +142,12 @@ describe("MCP Issue Report Tools", () => {
       expect(data.error).toBe(`Issue report ${theirs.id} not found`);
 
       // The guard actually guards: the other user's report is unchanged.
-      const rows = await getDb().select().from(issueReports).where(eq(issueReports.id, theirs.id));
-      expect(rows[0].status).toBe("new");
+      const stored = await rows<IssueReport>("SELECT * FROM issue_reports WHERE id = $1", [theirs.id]);
+      expect(stored[0].status).toBe("new");
     });
 
     it("returns an error when no fields are given", async () => {
-      const report = await createIssueReport(getDb(), userId, {
+      const report = await createIssueReport(userId, {
         description: "Mine",
         type: "bug",
         page: "/b/1",
@@ -163,7 +160,7 @@ describe("MCP Issue Report Tools", () => {
     });
 
     it("refuses a description of only whitespace at the schema boundary", async () => {
-      const report = await createIssueReport(getDb(), userId, {
+      const report = await createIssueReport(userId, {
         description: "Mine",
         type: "bug",
         page: "/b/1",
@@ -182,7 +179,7 @@ describe("MCP Issue Report Tools", () => {
 
   describe("delete_issue_report", () => {
     it("deletes a report the user owns", async () => {
-      const report = await createIssueReport(getDb(), userId, {
+      const report = await createIssueReport(userId, {
         description: "Mine",
         type: "bug",
         page: "/b/1",
@@ -193,13 +190,12 @@ describe("MCP Issue Report Tools", () => {
       expect(isError).toBe(false);
       expect(data).toEqual({ success: true, id: report.id });
 
-      const rows = await getDb().select().from(issueReports).where(eq(issueReports.id, report.id));
-      expect(rows).toHaveLength(0);
+      expect(await count("issue_reports", "id = $1", [report.id])).toBe(0);
     });
 
     it("returns an error for another user's report and leaves it intact", async () => {
       const otherUser = await createUser({ username: "someone-else" });
-      const theirs = await createIssueReport(getDb(), otherUser.id, {
+      const theirs = await createIssueReport(otherUser.id, {
         description: "Theirs",
         type: "bug",
         page: "/b/1",
@@ -210,8 +206,7 @@ describe("MCP Issue Report Tools", () => {
       expect(isError).toBe(true);
       expect(data.error).toBe(`Issue report ${theirs.id} not found`);
 
-      const rows = await getDb().select().from(issueReports).where(eq(issueReports.id, theirs.id));
-      expect(rows).toHaveLength(1);
+      expect(await count("issue_reports", "id = $1", [theirs.id])).toBe(1);
     });
   });
 

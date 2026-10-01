@@ -1,1 +1,0 @@
-ALTER TABLE "books" ADD CONSTRAINT "upcoming_days_range" CHECK ("books"."upcoming_days" >= 1 AND "books"."upcoming_days" <= 365);

@@ -1,8 +1,8 @@
 import { toDateString } from "../../lib/formatters";
-import { backfillLots } from "../../scripts/rebuild-lots";
+import { ledgerCli, workerDatabasePath } from "./test-database";
 import {
   createAccount, createInvestmentSplit, createSecurity, createSecurityPrice,
-  createTransactionWithSplits, db,
+  createTransactionWithSplits,
 } from "./db-utils";
 
 type SplitInput = Omit<Parameters<typeof createInvestmentSplit>[0], "transactionId">;
@@ -65,7 +65,8 @@ export async function createInvestmentScenario() {
     action: "dividend", sharesMicros: 0, priceMicros: 0,
   });
 
-  await backfillLots(db, { force: true });
+  // The fixtures write splits directly, so the lot engine builds the lots.
+  ledgerCli(["rebuild-lots", "--force"], workerDatabasePath());
   return { brokerage, ira, closed, cash, vti, bnd, idle };
 }
 

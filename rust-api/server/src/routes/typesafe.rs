@@ -16,6 +16,8 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use ledger_db::engine::DbExecutor;
+use ledger_db::locks::FOR_UPDATE;
 use serde_json::{Value, json};
 
 /// `typeSafeHttpError` for an error that is not a TypeSafe or reconcile
@@ -58,7 +60,7 @@ async fn authenticate(
 /// `getTypeSafeSettings`, on the pool or inside a transaction.
 async fn settings<'e, E>(executor: E, book_id: i32) -> Result<Value, ApiError>
 where
-    E: sqlx::PgExecutor<'e>,
+    E: DbExecutor<'e>,
 {
     let book: Option<(bool, i32)> = sqlx::query_as(
         "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books WHERE id = $1",
@@ -126,10 +128,12 @@ async fn set_settings(
     enabled: bool,
     clear: bool,
 ) -> Result<Value, ApiError> {
-    let mut transaction = state.pool.begin().await.map_err(unavailable)?;
-    let current: Option<bool> = sqlx::query_scalar(
-        "SELECT typesafe_reconciliation_enabled FROM books WHERE id = $1 FOR UPDATE",
-    )
+    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
+        .await
+        .map_err(unavailable)?;
+    let current: Option<bool> = sqlx::query_scalar(&format!(
+        "SELECT typesafe_reconciliation_enabled FROM books WHERE id = $1{FOR_UPDATE}"
+    ))
     .bind(book_id)
     .fetch_optional(transaction.as_mut())
     .await
@@ -186,14 +190,23 @@ pub(crate) async fn cleanup_route(headers: HeaderMap, State(state): State<AppSta
     if let Err(denied) = require_cron_secret(&headers, secret.as_deref()) {
         return denied.into_response();
     }
+    let _running = state.jobs.typesafe_cleanup.lock().await;
+    match run_cleanup(&state).await {
+        Ok(body) => body.into_response(),
+        Err(failure) => failure.into_response(),
+    }
+}
+
+/// The TypeSafe cleanup job, without the caller check and the job lock.
+pub(crate) async fn run_cleanup(state: &AppState) -> crate::error::ApiResult {
     match cleanup(&state.pool, now_millis()).await {
-        Ok(deleted) => {
-            Json(json!({ "deleted": deleted, "batchLimit": CLEANUP_BATCH })).into_response()
-        }
+        Ok(deleted) => Ok(Json(
+            json!({ "deleted": deleted, "batchLimit": CLEANUP_BATCH }),
+        )),
         Err(_) => {
             // As in Node, the log names no cause.
             tracing::error!("TypeSafe retention cleanup failed");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "Cleanup failed").into_response()
+            Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Cleanup failed"))
         }
     }
 }

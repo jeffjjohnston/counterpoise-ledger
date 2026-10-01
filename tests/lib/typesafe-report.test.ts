@@ -1,9 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { summarizeTypeSafe } from "@/lib/typesafe/report";
-import type { typesafeDecisions, typesafeEvaluations } from "@/db/schema";
+import type { TypeSafeDecision as Decision, TypeSafeEvaluation as Evaluation } from "@/types/db";
 
-type Evaluation = typeof typesafeEvaluations.$inferSelect;
-type Decision = typeof typesafeDecisions.$inferSelect;
 const pick = (choice: string) => ({ choice, probabilities: { [choice]: 1 }, confidence: 1 });
 
 function evaluation(id: number, overrides: Partial<Evaluation> = {}): Evaluation {

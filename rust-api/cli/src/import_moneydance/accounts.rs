@@ -1,10 +1,10 @@
 //! Phase 1 (accounts and securities) and phase 1.5 (opening balances).
 
+use ledger_db::engine::DbConnection;
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
 use ledger_core::formatters::to_date_string;
-use sqlx::{Connection, PgConnection};
 
 use super::values::{Item, field, int, is_true, owned, text, timestamp_date};
 use super::{ImportContext, RowError, finish, row_error};
@@ -89,7 +89,7 @@ fn initial_balance(item: &Item) -> Option<f64> {
 }
 
 pub async fn import_accounts(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     accounts: &[&Item],
     all_items: &[&Item],
@@ -152,7 +152,7 @@ pub async fn import_accounts(
             let is_active = !is_true(field(account, "is_inactive").as_deref());
             // The account and its cash child are two statements, as in the
             // TypeScript: a failed cash insert keeps the account and its mapping.
-            let mut savepoint = connection.begin().await?;
+            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
             let outcome = upsert_account(
                 &mut savepoint,
                 context.book_id,
@@ -193,7 +193,7 @@ pub async fn import_accounts(
                 stats.imported += 1;
                 continue;
             }
-            let mut savepoint = connection.begin().await?;
+            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
             let outcome = upsert_account(
                 &mut savepoint,
                 context.book_id,
@@ -236,7 +236,7 @@ pub async fn import_accounts(
             ) else {
                 continue;
             };
-            let mut savepoint = connection.begin().await?;
+            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
             let outcome = sqlx::query("UPDATE accounts SET parent_id = $1 WHERE id = $2")
                 .bind(parent)
                 .bind(child)
@@ -275,7 +275,7 @@ struct NewAccount<'a> {
 /// re-import updates the type of a plain account and the parent of a cash
 /// child, as the TypeScript upserts do.
 async fn upsert_account(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     now: chrono::NaiveDateTime,
     account: &NewAccount<'_>,
@@ -308,7 +308,7 @@ async fn upsert_account(
 /// Imports one `securities` row per underlying Moneydance security. Several
 /// security accounts can hold the same security.
 async fn import_securities(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     stats: &mut AccountStats,
     securities: &[&Item],
@@ -404,7 +404,7 @@ async fn import_securities(
             _ => "stock",
         };
         let symbol = ticker.clone().or_else(|| name.clone());
-        let mut savepoint = connection.begin().await?;
+        let mut savepoint = ledger_db::locks::savepoint(connection).await?;
         let outcome = sqlx::query_scalar::<_, i32>(
             "INSERT INTO securities (book_id, name, symbol, security_type, created_at)
              VALUES ($1, $2, $3, $4, $5)
@@ -457,7 +457,7 @@ pub struct OpeningBalanceStats {
 
 /// The "Imported Balance" expense account of this book, created when absent.
 async fn imported_balance_account(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &ImportContext,
 ) -> Result<i32, sqlx::Error> {
     let existing: Option<i32> = sqlx::query_scalar(
@@ -485,7 +485,7 @@ async fn imported_balance_account(
 /// the "Imported Balance" account. An investment account's balance goes to
 /// its cash child.
 pub async fn create_opening_balances(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     accounts: &[AccountWithBalance],
     today: NaiveDate,
@@ -543,7 +543,7 @@ pub async fn create_opening_balances(
                 account.name
             ));
         }
-        let mut savepoint = connection.begin().await?;
+        let mut savepoint = ledger_db::locks::savepoint(connection).await?;
         let outcome = async {
             let transaction_id = super::insert_transaction(
                 &mut savepoint,

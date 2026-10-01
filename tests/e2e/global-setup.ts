@@ -1,58 +1,47 @@
 import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { createHash } from "node:crypto";
 import { resolve } from "path";
-import { seedBookData } from "./seed-book";
-import { e2eDatabaseUrl } from "./database";
-import { leaseTestDatabase } from "../helpers/database-safety";
-import postgres from "postgres";
-import { drizzle } from "drizzle-orm/postgres-js";
-import { migrate } from "drizzle-orm/postgres-js/migrator";
+import type { FullConfig } from "@playwright/test";
+import { seedBookData, type ApiPost } from "./seed-book";
+import { e2eDatabasePath } from "./database";
 import { hashPassword } from "../helpers/password";
-import { MIGRATIONS_FOLDER } from "../../db/create-book";
+import { closeSql, insert, script, setDatabasePath } from "../helpers/sql";
 
-const E2E_DB_URL = e2eDatabaseUrl();
+const E2E_DB_PATH = e2eDatabasePath();
 const E2E_STORAGE_STATE_PATH = resolve(
   "./test-results/e2e-storage-state.json"
 );
 
 const SESSION_TOKEN = "e2e-test-session-token-fixed";
 
-function createQuietSql() {
-  return postgres(E2E_DB_URL, {
-    onnotice: () => {},
-  });
-}
-
 async function setupDatabase() {
-  // Drop and recreate schema for clean slate (including drizzle migration metadata)
-  const setupSql = createQuietSql();
-  await setupSql`DROP SCHEMA IF EXISTS drizzle CASCADE`;
-  await setupSql`DROP SCHEMA IF EXISTS public CASCADE`;
-  await setupSql`CREATE SCHEMA public`;
-  await setupSql.end();
-
-  // Run migrations
-  const migrationSql = createQuietSql();
-  await migrate(drizzle(migrationSql), { migrationsFolder: MIGRATIONS_FOLDER });
-  await migrationSql.end();
-
-  // Use a fresh connection for seeding
-  const sql = createQuietSql();
+  // The web server created and migrated the file when it started. Clear the
+  // rows of an earlier run: every table depends on users. Then restart the
+  // ID sequences.
+  await script("DELETE FROM users; DELETE FROM sqlite_sequence;");
 
   // Create user, book, and session
   const passwordHash = await hashPassword("testpassword");
-  const now = new Date();
   const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
 
   const sessionTokenHash = createHash("sha256").update(SESSION_TOKEN).digest("hex");
 
-  await sql`INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'testuser', ${passwordHash}, ${now})`;
-  await sql`INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES (1, 1, 'Test Book', ${now}, ${now})`;
-  await sql`INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (${sessionTokenHash}, 1, ${expiresAt}, ${now})`;
-  await sql`SELECT setval(pg_get_serial_sequence('users', 'id'), 1, true)`;
-  await sql`SELECT setval(pg_get_serial_sequence('books', 'id'), 1, true)`;
+  await insert("users", { id: 1, username: "testuser", passwordHash });
+  await insert("books", { id: 1, userId: 1, name: "Test Book" });
+  await insert("sessions", { tokenHash: sessionTokenHash, userId: 1, expiresAt });
+}
 
-  return sql;
+/** A POST to the E2E server with the session cookie of the E2E user. */
+function apiPost(baseUrl: string): ApiPost {
+  return async (path, body) => {
+    const response = await fetch(new URL(path, baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: `counterpoise_session=${SESSION_TOKEN}` },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`POST ${path}: ${response.status} ${await response.text()}`);
+    return response.json();
+  };
 }
 
 function writeStorageState() {
@@ -80,17 +69,20 @@ function writeStorageState() {
   writeFileSync(E2E_STORAGE_STATE_PATH, JSON.stringify(storageState, null, 2));
 }
 
-const globalSetup = async () => {
-  const release = await leaseTestDatabase(E2E_DB_URL, "counterpoise_e2e");
+const globalSetup = async (config: FullConfig) => {
+  // Playwright starts the web server before this setup, so the seed can
+  // write through the API. The server holds the lock of the file, so a
+  // second run on it fails to start its server.
+  const baseUrl = config.projects[0]?.use.baseURL;
+  if (!baseUrl) throw new Error("The Playwright config must set use.baseURL");
+  setDatabasePath(E2E_DB_PATH);
   try {
-    const sql = await setupDatabase();
-    try { await seedBookData(sql, 1); } finally { await sql.end(); }
-    writeStorageState();
-    return release;
-  } catch (error) {
-    await release();
-    throw error;
+    await setupDatabase();
+    await seedBookData(1, apiPost(baseUrl));
+  } finally {
+    await closeSql();
   }
+  writeStorageState();
 };
 
 export default globalSetup;

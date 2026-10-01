@@ -7,6 +7,7 @@ node_modules
 docs/
 tests/
 playwright.config.ts
+vitest.config.ts
 test-results/
 screenshots/
 moneydance_exports/
@@ -15,7 +16,7 @@ build/
 .claude
 .playwright-mcp/
 .venv
-pgdata/
+.e2e/
 data/
 backups/
 coverage/

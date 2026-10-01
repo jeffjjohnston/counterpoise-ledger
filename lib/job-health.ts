@@ -16,6 +16,7 @@ export type JobState =
   | "unverified"
   | "failed"
   | "missing"
+  | "not_configured"
   | "unknown";
 
 export type JobEntry = {
@@ -25,6 +26,8 @@ export type JobEntry = {
   verified: boolean | null;
   bytes: number | null;
   detail: string | null;
+  /** True for a run that had no secret and did nothing. Absent in old records. */
+  notConfigured?: boolean;
 };
 
 export type JobHealth = {
@@ -111,6 +114,9 @@ function parseTime(value: string | null): number | null {
  *   stale      — it last succeeded too long ago
  *   unverified — it completed, but the artifact it produced is unreadable
  *
+ * A fifth state, not_configured, is not a problem: the job has no secret
+ * (Plaid or Tiingo) and ran nothing. It is neither missing nor stale.
+ *
  * Collapsing "failed" into "missing" (the original shape) reported a job that
  * ran and blew up as one that had never run, and made "unverified" unreachable
  * for the corrupt-dump case it exists to detect.
@@ -121,6 +127,7 @@ function stateFor(
   now: number
 ): { state: JobState; ageMs: number | null } {
   if (!entry) return { state: "missing", ageMs: null };
+  if (entry.notConfigured === true) return { state: "not_configured", ageMs: null };
 
   const lastOk = parseTime(entry.lastOk);
   if (lastOk === null) {
@@ -173,12 +180,14 @@ export function evaluateJobHealth(
       label: cfg.label,
       schedule: cfg.schedule,
       state,
-      lastOk: entry?.lastOk ?? null,
+      lastOk: state === "not_configured" ? null : (entry?.lastOk ?? null),
       ageMs,
       detail: entry?.detail ?? null,
     };
   });
 
-  const overall = jobs.every((j) => j.state === "ok") ? "ok" : "attention";
+  const overall = jobs.every((j) => j.state === "ok" || j.state === "not_configured")
+    ? "ok"
+    : "attention";
   return { overall, jobs };
 }

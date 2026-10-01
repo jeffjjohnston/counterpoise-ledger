@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# The production image (the `rust-api` service of docker-compose.yml).
-# docker-entrypoint.sh checks the database credential, applies the Drizzle
-# migrations and rebuilds the investment lots, then starts the Rust server,
-# which serves the client build, the API and MCP. Node is in the runtime
-# image only for migrate.js.
+# The production image: one container, one process (the `rust-api` service of
+# docker-compose.yml). The Rust server applies the SQLite migrations when it
+# starts, then serves the client build, the API and MCP, and runs the
+# scheduled jobs and the backups.
 
 # --- Compile the shared Rust core for the browser ---
 FROM rust:1.98 AS wasm-builder
@@ -39,13 +38,6 @@ ARG NEXT_PUBLIC_POSTHOG_HOST
 ENV NEXT_PUBLIC_POSTHOG_KEY=$NEXT_PUBLIC_POSTHOG_KEY
 ENV NEXT_PUBLIC_POSTHOG_HOST=$NEXT_PUBLIC_POSTHOG_HOST
 RUN CORE_WASM_PREBUILT=1 npm run build
-# migrate.js needs these at runtime. Record the exact versions this build's
-# lockfile resolved, so the runtime installs those rather than whatever is
-# newest.
-RUN node -e "const n=['drizzle-orm','postgres']; \
-  require('fs').writeFileSync('/app/runtime-deps.txt', \
-    n.map(p => p + '@' + require('/app/node_modules/' + p + '/package.json').version).join(' '))" \
- && cat /app/runtime-deps.txt
 
 # --- Build the server and ledger-cli ---
 FROM rust:1.98-alpine AS builder
@@ -55,47 +47,59 @@ COPY package.json ./package.json
 COPY lib/api-contract.ts ./lib/api-contract.ts
 COPY rust-api ./rust-api
 ENV SQLX_OFFLINE=true
+# Every checkout on a host shares these caches: production, dev and each
+# worktree. A registry crate is fixed by its version and checksum, so sharing
+# it is safe. A workspace crate has the same path in every checkout, and cargo
+# decides freshness by file times, so a build could link a workspace crate
+# that another checkout compiled. `cargo clean -p` removes the workspace
+# crates first; the dependencies stay cached. Name every workspace member here;
+# a repository test checks the list against rust-api/Cargo.toml.
 RUN --mount=type=cache,id=counterpoise-rust-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=counterpoise-rust-target,target=/app/rust-api/target,sharing=locked \
+    cargo clean --release --manifest-path rust-api/Cargo.toml \
+      -p ledger-core -p ledger-db -p counterpoise-rust-api -p ledger-cli && \
     cargo build --release --locked --manifest-path rust-api/Cargo.toml \
       -p counterpoise-rust-api -p ledger-cli && \
     cp rust-api/target/release/counterpoise-rust-api rust-api/target/release/ledger-cli /app/
 
 # --- Runtime ---
-FROM node:26-alpine
+# No Node and no shell tools are needed: the binaries are static (musl), and
+# reqwest carries its own TLS roots. Alpine gives `sh` for `docker exec`.
+FROM alpine:3.22
 # chrono::Local reads TZ from these files. Without them it uses UTC in silence.
 RUN apk add --no-cache tzdata
-WORKDIR /app
-# node (uid 1000) ships in node:26-alpine. Chown the directory itself so the
-# npm install below can write into it as that user.
-RUN chown node:node /app
-ENV NODE_ENV=production
+# The server runs as uid 1000. /data holds counterpoise.db with its -wal,
+# -shm and lock files; /backups holds the snapshots and the job status
+# records. A new named volume takes this ownership from the image.
+RUN addgroup -g 1000 counterpoise \
+    && adduser -D -H -u 1000 -G counterpoise counterpoise \
+    && mkdir -p /data /backups/status \
+    && chown -R counterpoise:counterpoise /data /backups
 
 COPY --from=builder /app/counterpoise-rust-api /app/ledger-cli /usr/local/bin/
 COPY --from=client /app/build /srv/client
-ENV COUNTERPOISE_STATIC_DIR=/srv/client
 
-# The migration files and their runner.
-COPY --from=client --chown=node:node /app/db/migrations ./migrations
-COPY --from=client --chown=node:node /app/scripts/docker-migrate.mjs ./migrate.js
+# COUNTERPOISE_SCHEDULER=on: the server runs the scheduled jobs itself
+# (rust-api/server/src/scheduler.rs).
+ENV NODE_ENV=production \
+    RUST_BIND=0.0.0.0:4000 \
+    DATABASE_PATH=/data/counterpoise.db \
+    BACKUP_DIR=/backups \
+    COUNTERPOISE_STATIC_DIR=/srv/client \
+    COUNTERPOISE_SCHEDULER=on
 
-# Install the runtime dependencies of migrate.js, at the versions that the
-# client stage recorded, so rebuilding a commit cannot silently pick up a newer
-# major of drizzle-orm or postgres.
-#
-# Known gap: their TRANSITIVE versions still resolve fresh here. Pinning those
-# too means copying the lockfile-pinned production tree, or bundling
-# migrate.js so the runtime needs no install at all.
-#
-# --ignore-scripts: no allowScripts map applies to this install, and none of these
-# packages need install scripts.
-COPY --from=client --chown=node:node /app/runtime-deps.txt ./
-USER node
-RUN npm install --no-save --ignore-scripts $(cat runtime-deps.txt) \
- && rm runtime-deps.txt
-
-COPY --chown=node:node docker-entrypoint.sh ./
-COPY --chown=node:node scripts/check-db-credential.sh ./
-
+USER counterpoise
+WORKDIR /data
+VOLUME ["/data", "/backups"]
 EXPOSE 4000
-ENTRYPOINT ["./docker-entrypoint.sh"]
+
+# /health runs a query, so a broken database fails the check, not only a
+# dead process.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=5 \
+    CMD ["counterpoise-rust-api", "health"]
+
+# No entrypoint script: the server opens the file, takes the server lock,
+# applies the migrations and runs the lot guard before it serves. Any other
+# command runs in its place, for example
+# `docker run ... ledger-cli import-postgres --from ... --to /data/counterpoise.db`.
+CMD ["counterpoise-rust-api"]

@@ -1,13 +1,12 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { and, asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { securityPrices } from "../../db/schema";
 import { toDateString } from "../../lib/formatters";
 import {
   addBookMember, createAccount, createBook, createInvestmentSplit, createSecurity, createSecurityPrice,
-  createTransactionWithSplits, createUser, db, resetTestDatabase, setupTestDatabase,
+  createTransactionWithSplits, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
+import { rows } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 function json(method: string, body: unknown): RequestInit {
@@ -29,11 +28,10 @@ async function expectError(client: Client, path: string, init: RequestInit, stat
 }
 
 async function pricesOf(securityId: number) {
-  return db
-    .select({ priceDate: securityPrices.priceDate, priceMicros: securityPrices.priceMicros, source: securityPrices.source })
-    .from(securityPrices)
-    .where(eq(securityPrices.securityId, securityId))
-    .orderBy(asc(securityPrices.priceDate));
+  return rows<{ priceDate: string; priceMicros: number; source: string | null }>(
+    "SELECT price_date, price_micros, source FROM security_prices WHERE security_id = $1 ORDER BY price_date",
+    [securityId],
+  );
 }
 
 /** Buy (or sell) shares in a fresh transaction on the given account. */
@@ -437,7 +435,7 @@ describe("security price HTTP parity", () => {
     await expectError(client, pricePath, { method: "DELETE" }, 403, readOnly);
     await expectError(client, `/api/b/${shared.id}/security-prices/bulk`, { method: "POST", body: "{" }, 403, readOnly);
     await expectError(client, `/api/b/${shared.id}/security-prices/tiingo`, { method: "POST", body: "{" }, 403, readOnly);
-    expect(await db.select().from(securityPrices).where(and(eq(securityPrices.bookId, shared.id)))).toHaveLength(1);
+    expect(await rows("SELECT * FROM security_prices WHERE book_id = $1", [shared.id])).toHaveLength(1);
     await expectError(client, "/api/b/999/securities/prices-due", {}, 404, "Book not found");
   });
 });

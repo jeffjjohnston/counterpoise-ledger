@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use ledger_db::engine::DbPool;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -66,7 +66,7 @@ impl ApiKeyCache {
     pub(crate) async fn verified(
         &self,
         digest: KeyDigest,
-        pool: &PgPool,
+        pool: &DbPool,
     ) -> Result<Option<ApiKeyPrincipal>, sqlx::Error> {
         let cached = {
             let mut state = self.state.lock().expect("API key cache mutex poisoned");

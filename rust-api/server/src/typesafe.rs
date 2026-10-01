@@ -11,25 +11,28 @@ use crate::{
     validation::{is_js_whitespace, js_number, js_truthy},
 };
 use chrono::{DateTime, NaiveDateTime, TimeDelta};
+use ledger_db::engine::{Db, DbPool};
+use ledger_db::locks::FOR_UPDATE;
+use ledger_db::sql;
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use std::collections::HashSet;
 
 /// `recordTypeSafeUnlink`: after an unlink from the transaction banner, an
 /// `unlink` decision for each evaluation that an earlier `match` decision on
 /// this transaction came from. The book row is locked, as for every
 /// TypeSafe record, so a settings change cannot interleave.
-pub(crate) async fn record_unlink(pool: &PgPool, book_id: i32, transaction_id: i32) {
+pub(crate) async fn record_unlink(pool: &DbPool, book_id: i32, transaction_id: i32) {
     // The MCP tools record no TypeSafe decision, so a route that runs for a
     // tool records none.
     if crate::mcp::in_tool_call() {
         return;
     }
     let result: Result<(), sqlx::Error> = async {
-        let mut transaction = pool.begin().await?;
-        let enabled: bool = sqlx::query_scalar(
-            "SELECT typesafe_reconciliation_enabled FROM books WHERE id = $1 FOR UPDATE",
-        )
+        let mut transaction = ledger_db::locks::begin_pool(pool).await?;
+        let enabled: bool = sqlx::query_scalar(&format!(
+            "SELECT typesafe_reconciliation_enabled FROM books WHERE id = $1{FOR_UPDATE}"
+        ))
         .bind(book_id)
         .fetch_one(transaction.as_mut())
         .await?;
@@ -50,13 +53,15 @@ pub(crate) async fn record_unlink(pool: &PgPool, book_id: i32, transaction_id: i
                 };
                 sqlx::query(
                     "INSERT INTO typesafe_decisions
-                       (book_id, reconciliation_id, evaluation_id, action, transaction_id)
-                     VALUES ($1, $2, $3, 'unlink', $4)",
+                       (book_id, reconciliation_id, evaluation_id, action, transaction_id,
+                        decided_at)
+                     VALUES ($1, $2, $3, 'unlink', $4, $5)",
                 )
                 .bind(book_id)
                 .bind(reconciliation_id)
                 .bind(evaluation_id)
                 .bind(transaction_id)
+                .bind(chrono::Utc::now().naive_utc())
                 .execute(transaction.as_mut())
                 .await?;
             }
@@ -231,7 +236,7 @@ fn millis(value: NaiveDateTime) -> NaiveDateTime {
 /// the suggestion showed. It never changes the response; a failure is
 /// logged.
 pub(crate) async fn record_decision(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     input: &ReconcileInput,
     observation: &Observation,
@@ -243,11 +248,11 @@ pub(crate) async fn record_decision(
     }
     let result: Result<(), String> = async {
         let failed = |cause: sqlx::Error| cause.to_string();
-        let mut transaction = pool.begin().await.map_err(failed)?;
-        let (enabled, revision): (bool, i32) = sqlx::query_as(
+        let mut transaction = ledger_db::locks::begin_pool(pool).await.map_err(failed)?;
+        let (enabled, revision): (bool, i32) = sqlx::query_as(&format!(
             "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books
-             WHERE id = $1 FOR UPDATE",
-        )
+             WHERE id = $1{FOR_UPDATE}"
+        ))
         .bind(book_id)
         .fetch_one(transaction.as_mut())
         .await
@@ -280,7 +285,7 @@ fn integer_column(value: f64) -> Result<i32, String> {
 }
 
 async fn record_in(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    transaction: &mut sqlx::Transaction<'_, Db>,
     book_id: i32,
     revision: i32,
     input: &ReconcileInput,
@@ -291,11 +296,11 @@ async fn record_in(
     let reconciliation_id = integer_column(input.reconciliation_id)?;
     let evaluation_filter = observation.evaluation_id.map(integer_column).transpose()?;
     let record: Option<EvaluationRow> = sqlx::query_as(
-        "SELECT id, started_at, status, completed_at, displayed_at, snapshot::text AS snapshot,
-                answers::text AS answers
+        "SELECT id, started_at, status, completed_at, displayed_at,
+                CAST(snapshot AS TEXT) AS snapshot, CAST(answers AS TEXT) AS answers
          FROM typesafe_evaluations
          WHERE book_id = $1 AND reconciliation_id = $2 AND revision = $3
-           AND ($4::integer IS NULL OR id = $4)
+           AND ($4 IS NULL OR id = $4)
          ORDER BY started_at DESC LIMIT 1",
     )
     .bind(book_id)
@@ -318,12 +323,11 @@ async fn record_in(
         && record.status == "ready"
         && shown_before(record.completed_at)
         && shown_before(record.displayed_at);
-    let snapshot: Value =
-        serde_json::from_str(&record.snapshot).map_err(|cause| cause.to_string())?;
+    let snapshot: Value = read_json_column(&record.snapshot).map_err(|cause| cause.to_string())?;
     let answers: Option<Value> = record
         .answers
         .as_deref()
-        .map(serde_json::from_str)
+        .map(read_json_column)
         .transpose()
         .map_err(|cause| cause.to_string())?;
     let proposal = if visible {
@@ -474,10 +478,35 @@ struct StoredEvaluation {
     latency_ms: Option<i32>,
 }
 
+/// Reads a JSON column as PostgreSQL `jsonb` gave it back: each object's keys
+/// sorted by length, then by bytes. The TypeSafe request body and its
+/// fingerprint are built from stored snapshots, so this order keeps them the
+/// same as before the move to SQLite, which keeps the text as written.
+pub(crate) fn read_json_column(text: &str) -> serde_json::Result<Value> {
+    fn order(value: Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries: Vec<(String, Value)> = object.into_iter().collect();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+                });
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, order(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.into_iter().map(order).collect()),
+            other => other,
+        }
+    }
+    serde_json::from_str(text).map(order)
+}
+
 impl StoredEvaluation {
     fn parse(self) -> Result<SummaryEvaluation, String> {
-        let json =
-            |text: &str| serde_json::from_str::<Value>(text).map_err(|cause| cause.to_string());
+        let json = |text: &str| read_json_column(text).map_err(|cause| cause.to_string());
         Ok(SummaryEvaluation {
             id: self.id,
             status: self.status,
@@ -731,12 +760,12 @@ pub(crate) const CLEANUP_BATCH: i64 = 1000;
 /// added to the book's archived counts and deleted with their decisions,
 /// book by book under the book-row lock. Quotas of earlier days are deleted.
 /// Returns the number of evaluations deleted.
-pub(crate) async fn cleanup(pool: &PgPool, now: NaiveDateTime) -> Result<i64, String> {
+pub(crate) async fn cleanup(pool: &DbPool, now: NaiveDateTime) -> Result<i64, String> {
     let failed = |cause: sqlx::Error| cause.to_string();
     let cutoff = now - TimeDelta::days(RETENTION_DAYS);
     let batch: Vec<(i32, i32)> = sqlx::query_as(
         "SELECT id, book_id FROM typesafe_evaluations WHERE started_at < $1
-         ORDER BY id LIMIT $2",
+         ORDER BY id LIMIT COALESCE($2, -1)",
     )
     .bind(cutoff)
     .bind(CLEANUP_BATCH)
@@ -769,30 +798,33 @@ pub(crate) async fn cleanup(pool: &PgPool, now: NaiveDateTime) -> Result<i64, St
 }
 
 async fn archive_book(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     ids: &[i32],
     cutoff: NaiveDateTime,
 ) -> Result<i64, String> {
     let failed = |cause: sqlx::Error| cause.to_string();
-    let mut transaction = pool.begin().await.map_err(failed)?;
-    let locked: Option<i32> = sqlx::query_scalar("SELECT id FROM books WHERE id = $1 FOR UPDATE")
-        .bind(book_id)
-        .fetch_optional(transaction.as_mut())
-        .await
-        .map_err(failed)?;
+    let mut transaction = ledger_db::locks::begin_pool(pool).await.map_err(failed)?;
+    let locked: Option<i32> =
+        sqlx::query_scalar(&format!("SELECT id FROM books WHERE id = $1{FOR_UPDATE}"))
+            .bind(book_id)
+            .fetch_optional(transaction.as_mut())
+            .await
+            .map_err(failed)?;
     if locked.is_none() {
         return Err("Book not found".to_owned());
     }
-    let rows: Vec<StoredEvaluation> = sqlx::query_as(
-        "SELECT id, status, snapshot::text AS snapshot, choice, usage::text AS usage,
-                answers::text AS answers, displayed_at, latency_ms
+    let rows: Vec<StoredEvaluation> = sqlx::query_as(&format!(
+        "SELECT id, status, CAST(snapshot AS TEXT) AS snapshot, choice,
+                CAST(usage AS TEXT) AS usage, CAST(answers AS TEXT) AS answers, displayed_at,
+                latency_ms
          FROM typesafe_evaluations
-         WHERE book_id = $1 AND id = ANY($2) AND started_at < $3
+         WHERE book_id = $1 AND id {} AND started_at < $3
          ORDER BY id",
-    )
+        sql::in_integers("$2")
+    ))
     .bind(book_id)
-    .bind(ids)
+    .bind(sql::json_array(ids))
     .bind(cutoff)
     .fetch_all(transaction.as_mut())
     .await
@@ -805,40 +837,51 @@ async fn archive_book(
         .map(StoredEvaluation::parse)
         .collect::<Result<Vec<_>, _>>()?;
     let ids: Vec<i32> = rows.iter().map(|row| row.id).collect();
-    let decisions: Vec<SummaryDecision> = sqlx::query_as(
+    let decisions: Vec<SummaryDecision> = sqlx::query_as(&format!(
         "SELECT evaluation_id, action, transaction_id, suggestion_visible, accepted_suggestion,
                 proposal_payee_kept, proposal_category_kept, active_review_ms, decided_at
-         FROM typesafe_decisions WHERE evaluation_id = ANY($1) ORDER BY id",
-    )
-    .bind(&ids)
+         FROM typesafe_decisions WHERE evaluation_id {} ORDER BY id",
+        sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&ids))
     .fetch_all(transaction.as_mut())
     .await
     .map_err(failed)?;
-    let archived: Option<String> =
-        sqlx::query_scalar("SELECT counts::text FROM typesafe_aggregates WHERE book_id = $1")
-            .bind(book_id)
-            .fetch_optional(transaction.as_mut())
-            .await
-            .map_err(failed)?;
+    let archived: Option<String> = sqlx::query_scalar(
+        "SELECT CAST(counts AS TEXT) FROM typesafe_aggregates WHERE book_id = $1",
+    )
+    .bind(book_id)
+    .fetch_optional(transaction.as_mut())
+    .await
+    .map_err(failed)?;
     let mut counts = match archived {
-        Some(text) => Counts::parse(&text)?,
+        // In the order that jsonb gave, as the stored counts were read before.
+        Some(text) => Counts::parse(
+            &read_json_column(&text)
+                .map_err(|cause| cause.to_string())?
+                .to_string(),
+        )?,
         None => Counts::default(),
     };
     counts.merge(&summarize(&rows, &decisions)?);
-    sqlx::query(
-        "INSERT INTO typesafe_aggregates (book_id, counts) VALUES ($1, $2::jsonb)
+    sqlx::query(&format!(
+        "INSERT INTO typesafe_aggregates (book_id, counts) VALUES ($1, {})
          ON CONFLICT (book_id) DO UPDATE SET counts = excluded.counts",
-    )
+        sql::json("$2")
+    ))
     .bind(book_id)
     .bind(counts.to_json())
     .execute(transaction.as_mut())
     .await
     .map_err(failed)?;
-    sqlx::query("DELETE FROM typesafe_evaluations WHERE id = ANY($1)")
-        .bind(&ids)
-        .execute(transaction.as_mut())
-        .await
-        .map_err(failed)?;
+    sqlx::query(&format!(
+        "DELETE FROM typesafe_evaluations WHERE id {}",
+        sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&ids))
+    .execute(transaction.as_mut())
+    .await
+    .map_err(failed)?;
     transaction.commit().await.map_err(failed)?;
     Ok(ids.len() as i64)
 }

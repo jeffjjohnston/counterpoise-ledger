@@ -25,10 +25,13 @@ use ledger_core::accounting::{
     InvestmentAction, InvestmentActionInput, is_valid_date_string, validate_investment_actions,
     validate_investment_split_payload, validate_splits,
 };
+use ledger_db::engine::{Db, DbConnection, DbPool};
+use ledger_db::locks::FOR_UPDATE;
 use ledger_db::lots::{LotPair, collect_affected_pairs, rebuild_lots_for_pairs};
+use ledger_db::sql;
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json, to_value};
-use sqlx::{FromRow, PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{FromRow, QueryBuilder};
 use std::collections::{HashMap, HashSet};
 
 const INVALID_DATE: &str = "Date must be in YYYY-MM-DD format";
@@ -42,7 +45,7 @@ const NOT_FOUND: &str = "Transaction not found";
 
 /// `effectiveDateSql`: a floating transaction resolves to today in the
 /// session time zone.
-const EFFECTIVE_DATE: &str = "(CASE WHEN t.is_floating THEN CURRENT_DATE::text ELSE t.date END)";
+const EFFECTIVE_DATE: &str = sql::EFFECTIVE_DATE;
 
 const DEFAULT_LIMIT: i64 = 100;
 
@@ -193,7 +196,7 @@ struct TransactionJson<'a> {
 /// `ids`. A relational query has no ORDER BY for its children. Rust returns
 /// them in ID order, which is their insertion order.
 async fn load_transactions(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     ids: &[i32],
 ) -> Result<Vec<Value>, sqlx::Error> {
@@ -201,39 +204,43 @@ async fn load_transactions(
         return Ok(Vec::new());
     }
     let query = format!(
-        "SELECT {TRANSACTION_COLUMNS} FROM transactions WHERE book_id = $1 AND id = ANY($2)"
+        "SELECT {TRANSACTION_COLUMNS} FROM transactions WHERE book_id = $1 AND id {}",
+        sql::in_integers("$2")
     );
     let transactions: Vec<TransactionRow> = sqlx::query_as(&query)
         .bind(book_id)
-        .bind(ids)
+        .bind(sql::json_array(ids))
         .fetch_all(pool)
         .await?;
     let payee_ids: Vec<i32> = transactions
         .iter()
         .filter_map(|transaction| transaction.payee_id)
         .collect();
-    let payees: HashMap<i32, PayeeRow> = sqlx::query_as::<_, PayeeRow>(
-        "SELECT id, book_id, name, created_at FROM payees WHERE id = ANY($1)",
-    )
-    .bind(&payee_ids)
+    let payees: HashMap<i32, PayeeRow> = sqlx::query_as::<_, PayeeRow>(&format!(
+        "SELECT id, book_id, name, created_at FROM payees WHERE id {in1}",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&payee_ids))
     .fetch_all(pool)
     .await?
     .into_iter()
     .map(|payee| (payee.id, payee))
     .collect();
-    let splits: Vec<SplitRow> = sqlx::query_as(
+    let splits: Vec<SplitRow> = sqlx::query_as(&format!(
         "SELECT id, book_id, transaction_id, account_id, amount FROM transaction_splits
-         WHERE transaction_id = ANY($1) ORDER BY id",
-    )
-    .bind(ids)
+         WHERE transaction_id {in1} ORDER BY id",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(ids))
     .fetch_all(pool)
     .await?;
-    let investment_splits: Vec<InvestmentSplitRow> = sqlx::query_as(
+    let investment_splits: Vec<InvestmentSplitRow> = sqlx::query_as(&format!(
         "SELECT id, book_id, transaction_id, account_id, security_id, action, shares_micros,
                 price_micros, fees_cents, split_numerator, split_denominator
-         FROM investment_splits WHERE transaction_id = ANY($1) ORDER BY id",
-    )
-    .bind(ids)
+         FROM investment_splits WHERE transaction_id {in1} ORDER BY id",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(ids))
     .fetch_all(pool)
     .await?;
     let account_ids: Vec<i32> = splits
@@ -247,12 +254,13 @@ async fn load_transactions(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let accounts: HashMap<i32, AccountRow> = sqlx::query_as::<_, AccountRow>(
+    let accounts: HashMap<i32, AccountRow> = sqlx::query_as::<_, AccountRow>(&format!(
         "SELECT id, book_id, name, type AS account_type, subtype, parent_id, is_active,
                 is_favorite, is_investment_cash, icon, created_at, updated_at
-         FROM accounts WHERE id = ANY($1)",
-    )
-    .bind(&account_ids)
+         FROM accounts WHERE id {in1}",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&account_ids))
     .fetch_all(pool)
     .await?
     .into_iter()
@@ -264,12 +272,13 @@ async fn load_transactions(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let securities: HashMap<i32, SecurityRow> = sqlx::query_as::<_, SecurityRow>(
+    let securities: HashMap<i32, SecurityRow> = sqlx::query_as::<_, SecurityRow>(&format!(
         "SELECT id, book_id, name, symbol, security_type, fetch_prices, fixed_price_micros,
                 created_at
-         FROM securities WHERE id = ANY($1)",
-    )
-    .bind(&security_ids)
+         FROM securities WHERE id {in1}",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&security_ids))
     .fetch_all(pool)
     .await?
     .into_iter()
@@ -318,7 +327,7 @@ async fn load_transactions(
 }
 
 async fn load_transaction(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     id: i32,
 ) -> Result<Option<Value>, sqlx::Error> {
@@ -378,17 +387,15 @@ impl Filters {
 
     /// `buildTransactionFilters`: the FROM clause and the WHERE clause. The
     /// account filter is the only condition on another table.
-    fn push_from_where(&self, builder: &mut QueryBuilder<Postgres>, book_id: i32) {
+    fn push_from_where(&self, builder: &mut QueryBuilder<Db>, book_id: i32) {
         builder.push(" FROM transactions t");
         if self.account_ids.is_some() {
             builder.push(" JOIN transaction_splits s ON s.transaction_id = t.id");
         }
         builder.push(" WHERE t.book_id = ").push_bind(book_id);
         if let Some(ids) = &self.account_ids {
-            builder
-                .push(" AND s.account_id = ANY(")
-                .push_bind(ids.clone())
-                .push(")");
+            builder.push(" AND s.account_id ");
+            sql::push_in_integers(builder, ids);
         }
         if let Some(start) = &self.start_date {
             builder
@@ -431,7 +438,7 @@ struct PageRow {
 /// `REGISTER_ORDER` read as a strict "sorts ahead of" (`>`) or "sorts below"
 /// (`<`) the anchor: a later or earlier effective date, then the floating
 /// flag, then the ID.
-fn push_position(builder: &mut QueryBuilder<Postgres>, operator: &str, anchor: &PageRow) {
+fn push_position(builder: &mut QueryBuilder<Db>, operator: &str, anchor: &PageRow) {
     builder
         .push(format!(" AND ({EFFECTIVE_DATE} {operator} "))
         .push_bind(anchor.date.clone())
@@ -449,7 +456,7 @@ fn push_position(builder: &mut QueryBuilder<Postgres>, operator: &str, anchor: &
 }
 
 async fn exists_in_book(
-    pool: &PgPool,
+    pool: &DbPool,
     table: &str,
     id: i32,
     book_id: i32,
@@ -557,13 +564,15 @@ pub(crate) async fn list_transactions(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let owned: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM accounts WHERE id = ANY($1) AND book_id = $2")
-                .bind(&unique)
-                .bind(book.book_id)
-                .fetch_one(pool)
-                .await
-                .map_err(db_error)?;
+        let owned: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM accounts WHERE id {in1} AND book_id = $2",
+            in1 = sql::in_integers("$1")
+        ))
+        .bind(sql::json_array(&unique))
+        .bind(book.book_id)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
         if owned != unique.len() as i64 {
             return Err(bad_request(
                 "One or more accounts do not belong to this book",
@@ -585,10 +594,12 @@ pub(crate) async fn list_transactions(
     ));
     // A null limit also skips the offset, as in selectTransactionPage.
     if !every_row {
-        page.push(" LIMIT ")
+        // SQLite refuses LIMIT NULL; -1 is no limit.
+        page.push(" LIMIT COALESCE(")
             .push_bind(limit)
-            .push(" OFFSET ")
-            .push_bind(offset);
+            .push(", -1) OFFSET COALESCE(")
+            .push_bind(offset)
+            .push(", 0)");
     }
     let rows: Vec<PageRow> = page
         .build_query_as()
@@ -685,23 +696,24 @@ struct SplitAccount {
 }
 
 async fn load_split_accounts(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     account_ids: &[i32],
 ) -> Result<Vec<SplitAccount>, sqlx::Error> {
     if account_ids.is_empty() {
         return Ok(Vec::new());
     }
-    sqlx::query_as(
+    sqlx::query_as(&format!(
         "SELECT a.id, a.subtype, a.is_investment_cash,
                 CASE WHEN p.subtype = 'investment' THEN p.id ELSE NULL END AS investment_parent_id
          FROM accounts a
          LEFT JOIN accounts p ON p.id = a.parent_id AND p.book_id = $1
-         WHERE a.book_id = $1 AND a.id = ANY($2)
+         WHERE a.book_id = $1 AND a.id {in2}
          ORDER BY a.id",
-    )
+        in2 = sql::in_integers("$2")
+    ))
     .bind(book_id)
-    .bind(account_ids)
+    .bind(sql::json_array(account_ids))
     .fetch_all(pool)
     .await
 }
@@ -737,7 +749,7 @@ fn unique_in_order(ids: impl IntoIterator<Item = i32>) -> Vec<i32> {
 /// The investment-split checks that follow the account checks in both
 /// createTransaction and updateTransaction.
 async fn validate_investment_splits(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     splits: &[InvestmentSplitInput],
     accounts: &[SplitAccount],
@@ -773,13 +785,15 @@ async fn validate_investment_splits(
             .collect::<Vec<_>>(),
         failure,
     )?);
-    let owned: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM securities WHERE book_id = $1 AND id = ANY($2)")
-            .bind(book_id)
-            .bind(&security_ids)
-            .fetch_one(pool)
-            .await
-            .map_err(|cause| internal_error(cause, failure))?;
+    let owned: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM securities WHERE book_id = $1 AND id {in2}",
+        in2 = sql::in_integers("$2")
+    ))
+    .bind(book_id)
+    .bind(sql::json_array(&security_ids))
+    .fetch_one(pool)
+    .await
+    .map_err(|cause| internal_error(cause, failure))?;
     if owned != security_ids.len() as i64 {
         return Err(bad_request(
             "One or more investment split securities do not belong to this book",
@@ -799,7 +813,7 @@ async fn validate_investment_splits(
 /// `resolvePayeeId`: a case-insensitive match, or a new payee. The upsert
 /// covers a concurrent insert of the same name between the two statements.
 pub(crate) async fn resolve_payee_id(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     payee_name: &str,
 ) -> Result<Option<i32>, sqlx::Error> {
@@ -835,13 +849,13 @@ pub(crate) fn database_error(failure: &'static str) -> impl Fn(sqlx::Error) -> A
 /// Inserts the double-entry splits. The amounts passed `validate_splits`, so
 /// each is in the int4 range.
 async fn insert_splits(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     transaction_id: i32,
     splits: &[SplitInput],
     failure: &'static str,
 ) -> Result<(), ApiError> {
-    let mut insert = QueryBuilder::<Postgres>::new(
+    let mut insert = QueryBuilder::<Db>::new(
         "INSERT INTO transaction_splits (transaction_id, account_id, amount, book_id) ",
     );
     let rows = splits
@@ -870,7 +884,7 @@ async fn insert_splits(
 /// Inserts the investment splits. A stock split has no account. PostgreSQL
 /// rejects a fee or a ratio outside the int4 range, and so does this.
 async fn insert_investment_splits(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     transaction_id: i32,
     splits: &[InvestmentSplitInput],
@@ -899,7 +913,7 @@ async fn insert_investment_splits(
             ))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let mut insert = QueryBuilder::<Postgres>::new(
+    let mut insert = QueryBuilder::<Db>::new(
         "INSERT INTO investment_splits (transaction_id, account_id, security_id, action,
            shares_micros, price_micros, fees_cents, split_numerator, split_denominator, book_id) ",
     );
@@ -926,7 +940,7 @@ async fn insert_investment_splits(
 /// `assertUnchanged`: lock the row and compare its `updated_at` with the
 /// value the caller loaded, at millisecond precision.
 async fn assert_unchanged(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     transaction_id: i32,
     expected: Option<i64>,
@@ -935,9 +949,9 @@ async fn assert_unchanged(
     let Some(expected) = expected else {
         return Ok(());
     };
-    let current: Option<NaiveDateTime> = sqlx::query_scalar(
-        "SELECT updated_at FROM transactions WHERE id = $1 AND book_id = $2 FOR UPDATE",
-    )
+    let current: Option<NaiveDateTime> = sqlx::query_scalar(&format!(
+        "SELECT updated_at FROM transactions WHERE id = $1 AND book_id = $2{FOR_UPDATE}"
+    ))
     .bind(transaction_id)
     .bind(book_id)
     .fetch_optional(&mut *connection)
@@ -955,7 +969,7 @@ async fn assert_unchanged(
 // ---------------------------------------------------------------------------
 
 async fn create(
-    pool: &PgPool,
+    pool: &DbPool,
     book: &AuthenticatedBook,
     input: &CreateTransaction,
     failure: &'static str,
@@ -996,7 +1010,9 @@ async fn create(
     }
     validate_investment_splits(pool, book.book_id, investment_splits, &accounts, failure).await?;
 
-    let mut tx = pool.begin().await.map_err(database_error(failure))?;
+    let mut tx = ledger_db::locks::begin_pool(pool)
+        .await
+        .map_err(database_error(failure))?;
     let payee_id = match &input.payee_name {
         Some(name) => resolve_payee_id(&mut tx, book.book_id, name)
             .await
@@ -1091,7 +1107,7 @@ pub(crate) async fn create_transaction(
 // ---------------------------------------------------------------------------
 
 async fn existing_split_account_ids(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     transaction_id: i32,
     failure: &'static str,
@@ -1108,7 +1124,7 @@ async fn existing_split_account_ids(
 }
 
 async fn update(
-    pool: &PgPool,
+    pool: &DbPool,
     book: &AuthenticatedBook,
     transaction_id: i32,
     input: &UpdateTransaction,
@@ -1208,7 +1224,9 @@ async fn update(
     )
     .await?;
 
-    let mut tx = pool.begin().await.map_err(database_error(failure))?;
+    let mut tx = ledger_db::locks::begin_pool(pool)
+        .await
+        .map_err(database_error(failure))?;
     assert_unchanged(
         &mut tx,
         book.book_id,
@@ -1232,7 +1250,7 @@ async fn update(
         ),
     };
 
-    let mut set = QueryBuilder::<Postgres>::new("UPDATE transactions SET updated_at = ");
+    let mut set = QueryBuilder::<Db>::new("UPDATE transactions SET updated_at = ");
     set.push_bind(now_millis())
         .push(", updated_by = ")
         .push_bind(book.user_id);
@@ -1321,7 +1339,7 @@ struct ExistingTransaction {
 }
 
 async fn load_existing(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     transaction_id: i32,
 ) -> Result<Option<ExistingTransaction>, sqlx::Error> {
@@ -1508,13 +1526,15 @@ pub(crate) async fn update_transaction(
 ///    takes `pg_advisory_xact_lock` as its first statement, and the lock
 ///    releases at commit, so it must run on `tx`, not on the pool.
 async fn delete(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     transaction_id: i32,
     expected: Option<i64>,
     failure: &'static str,
 ) -> Result<bool, ApiError> {
-    let mut tx = pool.begin().await.map_err(database_error(failure))?;
+    let mut tx = ledger_db::locks::begin_pool(pool)
+        .await
+        .map_err(database_error(failure))?;
     assert_unchanged(&mut tx, book_id, transaction_id, expected, failure).await?;
     // Investment splits cascade away with the transaction, so their pairs
     // must be read first.

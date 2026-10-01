@@ -160,7 +160,12 @@ beforeEach(() => {
     join(binDir, "docker"),
     "#!/bin/sh\n" +
       '{ echo "cwd=$(pwd)"; echo "backups=${COUNTERPOISE_BACKUPS_DIR-}"; echo "args=$*"; } >>"$DOCKER_LOG"\n' +
-      'if [ "$DOCKER_FAIL" = "1" ] && [ "$6" = "up" ]; then echo "build failed" >&2; exit 1; fi\nexit 0\n'
+      'if [ "$DOCKER_FAIL" = "1" ] && [ "$6" = "up" ]; then echo "build failed" >&2; exit 1; fi\n' +
+      // The database volume: DOCKER_NO_VOLUME makes it absent, and
+      // DOCKER_RUN_STATUS is the exit of the `test -e counterpoise.db` in it.
+      'if [ "$1" = "volume" ] && [ "${DOCKER_NO_VOLUME-}" = "1" ]; then exit 1; fi\n' +
+      'if [ "$1" = "run" ] && [ -n "${DOCKER_RUN_STATUS-}" ]; then exit "$DOCKER_RUN_STATUS"; fi\n' +
+      "exit 0\n"
   );
   chmodSync(join(binDir, "docker"), 0o755);
 
@@ -185,7 +190,7 @@ beforeEach(() => {
     // The real repository ignores both of these, which is exactly why the stale
     // nested checkout that broke a release survived every `git status
     // --porcelain` gate: --porcelain does not report ignored paths.
-    writeFileSync(join(repo, ".gitignore"), "backups/\n.env.production.local\nworktrees/\n");
+    writeFileSync(join(repo, ".gitignore"), "backups/\n.env.production.local\n.env.deploy.local\nworktrees/\n");
     git(["add", "-A"]);
     git(["commit", "-m", "base"]);
     git(["push", "origin", "main"]);
@@ -688,11 +693,31 @@ describe("production checkout ownership", () => {
     expect(existsSync(join(dockerCwd(), "worktrees"))).toBe(false);
   });
 
-  it("defaults to ~/prod/counterpoise", () => {
+  it("defaults to ~/counterpoise-production", () => {
     const home = join(root, "home");
-    mkdirSync(join(home, "prod"), { recursive: true });
-    symlinkSync(buildDir, join(home, "prod", "counterpoise"));
+    mkdirSync(home, { recursive: true });
+    symlinkSync(buildDir, join(home, "counterpoise-production"));
     const result = deploy({ env: { COUNTERPOISE_BUILD_DIR: undefined, HOME: home } });
+    expect(result.code, result.output).toBe(0);
+    expect(dockerCwd()).toBe(buildDir);
+  });
+
+  it("reads the directory from .env.deploy.local, expanding a leading ~/", () => {
+    const home = join(root, "home");
+    mkdirSync(home, { recursive: true });
+    symlinkSync(buildDir, join(home, "chosen"));
+    writeFileSync(
+      join(repo, ".env.deploy.local"),
+      "# the owner's checkout\n\nOTHER=1\nCOUNTERPOISE_BUILD_DIR=\"~/chosen\"\n"
+    );
+    const result = deploy({ env: { COUNTERPOISE_BUILD_DIR: undefined, HOME: home } });
+    expect(result.code, result.output).toBe(0);
+    expect(dockerCwd()).toBe(buildDir);
+  });
+
+  it("lets the environment variable win over .env.deploy.local", () => {
+    writeFileSync(join(repo, ".env.deploy.local"), `COUNTERPOISE_BUILD_DIR=${join(root, "absent")}\n`);
+    const result = deploy();
     expect(result.code, result.output).toBe(0);
     expect(dockerCwd()).toBe(buildDir);
   });
@@ -707,7 +732,24 @@ describe("production checkout ownership", () => {
     const result = deploy({ env: { COUNTERPOISE_BUILD_DIR: join(root, "absent") } });
     expect(result.code).not.toBe(0);
     expect(result.output).toContain("existing production clone");
+    expect(result.output).toContain("came from the COUNTERPOISE_BUILD_DIR environment variable");
+    expect(result.output).toContain(".env.deploy.local at the root of this checkout");
     expect(git(["tag", "--list"])).toBe("");
+  });
+
+  it("names .env.deploy.local as the source when it gives a missing clone", () => {
+    writeFileSync(join(repo, ".env.deploy.local"), `COUNTERPOISE_BUILD_DIR=${join(root, "absent")}\n`);
+    const result = deploy({ env: { COUNTERPOISE_BUILD_DIR: undefined } });
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain(`came from ${join(repo, ".env.deploy.local")}`);
+  });
+
+  it("names the built-in default as the source when no directory is set", () => {
+    const home = join(root, "home");
+    mkdirSync(home, { recursive: true });
+    const result = deploy({ env: { COUNTERPOISE_BUILD_DIR: undefined, HOME: home } });
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain("came from the built-in default");
   });
 
   it("refuses a production clone from another origin", () => {
@@ -754,10 +796,78 @@ describe("production checkout ownership", () => {
   });
 
   it("validates Compose before publishing the tag", () => {
-    writeFileSync(join(binDir, "docker"), '#!/bin/sh\necho "invalid production Compose" >&2\nexit 1\n');
+    writeFileSync(
+      join(binDir, "docker"),
+      '#!/bin/sh\nif [ "$1" = "compose" ]; then echo "invalid production Compose" >&2; exit 1; fi\nexit 0\n'
+    );
     const result = deploy();
     expect(result.code).not.toBe(0);
     expect(result.output).toContain("validate production Compose configuration");
     expect(git(["tag", "--list"])).toBe("");
+  });
+});
+
+describe("the database volume is checked before anything changes", () => {
+  /** Asserts that the refused deploy left production and the tags alone. */
+  function expectNothingChanged(before: string) {
+    expect(git(["rev-parse", "HEAD"], buildDir)).toBe(before);
+    expect(git(["tag", "--list"])).toBe("");
+    expect(dockerCalls()).not.toContain("args=compose");
+  }
+
+  it("refuses a missing counterpoise_data volume before production moves", () => {
+    const before = git(["rev-parse", "HEAD"], buildDir);
+    const result = deploy({ env: { DOCKER_NO_VOLUME: "1" } });
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain("the volume counterpoise_data does not exist");
+    expect(result.output).toContain(`git -C ${buildDir} merge --ff-only ${mergeCommit}`);
+    expect(result.output).toContain(`(cd ${buildDir} && scripts/upgrade-to-sqlite.sh)`);
+    expectNothingChanged(before);
+  });
+
+  it("refuses DATABASE_URL with no counterpoise.db in the volume, and names the upgrade guide", () => {
+    writeFileSync(join(buildDir, ".env.production.local"), "TZ=Europe/London\nDATABASE_URL=postgresql://app@postgres/counterpoise\n");
+    const before = git(["rev-parse", "HEAD"], buildDir);
+    const result = deploy({ env: { DOCKER_RUN_STATUS: "1" } });
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain("sets DATABASE_URL, and the volume counterpoise_data holds no counterpoise.db");
+    expect(result.output).toContain("guides/upgrade-to-sqlite.md");
+    expect(result.output).toContain(`git -C ${buildDir} merge --ff-only ${mergeCommit}`);
+    expect(dockerCalls()).toContain("args=run --rm -v counterpoise_data:/data alpine:3.22 test -e /data/counterpoise.db");
+    expectNothingChanged(before);
+  });
+
+  it("refuses when it cannot look into the volume", () => {
+    writeFileSync(join(buildDir, ".env.production.local"), "DATABASE_URL=postgresql://app@postgres/counterpoise\n");
+    const before = git(["rev-parse", "HEAD"], buildDir);
+    const result = deploy({ env: { DOCKER_RUN_STATUS: "125" } });
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain("cannot look for counterpoise.db");
+    expectNothingChanged(before);
+  });
+
+  it("deploys a converted install that still has DATABASE_URL", () => {
+    writeFileSync(join(buildDir, ".env.production.local"), "DATABASE_URL=postgresql://app@postgres/counterpoise\n");
+    const result = deploy({ env: { DOCKER_RUN_STATUS: "0" } });
+    expect(result.code, result.output).toBe(0);
+    expect(git(["rev-parse", "HEAD"], buildDir)).toBe(mergeCommit);
+  });
+
+  // The first SQLite release: production is fast-forwarded to the release
+  // commit by hand, the upgrade script runs there, then the deploy runs.
+  it("deploys when production is already at the release commit after the upgrade", () => {
+    writeFileSync(join(buildDir, ".env.production.local"), "DATABASE_URL=postgresql://app@postgres/counterpoise\n");
+    git(["fetch", "--quiet", "origin"], buildDir);
+    git(["merge", "--ff-only", mergeCommit], buildDir);
+    const result = deploy({ env: { DOCKER_RUN_STATUS: "0" } });
+    expect(result.code, result.output).toBe(0);
+    expect(git(["rev-parse", "HEAD"], buildDir)).toBe(mergeCommit);
+    expect(dockerCalls()).toContain("args=compose");
+  });
+
+  it("does not look into the volume when DATABASE_URL is not set", () => {
+    const result = deploy({ env: { DOCKER_RUN_STATUS: "1" } });
+    expect(result.code, result.output).toBe(0);
+    expect(dockerCalls()).not.toContain("args=run");
   });
 });

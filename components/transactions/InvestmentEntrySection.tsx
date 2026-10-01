@@ -62,6 +62,13 @@ export function InvestmentEntrySection(props: {
   const investmentAccounts = accounts.filter(
     (a) => a.type === "asset" && a.subtype === "investment"
   );
+  // Issue report 40: the securities that the account holds come first.
+  const investmentAccountName = accounts.find(
+    (a) => a.id === investment.investmentAccountId
+  )?.name;
+  const held = investmentAccountName
+    ? { label: `Held in ${investmentAccountName}`, ids: investment.heldSecurityIds }
+    : undefined;
   const incomeAccounts = accounts.filter((a) => a.type === "income");
   const expenseAccounts = accounts.filter((a) => a.type === "expense");
 
@@ -80,6 +87,7 @@ export function InvestmentEntrySection(props: {
           securities={investment.securities}
           value={investment.selectedSecurityId}
           onChange={(id) => investment.selectSecurity(id)}
+          held={held}
           placeholder="Security..."
           allowClear={false}
           size="compact"
@@ -202,6 +210,7 @@ export function InvestmentEntrySection(props: {
           securities={investment.securities}
           value={investment.selectedSecurityId}
           onChange={(id) => investment.selectSecurity(id)}
+          held={held}
           placeholder="Search by name or symbol..."
           allowClear={false}
         />

@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { resolve } from "node:path";
+import { promisify } from "node:util";
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import {
   setupTestDatabase,
@@ -12,12 +15,29 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { getDb } from "@/db";
-import { securities } from "@/db/schema";
-import { eq } from "drizzle-orm";
-import { rebuildLots } from "@/lib/lots-db";
+import { count, row } from "@/tests/helpers/sql";
+import { workerDatabasePath } from "@/tests/helpers/test-database";
+import type { Security } from "@/types/db";
 
 let mcp: McpTestClient;
+
+const run = promisify(execFile);
+const CLI = resolve("rust-api/target/debug/ledger-cli");
+
+/**
+ * Rebuilds the lots of every pair with the Rust `ledger-cli`, on this worker's
+ * database. The test database holds only this test's pairs.
+ */
+async function rebuildAllLots() {
+  await run(CLI, ["rebuild-lots", "--force"], {
+    env: {
+      ...process.env,
+      DATABASE_PATH: workerDatabasePath(),
+      DATABASE_URL: "",
+      TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    },
+  });
+}
 
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
   callMcpTool(mcp.client, name, args);
@@ -86,7 +106,7 @@ describe("MCP Security and Investment Tools", () => {
       // after a write. Rebuild explicitly so
       // investment_lots reflects this pair, same as a real write-path call
       // would produce — getPositions now sources costBasis from lots.
-      await rebuildLots(getDb(), 1, investmentAcct.id, security.id);
+      await rebuildAllLots();
 
       // Add current price at $120
       await createSecurityPrice({
@@ -728,7 +748,7 @@ describe("MCP Security and Investment Tools", () => {
       expect(result.isError).toBe(true);
       const [content] = result.content as Array<{ type: string; text: string }>;
       expect(content.text).toBe(`A security with symbol "vti" already exists (id ${vti.id})`);
-      const [after] = await getDb().select().from(securities).where(eq(securities.id, bnd.id));
+      const after = await row<Security>("SELECT * FROM securities WHERE id = $1", [bnd.id]);
       expect(after.symbol).toBe("BND");
     });
 
@@ -745,7 +765,7 @@ describe("MCP Security and Investment Tools", () => {
       expect(isError).toBe(true);
       // The library names the ID; the HTTP route does not.
       expect(data.error).toBe(`Security ${theirs.id} not found`);
-      const [after] = await getDb().select().from(securities).where(eq(securities.id, theirs.id));
+      const after = await row<Security>("SELECT * FROM securities WHERE id = $1", [theirs.id]);
       expect(after.name).toBe("Theirs");
     });
   });
@@ -773,8 +793,7 @@ describe("MCP Security and Investment Tools", () => {
 
       expect(isError).toBe(true);
       expect(data.error).toContain("investment transactions");
-      const rows = await getDb().select().from(securities).where(eq(securities.id, sec.id));
-      expect(rows).toHaveLength(1);
+      expect(await count("securities", "id = $1", [sec.id])).toBe(1);
     });
   });
 });

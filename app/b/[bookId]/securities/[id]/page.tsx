@@ -15,7 +15,7 @@ import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
 import { apiGet, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
-import type { Security } from "@/db/schema";
+import type { Security } from "@/types/db";
 
 type SecurityDetail = Security & {
   latestPriceMicros: number | null;

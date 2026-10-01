@@ -133,18 +133,19 @@ pub(crate) async fn authenticate_book_membership(
     level: AccessLevel,
     failure_message: &'static str,
 ) -> Result<AuthenticatedBook, ApiError> {
-    let membership = sqlx::query!(
-        "SELECT bm.role FROM books b JOIN book_members bm ON bm.book_id = b.id WHERE b.id = $1 AND bm.user_id = $2",
-        book_id,
-        user_id
+    let membership: Option<String> = sqlx::query_scalar(
+        "SELECT bm.role FROM books b JOIN book_members bm ON bm.book_id = b.id
+         WHERE b.id = $1 AND bm.user_id = $2",
     )
+    .bind(book_id)
+    .bind(user_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|cause| internal_error(cause, failure_message))?;
     let role = match membership {
         None => None,
-        Some(row) => Some(
-            BookRole::from_database(&row.role)
+        Some(role) => Some(
+            BookRole::from_database(&role)
                 .ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, failure_message))?,
         ),
     };

@@ -3,7 +3,7 @@
   "info": {
     "title": "Counterpoise API",
     "description": "The routes a native client uses. Money is integer cents. Shares and prices are integer micros. Dates are YYYY-MM-DD strings.",
-    "version": "1.48.0",
+    "version": "1.50.0",
     "x-api-contract": 1
   },
   "servers": [

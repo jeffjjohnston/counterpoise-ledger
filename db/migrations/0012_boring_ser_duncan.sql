@@ -1,1 +1,0 @@
-ALTER TABLE "plaid_tokens" ADD COLUMN "last_error" text;

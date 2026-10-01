@@ -1,8 +1,12 @@
-// CLI only. Routes import lib/typesafe/report, never this entrypoint.
-import { closeDb, getDb } from "../db";
-import { typeSafeReport } from "../lib/typesafe/report";
+// CLI only. It reads the database that DATABASE_PATH names, read-only.
+import { existsSync } from "node:fs";
+import {
+  openReportDatabase,
+  reportDatabasePath,
+  typeSafeReport,
+} from "../lib/typesafe/report";
 
-async function main() {
+function main() {
   const [flag, id, ...extra] = process.argv.slice(2);
   if (
     flag !== "--book-id" ||
@@ -12,13 +16,20 @@ async function main() {
   ) {
     throw new Error("Usage: npm run typesafe:report -- --book-id <id>");
   }
-  console.log(
-    JSON.stringify(await typeSafeReport(getDb(), Number(id)), null, 2),
-  );
+  const path = reportDatabasePath();
+  // A read-only open of a missing file fails with an unclear message.
+  if (!existsSync(path)) throw new Error(`No database at ${path}; set DATABASE_PATH`);
+  const db = openReportDatabase(path);
+  try {
+    console.log(JSON.stringify(typeSafeReport(db, Number(id)), null, 2));
+  } finally {
+    db.close();
+  }
 }
-main()
-  .catch((error) => {
-    console.error(error instanceof Error ? error.message : "Report failed");
-    process.exitCode = 1;
-  })
-  .finally(closeDb);
+
+try {
+  main();
+} catch (error) {
+  console.error(error instanceof Error ? error.message : "Report failed");
+  process.exitCode = 1;
+}

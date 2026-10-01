@@ -121,10 +121,19 @@ impl Plaid {
         }
     }
 
-    /// `isPlaidConfigured`: the three variables are set. The value of
-    /// `PLAID_ENV` is not checked here.
-    pub(crate) fn is_configured(&self) -> bool {
-        self.client_id.is_some() && self.secret.is_some() && self.environment.is_some()
+    /// The first of the three variables that is not set, in the order that
+    /// `credentials` checks them. `None` when Plaid is configured
+    /// (`isPlaidConfigured`). The value of `PLAID_ENV` is not checked here.
+    pub(crate) fn missing_setting(&self) -> Option<&'static str> {
+        if self.client_id.is_none() {
+            Some("PLAID_CLIENT_ID")
+        } else if self.secret.is_none() {
+            Some("PLAID_SECRET")
+        } else if self.environment.is_none() {
+            Some("PLAID_ENV")
+        } else {
+            None
+        }
     }
 
     /// `getPlaidConfig`: the variables are checked in this order.

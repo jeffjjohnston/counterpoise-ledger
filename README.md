@@ -27,7 +27,7 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 
 ### Multi-Book Support
 - **Multiple Books** - Maintain separate sets of books (e.g., personal, business)
-- **Demo Book** - One click fills a brand-new book with the full sample dataset: three years of transactions, investment lots with cost basis, recurring rules, and a bank-sync queue waiting to be reconciled
+- **Demo Book** - One click fills a brand-new book with a sample dataset (a household of three years or a single homeowner of two years, ending today): transactions, investment lots with cost basis, recurring rules, and a bank-sync queue waiting to be reconciled
 - **User Authentication** - Session-based auth with scrypt password hashing
 - **Registration Control** - Signup open, closed, or self-closing after the first account, via `REGISTRATION_ENABLED`
 - **Book Isolation** - Data isolated by bookId within a single database
@@ -54,7 +54,7 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 - **Multiple Frequencies** - Daily, weekly, monthly, yearly, with custom intervals (e.g., every 2 weeks)
 - **Next Date Tracking** - Automatically calculates next occurrence
 - **Early Auto-Create Window** - Auto-create X days before the scheduled date (per rule)
-- **Cron Processing** - Hourly automatic processing via Docker scheduler
+- **Cron Processing** - Hourly automatic processing by the server
 
 ### Bank Sync (Plaid)
 - **Bank Connection** - Connect bank accounts via Plaid
@@ -86,20 +86,20 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 ## Tech Stack
 
 - **Web client**: React with React Router, built by Vite into static files
-- **API server**: Rust (Axum and SQLx). It serves the API, the MCP server and the client build
+- **API server**: Rust (Axum and SQLx). It serves the API, the MCP server and the client build, and runs the scheduled jobs and the backups
 - **Language**: TypeScript in the browser, Rust on the server. The browser runs the shared Rust domain code as WASM
 - **Styling**: Tailwind CSS
-- **Database**: PostgreSQL
-- **Schema and migrations**: Drizzle ORM
+- **Database**: SQLite, one file
+- **Schema and migrations**: numbered SQL files in `rust-api/db/migrations/`, applied by the server when it starts
 - **Testing**: Vitest (unit), `cargo test`, Playwright (E2E)
 
 ## Prerequisites
 
 - Node.js 26+
 - npm
-- Docker (for PostgreSQL)
 - Rust with `cargo` and the `wasm32-unknown-unknown` target. `npm run dev`
-  builds the core crate to WASM, and `npm run db:seed` runs the Rust CLI
+  builds the core crate to WASM, and the server and `npm run db:seed` are Rust
+- Docker, for a production deployment only. Development needs no Docker
 
 ## Installation
 
@@ -114,118 +114,106 @@ cd counterpoise-ledger
 npm install
 ```
 
-3. Start the dedicated development database (Compose creates its volume):
-```bash
-docker compose -f docker-compose.dev.yml up -d --wait
-```
-
-This uses project `counterpoise-dev`, volume `counterpoise_dev_pgdata`, and
-`127.0.0.1:5432`. It needs no production environment file and shares no data with
-production. Stop it with `docker compose -f docker-compose.dev.yml down`;
-the data volume survives. Keep port 5432 available for this database.
-
-The development checkout is separate from production. For a full Docker
-deployment, use the production clone (`~/prod/counterpoise` by default, branch `main`).
-In that clone, create the production volume, copy the example environment file,
-and point `DATABASE_URL` at the `postgres` service — inside a container,
-`localhost` is the container itself:
-
-```bash
-docker volume create counterpoise_pgdata
-cp .env.example .env.production.local
-
-# Then edit .env.production.local. Set the bootstrap superuser password —
-# production Compose has no fallback, and the published development value must
-# not be reused here:
-#   POSTGRES_PASSWORD=$(openssl rand -hex 32)
-#
-# Set an application-role password too, and put that same password into
-# DATABASE_URL — nothing derives one from the other:
-#   APP_DB_PASSWORD=$(openssl rand -hex 32)
-#   DATABASE_URL=postgresql://counterpoise_app:<that password>@postgres:5432/counterpoise
-
-docker compose --env-file .env.production.local up -d --build
-```
-
-`--env-file` is required, not optional: Compose reads `${VAR}` substitutions in
-`docker-compose.yml` from the shell, a `.env` file, or `--env-file` — a
-service-level `env_file:` populates the container but does **not** feed those
-substitutions. Without it, `TZ` keeps its default and `POSTGRES_PASSWORD`
-arrives empty, which the postgres image refuses to initialize a volume with.
-
-Run tests only against the separate dev database. Its test databases can be
-reclaimed manually with `scripts/scheduler/sweep-test-databases.sh`; see
-[testing.md](guides/testing.md). Production does not schedule dev cleanup.
-
-4. In the development checkout, create the local dev database (and the E2E database):
-```bash
-npm run db:create-test-dbs
-```
-
-Docker only creates the `counterpoise` database; local development uses `counterpoise_dev`, which this script creates along with `counterpoise_e2e`. The Vitest suite needs neither: each run creates its own databases as it starts, and the dev cleanup script can reclaim them.
-
-5. Seed with sample data (optional):
+3. Seed with sample data (optional):
 ```bash
 npm run db:seed
 ```
 
-This resets the local database, creates a sample `admin` user with password `password`, creates a sample book, and seeds it with data. If you want to seed an existing book instead, first create the book, then run `npm run db:list-books` to find its ID and `npm run db:seed -- --book-id <id>`. The seed runs `ledger-cli seed` through `cargo run`, so the first run also builds the Rust CLI.
+This deletes and recreates the development database, `data/counterpoise.db`,
+creates a sample `admin` user with password `password`, creates a sample book,
+and seeds it with data. The dates end today. Add `-- --today YYYY-MM-DD` to
+pin the end date (`2025-12-31` gives the 2023-2025 rows, 2,235 transactions).
+Add `-- --dataset single` for the single-homeowner dataset. The default is
+`household`. If you want to seed an existing book instead, first
+create the book, then run `npm run db:list-books` to find its ID and
+`npm run db:seed -- --book-id <id>`. The seed runs `ledger-cli seed` through
+`cargo run`, so the first run also builds the Rust CLI. Stop the API server
+first: the seed refuses while a server uses the file.
 
-If you skip seeding, run `npm run db:migrate` instead to apply the schema — migrations are not applied automatically in local dev.
+If you skip seeding, the API server creates the database and applies the
+migrations when it first starts.
 
-6. Start the API server and the Vite development server, in two terminals.
+4. Start the API server and the Vite development server, in two terminals.
    Vite serves the client on port 3000. It sends every `/api` request to the
    API server on `127.0.0.1:4000` (set `RUST_API_URL` to use a different address):
 ```bash
-DATABASE_URL=postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev \
-  cargo run --manifest-path rust-api/Cargo.toml -p counterpoise-rust-api
+cargo run --manifest-path rust-api/Cargo.toml -p counterpoise-rust-api
 npm run dev
 ```
 
-7. Open [http://localhost:3000](http://localhost:3000).
+Set `DATABASE_PATH` to use a database file other than `data/counterpoise.db`.
+
+5. Open [http://localhost:3000](http://localhost:3000).
 
 If you ran `npm run db:seed`, sign in with `admin` / `password`. Otherwise, register an account and create a book.
 
 To explore with realistic data instead of an empty book, click **Add demo book**
-on the books page. It creates a book named "Demo Book" and fills it with the
-same sample dataset the seed uses. Unlike `npm run db:seed`, which resets the
+on the books page. It creates a book named "Demo Book" (or "Demo Book - Single")
+and fills it with the same sample dataset the seed uses. The books page shows one row
+for each dataset: `household` or `single`. The API is `POST /api/books/demo` with an
+optional `{ "dataset": "household" | "single" }`, and `GET /api/books/demo/datasets`
+lists the datasets. Unlike `npm run db:seed`, which resets the
 entire database, this only ever writes to the book it just created — so it is
 safe to run on an instance that already holds real data, and you can add several.
 It writes thousands of rows in one transaction, so give it a few seconds. If it
 fails, no demo book remains.
 
+The development checkout is separate from production. For a Docker deployment,
+use a separate production clone (`~/counterpoise-production` by default, branch
+`main`). See "Docker Deployment" below.
+
 ## Database Architecture
 
-Counterpoise uses a PostgreSQL database containing all meta tables (users, sessions, books) and book-scoped tables. Book-scoped tables have a `bookId` foreign key for data isolation. Local development defaults to `postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev` when `DATABASE_URL` is unset; Docker deployment uses `counterpoise` via `.env.production.local`.
+Counterpoise keeps all data in one SQLite file: the meta tables (users,
+sessions, books) and the book-scoped tables. Book-scoped tables have a
+`book_id` foreign key for data isolation. `DATABASE_PATH` names the file. The
+default is `data/counterpoise.db` in development and `/data/counterpoise.db`
+in the Docker image. The server applies the migrations when it starts. See
+[guides/database-management.md](guides/database-management.md).
 
 ### Core Tables
 
 - **accounts** - Chart of accounts with hierarchy (types: asset, liability, equity, income, expense)
-- **transactions** / **transactionSplits** - Double-entry transactions
-- **securities** / **securityPrices** - Investment securities and price history
-- **investmentSplits** / **investmentLots** - Investment transactions and FIFO lot tracking
+- **transactions** / **transaction_splits** - Double-entry transactions
+- **securities** / **security_prices** - Investment securities and price history
+- **investment_splits** / **investment_lots** - Investment transactions and FIFO lot tracking
 - **payees** - Deduplicated payees (normalized-name matching)
-- **recurringRules** / **recurringTemplateSplits** - Recurring transaction templates
-- **plaidTokens** / **plaidAccounts** / **plaidTransactionReconciliation** - Bank sync via Plaid
-- **apiKeys** - User API keys for MCP access
-- **issueReports** - In-app issue reports (meta table, scoped to user)
+- **recurring_rules** / **recurring_template_splits** - Recurring transaction templates
+- **plaid_tokens** / **plaid_accounts** / **plaid_transaction_reconciliation** - Bank sync via Plaid
+- **api_keys** - User API keys for MCP access
+- **issue_reports** - In-app issue reports (meta table, scoped to user)
 
 ## Docker Deployment
 
-The full stack runs as three Docker Compose services:
+The production deployment is one image, one container and one process. The
+Compose file has one service:
 
-| Service     | Description                                                              |
-|-------------|--------------------------------------------------------------------------|
-| `postgres`  | PostgreSQL 16 database with persistent volume                            |
-| `rust-api`  | The app: the UI (the Vite client build), the API and MCP, on host port 3000. Before the server starts, it checks the database credential, applies the Drizzle migrations and rebuilds the investment lots |
-| `scheduler` | PostgreSQL Alpine sidecar — recurring transactions, Plaid sync, backups, pruning, reindex |
+| Service     | Description |
+|-------------|-------------|
+| `rust-api`  | The app: the UI (the Vite client build), the API and MCP, on host port 3000. It also runs the scheduled jobs and the hourly backups. Before it serves, it takes the server lock on the database file, applies the migrations and runs the lot guard |
+
+The image is about 57 MB, on `alpine:3.22`, with no Node. The server runs as
+uid 1000 (`counterpoise`). It uses two volumes:
+
+| Volume | Mounted at | Holds |
+| --- | --- | --- |
+| `counterpoise_data` (external) | `/data` | `counterpoise.db`, its `-wal` and `-shm` files, and its lock files |
+| `${COUNTERPOISE_BACKUPS_DIR:-./backups}` | `/backups` | The hourly snapshots and the job status records (`status/`). It must be writable by uid 1000 |
+
+> **An install that ran an earlier release on PostgreSQL** must convert its
+> data once before this release can start. Follow
+> [guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md).
 
 ### Configuration
 
-The `rust-api` and `scheduler` services read secrets from `.env.production.local` via `env_file`. Configure these variables:
+The `rust-api` service reads secrets from `.env.production.local` via
+`env_file`. Compose refuses to start without that file. Configure these
+variables:
 
 ```bash
 # .env.production.local
+# Optional — only gates the manual /api/cron/* triggers. The server runs the
+# scheduled jobs itself.
 CRON_SECRET=your-cron-secret-here
 
 # Optional — signup control. Leave unset and registration is open only until the
@@ -251,69 +239,75 @@ TIINGO_API_KEY=...
 NEXT_PUBLIC_POSTHOG_KEY=...
 NEXT_PUBLIC_POSTHOG_HOST=...
 POSTHOG_PERSONAL_API_KEY=...  # runtime; used for querying the PostHog API
+
+# The time zone of the scheduled jobs and of "today". Set your own.
+TZ=America/New_York
 ```
 
-Set `DATABASE_URL` in `.env.production.local`, pointing at the internal
-`postgres` hostname and at the application role — for example
-`postgresql://counterpoise_app:<app password>@postgres:5432/counterpoise`. That
-role is created from `APP_DB_PASSWORD` by
-`scripts/postgres-init/01-app-role.sh`, which runs on **first initialization
-only**: the postgres image skips `/docker-entrypoint-initdb.d` once the volume
-holds a database. Set `APP_DB_PASSWORD` before the first `docker compose up` —
-setting it later does nothing. The app refuses to start while
-`DATABASE_URL` still carries the published `counterpoise:counterpoise` default,
-which is in this repository and known to every reader of it.
+Do not set `DATABASE_PATH` or `DATABASE_URL` there. The image sets
+`DATABASE_PATH=/data/counterpoise.db`. When the server finds `DATABASE_URL`
+set and no database file, it refuses to start and names the upgrade guide: that
+install has not converted its PostgreSQL data yet.
 
 ### Starting
 
 > **Run production `docker compose` commands from the production checkout root**
-> (`~/prod/counterpoise` by default, branch `main`). Dev uses `-f docker-compose.dev.yml`. The project
+> (`~/counterpoise-production` by default, branch `main`). The project
 > name is pinned in `docker-compose.yml`, so Compose addresses the same
 > containers from any directory, while `--env-file` is resolved against the
 > directory the command runs in. A command run one directory away therefore
-> recreates production's containers reading `TZ`, `POSTGRES_PASSWORD` and
+> recreates production's container reading `TZ` and
 > `COUNTERPOISE_BACKUPS_DIR` from the wrong file. An env file that is missing
 > outright is refused — Compose exits 1 — so the hazard is one that exists and
 > disagrees. `./scripts/check-compose-cwd.sh` answers "am I in
 > the right directory?" and `scripts/deploy.sh` runs it first.
 
+For a new install, in the production clone:
+
 ```bash
-# Create the persistent data volume (first time only)
-docker volume create counterpoise_pgdata
+# Create the data volume (first time only). `up` refuses while it is missing.
+docker volume create counterpoise_data
 
-# Build and start all services
-docker compose --env-file .env.production.local up -d --build
+# Make the backups directory, writable by uid 1000
+mkdir -p backups
+docker run --rm -v "$PWD/backups:/backups" alpine:3.22 chown 1000:1000 /backups
 
-# Or start only the production database
-docker compose --env-file .env.production.local up -d postgres
+cp .env.example .env.production.local   # then edit it
+
+# Build and start
+docker compose --env-file .env.production.local up -d --build --wait
 ```
 
-The app will be available at http://localhost:3000. The `rust-api` entrypoint
-(`docker-entrypoint.sh`) applies the migrations before the server starts. If a
+`--env-file` is required, not optional: Compose reads `${VAR}` substitutions in
+`docker-compose.yml` from the shell, a `.env` file, or `--env-file` — a
+service-level `env_file:` populates the container but does **not** feed those
+substitutions. Without it, `TZ` and `APP_BIND` keep their defaults.
+
+The app will be available at http://localhost:3000. The server creates
+`/data/counterpoise.db` and applies the migrations before it serves. If a
 migration fails, the server does not start.
 
 ### Rebuilding
 
-Rebuild the image after code changes. The new migrations run before the new
-server starts:
+Rebuild the image after code changes. The server applies the new migrations
+before it serves:
 
 ```bash
-docker compose --env-file .env.production.local up -d --build rust-api
+docker compose --env-file .env.production.local up -d --build --wait rust-api
 ```
 
-### Upgrading to SQLite
+### Upgrading from PostgreSQL
 
-v1.48.0 is the last release that uses PostgreSQL. The next release moves the
-data to SQLite, and an existing install must convert its data one time. Read
-[guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md) before you upgrade
-past v1.48.0.
+An install that runs v1.48.0, the last release that uses PostgreSQL, must
+convert its data one time before this release can start. Follow
+[guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md).
 
 ### Updating Environment Variables
 
 Docker Compose reads `env_file` only when **creating** a container. After editing `.env.production.local`, force-recreate to pick up changes:
 
 ```bash
-docker compose --env-file .env.production.local up -d --force-recreate rust-api scheduler
+docker compose --env-file .env.production.local up -d --force-recreate rust-api
 ```
 
 > **Note:** `docker compose restart` will **not** re-read the env file — it only stops and starts the existing container with the old environment.
@@ -321,22 +315,18 @@ docker compose --env-file .env.production.local up -d --force-recreate rust-api 
 ### Viewing Logs
 
 ```bash
-# All services
-docker compose logs -f
-
-# Specific service
 docker compose logs -f rust-api
 ```
 
 ### Stopping
 
 ```bash
-# Stop all services (data persists in the pgdata volume)
+# Stop the service (the data stays in the counterpoise_data volume)
 docker compose down
 
-# Stop and delete the database volume (external volume must be removed separately)
+# Delete the data too. The volume is external, so `down -v` does not delete it.
 docker compose down
-docker volume rm counterpoise_pgdata
+docker volume rm counterpoise_data
 ```
 
 ### Build Architecture
@@ -345,14 +335,15 @@ The root `Dockerfile` builds one image in stages:
 
 1. **wasm-builder** — compiles the core crate to WASM for the browser
 2. **client** — runs `npm ci` and `npm run build` (Vite) to make the client in `build/`
-3. **builder** — compiles the Rust server and `ledger-cli`
-4. **runtime** — a small Node image with the two binaries, the client in
-   `/srv/client` (`COUNTERPOISE_STATIC_DIR`), the migrations and `migrate.js`
+3. **builder** — compiles the Rust server and `ledger-cli` as static binaries
+4. **runtime** — `alpine:3.22` with the two binaries and the client in
+   `/srv/client` (`COUNTERPOISE_STATIC_DIR`). No Node
 
-Its entrypoint (`docker-entrypoint.sh`) checks the database credential,
-applies the Drizzle migrations, rebuilds the lots with `ledger-cli
-rebuild-lots`, and then starts the server. Node runs only for `migrate.js`. A
-new server never runs against the old schema.
+The image has no entrypoint script. `CMD` is `counterpoise-rust-api`: the
+server opens the file, takes the server lock, applies the embedded migrations,
+runs the lot guard and then serves. A second server on the same file refuses
+to start. The healthcheck runs `counterpoise-rust-api health`, which calls
+`/health`; that route runs a query, so a broken database fails the check.
 
 ## Getting HTTPS
 
@@ -458,6 +449,11 @@ Set `TRUST_PROXY=true` when a proxy on a different host is the only way in and
 `APP_BIND` is therefore not loopback. Do not set it when clients can also reach
 port 3000 directly.
 
+The same rule applies to `X-Forwarded-Host` and `X-Forwarded-Proto`. When the
+server uses the peer address, it also ignores these two headers, because a
+client that connects directly could write them too. The cross-origin check
+then compares `Origin` with `Host` only.
+
 With `APP_BIND=0.0.0.0` and no proxy, the server uses the peer address. On
 Linux with the default Docker network, that is the real client address. Docker
 Desktop (macOS and Windows) and rootless Docker can show the same internal
@@ -493,19 +489,17 @@ exposing it to anything wider, understand these defaults:
   HTTP, silently breaks login. See "Getting HTTPS" above.
 - **`npm run db:seed` creates an `admin` / `password` account.** Delete or change
   it before the instance is reachable by anyone else.
-- **The bootstrap superuser password comes from `POSTGRES_PASSWORD`**, and
-  production Compose has no fallback for it: a fresh deployment must supply
-  one, and must not reuse the published development value. Nothing enforces
-  that yet — the postgres image reads the password before any script of ours
-  runs.
-- **The application connects as its own non-superuser role.** A fresh install
-  creates `counterpoise_app` from `APP_DB_PASSWORD`, and the app refuses to
-  start if `DATABASE_URL` still carries the published default.
+- **The database is a file with no password.** Anyone who can read the
+  `counterpoise_data` volume, or the snapshots in `backups/`, can read every
+  book. Protect the host, the volume and the backups directory, and every
+  off-machine copy of the snapshots.
 - **Cron endpoints fail closed.** `/api/cron/*` returns 401 unless `CRON_SECRET`
-  is set and presented as a bearer token.
+  is set and presented as a bearer token. The scheduled jobs do not need it:
+  the server runs them itself.
 - **A reverse proxy in front of Counterpoise must preserve the original `Host`
   header.** The cross-origin write check compares the request's `Origin`
-  against its `Host` header (or `X-Forwarded-Host` when the proxy sets it).
+  against its `Host` header (or `X-Forwarded-Host` when the proxy sets it and
+  the server trusts the proxy: see "Client addresses and rate limits").
   The Rust server does this check in `rust-api/server/src/security.rs`.
   Tailscale Serve preserves `Host` by
   default, so this works out of the box behind it. nginx does **not** — its
@@ -520,123 +514,89 @@ exposing it to anything wider, understand these defaults:
   timeout will cut. The seed keeps running server-side when it does, so the
   symptom is a failed request plus a complete demo book the page never showed.
 
-### Separating the application database role
-
-`scripts/postgres-init/01-app-role.sh` creates `counterpoise_app` on the FIRST
-initialization of the postgres volume. An instance that already holds a database
-skips that directory entirely, so an existing deployment has to be migrated by
-hand.
-
-```sql
--- As the bootstrap superuser, against the application database.
-CREATE ROLE counterpoise_app LOGIN PASSWORD 'the value of APP_DB_PASSWORD';
-ALTER DATABASE counterpoise OWNER TO counterpoise_app;
-
--- Then, connected to that database, hand over what it contains:
-REASSIGN OWNED BY counterpoise TO counterpoise_app;
-```
-
-**`REASSIGN OWNED BY` reaches past the database you run it in.** It moves every
-object inside the current database *and* every shared object the old role owns
-— databases and tablespaces — whichever database the connection is using.
-Connecting to the right database confines the first half only, so running it
-once per database does not stop the second. On an instance where the bootstrap
-role also owns development or test databases, those databases change owner too.
-Run it only where the old role owns nothing you mean to leave alone — a
-production instance holding one database — and otherwise move ownership by
-hand, with `ALTER DATABASE` and an `ALTER ... OWNER TO` per object inside.
-
-Afterwards point `DATABASE_URL` at the new role and restart. The app refuses to
-start while `DATABASE_URL` still carries the published bootstrap
-credential, so a missed step fails loudly rather than running as a superuser.
-
-#### The bootstrap password
-
-`POSTGRES_PASSWORD` is the superuser's, and it has no default: set your own in
-`.env.production.local` before the first start. `scripts/postgres-entrypoint-guard.sh`
-runs as the postgres entrypoint and refuses the password this repository
-publishes, ahead of `initdb` — the only moment refusing costs nothing, because
-no cluster exists yet. Change the variable and start again.
-
-On a deployment ALREADY initialized with that password the guard warns on every
-start and lets postgres run, because refusing there would take a working
-deployment down without fixing anything. Changing the variable does not help
-either: the password lives in the cluster once it is created. Rotate it in
-place instead.
-
-```sql
--- As the bootstrap superuser.
-ALTER ROLE counterpoise WITH PASSWORD 'a value of your own';
-```
-
-Then set that same value as `POSTGRES_PASSWORD` in `.env.production.local`, so
-a future re-initialization matches. Backups authenticate as `counterpoise_app`
-and are unaffected.
-
 ## Backups
 
-The `scheduler` container dumps the database hourly to `./backups`, prunes dumps
-older than 30 days, and reindexes monthly.
+The server makes the backups itself. Hourly from 6am to 9pm (in `TZ`), it
+writes a snapshot into `backups/` with SQLite's `VACUUM INTO`, first as a
+`.partial` file. It checks the copy with a read-only `PRAGMA integrity_check`,
+and only then gives it the name `counterpoise-YYYYMMDD-HHMMSS.db`. A copy
+that fails the check gets the name `.db.bad` instead. Each snapshot is a
+complete database. Daily at 4am, it deletes snapshots (and the hourly `.dump`
+files from a PostgreSQL release) older than 30 days. It never deletes a
+`.partial` or `.bad` file, or the safety dump of the upgrade
+(`counterpoise-pre-sqlite-<time>.dump`): delete those by hand.
 
 ```bash
-# Take a backup now
-docker exec counterpoise-scheduler-1 sh -c \
-  'pg_dump -Fc "$DATABASE_URL" > /backups/manual-$(date +%Y%m%d-%H%M%S).dump'
+# Take a snapshot now
+docker exec counterpoise-rust-api-1 ledger-cli backup
 
-# List a dump's contents without restoring
-pg_restore --list backups/<file>.dump
-
-# Full restore (drops and recreates all objects) — stop the app first
-docker compose stop rust-api
-pg_restore --clean --if-exists -d "$DATABASE_URL" backups/<file>.dump
-docker compose start rust-api
+# Open a snapshot with the SQLite shell on the host (read-only)
+sqlite3 -readonly backups/counterpoise-YYYYMMDD-HHMMSS.db 'SELECT COUNT(*) FROM transactions'
 ```
 
-### Get the dumps off the machine
+To restore a snapshot, stop the service, copy the snapshot over
+`/data/counterpoise.db`, delete the `-wal` and `-shm` files, and start the
+service. Run this in the production checkout:
 
-Everything above runs on one disk. Hourly dumps beside the database they came
-from protect you from a bad migration or a mistaken delete — not from disk
-failure, theft, or ransomware, all of which take the database and every dump
-together. Nothing in this repo can fix that for you; it needs a second place.
+```bash
+docker compose stop rust-api
+docker run --rm -v counterpoise_data:/data -v "$PWD/backups:/backups:ro" alpine \
+  sh -c 'rm -f /data/counterpoise.db-wal /data/counterpoise.db-shm &&
+         cp /backups/counterpoise-YYYYMMDD-HHMMSS.db /data/counterpoise.db &&
+         chown 1000:1000 /data /data/counterpoise.db'
+docker compose --env-file .env.production.local up -d --wait
+```
+
+Do not copy `/data/counterpoise.db` itself while the server runs: without its
+`-wal` file, the copy can miss the last writes. Use a snapshot.
+
+The `.dump` files of a PostgreSQL release, and the
+`counterpoise-pre-sqlite-*.dump` safety copy that the upgrade writes, are
+`pg_dump` archives. SQLite cannot read them. Only the previous release can use
+one, with `pg_restore` into its PostgreSQL. To go back to that release, see
+"If something goes wrong" in [guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md).
+
+### Get the backups off the machine
+
+Everything above runs on one disk. Hourly snapshots beside the database they
+came from protect you from a bad migration or a mistaken delete — not from disk
+failure, theft, or ransomware, all of which take the database and every
+snapshot together. Nothing in this repo can fix that for you; it needs a second
+place.
 
 Two ways, either is fine:
 
 - **A whole-disk backup service** already covering the host — Backblaze, Time
   Machine to a separate drive, or equivalent. Nothing to configure here, as
   long as `./backups` is not in an exclusion list. Check that it is actually
-  being picked up rather than assuming it.
-- **A scheduled copy of the newest dump** to cloud storage or another machine.
-  Run this from the **host's** crontab, not the scheduler container: that
-  container is `postgres:16-alpine` and has no `rclone`. Use an absolute path
-  to your checkout — `/backups` is the path *inside* the container, and cron
-  has no working directory to speak of:
+  being picked up rather than assuming it. Let it copy `backups/`, not the
+  live database in the Docker volume.
+- **A scheduled copy of the newest snapshot** to cloud storage or another
+  machine. Run this from the **host's** crontab: the image has no `rclone`.
+  Use an absolute path to your checkout — `/backups` is the path *inside* the
+  container, and cron has no working directory to speak of:
 
   ```bash
-  0 5 * * * rclone copy "$(ls -t /srv/counterpoise/backups/counterpoise-*.dump | head -1)" remote:counterpoise/
+  0 5 * * * rclone copy "$(ls -t /srv/counterpoise/backups/counterpoise-*.db | head -1)" remote:counterpoise/
   ```
 
-  `restic`, `rsync` over SSH, or `aws s3 cp` all work the same way. Putting the
-  copy in the scheduler's crontab instead means building your own image with
-  the tool installed — the stock one cannot do it.
+  `restic`, `rsync` over SSH, or `aws s3 cp` all work the same way.
 
 Whichever you pick, **keep version history**. A backup that mirrors the current
 state one-for-one will faithfully replicate a corruption or an encryption event
 to your only other copy. Thirty days of retention turns that from a disaster
 into an inconvenience.
 
-The scheduler checks every dump, but check what that check is: `pg_restore
---list` reads the archive's header and table of contents and stops there. It
-catches a file whose header or contents list is unreadable, and a `pg_dump`
-that failed outright is caught separately by its own exit status. It never
-reaches the data blocks, so a dump truncated or corrupted past the contents
-list lists cleanly. Nothing here restores a dump or reads a row, so nothing
-here can tell you the data inside is complete — only a restore into a scratch
-database does that, and none is performed. See Monitoring below.
+Know what the check proves. `PRAGMA integrity_check` reads every page of the
+snapshot and checks the structure of every table and index. It catches a
+truncated or corrupt file. It cannot tell you that the data was correct when
+the snapshot was taken: a mistaken delete is copied faithfully. Only a restore
+and a look at the books tells you that.
 
 ### Monitoring
 
-Counterpoise reads each dump's table of contents with `pg_restore --list` and
-records the outcome of every scheduled job to `backups/status/`. The app surfaces stale or
+The server records the outcome of every scheduled job in `backups/status/`,
+and `/api/system/status` reads those records. The app surfaces stale or
 unverified jobs in the navbar — silently, until something needs attention.
 
 That design assumes **you use the app**. It detects a broken backup job while
@@ -645,24 +605,29 @@ it is running on that host. On a machine you open regularly that gap is covered
 by you noticing.
 
 **If you deploy this somewhere you don't look at daily, add an external dead-man
-switch** — healthchecks.io or similar — by appending a ping to each cron line in
-`docker-compose.yml`. That is the only layer that still reports when the whole
-host is down.
+switch** — healthchecks.io or similar — pinged from the host's crontab, for
+example after the copy of the newest snapshot above. That is the only layer that
+still reports when the whole host is down.
 
 ## Scheduler
 
-The `scheduler` container runs all cron jobs on a `postgres:16-alpine` image (giving it access to `pg_dump`, `reindexdb`, and `wget`):
+The server runs every scheduled job itself, in the time zone that `TZ` sets
+(`COUNTERPOISE_SCHEDULER=on`, set in the image; `rust-api/server/src/scheduler.rs`).
+There is no scheduler container.
 
 | Job | Schedule | Description |
 |-----|----------|-------------|
-| Recurring transactions | Hourly | Calls `/api/cron/recurring` authenticated with `CRON_SECRET` |
-| Plaid sync | Every 6 hours | Calls `/api/cron/plaid-sync` for all linked asset/liability accounts |
-| Security price sync | Tue–Sat 6am ET | Calls `/api/cron/price-sync` to fetch Tiingo end-of-day prices |
-| Database backup | Hourly, 6am–9pm | `pg_dump` to `backups/counterpoise-<timestamp>.dump` |
-| Backup pruning | Daily at 4am | Deletes `.dump` files older than 30 days |
-| REINDEX | 1st of month at 3am | `reindexdb "$DATABASE_URL"` |
+| Recurring transactions | Hourly | Creates the due transactions of each book |
+| Plaid sync | 12am, 6am, 12pm, 6pm | Syncs every connection with a linked asset or liability account |
+| Security price sync | Tue–Sat 6am | Fetches Tiingo end-of-day prices |
+| TypeSafe cleanup | Hourly at :15 | Removes TypeSafe details older than 30 days |
+| Database backup | Hourly, 6am–9pm | `VACUUM INTO` a `.partial` copy, `PRAGMA integrity_check`, then the name `backups/counterpoise-<timestamp>.db` (`.db.bad` when the check fails) |
+| Backup pruning | Daily at 4am | Deletes snapshots and hourly `.dump` files older than 30 days (never `.partial`, `.bad` or the upgrade's safety dump), then runs `PRAGMA optimize` |
+| `VACUUM` | 1st of month at 3am | Rebuilds the database file |
 
-Manual trigger:
+A run of a job does not start while the last run of that job still runs.
+Backup, pruning and `VACUUM` never overlap. To run a server job now, call its
+route with `CRON_SECRET`:
 
 ```bash
 curl -H "authorization: Bearer ${CRON_SECRET}" http://localhost:3000/api/cron/recurring
@@ -693,8 +658,8 @@ closed to new signups on 15 April 2026.)
 Use the **Sandbox** secret in `.env.local` and the **Production** secret in
 `.env.production.local`. `.env.example` explains why that separation is not
 optional: a production secret in `.env.local` means `npm run dev` reaches real
-banks and bills real API requests, and the separate `counterpoise_dev`
-database does nothing to prevent it — it bounds writes, not outbound calls.
+banks and bills real API requests, and the separate development database does
+nothing to prevent it — it bounds writes, not outbound calls.
 
 ### 2. Mint an access token
 
@@ -732,7 +697,7 @@ name, and paste the Item ID and Access Token. Counterpoise fetches the
 institution's accounts, and **Assign Accounts** maps each one to a Counterpoise
 account.
 
-From then on the `scheduler` sidecar syncs every six hours, staging
+From then on the server syncs every six hours, staging
 transactions for reconciliation rather than writing them to the ledger
 directly. Review them on the **Sync** page.
 
@@ -822,31 +787,29 @@ The system will automatically show when it's due and allow one-click processing.
 ### Available Scripts
 
 ```bash
-npm run dev          # Start the web server (the API server runs with cargo; see step 6 above)
-npm run build        # Build for production
-npm run start        # Start production server
+npm run dev          # Start the Vite dev server (the API server runs with cargo; see step 4 above)
+npm run build        # Build the client into build/
 npm run lint         # Run ESLint
-npm test             # Run unit tests (Vitest)
+npm test             # Run unit tests (Vitest); build ledger-cli first (cargo build -p ledger-cli)
 npm run test:ui      # Open Vitest UI
 npm run test:coverage # Generate coverage report
 npm run test:e2e     # Run Playwright E2E tests
-npm run db:generate  # Generate a migration from /db/schema.ts into /db/migrations
-npm run db:migrate   # Apply pending migrations
-npm run db:create-test-dbs  # Create dev + E2E databases (one-time setup)
+npm run db:migrate   # Apply pending migrations (ledger-cli migrate)
 npm run db:list-books  # List books and their IDs
-npm run db:seed -- --book-id 2  # Full reset + seed sample data for a specific book
-npm run mcp:dev      # Start the MCP server over stdio (Rust; needs DATABASE_URL and COUNTERPOISE_API_KEY)
+npm run db:seed      # Delete and recreate the dev database with sample data
+npm run db:seed -- --book-id 2  # Seed sample data into an existing book
+npm run db:seed -- --dataset single --today 2025-12-31  # Pick the dataset and pin the end date
+npm run db:rebuild-lots  # Regenerate investment lots from splits
+npm run mcp:dev      # Start the MCP server over stdio (Rust; needs COUNTERPOISE_API_KEY)
 npm run plaid:link   # Mint a Plaid access token for one bank (sandbox)
-npx drizzle-kit studio  # Open Drizzle Studio (database GUI)
+sqlite3 data/counterpoise.db  # Open the dev database in the SQLite shell
 ```
 
-For book schema changes, use this workflow:
-1. Edit `/db/schema.ts`
-2. Run `npm run db:generate`
-3. Run `npm run db:migrate`
-4. Commit the SQL migration plus the updated snapshot and journal in `/db/migrations/meta/`
-
-Migrations are NOT auto-applied by `getDb()`. Use `runMigrations()` explicitly in scripts; seed and test helpers handle migrations automatically.
+For schema changes, add a new numbered SQL file to `rust-api/db/migrations/`
+(for example `0002_account_notes.sql`), and update the Rust SQL that uses the
+changed columns. Never edit a migration that has run: the server records each
+migration's checksum and refuses to start when a file changes. See
+[guides/database-management.md](guides/database-management.md).
 
 ### Project Structure
 
@@ -860,30 +823,26 @@ Migrations are NOT auto-applied by `getDb()`. Use `runMigrations()` explicitly i
     /securities, /recurring       # Investment & recurring
     /payees, /sync                # Payees & bank sync
     /reports, /search             # Financial reports & search
-  /api/
-    /auth/                        # Authentication
-    /books/                       # Book management
-    /b/[bookId]/                  # Book-scoped API routes
-    /cron/                        # Cron endpoints (recurring, plaid-sync, price-sync)
+/client                           # Client entry and route table (Vite)
 /components
   /ui                             # Reusable UI components
   /accounts, /transactions        # Feature components
   /securities, /sync, /layout     # Domain components
   /reports                        # Financial report components
-/db
-  /schema.ts                      # Unified database schema (meta + book-scoped tables)
-  /index.ts                       # Database connection (getDb)
-  /seed.ts                        # Sample data
 /lib
   /accounting.ts                  # Accounting helpers
   /investments.ts                 # Investment calculations
   /formatters.ts                  # Display formatters
-  /api-auth.ts                    # API authentication
+  /api-client.ts                  # Browser API requests
   /reports.ts                     # Financial report logic
 /hooks
   /useBookId.ts                   # Client hooks (also useIsMobile, useRegisterShortcuts)
 /rust-api
+  /core                           # Shared domain code (also built to WASM)
+  /db                             # Database code; /db/migrations holds the schema
+  /server/src/routes              # API routes
   /server/src/mcp                 # MCP server (AI access to accounting data)
+  /cli                            # ledger-cli: seed, migrate, import, backup
 ```
 
 ## License

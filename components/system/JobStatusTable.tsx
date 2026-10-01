@@ -28,7 +28,14 @@ const STATE_DOT: Record<JobState, string> = {
   unverified: "text-fg-warning",
   failed: "text-fg-danger",
   missing: "text-fg-danger",
+  // Neutral, like unknown: an install without Plaid or Tiingo is normal.
+  not_configured: "text-fg-tertiary",
   unknown: "text-fg-tertiary",
+};
+
+/** The text of a state. Most states show their own name. */
+const STATE_LABEL: Partial<Record<JobState, string>> = {
+  not_configured: "Not configured",
 };
 
 const OVERALL_BADGE: Record<Overall, string> = {
@@ -197,7 +204,9 @@ export function JobStatusTable() {
                     <span className={STATE_DOT[job.state]} aria-hidden>
                       ●
                     </span>{" "}
-                    <span className="text-fg-secondary">{job.state}</span>
+                    <span className="text-fg-secondary">
+                      {STATE_LABEL[job.state] ?? job.state}
+                    </span>
                   </td>
                   <td className="px-4 py-2 text-fg-secondary whitespace-nowrap">
                     {lastSuccess(job.lastOk)}

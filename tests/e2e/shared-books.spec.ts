@@ -1,19 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import postgres from "postgres";
 import { smallBookTest as test, expect } from "./fixtures";
-import { e2eDatabaseUrl } from "./database";
+import { exec, insert } from "../helpers/sql";
 
 test("an owner adds a viewer, and the viewer sees the book read-only", async ({ page, browser, bookId }) => {
   const username = `viewer-${randomUUID().slice(0, 8)}`;
   const token = `e2e-viewer-${randomUUID()}`;
-  const sql = postgres(e2eDatabaseUrl(), { onnotice: () => {} });
   try {
-    const now = new Date();
-    const [user] = await sql`INSERT INTO users (username, password_hash, created_at)
-      VALUES (${username}, 'unused', ${now}) RETURNING id`;
-    await sql`INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
-      VALUES (${createHash("sha256").update(token).digest("hex")}, ${user.id},
-              ${new Date(Date.now() + 86_400_000)}, ${now})`;
+    const user = await insert<{ id: number }>("users", { username, passwordHash: "unused" });
+    await insert("sessions", {
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+      userId: user.id,
+      expiresAt: new Date(Date.now() + 86_400_000),
+    });
 
     // The owner (the default E2E user) adds the viewer from Settings.
     await page.goto(`/b/${bookId}/transactions`);
@@ -47,7 +45,6 @@ test("an owner adds a viewer, and the viewer sees the book read-only", async ({ 
     await expect(viewer.getByLabel(/^Edit /)).toHaveCount(0);
     await context.close();
   } finally {
-    await sql`DELETE FROM users WHERE username = ${username}`;
-    await sql.end();
+    await exec("DELETE FROM users WHERE username = $1", [username]);
   }
 });

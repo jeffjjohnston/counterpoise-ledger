@@ -14,9 +14,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::{NaiveDate, NaiveDateTime, SecondsFormat, Utc};
+use ledger_db::engine::{Db, DbConnection, DbPool};
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
-use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::QueryBuilder;
 use std::collections::{HashMap, HashSet};
 
 /// The filter of `accounts_with_balances()`.
@@ -120,7 +121,7 @@ struct AccountWithChildren {
 }
 
 async fn account_with_children(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     account_id: i32,
     failure_message: &'static str,
@@ -162,7 +163,7 @@ fn is_investment_account(account_type: &str, subtype: Option<&str>) -> bool {
 /// account. The caller's transaction also holds the investment account's own
 /// write, so the pair changes together.
 async fn ensure_investment_cash_account(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     account_id: i32,
     account_name: &str,
@@ -222,9 +223,7 @@ pub(crate) async fn create_account(
     require_account_parent(&state.pool, book.book_id, input.parent_id, FAILURE).await?;
     let parent_id = input.parent_id.map(|id| id as i32);
 
-    let mut transaction = state
-        .pool
-        .begin()
+    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
     let now = Utc::now().naive_utc();
@@ -295,9 +294,7 @@ pub(crate) async fn update_account(
     let account_id = account_path_id(&raw_id)
         .ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
 
-    let mut transaction = state
-        .pool
-        .begin()
+    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
     let query = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = $1 AND book_id = $2");
@@ -310,7 +307,7 @@ pub(crate) async fn update_account(
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Account not found"))?;
 
     let now = Utc::now().naive_utc();
-    let mut update = QueryBuilder::<Postgres>::new("UPDATE accounts SET updated_at = ");
+    let mut update = QueryBuilder::<Db>::new("UPDATE accounts SET updated_at = ");
     update.push_bind(now);
     if let Some(name) = &input.name {
         update.push(", name = ").push_bind(name);
@@ -535,7 +532,7 @@ fn account_tree(rows: Vec<AccountRow>, balances: Vec<(i32, i32, i32)>) -> Vec<Ac
 /// The accounts that `query` selects, ordered by type and then name, and the
 /// split total and split count of each account that has splits.
 async fn account_rows(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     query: &AccountQuery,
 ) -> sqlx::Result<(Vec<AccountRow>, Vec<(i32, i32, i32)>)> {
@@ -553,22 +550,36 @@ async fn account_rows(
     }
     let rows = account_query.fetch_all(pool).await?;
 
-    let mut balance_query = QueryBuilder::<Postgres>::new(
+    let mut balance_query = QueryBuilder::<Db>::new("");
+    push_balance_query(&mut balance_query, book_id, query.as_of_date.as_deref());
+    let balances: Vec<(i32, i32, i32)> = balance_query.build_query_as().fetch_all(pool).await?;
+    Ok((rows, balances))
+}
+
+/// Pushes the query for the split total and the split count of each account
+/// of the book that has splits. With `as_of_date`, it counts only the splits
+/// whose transaction has an effective date on or before that date.
+///
+/// Only the date filter reads the transaction. Without a date, the query
+/// reads only the index idx_transaction_splits_book_account. On a large book,
+/// the join alone made the query more than five times slower.
+fn push_balance_query(builder: &mut QueryBuilder<'_, Db>, book_id: i32, as_of_date: Option<&str>) {
+    builder.push(
         "SELECT s.account_id, CAST(SUM(s.amount) AS integer), CAST(COUNT(*) AS integer)
-         FROM transaction_splits s LEFT JOIN transactions t ON t.id = s.transaction_id
-         WHERE s.book_id = ",
+         FROM transaction_splits s",
     );
-    balance_query.push_bind(book_id);
-    if let Some(as_of_date) = &query.as_of_date {
-        balance_query
+    if as_of_date.is_some() {
+        builder.push(" LEFT JOIN transactions t ON t.id = s.transaction_id");
+    }
+    builder.push(" WHERE s.book_id = ").push_bind(book_id);
+    if let Some(as_of_date) = as_of_date {
+        builder
             .push(" AND (CASE WHEN t.is_floating THEN ")
             .push_bind(local_today())
             .push(" ELSE t.date END) <= ")
-            .push_bind(as_of_date);
+            .push_bind(as_of_date.to_owned());
     }
-    balance_query.push(" GROUP BY s.account_id");
-    let balances: Vec<(i32, i32, i32)> = balance_query.build_query_as().fetch_all(pool).await?;
-    Ok((rows, balances))
+    builder.push(" GROUP BY s.account_id");
 }
 
 /// A flat list of account
@@ -577,7 +588,7 @@ async fn account_rows(
 /// `list_accounts` and `get_account_tree` shape this list; `GET /accounts`
 /// gives a tree that drops such an account, so the tools cannot use it.
 pub(crate) async fn accounts_with_balances(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     query: &AccountQuery,
 ) -> sqlx::Result<Vec<Value>> {
@@ -626,7 +637,7 @@ pub(crate) async fn list_accounts(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::parse_account_query;
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
     use serde_json::{Value, json};
@@ -657,5 +668,102 @@ mod tests {
                     .unwrap();
             assert_eq!(body, expected);
         }
+    }
+
+    /// Book 1: checking (1), salary (2, income), groceries (3, expense) and
+    /// an inactive expense (4). One transaction floats: its effective date is
+    /// today. Book 2 has an account (5) with splits that book 1 must not
+    /// count.
+    pub(crate) async fn balance_fixture() -> ledger_db::testing::TempDatabase {
+        let database = ledger_db::testing::TempDatabase::new(1).await;
+        let now = chrono::Utc::now().naive_utc();
+        for sql in [
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'u', 'h', $1)",
+            "INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES (1, 1, 'A', $1, $1), (2, 1, 'B', $1, $1)",
+            "INSERT INTO accounts (id, book_id, name, type, is_active, created_at, updated_at) VALUES
+               (1, 1, 'Checking', 'asset', 1, $1, $1), (2, 1, 'Salary', 'income', 1, $1, $1),
+               (3, 1, 'Groceries', 'expense', 1, $1, $1), (4, 1, 'Old', 'expense', 0, $1, $1),
+               (5, 2, 'Other', 'expense', 1, $1, $1)",
+            "INSERT INTO transactions (id, book_id, date, is_floating, created_at, updated_at) VALUES
+               (1, 1, '2025-01-10', 0, $1, $1), (2, 1, '2025-02-01', 0, $1, $1),
+               (3, 1, '2024-12-31', 1, $1, $1), (4, 1, '2025-03-01', 0, $1, $1),
+               (5, 2, '2025-01-10', 0, $1, $1)",
+            "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) VALUES
+               (1, 1, 1, 500000), (1, 1, 2, -500000), (1, 2, 3, 1234), (1, 2, 1, -1234),
+               (1, 3, 3, 700), (1, 3, 1, -700), (1, 4, 4, 100), (1, 4, 1, -100),
+               (2, 5, 5, 999), (2, 5, 5, -1)",
+        ] {
+            sqlx::query(sql)
+                .bind(now)
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
+        database
+    }
+
+    /// The `detail` column of each step of the query plan.
+    pub(crate) async fn plan(
+        pool: &ledger_db::engine::DbPool,
+        push: impl FnOnce(&mut sqlx::QueryBuilder<'_, ledger_db::engine::Db>),
+    ) -> Vec<String> {
+        let mut query = sqlx::QueryBuilder::new("EXPLAIN QUERY PLAN ");
+        push(&mut query);
+        query
+            .build_query_as::<(i64, i64, i64, String)>()
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect()
+    }
+
+    async fn balances(
+        pool: &ledger_db::engine::DbPool,
+        as_of_date: Option<&str>,
+    ) -> Vec<(i32, i32, i32)> {
+        let mut query = sqlx::QueryBuilder::new("");
+        super::push_balance_query(&mut query, 1, as_of_date);
+        let mut rows: Vec<(i32, i32, i32)> = query.build_query_as().fetch_all(pool).await.unwrap();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Without a date, the query does not read the transactions, and a date
+    /// after every transaction (the floating one included) gives the same
+    /// totals and counts.
+    #[tokio::test]
+    async fn balances_with_and_without_a_date_agree() {
+        let database = balance_fixture().await;
+        let pool = database.pool();
+        let all = vec![
+            (1, 497_966, 4),
+            (2, -500_000, 1),
+            (3, 1_934, 2),
+            (4, 100, 1),
+        ];
+        assert_eq!(balances(pool, None).await, all);
+        assert_eq!(balances(pool, Some("9999-12-31")).await, all);
+        // The floating transaction is dated today, after this date.
+        assert_eq!(
+            balances(pool, Some("2025-01-31")).await,
+            vec![(1, 500_000, 1), (2, -500_000, 1)]
+        );
+    }
+
+    /// Without a date, the query reads only the covering index of
+    /// migration 0002: no split row and no transaction. The join to the
+    /// transactions made the account list five times slower on a large book.
+    #[tokio::test]
+    async fn balances_without_a_date_read_only_the_covering_index() {
+        let database = balance_fixture().await;
+        assert_eq!(
+            plan(database.pool(), |query| super::push_balance_query(
+                query, 1, None
+            ))
+            .await,
+            ["SEARCH s USING COVERING INDEX idx_transaction_splits_book_account (book_id=?)"]
+        );
     }
 }

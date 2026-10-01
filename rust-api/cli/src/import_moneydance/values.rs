@@ -155,26 +155,7 @@ pub fn is_transaction_reconciled(item: &Item) -> bool {
 
 /// The payee normalization of `normalizePayeeName()`: trim, collapse
 /// whitespace, and straighten quote characters. It does not change case.
-pub fn normalize_name(name: &str) -> String {
-    let mut normalized = String::with_capacity(name.len());
-    let mut space = false;
-    for character in name.trim_matches(is_js_whitespace).chars() {
-        if is_js_whitespace(character) {
-            space = true;
-            continue;
-        }
-        if space {
-            normalized.push(' ');
-            space = false;
-        }
-        normalized.push(match character {
-            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' | '\u{0060}'
-            | '\u{00B4}' => '\'',
-            other => other,
-        });
-    }
-    normalized
-}
+pub use ledger_core::names::normalize_payee_name as normalize_name;
 
 /// Trimmed text, or `None` when it is blank or missing.
 pub fn normalize_optional_text(value: Option<&str>) -> Option<String> {

@@ -1,15 +1,14 @@
-import { asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-  accounts, books, plaidTokens, plaidTransactionReconciliation, transactions, typesafeDecisions,
-  typesafeEvaluations,
-} from "../../db/schema";
 import { toDateString } from "../../lib/formatters";
+import type {
+  Account, PlaidTransactionReconciliation, Transaction, TypeSafeDecision, TypeSafeEvaluation,
+} from "../../types/db";
 import {
   addBookMember, createAccount, createBook, createPlaidAccount, createPlaidReconciliation,
-  createPlaidToken, createTransactionWithSplits, createUser, db, resetTestDatabase, setupTestDatabase,
+  createPlaidToken, createTransactionWithSplits, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { exec, insert, insertRows, row, rows } from "../helpers/sql";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 
@@ -71,7 +70,7 @@ describe("Plaid read HTTP parity", () => {
     const card = await createAccount({ name: "Card", type: "liability" });
     const zeta = await createPlaidToken({ financialInstitution: "Zeta", itemId: "item-zeta", accessToken: "t" });
     const lastSyncedAt = new Date("2025-03-04T05:06:07.890Z");
-    await db.update(plaidTokens).set({ lastSyncedAt, lastError: "Plaid said no" }).where(eq(plaidTokens.id, zeta.id));
+    await exec("UPDATE plaid_tokens SET last_synced_at = $1, last_error = $2 WHERE id = $3", [lastSyncedAt, "Plaid said no", zeta.id]);
     const cardLink = await createPlaidAccount({ tokenId: zeta.id, plaidAccountId: "pa-card", name: "Card", mask: "4242", type: "credit", counterpoiseAccountId: card.id });
     await createPlaidAccount({ tokenId: zeta.id, plaidAccountId: "pa-unmapped", name: "Unmapped", type: "depository" });
     for (const [plaidTransactionId, status, reviewReason] of [
@@ -170,8 +169,8 @@ describe("Plaid read HTTP parity", () => {
       await createPlaidReconciliation({ plaidAccountLinkId: linkId, plaidTransactionId: id, date: "2025-07-01", amountCents: 1, name: id, resolutionStatus: status, reviewReason: review });
     }
     const [checkingRow, cardRow] = await Promise.all([checking.account.id, card.account.id].map(async (id) => {
-      const [row] = await db.select().from(accounts).where(eq(accounts.id, id));
-      return { ...row, createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString() };
+      const account = await row<Account>("SELECT * FROM accounts WHERE id = $1", [id]);
+      return { ...account, createdAt: account.createdAt.toISOString(), updatedAt: account.updatedAt.toISOString() };
     }));
     const epoch = "1970-01-01T00:00:00.000Z";
     const display = (reconId: number, date: string, name: string, payee: string, amount: number, account: typeof checkingRow, category: string | null) => {
@@ -209,7 +208,7 @@ describe("Plaid read HTTP parity", () => {
       amountCents: 500, name: "COFFEE SHOP", merchantName: "Coffee Shop", originalDescription: "COFFEE SHOP #1234",
       categoryPrimary: "FOOD_AND_DRINK", resolutionStatus: "matched", matchedTransactionId: txn.id,
     });
-    const [stored] = await db.select().from(plaidTransactionReconciliation).where(eq(plaidTransactionReconciliation.id, recon.id));
+    const stored = await row<PlaidTransactionReconciliation>("SELECT * FROM plaid_transaction_reconciliation WHERE id = $1", [recon.id]);
     expect(await ok(client, `/api/b/1/transactions/${txn.id}/plaid`)).toEqual({
       id: recon.id, plaidTransactionId: "plaid-txn-1", date: "2025-06-02", authorizedDate: "2025-06-01", amountCents: 500,
       name: "COFFEE SHOP", merchantName: "Coffee Shop", originalDescription: "COFFEE SHOP #1234", pending: false,
@@ -233,23 +232,23 @@ describe("Plaid read HTTP parity", () => {
       date: "2025-06-01", isReconciled: true,
       splits: [{ accountId: checking.account.id, amount: -2000 }, { accountId: savings.account.id, amount: 2000 }],
     });
-    const rows = [];
+    const linked = [];
     for (const [plaidAccount, id] of [[checking.plaidAccount, "out"], [savings.plaidAccount, "in"]] as const) {
-      rows.push(await createPlaidReconciliation({
+      linked.push(await createPlaidReconciliation({
         plaidAccountLinkId: plaidAccount.id, plaidTransactionId: id, date: "2025-06-01", amountCents: 2000, name: id,
         resolutionStatus: "matched", reviewReason: "plaid_modified", matchedTransactionId: transfer.id,
       }));
     }
-    await db.update(plaidTransactionReconciliation).set({ resolvedAt: new Date(), reviewMetadataJson: "{}" });
+    await exec("UPDATE plaid_transaction_reconciliation SET resolved_at = $1, review_metadata_json = $2", [new Date(), "{}"]);
 
     expect(await ok(client, `/api/b/1/transactions/${transfer.id}/plaid/unlink`, { method: "POST" })).toEqual({ success: true });
-    const staged = await db.select().from(plaidTransactionReconciliation).orderBy(asc(plaidTransactionReconciliation.id));
-    expect(staged.map((row) => row.id)).toEqual(rows.map((row) => row.id));
-    for (const row of staged) {
-      expect(row).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null, reviewReason: null, reviewMetadataJson: null, resolvedAt: null });
-      expect(Math.abs(row.updatedAt.getTime() - Date.now())).toBeLessThan(60_000);
+    const staged = await rows<PlaidTransactionReconciliation>("SELECT * FROM plaid_transaction_reconciliation ORDER BY id");
+    expect(staged.map((item) => item.id)).toEqual(linked.map((item) => item.id));
+    for (const item of staged) {
+      expect(item).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null, reviewReason: null, reviewMetadataJson: null, resolvedAt: null });
+      expect(Math.abs(item.updatedAt.getTime() - Date.now())).toBeLessThan(60_000);
     }
-    const [stored] = await db.select().from(transactions).where(eq(transactions.id, transfer.id));
+    const stored = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [transfer.id]);
     expect(stored).toMatchObject({ isReconciled: false, updatedBy: 1 });
 
     const path = `/api/b/1/transactions/${transfer.id}/plaid/unlink`;
@@ -270,12 +269,12 @@ describe("Plaid read HTTP parity", () => {
       resolutionStatus: "matched", matchedTransactionId: transactionId,
     });
     const [firstRow, secondRow] = [await recon("a", first.id), await recon("b", second.id)];
-    const evaluation = async (fingerprint: string) => (await db.insert(typesafeEvaluations).values({
+    const evaluation = async (fingerprint: string) => insert<TypeSafeEvaluation>("typesafe_evaluations", {
       bookId: 1, reconciliationId: firstRow.id, linkId: checking.plaidAccount.id, revision: 0, fingerprint,
-      attempt: fingerprint, snapshot: {} as never, status: "ready",
-    }).returning())[0];
+      attempt: fingerprint, snapshot: {}, status: "ready",
+    });
     const [e1, e2] = [await evaluation("f1"), await evaluation("f2")];
-    await db.insert(typesafeDecisions).values([
+    await insertRows("typesafe_decisions", [
       { bookId: 1, reconciliationId: firstRow.id, evaluationId: e1.id, action: "match", transactionId: first.id },
       { bookId: 1, reconciliationId: firstRow.id, evaluationId: e1.id, action: "match", transactionId: first.id },
       { bookId: 1, reconciliationId: 77, evaluationId: e2.id, action: "match", transactionId: first.id },
@@ -283,7 +282,7 @@ describe("Plaid read HTTP parity", () => {
       { bookId: 1, reconciliationId: firstRow.id, evaluationId: e2.id, action: "create", transactionId: first.id },
       { bookId: 1, reconciliationId: secondRow.id, evaluationId: e2.id, action: "match", transactionId: second.id },
     ]);
-    const unlinks = async () => (await db.select().from(typesafeDecisions).where(eq(typesafeDecisions.action, "unlink")).orderBy(asc(typesafeDecisions.id)))
+    const unlinks = async () => (await rows<TypeSafeDecision>("SELECT * FROM typesafe_decisions WHERE action = $1 ORDER BY id", ["unlink"]))
       .map(({ bookId, reconciliationId, evaluationId, transactionId, suggestionVisible, acceptedSuggestion }) =>
         ({ bookId, reconciliationId, evaluationId, transactionId, suggestionVisible, acceptedSuggestion }));
 
@@ -291,7 +290,7 @@ describe("Plaid read HTTP parity", () => {
     await ok(client, `/api/b/1/transactions/${second.id}/plaid/unlink`, { method: "POST" });
     expect(await unlinks()).toEqual([]);
 
-    await db.update(books).set({ typesafeReconciliationEnabled: true }).where(eq(books.id, 1));
+    await exec("UPDATE books SET typesafe_reconciliation_enabled = $1 WHERE id = $2", [true, 1]);
     await ok(client, `/api/b/1/transactions/${first.id}/plaid/unlink`, { method: "POST" });
     expect(await unlinks()).toEqual([
       { bookId: 1, reconciliationId: firstRow.id, evaluationId: e1.id, transactionId: first.id, suggestionVisible: false, acceptedSuggestion: false },

@@ -134,7 +134,7 @@ pub(crate) async fn call(
         "list_books" => books::list_books(caller).await,
         "create_book" => books::create_book(caller, arguments).await,
         "update_book" => books::update_book(caller, arguments).await,
-        "create_demo_book" => books::create_demo_book(caller).await,
+        "create_demo_book" => books::create_demo_book(caller, arguments).await,
         "delete_book" => books::delete_book(caller, arguments).await,
         "list_book_members" => book_members::list(caller, arguments).await,
         "add_book_member" => book_members::add(caller, arguments).await,

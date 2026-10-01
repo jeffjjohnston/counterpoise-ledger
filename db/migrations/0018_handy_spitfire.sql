@@ -1,1 +1,0 @@
-ALTER TABLE "recurring_rules" ADD COLUMN "business_days_only" boolean DEFAULT false NOT NULL;

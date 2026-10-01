@@ -1,8 +1,8 @@
 import { defineConfig } from "@playwright/test";
 import { resolve } from "path";
-import { e2eDatabaseUrl } from "./tests/e2e/database";
+import { e2eDatabasePath } from "./tests/e2e/database";
 
-const e2eDbUrl = e2eDatabaseUrl();
+const e2eDbPath = e2eDatabasePath();
 const e2eStorageStatePath = resolve("./test-results/e2e-storage-state.json");
 
 export default defineConfig({
@@ -26,11 +26,11 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 180000,
       env: {
-        DATABASE_URL: e2eDbUrl,
+        // The server creates and migrates the file when it starts, before
+        // globalSetup writes the E2E user and book.
+        DATABASE_PATH: e2eDbPath,
+        DATABASE_URL: "",
         TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        // Playwright starts web servers before globalSetup migrates the E2E
-        // database. Compile SQLx macros from the checked-in query cache.
-        SQLX_OFFLINE: "true",
         RUST_BIND: "127.0.0.1:3001",
         COUNTERPOISE_STATIC_DIR: "build",
         // The E2E database is seeded with users, so the default rule would close

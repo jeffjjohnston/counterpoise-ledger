@@ -83,10 +83,17 @@ pub(super) async fn update_book(
     Ok(ok(&book))
 }
 
-pub(super) async fn create_demo_book(caller: &Caller) -> ToolResult<CallToolResult> {
+/// The route chooses the household dataset when no body names one.
+pub(super) async fn create_demo_book(
+    caller: &Caller,
+    arguments: &Map<String, Value>,
+) -> ToolResult<CallToolResult> {
     caller.user().await?;
+    let body = arguments
+        .get("dataset")
+        .map(|dataset| json!({ "dataset": dataset }));
     let book = caller
-        .request(Method::POST, "/api/books/demo", None)
+        .request(Method::POST, "/api/books/demo", body.as_ref())
         .await?;
     Ok(ok(&book))
 }

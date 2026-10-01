@@ -13,8 +13,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{NaiveDateTime, SecondsFormat, Utc};
+use ledger_db::engine::Db;
+use ledger_db::locks::FOR_UPDATE;
 use serde_json::{Value, json};
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::{FromRow, Transaction};
 use std::time::Instant;
 
 const CANNOT_ADD: &str = "Cannot add that user";
@@ -92,7 +94,7 @@ fn target_id(raw: &str) -> Result<i32, ApiError> {
 }
 
 async fn get_member(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction<'_, Db>,
     book_id: i32,
     user_id: i32,
     failure: &'static str,
@@ -106,13 +108,13 @@ async fn get_member(
 }
 
 async fn lock_members(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction<'_, Db>,
     book_id: i32,
     failure: &'static str,
 ) -> Result<Vec<LockedMember>, ApiError> {
-    sqlx::query_as::<_, LockedMember>(
-        "SELECT user_id, role FROM book_members WHERE book_id = $1 ORDER BY user_id FOR UPDATE",
-    )
+    sqlx::query_as::<_, LockedMember>(&format!(
+        "SELECT user_id, role FROM book_members WHERE book_id = $1 ORDER BY user_id{FOR_UPDATE}"
+    ))
     .bind(book_id)
     .fetch_all(tx.as_mut())
     .await
@@ -188,9 +190,7 @@ pub(crate) async fn add_member(
         state
             .rate_limits
             .enforce(Scope::BookMemberAdd, &keys, Instant::now())?;
-        let mut tx = state
-            .pool
-            .begin()
+        let mut tx = ledger_db::locks::begin_pool(&state.pool)
             .await
             .map_err(|cause| internal_error(cause, "Failed to add member"))?;
         let rows = lock_members(&mut tx, auth.book_id, "Failed to add member").await?;
@@ -239,9 +239,7 @@ pub(crate) async fn change_member(
     let target = target_id(&user_id)?;
     let body = parse_json_body(&body, "Failed to change member")?;
     let new_role = role(body.get("role"))?;
-    let mut tx = state
-        .pool
-        .begin()
+    let mut tx = ledger_db::locks::begin_pool(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, "Failed to change member"))?;
     let rows = lock_members(&mut tx, auth.book_id, "Failed to change member").await?;
@@ -287,9 +285,7 @@ pub(crate) async fn remove_member(
     if target != auth.user_id && auth.role != BookRole::Owner {
         return Err(error(StatusCode::FORBIDDEN, "Only an owner can do this"));
     }
-    let mut tx = state
-        .pool
-        .begin()
+    let mut tx = ledger_db::locks::begin_pool(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, "Failed to remove member"))?;
     let rows = lock_members(&mut tx, auth.book_id, "Failed to remove member").await?;
@@ -319,28 +315,25 @@ pub(crate) async fn remove_member(
 mod tests {
     use super::{NOT_MEMBER, get_member};
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+
     use serde_json::{Value, json};
-    use sqlx::postgres::PgPoolOptions;
 
     #[tokio::test]
     async fn missing_joined_user_returns_not_found() {
-        let Some(url) = crate::state::test_database_url() else {
-            return;
-        };
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
-        let mut tx = pool.begin().await.unwrap();
+        let database = ledger_db::testing::TempDatabase::new(1).await;
+        let pool = database.pool().clone();
+        let mut tx = ledger_db::locks::begin_pool(&pool).await.unwrap();
         sqlx::query("CREATE TEMP TABLE book_members (book_id integer, user_id integer, role text, created_at timestamp)")
             .execute(tx.as_mut()).await.unwrap();
         sqlx::query("CREATE TEMP TABLE users (id integer, username text)")
             .execute(tx.as_mut())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO book_members VALUES (1, 7, 'viewer', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')")
-            .execute(tx.as_mut()).await.unwrap();
+        sqlx::query("INSERT INTO book_members VALUES (1, 7, 'viewer', $1)")
+            .bind(chrono::Utc::now().naive_utc())
+            .execute(tx.as_mut())
+            .await
+            .unwrap();
         let response = get_member(&mut tx, 1, 7, "Failed to change member")
             .await
             .unwrap_err()

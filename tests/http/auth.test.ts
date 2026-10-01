@@ -1,10 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createHash, randomBytes } from "node:crypto";
-import { eq } from "drizzle-orm";
-import { apiKeys, sessions, users } from "../../db/schema";
 import { hashPassword } from "../helpers/password";
 import { generateApiKey, hashApiKey } from "../helpers/api-keys";
-import { db, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { count, exec, insert, scalar } from "../helpers/sql";
 import { startHttpTestServer } from "../helpers/http-parity";
 
 describe("auth HTTP parity", () => {
@@ -46,7 +45,7 @@ describe("auth HTTP parity", () => {
   });
 
   it("authenticates an existing Node password hash and keeps cookie-only credential routes", async () => {
-    await db.update(users).set({ passwordHash: await hashPassword("oldpassword") }).where(eq(users.id, 1));
+    await exec("UPDATE users SET password_hash = $1 WHERE id = $2", [await hashPassword("oldpassword"), 1]);
     const wrong = await request("/api/auth/login", json("POST", { username: "testuser", password: "wrong" }));
     expect([wrong.status, await wrong.json()]).toEqual([401, { error: "Invalid username or password" }]);
     const login = await request("/api/auth/login", json("POST", { username: "testuser", password: "oldpassword" }));
@@ -70,7 +69,7 @@ describe("auth HTTP parity", () => {
     const key = await minted.json() as { id: number; key: string; name: string; keyPrefix: string };
     expect(key).toMatchObject({ name: "Phone", keyPrefix: key.key.slice(0, 8) });
     expect(key.key).toMatch(/^cpk_[a-f0-9]{48}$/);
-    expect((await db.select().from(apiKeys).where(eq(apiKeys.id, key.id)))[0].keyHash).not.toContain(key.key);
+    expect(await scalar<string>("SELECT key_hash FROM api_keys WHERE id = $1", [key.id])).not.toContain(key.key);
     const listed = await request("/api/auth/api-keys", { headers: { cookie } });
     expect(await listed.json()).toMatchObject([{ id: key.id, name: "Phone", keyPrefix: key.keyPrefix }]);
     const whitespaceName = await request("/api/auth/api-keys", json("POST", { name: "\uFEFF" }, cookie));
@@ -83,25 +82,25 @@ describe("auth HTTP parity", () => {
     const revoked = await request(`/api/auth/api-keys/+${key.id}`, { method: "DELETE", headers: { cookie } });
     expect(await revoked.json()).toEqual({ success: true });
     expect((await request("/api/auth/me", { headers: bearer })).status).toBe(401);
-    expect((await db.select().from(sessions)).length).toBe(1);
+    expect(await count("sessions")).toBe(1);
   });
 
   it("accepts existing Node session tokens and API key hashes", async () => {
     const token = randomBytes(32).toString("hex");
-    await db.insert(sessions).values({
+    await insert("sessions", {
       userId: 1, tokenHash: createHash("sha256").update(token).digest("hex"),
       expiresAt: new Date(Date.now() + 3_600_000),
     });
     const cookie = `counterpoise_session=${token}`;
     expect(await (await request("/api/auth/me", { headers: { cookie } })).json()).toMatchObject({ id: 1, username: "testuser" });
     const key = generateApiKey();
-    await db.insert(apiKeys).values({ userId: 1, name: "Existing", keyHash: await hashApiKey(key), keyPrefix: key.slice(0, 8) });
+    await insert("api_keys", { userId: 1, name: "Existing", keyHash: await hashApiKey(key), keyPrefix: key.slice(0, 8) });
     expect(await (await request("/api/auth/me", { headers: { authorization: `Bearer ${key}` } })).json()).toMatchObject({ id: 1, username: "testuser" });
   });
 
   it("uses the last valid decoded duplicate session cookie for identity and logout", async () => {
     const token = randomBytes(32).toString("hex");
-    await db.insert(sessions).values({
+    await insert("sessions", {
       userId: 1, tokenHash: createHash("sha256").update(token).digest("hex"),
       expiresAt: new Date(Date.now() + 3_600_000),
     });
@@ -168,14 +167,14 @@ describe("auth HTTP parity", () => {
   });
 
   it("serializes bootstrap registration so only one first account can be created", async () => {
-    await db.delete(users);
+    await exec("DELETE FROM users");
     const bootstrap = await startHttpTestServer({ REGISTRATION_ENABLED: "" });
     try {
       const responses = await Promise.all(["alice", "bob"].map((username) =>
         fetch(`${bootstrap.baseUrl}/api/auth/register`, json("POST", { username, password: "password123" }))
       ));
       expect(responses.map((response) => response.status).sort()).toEqual([200, 403]);
-      expect((await db.select().from(users)).length).toBe(1);
+      expect(await count("users")).toBe(1);
       expect(await (await fetch(`${bootstrap.baseUrl}/api/auth/registration-open`)).json()).toEqual({ open: false });
     } finally {
       await bootstrap.stop();

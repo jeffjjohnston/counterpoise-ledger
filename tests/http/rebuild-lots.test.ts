@@ -1,14 +1,13 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { sql } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { backfillLots } from "../../scripts/rebuild-lots";
 import {
   createAccount, createBook, createInvestmentSplit, createSecurity, createTransactionWithSplits,
-  db, resetTestDatabase, setupTestDatabase,
+  resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
-import { workerDatabaseUrl } from "../helpers/database-safety";
+import { rows, scalar, script } from "../helpers/sql";
+import { workerDatabasePath } from "../helpers/test-database";
 
 const run = promisify(execFile);
 const CLI = path.resolve("rust-api/target/debug/ledger-cli");
@@ -18,7 +17,8 @@ async function cli(...args: string[]) {
   return run(CLI, args, {
     env: {
       ...process.env,
-      DATABASE_URL: workerDatabaseUrl(),
+      DATABASE_PATH: workerDatabasePath(),
+      DATABASE_URL: "",
       TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
     },
   });
@@ -30,27 +30,28 @@ async function rustRebuild(...args: string[]) {
 }
 
 /**
- * Every lot and allocation, in insertion order, without the serial IDs that
- * differ between two runs. An allocation names its lot by the buy split that
- * opened it, which is unique per lot.
+ * Every lot and allocation, without the serial IDs, which a rebuild
+ * regenerates. The rows are in pair order, and in insertion order inside one
+ * pair. A rebuild writes each pair in replay order, but the writers visit
+ * the pairs in different orders. An allocation names its lot by the buy
+ * split that opened it, which is unique per lot.
  */
 async function snapshot() {
-  const lots = await db.execute(sql`
-    select book_id, account_id, security_id, acquired_date, opened_split_id,
+  const lots = await rows(`
+    SELECT book_id, account_id, security_id, acquired_date, opened_split_id,
            opened_transaction_id, closed_transaction_id, original_shares_micros,
            original_basis_cents, remaining_shares_micros, remaining_basis_cents
-    from investment_lots order by id`);
-  const allocations = await db.execute(sql`
-    select a.book_id, l.opened_split_id, a.sell_split_id, a.transaction_id,
-           a.shares_micros, a.basis_cents, a.proceeds_cents
-    from investment_lot_allocations a join investment_lots l on l.id = a.lot_id
-    order by a.id`);
-  return { lots: [...lots], allocations: [...allocations] };
+    FROM investment_lots ORDER BY book_id, account_id, security_id, id`);
+  const allocations = await rows(`
+    SELECT a.book_id, l.account_id, l.security_id, l.opened_split_id, a.sell_split_id,
+           a.transaction_id, a.shares_micros, a.basis_cents, a.proceeds_cents
+    FROM investment_lot_allocations a JOIN investment_lots l ON l.id = a.lot_id
+    ORDER BY a.book_id, l.account_id, l.security_id, a.id`);
+  return { lots, allocations };
 }
 
-/** Pairs the seed and the importer do not produce. The seed and the import
- * come from `ledger-cli`; the TypeScript backfill still runs in the Docker
- * entrypoint, so both backfills must write the same lots. */
+/** Pairs that the seed and the importer do not produce, in book 1. The rows
+ * come from node:sqlite, so no lots exist until a rebuild writes them. */
 async function createEdgeCases() {
   const brokerage = await createAccount({ name: "Edge Brokerage", type: "asset", subtype: "investment" });
   const ira = await createAccount({ name: "Edge IRA", type: "asset", subtype: "investment" });
@@ -79,32 +80,44 @@ async function createEdgeCases() {
   return { brokerage, ira };
 }
 
-describe("rebuild-lots parity between the TypeScript script and the Rust CLI", () => {
+describe("ledger-cli rebuild-lots", () => {
   beforeAll(async () => { await setupTestDatabase(); }, 120_000);
   beforeEach(async () => { await resetTestDatabase(); });
 
-  it("writes identical lots and allocations for seeded, imported, and edge-case books", async () => {
-    await cli("seed", "--book-id", "1");
+  it("rewrites the lots and allocations of seeded, imported, and edge-case books unchanged", async () => {
+    // The deploy backfill writes the edge-case pairs: no allocation exists yet.
     await createEdgeCases();
+    expect((await rustRebuild()).stdout.trim()).toBe("Lot rebuild: 2 pair(s) across 1 book(s).");
+    // The seed and the importer write the lots of their own books.
+    const seeded = await createBook({ name: "Seeded" });
+    await cli("seed", "--book-id", String(seeded.id));
     const imported = await createBook({ name: "Imported" });
     await cli(
       "import-moneydance", path.resolve("tests/fixtures/moneydance-sample.json"), "--book-id", String(imported.id)
     );
 
-    const node = await backfillLots(db, { force: true });
     const expected = await snapshot();
     expect(expected.lots.length).toBeGreaterThan(20);
     expect(expected.allocations.length).toBeGreaterThan(5);
-    expect(expected.lots.some((lot) => lot.closed_transaction_id !== null)).toBe(true);
+    expect(expected.lots.some((lot) => lot.closedTransactionId !== null)).toBe(true);
+    for (const book of [1, seeded.id, imported.id]) {
+      expect(expected.lots.some((lot) => lot.bookId === book), `lots of book ${book}`).toBe(true);
+    }
+    const lotIds = await rows<{ id: number }>("SELECT id FROM investment_lots ORDER BY id");
 
+    // A forced rebuild deletes every lot and writes each pair again.
+    const pairs = await scalar<number>(`
+      SELECT COUNT(*) FROM (SELECT DISTINCT book_id, account_id, security_id FROM investment_splits
+        WHERE action IN ('buy', 'sell') AND account_id IS NOT NULL)`);
     const { stdout } = await rustRebuild("--force");
-    expect(stdout.trim()).toBe(
-      `Lot rebuild: ${node.pairsRebuilt} pair(s) across ${node.booksProcessed} book(s).`
-    );
+    expect(stdout.trim()).toBe(`Lot rebuild: ${pairs} pair(s) across 3 book(s).`);
+    const rebuiltIds = await rows<{ id: number }>("SELECT id FROM investment_lots ORDER BY id");
+    expect(rebuiltIds).toHaveLength(lotIds.length);
+    expect(rebuiltIds).not.toEqual(lotIds);
     expect(await snapshot()).toEqual(expected);
   }, 120_000);
 
-  it("keeps the TypeScript guard: skip when allocations exist or nothing trades", async () => {
+  it("keeps the deploy guard: skip when allocations exist or nothing trades", async () => {
     expect((await rustRebuild()).stdout.trim()).toBe("Lot rebuild: already populated, skipping.");
     await createEdgeCases();
     expect((await rustRebuild()).stdout.trim()).toBe("Lot rebuild: 2 pair(s) across 1 book(s).");
@@ -118,22 +131,14 @@ describe("rebuild-lots parity between the TypeScript script and the Rust CLI", (
     expect(brokerage.id).toBeLessThan(ira.id);
     // Pairs rebuild in account order, so the brokerage pair is written before
     // this trigger refuses the IRA pair.
-    await db.execute(sql.raw(`
-      create function refuse_edge_lot() returns trigger language plpgsql as $$
-      begin
-        if new.account_id = ${ira.id} then raise exception 'refused for the test'; end if;
-        return new;
-      end $$;
-      create trigger refuse_edge_lot before insert on investment_lots
-        for each row execute function refuse_edge_lot();`));
+    await script(`CREATE TRIGGER refuse_edge_lot BEFORE INSERT ON investment_lots
+      WHEN NEW.account_id = ${ira.id} BEGIN SELECT RAISE(ABORT, 'refused for the test'); END;`);
     try {
       await expect(rustRebuild()).rejects.toMatchObject({
         code: 1, stderr: expect.stringContaining("Lot rebuild FAILED"),
       });
     } finally {
-      await db.execute(sql.raw(`
-        drop trigger refuse_edge_lot on investment_lots;
-        drop function refuse_edge_lot();`));
+      await script("DROP TRIGGER IF EXISTS refuse_edge_lot");
     }
     expect((await snapshot()).lots).toEqual([]);
   });

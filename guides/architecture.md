@@ -10,8 +10,9 @@ it carries the rules that apply everywhere and says when to come here.
 - **API server**: Rust, with Axum and SQLx, in `rust-api/`. It serves every
   `/api` route, the MCP server and, in production, the client build.
 - **Shared logic**: the Rust core crate, which the browser loads as WASM.
-- **Database**: PostgreSQL. Drizzle ORM holds the schema and is the only
-  migrator (`db/schema.ts`, `db/migrations/`).
+- **Database**: SQLite, one file (`DATABASE_PATH`). The schema is the
+  numbered SQL files in `rust-api/db/migrations/`, which the server applies
+  with `sqlx::migrate!` when it starts.
 - **Testing**: Vitest (unit, database, HTTP and MCP suites), `cargo test`, and
   Playwright (E2E).
 
@@ -23,24 +24,27 @@ it carries the rules that apply everywhere and says when to come here.
   expression, formatting, position and FIFO lot helpers. The browser loads it
   as WASM through `lib/wasm-client.ts`. `rust-api/core/fixtures/core.json` is
   the corpus that its tests check.
-- `db` holds the database code that both binaries run: the lot rebuild and
-  the sample seed.
+- `db` (`ledger_db`) holds the database code that both binaries run: opening
+  the file, the migrations, the SQL functions, the locks, the portable SQL
+  helpers, the backups, the lot rebuild and the sample seed.
 - `server` holds the API server (`counterpoise-rust-api`). Route areas are
   under `server/src/routes/`. The database pool, configuration, tracing,
   authentication and the JSON error response are separate modules.
-- `cli` holds `ledger-cli`: `rebuild-lots`, `seed` and `import-moneydance`.
+- `cli` holds `ledger-cli`: `migrate`, `seed`, `list-books`,
+  `rebuild-lots`, `import-moneydance`, `backup` and `import-postgres` (the
+  one-time converter; see [upgrade-to-sqlite.md](upgrade-to-sqlite.md)).
 
 `rust-api/routes.json` lists the method and path pattern of each route that
 the Axum router registers from its handler table. A few routes are registered
 by name instead: `/health`, `/api/health`, `/api/mcp` and WebMCP. The Rust
-server's SQLx query metadata lives in `rust-api/.sqlx/`, so production images
-compile without database access.
+code uses only runtime queries (`sqlx::query()` and its forms), so a build
+needs no database and no query metadata.
 
 Rust serves every API route. In production, the Rust server also serves the
 pages, so the browser has one origin and no other process is in front of the
-API. The Rust server answers a key with its own API-key lockout. The server
-and the database use the same `TZ` setting so date-based balance queries have
-the same local day.
+API. The Rust server answers a key with its own API-key lockout. `cp_today()`, the
+SQL function for today's date, follows the server's `TZ`, so date-based
+balance queries use the app's local day.
 
 ### Security layers
 
@@ -55,7 +59,9 @@ these checks. `serve()` in `main.rs` puts them around the router with
    `ENABLE_HSTS=true`. The server reads `ENABLE_HSTS` when it starts.
 2. **Cross-origin write check** on `/api/*`, before every route, with a 403
    when it refuses. The host that the `Origin` must name is `X-Forwarded-Host`
-   when a reverse proxy sets it, and `Host` when not.
+   when a reverse proxy sets it, and `Host` when not. `client_ip::record`
+   removes `X-Forwarded-Host` and `X-Forwarded-Proto` when the server does not
+   trust a proxy (`TRUST_PROXY`), as it ignores `X-Forwarded-For` then.
 3. **The API gate**, before the router: the session and bearer test.
    An `/api/` request with no session cookie and no bearer header
    gets 401 `{"error":"Unauthorized"}`, whether a route has its path and
@@ -92,7 +98,8 @@ test the layer.
 
 `/health` is the healthcheck of the `rust-api` container, and `/api/health` is
 the deploy check, which reads `"ok":true`. Both are public. Each runs a
-`select 1` and answers 503 when it fails. `/health` sends only the status;
+`select 1` and answers 503 when it fails. The image has no `wget`: its
+healthcheck runs `counterpoise-rust-api health`, which calls `/health`. `/health` sends only the status;
 `/api/health` sends `{ "ok": true, "db": true }`. So the container is healthy
 only when the server and the database both answer.
 
@@ -105,10 +112,13 @@ without a `counterpoise_session` cookie to `/login`, as the page gate does in
 production. Without the Rust server, every API request fails:
 
 ```bash
-DATABASE_URL=postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev \
-  cargo run --manifest-path rust-api/Cargo.toml -p counterpoise-rust-api  # listens on 127.0.0.1:4000
+cargo run --manifest-path rust-api/Cargo.toml -p counterpoise-rust-api  # listens on 127.0.0.1:4000
 npm run dev
 ```
+
+The first start creates `data/counterpoise.db` and applies the migrations.
+`npm run db:seed` fills it with the sample book; stop the server first,
+because `ledger-cli seed --reset` refuses while a server holds the file.
 
 The login and register pages are static. They ask for the registration state
 in the browser, with `useRegistrationOpen()` from `hooks/useRegistrationOpen.ts`.
@@ -176,36 +186,63 @@ import { apiGet } from "@/lib/api-client";
 import { formatCurrency } from "@/lib/formatters";
 ```
 
-## PostgreSQL Database
-All data lives in a PostgreSQL database. Local development defaults to `postgresql://counterpoise:counterpoise@localhost:5432/counterpoise_dev` when `DATABASE_URL` is unset. Docker deployment uses a separate `counterpoise` database via `.env.production.local`. Meta tables (users, sessions, books) and book-scoped tables coexist in one schema, with a `bookId` foreign key on every book-scoped table for data isolation.
+## SQLite Database
+All data lives in one SQLite file. `DATABASE_PATH` names it: the production
+image uses `/data/counterpoise.db`, and development uses
+`data/counterpoise.db` when it is unset. Meta tables (users, sessions, books)
+and book-scoped tables are in one schema, with a `book_id` foreign key on
+every book-scoped table for data isolation. See
+[database-management.md](database-management.md) for the files, the locks and
+the backups.
 
-Each Vitest run generates its own database name: `vitest.config.ts` mints a run
-id and every worker creates `counterpoise_test_${runId}_${pool}` as its suite
-starts, so two runs never share a schema and nothing is assigned. The scheduler
-reclaims them — see [testing.md](testing.md). `npm run db:create-test-dbs`
-creates only `counterpoise_dev` and `counterpoise_e2e`.
+Each Vitest worker gets its own database file; see [testing.md](testing.md).
 
 ```
-counterpoise (PostgreSQL database)
-├── users, sessions, apiKeys, books, issueReports (meta tables)
-├── accounts                        (+ bookId FK)
-├── transactions, transactionSplits (+ bookId FK)
-├── securities, securityPrices      (+ bookId FK)
-├── investmentSplits, investmentLots, investmentLotAllocations (+ bookId FK)
-├── recurringRules, recurringTemplateSplits (+ bookId FK)
-├── payees                          (+ bookId FK)
-└── plaidTokens, plaidAccounts, plaidTransactionReconciliation (+ bookId FK)
+counterpoise.db (SQLite)
+├── users, sessions, api_keys, books, book_members, issue_reports (meta tables)
+├── accounts                        (+ book_id FK)
+├── transactions, transaction_splits (+ book_id FK)
+├── securities, security_prices     (+ book_id FK)
+├── investment_splits, investment_lots, investment_lot_allocations (+ book_id FK)
+├── recurring_rules, recurring_template_splits (+ book_id FK)
+├── payees                          (+ book_id FK)
+├── plaid_tokens, plaid_accounts, plaid_transaction_reconciliation (+ book_id FK)
+├── typesafe_evaluations, typesafe_decisions, typesafe_quotas, typesafe_aggregates (+ book_id FK)
+└── change_marks                    (live-update counts)
 ```
 
-- **Schema**: all tables are defined in `/db/schema.ts`. Drizzle generates the
-  migrations from it. The Rust server never applies DDL.
+- **Schema**: the numbered SQL files in `rust-api/db/migrations/`. The server
+  applies the pending ones when it starts; `ledger-cli migrate` applies them
+  without a server.
 - **Pages** live under `/app/b/[bookId]/...` (e.g., `/app/b/[bookId]/transactions/page.tsx`)
 - **API routes** live under `rust-api/server/src/routes/`. See
   [api-route-patterns.md](api-route-patterns.md).
-- **TypeScript scripts** (`db/migrate.ts`, `scripts/rebuild-lots.ts`, the test
-  helpers) use `getDb()` from `/db/index.ts`. It returns a cached Drizzle
-  instance and does not migrate; call `runMigrations()` first where a script
-  needs the schema.
+- **TypeScript** has no database code. The test helpers run raw SQL with
+  `node:sqlite` (`tests/helpers/sql.ts`).
+
+## Scheduled jobs
+
+The server runs the scheduled jobs itself (`rust-api/server/src/scheduler.rs`)
+when `COUNTERPOISE_SCHEDULER=on`. The production image sets it. The default
+is off, so a development or test server never runs a job on its own. The
+times are in `TZ`:
+
+| Job | When |
+| --- | --- |
+| Recurring transactions | Hourly |
+| Plaid sync | 00:00, 06:00, 12:00, 18:00 |
+| Security prices | 06:00, Tuesday to Saturday |
+| TypeSafe cleanup | Hourly at :15 |
+| Backup (a `VACUUM INTO` snapshot, then `PRAGMA integrity_check`) | Hourly, 06:00 to 21:00 |
+| Prune (snapshots and old `.dump` files older than 30 days), then `PRAGMA optimize` | Daily, 04:00 |
+| `VACUUM` | The 1st of the month, 03:00 |
+
+Each job calls its job function directly, not over HTTP. A job that still
+runs when its next time comes is skipped, not started twice. Backup, prune
+and `VACUUM` share one lock. Each job writes its status to
+`<STATUS_DIR>/<job>.json` (default `/backups/status`), which
+`/api/system/status` reads. The `/api/cron/*` routes still run a job by hand;
+`CRON_SECRET` gates them.
 
 ## Layered Architecture
 ```
@@ -217,38 +254,43 @@ Rust route handler (rust-api/server/src/routes/*.rs)
     ↓  authenticate_book(..., AccessLevel::...) → book id and role
 SQL through SQLx, filtered by book_id
     ↓
-PostgreSQL Database
+SQLite database file (DATABASE_PATH)
 ```
 
-## Advisory locks in Rust
+## Locks in Rust
 
-`with_advisory_lock` in `rust-api/server/src/db_scope.rs` takes a
-session-level advisory lock on one connection that it acquires from the pool.
-It gives the callback that connection. Run the callback's queries on that
-connection, and open a transaction on it with `with_transaction`. Never take a
-second connection from the pool inside the callback: it does not hold the
-lock. The connection closes when the callback ends, so a lock with an
-uncertain state never goes back to the pool. The Plaid sync
-(`routes/plaid_sync.rs`) uses it. A lock that lasts for one transaction only
-uses `pg_advisory_xact_lock` in that transaction instead, as the lot rebuild in
-`rust-api/db/src/lots.rs` does.
+`ledger_db::locks` (`rust-api/db/src/locks.rs`) holds every lock. Open each
+write transaction with `locks::begin` or `locks::begin_pool`, which send
+`BEGIN IMMEDIATE`; `clippy.toml` forbids plain `begin()`. The write lock of
+the file then serializes every writer, in this process and in others.
+
+`with_session_lock` holds a lock across several transactions. It is a file
+lock under `<database>.locks/`, so it also holds against the MCP stdio
+process. It gives the callback one connection from the pool. Run the
+callback's queries on that connection, and open a transaction on it with
+`with_transaction` in `rust-api/server/src/db_scope.rs`. A second caller does
+not wait: it gets `None`. The Plaid sync (`routes/plaid_sync.rs`) uses it.
+
+The server lock (`<database>.lock`) keeps a second server off the file, so the
+scheduler and the change hints of one server see every write that another
+server could have made.
 
 ## Live book updates
 
-Row triggers installed by the book-change migration notify `counterpoise_changes`
-after commit. The payload contains only `bookId` and a table name. Writers in
-cron, MCP, import and seed processes need no application event calls. Identical
-payloads collapse inside one transaction; an import spanning transactions still
-produces multiple notifications. The books trigger maps its id to bookId, so
-projection settings changes also invalidate the register. Row triggers do not
-cover TRUNCATE or DDL.
+Insert, update and delete triggers on 14 tables count the row changes of each
+(book, table) in the table `change_marks`. The tables are `CHANGE_TABLES` in
+`rust-api/server/src/book_changes.rs`. Every writer runs the triggers: the
+server, `ledger-cli`, MCP over stdio and the `sqlite3` shell. Thus the import,
+the seed and the MCP tools need no event calls. A write that rolls back also
+rolls back its count. The `books` triggers count under the book's own id, so a
+change of the projection settings also invalidates the register.
 
 Rust serves `/api/b/[bookId]/events` from
-`rust-api/server/src/routes/events.rs`. `rust-api/server/src/book_changes.rs`
-opens one LISTEN connection per process at the first subscription. That
-connection comes from its own one-connection pool, so it never takes a slot
-from the request pool. The hub validates hints and coalesces them per book in
-250 ms windows. The route streams SSE with 25-second heartbeats. It bounds
+`rust-api/server/src/routes/events.rs`. At the first subscription,
+`BookChangeHub` in `rust-api/server/src/book_changes.rs` starts one poller for
+the process. Every 100 ms, it reads the counts of the books that have a
+subscriber, and a count that moved is a hint for that table. The hub
+coalesces hints per book in 250 ms windows. The route streams SSE with 25-second heartbeats. It bounds
 client queues and closes streams after five minutes to revalidate
 authorization on reconnect. A graceful shutdown closes the open streams.
 Revoked sessions can receive invalidation hints until that reconnect; data
@@ -256,15 +298,14 @@ fetches authenticate each request. No ledger values or credentials are
 streamed. `lib/book-change-hub.ts` holds the `BookChange` type that the client
 reads.
 
-Notifications have no replay log. Listener reconnection sends `reset`; a new SSE
-subscription sends `ready` only after LISTEN is established. Both require clients
-to refetch current state. The book layout's `BookChangesProvider` shares one
+Hints have no replay log. A new SSE subscription sends `ready`, and the client
+then refetches the current state. The counts cannot be lost, so the server
+never sends `reset`; the client still accepts one. The book layout's `BookChangesProvider` shares one
 EventSource per tab between subscribers and also invalidates on focus/visibility
 restoration. The consumers are the transactions page and navbar sync badge;
 the badge retains its 60-second fallback poll. Other pages keep their existing
 refresh mechanisms. See the nginx streaming location in README.md.
 
 When you change the book-change triggers or the events route, verify in
-production that the migration role owns the affected tables and that events
-stream through the deployed proxy. Development tests do not establish either
-production property.
+production that events stream through the deployed proxy. Development tests
+do not prove it.

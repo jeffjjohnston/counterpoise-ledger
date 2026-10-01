@@ -1,15 +1,13 @@
-import { asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-  books, payees, recurringRules, recurringTemplateSplits, transactions, transactionSplits,
-} from "../../db/schema";
 import { advanceNextDateToFuture, getInitialNextDate, type RecurrenceConfig } from "../../lib/accounting";
 import { toDateString } from "../../lib/formatters";
 import { addDaysToDateString, getOccurrenceDate } from "../../lib/recurring";
 import {
   addBookMember, createAccount, createBook, createPayee, createRecurringRule,
-  createTransactionWithSplits, createUser, db, resetTestDatabase, setupTestDatabase,
+  createTransactionWithSplits, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
+import { exec, row, rows } from "../helpers/sql";
+import type { Payee, RecurringRule, Transaction, TransactionSplit } from "../../types/db";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 function json(method: string, body: unknown): RequestInit {
@@ -96,14 +94,14 @@ describe("recurring HTTP parity", () => {
   const processRules = (body: unknown) => ok("/api/b/1/recurring/process", json("POST", body));
 
   async function storedRule(id: number) {
-    const [rule] = await db.select().from(recurringRules).where(eq(recurringRules.id, id));
+    const [rule] = await rows<RecurringRule>("SELECT * FROM recurring_rules WHERE id = $1", [id]);
     return rule;
   }
 
   async function bookTransactions() {
-    const rows = await db.select().from(transactions).where(eq(transactions.bookId, 1)).orderBy(asc(transactions.id));
-    const splits = await db.select().from(transactionSplits).orderBy(asc(transactionSplits.id));
-    return rows.map((row) => ({ ...row, splits: splits.filter((split) => split.transactionId === row.id) }));
+    const stored = await rows<Transaction>("SELECT * FROM transactions WHERE book_id = $1 ORDER BY id", [1]);
+    const splits = await rows<TransactionSplit>("SELECT * FROM transaction_splits ORDER BY id");
+    return stored.map((row) => ({ ...row, splits: splits.filter((split) => split.transactionId === row.id) }));
   }
 
   // -------------------------------------------------------------------------
@@ -192,7 +190,7 @@ describe("recurring HTTP parity", () => {
   });
 
   it("projects from tomorrow through the book's upcoming days by default", async () => {
-    await db.update(books).set({ upcomingDays: 5 }).where(eq(books.id, 1));
+    await exec("UPDATE books SET upcoming_days = $1 WHERE id = $2", [5, 1]);
     const rule = await createRecurringRule({
       name: "Daily", frequency: "daily", startDate: inDays(-1), nextDate: inDays(-1), templateSplits: pay(10),
     });
@@ -289,7 +287,7 @@ describe("recurring HTTP parity", () => {
     });
     expect(last).toMatchObject({ interval: -1, payeeId: null, payee: null });
     expect(normalized({ weekly, nth, last })).toMatchSnapshot();
-    expect((await db.select().from(payees).where(eq(payees.bookId, 1))).map((row) => row.name).sort())
+    expect((await rows<Payee>("SELECT * FROM payees WHERE book_id = $1", [1])).map((row) => row.name).sort())
       .toEqual(["Landlord", "new Landlord"]);
   });
 
@@ -364,8 +362,8 @@ describe("recurring HTTP parity", () => {
       await expectError("/api/b/1/recurring", json("POST", body), status, message);
     }
     await expectError("/api/b/1/recurring", { method: "POST", body: "{" }, 500, "Failed to create recurring rule");
-    expect(await db.select().from(recurringRules).where(eq(recurringRules.bookId, 1))).toHaveLength(0);
-    expect(await db.select().from(payees).where(eq(payees.name, "Rolled Back"))).toHaveLength(0);
+    expect(await rows("SELECT * FROM recurring_rules WHERE book_id = $1", [1])).toHaveLength(0);
+    expect(await rows("SELECT * FROM payees WHERE name = $1", ["Rolled Back"])).toHaveLength(0);
   });
 
   // -------------------------------------------------------------------------
@@ -392,7 +390,7 @@ describe("recurring HTTP parity", () => {
     expect((await update(rule.id, { templateSplits: pay(250, () => a.electric) })).templateSplits).toMatchObject([
       { accountId: a.electric, amount: 250 }, { accountId: a.checking, amount: -250 },
     ]);
-    expect(await db.select().from(recurringTemplateSplits).where(eq(recurringTemplateSplits.recurringRuleId, rule.id)))
+    expect(await rows("SELECT * FROM recurring_template_splits WHERE recurring_rule_id = $1", [rule.id]))
       .toHaveLength(2);
   });
 
@@ -472,8 +470,8 @@ describe("recurring HTTP parity", () => {
     }
     await expectError(`/api/b/1/recurring/${rule.id}`, { method: "PUT", body: "{" }, 500, "Failed to update recurring rule");
     expect(await storedRule(rule.id)).toEqual(before);
-    expect(await db.select().from(payees).where(eq(payees.name, "Rolled Back"))).toHaveLength(0);
-    const [foreign] = await db.select().from(recurringRules).where(eq(recurringRules.id, a.otherRule));
+    expect(await rows("SELECT * FROM payees WHERE name = $1", ["Rolled Back"])).toHaveLength(0);
+    const foreign = await row<RecurringRule>("SELECT * FROM recurring_rules WHERE id = $1", [a.otherRule]);
     expect(foreign.endDate).toBeNull();
   });
 
@@ -495,8 +493,8 @@ describe("recurring HTTP parity", () => {
       await expectError(`/api/b/1/recurring/${id}`, { method: "DELETE" }, status, message);
     }
     expect(await ok(`/api/b/1/recurring/${rule.id}`, { method: "DELETE" })).toEqual({ success: true });
-    expect(await db.select().from(recurringTemplateSplits).where(eq(recurringTemplateSplits.bookId, 1))).toHaveLength(0);
-    const [kept] = await db.select().from(transactions).where(eq(transactions.id, made.id));
+    expect(await rows("SELECT * FROM recurring_template_splits WHERE book_id = $1", [1])).toHaveLength(0);
+    const kept = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [made.id]);
     expect(kept.recurringRuleId).toBeNull();
     await expectError(`/api/b/1/recurring/${rule.id}`, { method: "DELETE" }, 404, "Recurring rule not found");
   });
@@ -578,7 +576,7 @@ describe("recurring HTTP parity", () => {
     // ruleId 0 is "not given": processAll runs instead. It checks that a
     // rule is due before it counts the template splits.
     expect(await processRules({ ruleId: 0 })).toEqual({ success: true, transactionsCreated: 0, transactionIds: [], skipped: [] });
-    await db.update(recurringRules).set({ nextDate: "2025-01-01" }).where(eq(recurringRules.id, lonely.id));
+    await exec("UPDATE recurring_rules SET next_date = $1 WHERE id = $2", ["2025-01-01", lonely.id]);
     expect((await processRules({ ruleId: 0, processAll: true })).skipped).toEqual([
       { ruleId: lonely.id, reason: "fewer than 2 template splits" },
     ]);
@@ -629,7 +627,7 @@ describe("recurring HTTP parity", () => {
     }
     await expectError("/api/b/1/recurring/process", { method: "POST", body: "" }, 500, "Failed to process recurring rules");
     expect(await processRules({})).toEqual({ success: true, transactionsCreated: 0, transactionIds: [], skipped: [] });
-    const [foreign] = await db.select().from(recurringRules).where(eq(recurringRules.id, a.otherRule));
+    const foreign = await row<RecurringRule>("SELECT * FROM recurring_rules WHERE id = $1", [a.otherRule]);
     expect(foreign.nextDate).toBe("2030-01-01");
   });
 

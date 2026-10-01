@@ -5,9 +5,9 @@ use chrono::{Local, NaiveDate};
 /// U+FEFF, so a stored payee name would differ from the one Node stores.
 pub(crate) use ledger_core::js::is_js_whitespace;
 use ledger_core::js::parse_int;
+use ledger_db::engine::DbPool;
 use serde::de::DeserializeOwned;
 use serde_json::{Number, Value};
-use sqlx::PgPool;
 use std::collections::HashMap;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -497,10 +497,86 @@ pub(crate) fn database_integer(value: i64, failure_message: &'static str) -> Res
     i32::try_from(value).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, failure_message))
 }
 
+/// The `integer` input function of PostgreSQL 16 (`pg_strtoint32_safe`):
+/// the value that `CAST(text AS integer)` gives, or the message of its error.
+/// Node sent some values as text and let PostgreSQL decide; this keeps the
+/// same values accepted and refused on any engine.
+pub(crate) fn parse_pg_int4(text: &str) -> Result<i32, String> {
+    let invalid = || format!("invalid input syntax for type integer: \"{text}\"");
+    let out_of_range = || format!("value \"{text}\" is out of range for type integer");
+    let is_space = |byte: u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() && is_space(bytes[at]) {
+        at += 1;
+    }
+    let negative = match bytes.get(at) {
+        Some(b'-') => {
+            at += 1;
+            true
+        }
+        Some(b'+') => {
+            at += 1;
+            false
+        }
+        _ => false,
+    };
+    let radix = match (bytes.get(at), bytes.get(at + 1).map(u8::to_ascii_lowercase)) {
+        (Some(b'0'), Some(b'x')) => 16,
+        (Some(b'0'), Some(b'o')) => 8,
+        (Some(b'0'), Some(b'b')) => 2,
+        _ => 10,
+    };
+    if radix != 10 {
+        at += 2;
+    }
+    let first_digit = at;
+    let digit = |byte: u8| (byte as char).to_digit(radix);
+    let mut magnitude: i64 = 0;
+    while at < bytes.len() {
+        if let Some(value) = digit(bytes[at]) {
+            magnitude = magnitude * i64::from(radix) + i64::from(value);
+            if magnitude > i64::from(i32::MAX) + 1 {
+                return Err(out_of_range());
+            }
+            at += 1;
+        } else if bytes[at] == b'_' {
+            // An underscore must be followed by more digits.
+            at += 1;
+            if !bytes.get(at).is_some_and(|byte| digit(*byte).is_some()) {
+                return Err(invalid());
+            }
+        } else {
+            break;
+        }
+    }
+    if at == first_digit {
+        return Err(invalid());
+    }
+    while at < bytes.len() && is_space(bytes[at]) {
+        at += 1;
+    }
+    if at != bytes.len() {
+        return Err(invalid());
+    }
+    let value = if negative { -magnitude } else { magnitude };
+    i32::try_from(value).map_err(|_| out_of_range())
+}
+
+/// `CAST(x AS integer)` of a PostgreSQL `float8`: round half to even, and
+/// refuse a value outside the int4 range.
+pub(crate) fn pg_float8_to_int4(value: f64) -> Result<i32, String> {
+    let rounded = value.round_ties_even();
+    if rounded.is_nan() || rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
+        return Err("integer out of range".to_owned());
+    }
+    Ok(rounded as i32)
+}
+
 /// Reference checks always include book_id. Schema validation alone cannot
 /// distinguish a parent's ID in another book from a permitted parent.
 pub(crate) async fn require_account_parent(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     parent_id: Option<i64>,
     failure_message: &'static str,
@@ -528,6 +604,55 @@ mod tests {
     use super::*;
     use axum::{body::to_bytes, response::IntoResponse};
     use serde_json::json;
+
+    #[test]
+    fn pg_float8_to_int4_rounds_half_to_even() {
+        assert_eq!(pg_float8_to_int4(2.5), Ok(2));
+        assert_eq!(pg_float8_to_int4(3.5), Ok(4));
+        assert_eq!(pg_float8_to_int4(-2.5), Ok(-2));
+        assert_eq!(pg_float8_to_int4(2_147_483_647.0), Ok(i32::MAX));
+        assert!(pg_float8_to_int4(2_147_483_648.0).is_err());
+        assert!(pg_float8_to_int4(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn pg_int4_accepts_and_refuses_what_postgresql_16_does() {
+        for (text, value) in [
+            ("7", 7),
+            (" 7 ", 7),
+            ("\t-12\n", -12),
+            ("+3", 3),
+            ("1_000", 1000),
+            ("0x1F", 31),
+            ("0o17", 15),
+            ("0b101", 5),
+            ("-2147483648", i32::MIN),
+            ("2147483647", i32::MAX),
+        ] {
+            assert_eq!(parse_pg_int4(text), Ok(value), "{text}");
+        }
+        for text in [
+            "", " ", "1.5", "1e3", "abc", "1_", "1__0", "0x", "--1", "7 7", "true",
+        ] {
+            assert_eq!(
+                parse_pg_int4(text),
+                Err(format!("invalid input syntax for type integer: \"{text}\"")),
+                "{text}"
+            );
+        }
+        for text in [
+            "2147483648",
+            "-2147483649",
+            "3000000000",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                parse_pg_int4(text),
+                Err(format!("value \"{text}\" is out of range for type integer")),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn json_bytes_are_decoded_as_utf8_text_first() {
@@ -815,14 +940,8 @@ mod tests {
 
     #[tokio::test]
     async fn account_parent_reference_is_scoped_to_the_book() {
-        let Some(url) = crate::state::test_database_url() else {
-            return;
-        };
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
+        let database = ledger_db::testing::TempDatabase::new(1).await;
+        let pool = database.pool().clone();
         sqlx::query("CREATE TEMP TABLE accounts (id integer, book_id integer)")
             .execute(&pool)
             .await

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { issueReports } from "../../db/schema";
-import { createUser, db, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { createUser, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { insert } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
@@ -25,7 +25,7 @@ describe("issue report HTTP parity", () => {
 
   it("creates, orders, updates, and deletes reports for the caller", async () => {
     const other = await createUser({ username: "other" });
-    await db.insert(issueReports).values({ userId: other.id, description: "private", page: "/other" });
+    await insert("issue_reports", { userId: other.id, description: "private", page: "/other" });
     const before = Date.now();
     const first = await client.request("/api/issue-reports", request("POST", { description: "  First  ", page: "/one", bookId: 99 }));
     expect(first.status).toBe(200);

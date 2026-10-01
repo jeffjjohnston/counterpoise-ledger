@@ -7,6 +7,8 @@
 //! investment split, or a lot is deleted. Those cascades are in the DDL, not
 //! in this file.
 
+use crate::engine::{Db, DbConnection, DbPool};
+use crate::locks::{TransactionLock, lock_transaction};
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
@@ -14,7 +16,7 @@ use ledger_core::{
     accounting::InvestmentAction,
     lots::{ReplaySplit, replay_lots},
 };
-use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder, Row};
+use sqlx::{QueryBuilder, Row};
 
 /// One (account, security) pair. Account and security IDs are global serials,
 /// so the pair alone identifies a set of lots.
@@ -26,7 +28,7 @@ pub struct LotPair {
 
 /// The effective date: a floating transaction resolves to today in the
 /// session time zone, as `effectiveDateSql` does.
-const EFFECTIVE_DATE: &str = "CASE WHEN t.is_floating THEN CURRENT_DATE::text ELSE t.date END";
+const EFFECTIVE_DATE: &str = crate::sql::EFFECTIVE_DATE;
 
 /// PostgreSQL accepts at most 65,535 bind parameters in one statement.
 const INSERT_CHUNK_ROWS: usize = 1_000;
@@ -44,16 +46,19 @@ fn investment_action(value: &str) -> Result<InvestmentAction, sqlx::Error> {
 /// pair whose DELETE matches no rows. It is released at commit or rollback, so
 /// the caller must pass a connection inside an explicit transaction.
 pub async fn rebuild_lots(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     account_id: i32,
     security_id: i32,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
-        .bind(account_id)
-        .bind(security_id)
-        .execute(&mut *connection)
-        .await?;
+    lock_transaction(
+        connection,
+        TransactionLock::LotPair {
+            account_id,
+            security_id,
+        },
+    )
+    .await?;
 
     // A stock split has no account and applies to every account that holds
     // the security, so it is read with this account's own rows.
@@ -107,6 +112,34 @@ pub async fn rebuild_lots(
     if result.lots.is_empty() {
         return Ok(());
     }
+    // The cents columns were `integer` in PostgreSQL, and the readers decode
+    // them as 32-bit integers. SQLite stores any 64-bit value, so a value out
+    // of that range is refused here, as PostgreSQL refused it at the insert.
+    // The transaction routes bound these values already; an imported price
+    // is not bound.
+    let cents = result
+        .lots
+        .iter()
+        .flat_map(|lot| {
+            [
+                ("original_basis_cents", lot.original_basis_cents),
+                ("remaining_basis_cents", lot.remaining_basis_cents),
+            ]
+        })
+        .chain(result.allocations.iter().flat_map(|allocation| {
+            [
+                ("basis_cents", allocation.basis_cents),
+                ("proceeds_cents", allocation.proceeds_cents),
+            ]
+        }));
+    for (column, value) in cents {
+        if i32::try_from(value).is_err() {
+            return Err(sqlx::Error::Protocol(format!(
+                "rebuild_lots: {column} {value} is out of the integer range \
+                 (book {book_id}, account {account_id}, security {security_id})"
+            )));
+        }
+    }
 
     // acquired_date is the buy's effective date at rebuild time. For a
     // floating buy it is a snapshot of today, which stays fixed until the next
@@ -114,7 +147,7 @@ pub async fn rebuild_lots(
     let now = Utc::now().naive_utc();
     let mut lot_ids: HashMap<i64, i32> = HashMap::new();
     for chunk in result.lots.chunks(INSERT_CHUNK_ROWS) {
-        let mut insert = QueryBuilder::<Postgres>::new(
+        let mut insert = QueryBuilder::<Db>::new(
             "INSERT INTO investment_lots (book_id, account_id, security_id, acquired_date,
                opened_split_id, opened_transaction_id, closed_transaction_id,
                original_shares_micros, original_basis_cents, remaining_shares_micros,
@@ -169,7 +202,7 @@ pub async fn rebuild_lots(
             })?;
             rows.push((lot_id, allocation));
         }
-        let mut insert = QueryBuilder::<Postgres>::new(
+        let mut insert = QueryBuilder::<Db>::new(
             "INSERT INTO investment_lot_allocations (book_id, lot_id, sell_split_id,
                transaction_id, shares_micros, basis_cents, proceeds_cents) ",
         );
@@ -192,7 +225,7 @@ pub async fn rebuild_lots(
 /// caller takes the advisory locks in the same order, so two callers with
 /// overlapping pairs queue and cannot deadlock.
 pub async fn rebuild_lots_for_pairs(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     pairs: &[LotPair],
 ) -> Result<(), sqlx::Error> {
@@ -210,14 +243,14 @@ pub async fn rebuild_lots_for_pairs(
 }
 
 async fn find_pairs(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     security_id: Option<i32>,
 ) -> Result<Vec<LotPair>, sqlx::Error> {
     let rows: Vec<(i32, i32)> = sqlx::query_as(
         "SELECT DISTINCT account_id, security_id FROM investment_splits
          WHERE book_id = $1 AND action IN ('buy', 'sell') AND account_id IS NOT NULL
-           AND ($2::integer IS NULL OR security_id = $2)
+           AND ($2 IS NULL OR security_id = $2)
          ORDER BY account_id, security_id",
     )
     .bind(book_id)
@@ -236,7 +269,7 @@ async fn find_pairs(
 /// Every pair with at least one buy or sell in the book. A stock split has no
 /// account and only changes pairs that a buy already established.
 pub async fn find_all_lot_pairs(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
 ) -> Result<Vec<LotPair>, sqlx::Error> {
     find_pairs(connection, book_id, None).await
@@ -247,7 +280,7 @@ pub async fn find_all_lot_pairs(
 /// expands to all of them. The expansion reads splits, not lots, so it is
 /// correct before any lot exists.
 pub async fn collect_affected_pairs(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     transaction_id: i32,
 ) -> Result<Vec<LotPair>, sqlx::Error> {
@@ -280,14 +313,15 @@ pub struct BackfillResult {
     pub skipped: bool,
 }
 
-/// The deploy-time backfill from `scripts/rebuild-lots.ts`.
+/// The startup backfill: the server runs it before it serves, and
+/// `ledger-cli rebuild-lots` runs it by hand.
 ///
 /// Without `force`, it does nothing when allocations already exist or when no
 /// buy or sell exists. Every book and pair is rebuilt in one transaction. With
 /// one transaction per pair, a crash and restart part way through would let
 /// the guard read partial progress as "already populated" and skip the
 /// remaining pairs, which would then report zero cost basis.
-pub async fn backfill_lots(pool: &PgPool, force: bool) -> Result<BackfillResult, sqlx::Error> {
+pub async fn backfill_lots(pool: &DbPool, force: bool) -> Result<BackfillResult, sqlx::Error> {
     if !force {
         let allocations: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM investment_lot_allocations")
@@ -314,7 +348,7 @@ pub async fn backfill_lots(pool: &PgPool, force: bool) -> Result<BackfillResult,
         }
     }
 
-    let mut transaction = pool.begin().await?;
+    let mut transaction = crate::locks::begin_pool(pool).await?;
     let books: Vec<i32> = sqlx::query_scalar("SELECT id FROM books ORDER BY id")
         .fetch_all(&mut *transaction)
         .await?;
@@ -354,5 +388,48 @@ mod tests {
         );
         assert_eq!(investment_action("split").unwrap(), InvestmentAction::Split);
         assert!(investment_action("short").is_err());
+    }
+
+    /// A basis that does not fit a 32-bit integer is refused, and no lot is
+    /// written: the readers could not decode it.
+    #[tokio::test]
+    async fn a_basis_out_of_the_integer_range_is_refused() {
+        let database = crate::testing::TempDatabase::new(1).await;
+        let pool = database.pool();
+        sqlx::raw_sql(
+            "INSERT INTO users (id, username, password_hash, created_at)
+               VALUES (1, 'u', 'h', '2025-01-01 00:00:00');
+             INSERT INTO books (id, user_id, name, created_at, updated_at)
+               VALUES (1, 1, 'B', '2025-01-01 00:00:00', '2025-01-01 00:00:00');
+             INSERT INTO accounts (id, book_id, name, type, created_at, updated_at)
+               VALUES (10, 1, 'Brokerage', 'asset', '2025-01-01 00:00:00', '2025-01-01 00:00:00');
+             INSERT INTO securities (id, book_id, name, symbol, security_type, created_at)
+               VALUES (20, 1, 'Fund', 'FND', 'stock', '2025-01-01 00:00:00');
+             INSERT INTO transactions (id, book_id, date, created_at, updated_at)
+               VALUES (30, 1, '2025-01-02', '2025-01-02 00:00:00', '2025-01-02 00:00:00');
+             -- One share at $30,000,000: a basis of 3,000,000,000 cents.
+             INSERT INTO investment_splits
+               (book_id, transaction_id, account_id, security_id, action, shares_micros, price_micros)
+               VALUES (1, 30, 10, 20, 'buy', 1000000, 30000000000000);",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut transaction = crate::locks::begin_pool(pool).await.unwrap();
+        let refused = super::rebuild_lots(transaction.as_mut(), 1, 10, 20)
+            .await
+            .err()
+            .map(|cause| cause.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("original_basis_cents 3000000000"),
+            "{refused}"
+        );
+        transaction.rollback().await.unwrap();
+        let lots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM investment_lots")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(lots, 0);
     }
 }

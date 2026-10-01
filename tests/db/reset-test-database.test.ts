@@ -1,13 +1,12 @@
 import { beforeAll, expect, it } from "vitest";
-import { accounts, books, transactions } from "@/db/schema";
 import {
   createAccount,
   createBook,
   createTransactionWithSplits,
-  db,
   resetTestDatabase,
   setupTestDatabase,
 } from "@/tests/helpers/db-utils";
+import { count, rows } from "@/tests/helpers/sql";
 
 beforeAll(setupTestDatabase);
 
@@ -26,9 +25,10 @@ it("clears dependent rows and resets sequences while keeping the baseline book",
 
   await resetTestDatabase();
 
-  expect(await db.select().from(accounts)).toHaveLength(0);
-  expect(await db.select().from(transactions)).toHaveLength(0);
-  expect(await db.select().from(books)).toMatchObject([{ id: 1, name: "Test Book" }]);
+  expect(await count("accounts")).toBe(0);
+  expect(await count("transactions")).toBe(0);
+  expect(await count("transaction_splits")).toBe(0);
+  expect(await rows("SELECT id, name FROM books")).toEqual([{ id: 1, name: "Test Book" }]);
   expect((await createAccount({ name: "Checking", type: "asset" })).id).toBe(1);
   expect((await createBook({ name: "Extra" })).id).toBe(2);
 });

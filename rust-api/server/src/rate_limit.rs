@@ -262,6 +262,47 @@ mod tests {
     }
 
     #[test]
+    fn addresses_in_one_ipv6_64_share_the_ip_bucket() {
+        let limits = RateLimiter::default();
+        let now = Instant::now();
+        let key = |address: &str| crate::client_ip::rate_limit_key(address);
+        let first = key("2001:db8:1:2::1");
+        let same_prefix = key("2001:db8:1:2:dead:beef:0:7");
+        let other_prefix = key("2001:db8:1:3::1");
+        let keys = |ip: &'_ str| -> Vec<(String, u32)> {
+            Keys {
+                username: None,
+                ip: Some(ip),
+            }
+            .buckets(Scope::Login)
+        };
+        assert_eq!(keys(&first), keys(&same_prefix));
+        assert_ne!(keys(&first), keys(&other_prefix));
+        for _ in 0..20 {
+            limits.failure(
+                Scope::Login,
+                &Keys {
+                    username: None,
+                    ip: Some(&first),
+                },
+                now,
+            );
+        }
+        let check = |ip: &str| {
+            limits.check(
+                Scope::Login,
+                &Keys {
+                    username: None,
+                    ip: Some(ip),
+                },
+                now,
+            )
+        };
+        assert!(check(&same_prefix).is_some());
+        assert_eq!(check(&other_prefix), None);
+    }
+
+    #[test]
     fn flooding_cannot_remove_an_active_lockout() {
         let limits = RateLimiter::default();
         let now = Instant::now();

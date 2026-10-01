@@ -1,11 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
+import { appendFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { db } from "./db-utils";
-import { sessions } from "../../db/schema";
-import { workerDatabaseUrl } from "./database-safety";
+import { insert } from "./sql";
+import { workerDatabasePath } from "./test-database";
 
 async function freePort(): Promise<number> {
   const socket = createServer();
@@ -46,7 +46,10 @@ export async function startHttpTestServer(
     cwd: resolve("."),
     env: {
       ...process.env,
-      DATABASE_URL: workerDatabaseUrl(),
+      DATABASE_PATH: workerDatabasePath(),
+      DATABASE_URL: "",
+      // Some suites run a second server on the file with other settings.
+      COUNTERPOISE_TEST_SHARED_DATABASE: "1",
       RUST_BIND: `127.0.0.1:${port}`,
       NODE_ENV: "production",
       ...overrides,
@@ -54,7 +57,11 @@ export async function startHttpTestServer(
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
-  const record = (chunk: Buffer) => { output = (output + chunk.toString()).slice(-12_000); };
+  const capture = process.env.COUNTERPOISE_SQL_CAPTURE;
+  const record = (chunk: Buffer) => {
+    if (capture) appendFileSync(capture, chunk);
+    output = (output + chunk.toString()).slice(-12_000);
+  };
   child.stdout?.on("data", record);
   child.stderr?.on("data", record);
   const error = new Promise<never>((_, reject) => child.once("error", reject));
@@ -81,7 +88,7 @@ export async function startHttpTestServer(
 /** Create a real session; never bypass the server's auth in an HTTP test. */
 export async function sessionHttpClient(baseUrl: string) {
   const token = randomBytes(32).toString("hex");
-  await db.insert(sessions).values({
+  await insert("sessions", {
     userId: 1,
     tokenHash: createHash("sha256").update(token).digest("hex"),
     expiresAt: new Date(Date.now() + 60 * 60 * 1000),

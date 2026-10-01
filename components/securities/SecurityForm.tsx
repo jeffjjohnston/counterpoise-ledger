@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
 import { evaluateExpression } from "@/lib/wasm-client";
 import { formatPriceMicrosInput } from "@/lib/wasm-client";
-import type { Security } from "@/db/schema";
+import type { Security } from "@/types/db";
 
 interface SecurityFormProps {
   security?: Security;

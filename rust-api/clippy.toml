@@ -1,0 +1,6 @@
+# Every transaction opens through ledger_db::locks, so that the engine
+# decides how a write transaction starts.
+disallowed-methods = [
+  { path = "sqlx::Connection::begin", reason = "use ledger_db::locks::begin or savepoint" },
+  { path = "sqlx::Pool::begin", reason = "use ledger_db::locks::begin_pool" },
+]

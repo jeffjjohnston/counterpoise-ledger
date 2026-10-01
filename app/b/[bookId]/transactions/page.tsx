@@ -959,7 +959,10 @@ function TransactionsPageInner() {
       <div className="flex-1 flex flex-col overflow-hidden">
         <div
           ref={scrollContainerRef}
-          className="flex-1 overflow-y-auto bg-surface"
+          // `relative` makes this the containing block of absolute
+          // descendants, such as the `sr-only` date of a row. Without it,
+          // they escape the scroll area and make the page scroll.
+          className="relative flex-1 overflow-y-auto bg-surface"
         >
           <div className="px-3 py-3 lg:px-6 lg:py-4 border-b border-border">
             <div className="flex items-center justify-between gap-2">

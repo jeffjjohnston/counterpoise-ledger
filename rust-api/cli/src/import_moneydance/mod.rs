@@ -28,11 +28,12 @@ mod securities;
 mod transactions;
 mod values;
 
+use ledger_db::engine::{Db, DbConnection};
 use std::collections::HashMap;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::Value;
-use sqlx::{PgConnection, Postgres, QueryBuilder};
+use sqlx::QueryBuilder;
 
 use values::{Item, int4, int8, text};
 
@@ -46,7 +47,7 @@ pub fn row_error(cause: sqlx::Error) -> RowError {
 /// Releases the savepoint when `outcome` is a success, and rolls it back
 /// when it is a failure. Only an error of the savepoint itself is fatal.
 async fn finish<T>(
-    savepoint: sqlx::Transaction<'_, Postgres>,
+    savepoint: sqlx::Transaction<'_, Db>,
     outcome: Result<T, RowError>,
 ) -> Result<Result<T, RowError>, sqlx::Error> {
     match outcome {
@@ -171,7 +172,7 @@ pub struct NewTransaction {
 }
 
 async fn insert_transaction(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     now: NaiveDateTime,
     transaction: &NewTransaction,
@@ -197,7 +198,7 @@ async fn insert_transaction(
 /// Inserts `(account, amount)` splits in one statement, in the order given.
 /// Every amount is checked first, so a bad amount writes none of them.
 async fn insert_splits(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     transaction_id: i32,
     splits: &[(i32, f64)],
@@ -206,7 +207,7 @@ async fn insert_splits(
         .iter()
         .map(|(account_id, amount)| Ok((*account_id, int4(*amount)?)))
         .collect::<Result<Vec<_>, RowError>>()?;
-    let mut insert: QueryBuilder<Postgres> = QueryBuilder::new(
+    let mut insert: QueryBuilder<Db> = QueryBuilder::new(
         "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) ",
     );
     insert.push_values(amounts, |mut row, (account_id, amount)| {
@@ -235,7 +236,7 @@ pub struct NewInvestmentSplit {
 }
 
 async fn insert_investment_split(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     split: &NewInvestmentSplit,
 ) -> Result<(), RowError> {
@@ -328,7 +329,7 @@ pub struct ImportSummary {
 
 /// Deletes the importable rows of one book, children first.
 pub async fn overwrite_book(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
 ) -> Result<(), sqlx::Error> {
     for table in [
@@ -358,7 +359,7 @@ pub async fn overwrite_book(
 /// the caller rolls its transaction back. `today` dates an opening balance that
 /// has no creation date and moves stale reminders forward.
 pub async fn run_import(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     export: &Export,
     book_id: i32,
     options: ImportOptions,

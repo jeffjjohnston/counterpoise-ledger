@@ -3,7 +3,8 @@
  *
  * Given every buy/sell/stock-split investment split for ONE (account, security)
  * pair, produces the lots those buys opened and the allocations those sells
- * consumed. No database access — `lib/lots-db.ts` wraps this with persistence.
+ * consumed. No database access. The runtime engine is `rebuild_lots()` in
+ * rust-api/db/src/lots.rs, which writes the lots to the database.
  *
  * Recompute-over-increment is deliberate: transactions in this app are freely
  * backdated and edited, so "which existing allocations does this new row

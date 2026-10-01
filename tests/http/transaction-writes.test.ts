@@ -1,15 +1,12 @@
-import { asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-  investmentLotAllocations, investmentLots, payees, plaidTransactionReconciliation, transactions,
-  transactionSplits,
-} from "../../db/schema";
 import { toDateString } from "../../lib/formatters";
 import {
   addBookMember, createAccount, createBook, createPayee, createPlaidAccount, createPlaidReconciliation,
-  createPlaidToken, createSecurity, createTransactionWithSplits, createUser, db, resetTestDatabase,
+  createPlaidToken, createSecurity, createTransactionWithSplits, createUser, resetTestDatabase,
   setupTestDatabase,
 } from "../helpers/db-utils";
+import { exec, row, rows } from "../helpers/sql";
+import type { PlaidTransactionReconciliation } from "../../types/db";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { contract } from "../helpers/contract";
 
@@ -39,8 +36,8 @@ function normalized(body: unknown): unknown {
 /** The derived lot rows, which the server rebuilds with each write. */
 async function lotRows() {
   return normalized({
-    lots: await db.select().from(investmentLots).orderBy(asc(investmentLots.id)),
-    allocations: await db.select().from(investmentLotAllocations).orderBy(asc(investmentLotAllocations.id)),
+    lots: await rows("SELECT * FROM investment_lots ORDER BY id"),
+    allocations: await rows("SELECT * FROM investment_lot_allocations ORDER BY id"),
   });
 }
 
@@ -121,7 +118,7 @@ describe("transaction write HTTP parity", () => {
     expect(reused.payeeId).toBe(a.ikea);
     const blank = await create({ date: "2025-03-03", payeeName: " ﻿ ", splits: spend() });
     expect(blank.payee).toBeNull();
-    expect(await db.select().from(payees)).toHaveLength(2);
+    expect(await rows("SELECT * FROM payees")).toHaveLength(2);
   });
 
   it("creates investment splits on the derived account and rebuilds the lots", async () => {
@@ -193,8 +190,8 @@ describe("transaction write HTTP parity", () => {
       await expectError("/api/b/1/transactions", json("POST", body), status, message);
     }
     await expectError("/api/b/1/transactions", { method: "POST", body: "{" }, 500, "Failed to create transaction");
-    expect(await db.select().from(transactions).where(eq(transactions.bookId, 1))).toHaveLength(1);
-    expect(await db.select().from(payees).where(eq(payees.name, "Rolled Back"))).toHaveLength(0);
+    expect(await rows("SELECT * FROM transactions WHERE book_id = $1", [1])).toHaveLength(1);
+    expect(await rows("SELECT * FROM payees WHERE name = $1", ["Rolled Back"])).toHaveLength(0);
   });
 
   it("reads one transaction by a parseInt ID", async () => {
@@ -306,7 +303,7 @@ describe("transaction write HTTP parity", () => {
     }
     await expectError(path, { method: "PUT", body: "[" }, 500, "Failed to update transaction");
     expect(await ok(path)).toMatchObject({ date: "2025-01-01", checkNumber: null, notes: null });
-    expect(await db.select().from(payees)).toHaveLength(1);
+    expect(await rows("SELECT * FROM payees")).toHaveLength(1);
   });
 
   it("checks expectedUpdatedAt on update and delete", async () => {
@@ -352,17 +349,18 @@ describe("transaction write HTTP parity", () => {
 
     expect(await ok(`/api/b/1/transactions/${buy.id}`, { method: "DELETE" })).toEqual({ success: true });
     await expectError(`/api/b/1/transactions/${buy.id}`, {}, 404, "Transaction not found");
-    expect(await db.select().from(transactionSplits).where(eq(transactionSplits.transactionId, buy.id))).toEqual([]);
-    const rows = await db.select().from(plaidTransactionReconciliation).orderBy(asc(plaidTransactionReconciliation.id));
-    expect(rows.map((row) => [row.id, row.resolutionStatus, row.matchedTransactionId, row.resolvedAt])).toEqual([
+    expect(await rows("SELECT * FROM transaction_splits WHERE transaction_id = $1", [buy.id])).toEqual([]);
+    const reconciliations = await rows<PlaidTransactionReconciliation>(
+      "SELECT * FROM plaid_transaction_reconciliation ORDER BY id",
+    );
+    expect(reconciliations.map((row) => [row.id, row.resolutionStatus, row.matchedTransactionId, row.resolvedAt])).toEqual([
       [matched.id, "pending", null, null], [stranded.id, "pending", null, null],
     ]);
     // The sell now has no lot to consume.
     expect(await lotRows()).toMatchSnapshot();
 
     // A missing row is a 404, but the sweep still commits.
-    await db.update(plaidTransactionReconciliation).set({ resolutionStatus: "matched" })
-      .where(eq(plaidTransactionReconciliation.id, stranded.id));
+    await exec("UPDATE plaid_transaction_reconciliation SET resolution_status = $1 WHERE id = $2", ["matched", stranded.id]);
     for (const [id, status, message] of [
       ["999999", 404, "Transaction not found"],
       [String(a.otherTransaction), 404, "Transaction not found"],
@@ -371,7 +369,9 @@ describe("transaction write HTTP parity", () => {
     ] as const) {
       await expectError(`/api/b/1/transactions/${id}`, { method: "DELETE" }, status, message);
     }
-    const [swept] = await db.select().from(plaidTransactionReconciliation).where(eq(plaidTransactionReconciliation.id, stranded.id));
+    const swept = await row<PlaidTransactionReconciliation>(
+      "SELECT * FROM plaid_transaction_reconciliation WHERE id = $1", [stranded.id],
+    );
     expect(swept.resolutionStatus).toBe("pending");
     // The query string is validated before an unusable ID fails.
     await expectError("/api/b/1/transactions/abc?expectedUpdatedAt=x", { method: "DELETE" }, 400,

@@ -1,14 +1,22 @@
-import postgres from "postgres";
-import { drizzle } from "drizzle-orm/postgres-js";
 import { buildSeedData } from "./seed-data";
-import { e2eDatabaseUrl } from "./database";
-import { rebuildLots } from "../../lib/lots-db";
-import * as schema from "../../db/schema";
+import { exec, insert, insertRows } from "../helpers/sql";
+
+/**
+ * Sends a POST with a JSON body to the E2E server as the E2E user, and returns
+ * the parsed answer. It throws when the status is not 2xx.
+ */
+export type ApiPost = (path: string, body: unknown) => Promise<unknown>;
+
+/**
+ * Seeds a book. The caller sets the E2E database with `setDatabasePath()`
+ * before it calls a seed function.
+ */
+export type SeedBook = (bookId: number, post: ApiPost) => Promise<void>;
 
 /** Only the accounts and one register row needed by basic CRUD and access tests. */
-export async function seedSmallBookData(sql: postgres.Sql, bookId: number) {
+export async function seedSmallBookData(bookId: number) {
   const now = new Date();
-  const accounts = await insertAccounts(sql, bookId, [
+  const accounts = await insertAccounts(bookId, [
     { name: "Checking", type: "asset" },
     { name: "Savings", type: "asset" },
     { name: "Groceries", type: "expense" },
@@ -16,7 +24,7 @@ export async function seedSmallBookData(sql: postgres.Sql, bookId: number) {
   ]);
   const checking = accounts.find((account) => account.name === "Checking")!;
   const salary = accounts.find((account) => account.name === "Salary")!;
-  await insertTransactionWithSplits(sql, bookId, {
+  await insertTransactionWithSplits(bookId, {
     date: formatDate(now),
     description: "Opening salary",
     splits: [
@@ -46,63 +54,46 @@ const formatTransferDate = (index: number) => {
 
 type SeedAccount = { name: string; type: string; subtype?: string; isInvestmentCash?: boolean; parentId?: number };
 
-async function insertAccounts(sql: postgres.Sql, bookId: number, data: SeedAccount[]) {
-  const now = new Date();
-  const rows = data.map((account) => ({
-    book_id: bookId,
+async function insertAccounts(bookId: number, data: SeedAccount[]) {
+  const inserted = await insertRows<{ id: number; name: string; type: string }>("accounts", data.map((account) => ({
+    bookId,
     name: account.name,
     type: account.type,
     subtype: account.subtype ?? null,
-    is_investment_cash: account.isInvestmentCash ?? false,
-    parent_id: account.parentId ?? null,
-    created_at: now,
-    updated_at: now,
-  }));
-  const inserted = await sql`
-    INSERT INTO accounts ${sql(rows, "book_id", "name", "type", "subtype", "is_investment_cash", "parent_id", "created_at", "updated_at")}
-    RETURNING id, name, type
-  `;
-  return inserted.map((row) => ({ id: row.id as number, name: row.name as string, type: row.type as string }));
+    isInvestmentCash: account.isInvestmentCash ?? false,
+    parentId: account.parentId ?? null,
+  })));
+  return inserted.map((row) => ({ id: row.id, name: row.name, type: row.type }));
 }
 
-async function insertAccount(sql: postgres.Sql, bookId: number, data: SeedAccount) {
-  const [account] = await insertAccounts(sql, bookId, [data]);
+async function insertAccount(bookId: number, data: SeedAccount) {
+  const [account] = await insertAccounts(bookId, [data]);
   return account;
 }
 
-async function insertPayee(sql: postgres.Sql, bookId: number, name: string) {
-  const now = new Date();
-  const [row] = await sql`INSERT INTO payees (book_id, name, created_at) VALUES (${bookId}, ${name}, ${now}) RETURNING id`;
-  return { id: row.id as number, name };
+async function insertPayee(bookId: number, name: string) {
+  const row = await insert<{ id: number }>("payees", { bookId, name });
+  return { id: row.id, name };
 }
 
 async function insertSecurity(
-  sql: postgres.Sql,
   bookId: number,
   data: { name: string; symbol: string; securityType: string }
 ) {
-  const now = new Date();
-  const [row] = await sql`
-    INSERT INTO securities (book_id, name, symbol, security_type, created_at)
-    VALUES (${bookId}, ${data.name}, ${data.symbol}, ${data.securityType}, ${now})
-    RETURNING id
-  `;
-  return { id: row.id as number, ...data };
+  const row = await insert<{ id: number }>("securities", {
+    bookId, name: data.name, symbol: data.symbol, securityType: data.securityType,
+  });
+  return { id: row.id, ...data };
 }
 
 async function insertSecurityPrice(
-  sql: postgres.Sql,
   bookId: number,
   data: { securityId: number; priceDate: string; priceMicros: number }
 ) {
-  await sql`
-    INSERT INTO security_prices (book_id, security_id, price_date, price_micros)
-    VALUES (${bookId}, ${data.securityId}, ${data.priceDate}, ${data.priceMicros})
-  `;
+  await insert("security_prices", { bookId, ...data });
 }
 
 async function insertRecurringRule(
-  sql: postgres.Sql,
   bookId: number,
   data: {
     name: string;
@@ -114,25 +105,26 @@ async function insertRecurringRule(
     splits: Array<{ accountId: number; amount: number }>;
   }
 ) {
-  const now = new Date();
-  const [row] = await sql`
-    INSERT INTO recurring_rules (book_id, name, frequency, interval, start_date, next_date, payee_id, template_description, created_at)
-    VALUES (${bookId}, ${data.name}, ${data.frequency}, 1, ${data.startDate}, ${data.nextDate}, ${data.payeeId ?? null}, ${data.templateDescription ?? null}, ${now})
-    RETURNING id
-  `;
-  const ruleId = row.id as number;
+  const row = await insert<{ id: number }>("recurring_rules", {
+    bookId,
+    name: data.name,
+    frequency: data.frequency,
+    interval: 1,
+    startDate: data.startDate,
+    nextDate: data.nextDate,
+    payeeId: data.payeeId ?? null,
+    templateDescription: data.templateDescription ?? null,
+  });
 
   for (const split of data.splits) {
-    await sql`
-      INSERT INTO recurring_template_splits (book_id, recurring_rule_id, account_id, amount)
-      VALUES (${bookId}, ${ruleId}, ${split.accountId}, ${split.amount})
-    `;
+    await insert("recurring_template_splits", {
+      bookId, recurringRuleId: row.id, accountId: split.accountId, amount: split.amount,
+    });
   }
-  return { id: ruleId };
+  return { id: row.id };
 }
 
 async function insertTransactionWithSplits(
-  sql: postgres.Sql,
   bookId: number,
   data: {
     date: string;
@@ -140,38 +132,50 @@ async function insertTransactionWithSplits(
     splits: Array<{ accountId: number; amount: number }>;
   }
 ) {
-  const now = new Date();
-  const [row] = await sql`
-    INSERT INTO transactions (book_id, date, description, created_at, updated_at)
-    VALUES (${bookId}, ${data.date}, ${data.description}, ${now}, ${now})
-    RETURNING id
-  `;
-  const txnId = row.id as number;
-
-  await sql`
-    INSERT INTO transaction_splits ${sql(data.splits.map((split) => ({
-      book_id: bookId,
-      transaction_id: txnId,
-      account_id: split.accountId,
-      amount: split.amount,
-    })), "book_id", "transaction_id", "account_id", "amount")}
-  `;
-  return { id: txnId };
+  const row = await insert<{ id: number }>("transactions", {
+    bookId, date: data.date, description: data.description,
+  });
+  await insertRows("transaction_splits", data.splits.map((split) => ({
+    bookId, transactionId: row.id, accountId: split.accountId, amount: split.amount,
+  })));
+  return { id: row.id };
 }
 
-export async function seedBookData(sql: postgres.Sql, bookId: number) {
+/**
+ * Writes one investment transaction through the server. The server writes
+ * the splits and rebuilds the lots of each pair in the same transaction.
+ */
+async function postInvestmentTransaction(
+  post: ApiPost,
+  bookId: number,
+  data: {
+    date: string;
+    description: string;
+    splits: Array<{ accountId: number; amount: number }>;
+    investmentSplit: { securityId: number; action: "buy" | "sell"; sharesMicros: number; priceMicros: number };
+  }
+) {
+  await post(`/api/b/${bookId}/transactions`, {
+    date: data.date,
+    description: data.description,
+    splits: data.splits,
+    investmentSplits: [{ ...data.investmentSplit, feesCents: 0 }],
+  });
+}
+
+export async function seedBookData(bookId: number, post: ApiPost) {
   const seed = buildSeedData();
 
-  const checking = await insertAccount(sql, bookId, { name: "Checking", type: "asset" });
-  const savings = await insertAccount(sql, bookId, { name: "Savings", type: "asset" });
-  const salary = await insertAccount(sql, bookId, { name: "Salary", type: "income" });
-  const groceries = await insertAccount(sql, bookId, {
+  const checking = await insertAccount(bookId, { name: "Checking", type: "asset" });
+  const savings = await insertAccount(bookId, { name: "Savings", type: "asset" });
+  const salary = await insertAccount(bookId, { name: "Salary", type: "income" });
+  const groceries = await insertAccount(bookId, {
     name: "Groceries",
     type: "expense",
   });
-  const rent = await insertAccount(sql, bookId, { name: "Rent", type: "expense" });
+  const rent = await insertAccount(bookId, { name: "Rent", type: "expense" });
 
-  await insertTransactionWithSplits(sql, bookId, {
+  await insertTransactionWithSplits(bookId, {
     date: seed.dates.currentMonth,
     description: "Salary (current month)",
     splits: [
@@ -180,7 +184,7 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
     ],
   });
 
-  await insertTransactionWithSplits(sql, bookId, {
+  await insertTransactionWithSplits(bookId, {
     date: seed.dates.currentMonth,
     description: "Groceries (current month)",
     splits: [
@@ -189,7 +193,7 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
     ],
   });
 
-  await insertTransactionWithSplits(sql, bookId, {
+  await insertTransactionWithSplits(bookId, {
     date: seed.dates.lastMonth,
     description: "Salary (last month)",
     splits: [
@@ -198,7 +202,7 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
     ],
   });
 
-  await insertTransactionWithSplits(sql, bookId, {
+  await insertTransactionWithSplits(bookId, {
     date: seed.dates.lastMonth,
     description: "Rent (last month)",
     splits: [
@@ -207,7 +211,7 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
     ],
   });
 
-  await insertTransactionWithSplits(sql, bookId, {
+  await insertTransactionWithSplits(bookId, {
     date: seed.dates.lastYear,
     description: "Salary (last year)",
     splits: [
@@ -216,7 +220,7 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
     ],
   });
 
-  await insertTransactionWithSplits(sql, bookId, {
+  await insertTransactionWithSplits(bookId, {
     date: seed.dates.lastYear,
     description: "Groceries (last year)",
     splits: [
@@ -226,7 +230,7 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
   });
 
   for (let index = 0; index < seed.transferCount; index += 1) {
-    await insertTransactionWithSplits(sql, bookId, {
+    await insertTransactionWithSplits(bookId, {
       date: formatTransferDate(index + 1),
       description: `Transfer ${index + 1}`,
       splits: [
@@ -237,25 +241,25 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
   }
 
   // Payees
-  const wholeFoods = await insertPayee(sql, bookId, "Whole Foods");
-  const acmeCorp = await insertPayee(sql, bookId, "Acme Corp");
+  const wholeFoods = await insertPayee(bookId, "Whole Foods");
+  const acmeCorp = await insertPayee(bookId, "Acme Corp");
 
   // Link salary transactions to Acme Corp payee
-  await sql`UPDATE transactions SET payee_id = ${acmeCorp.id} WHERE book_id = ${bookId} AND description LIKE '%Salary%'`;
+  await exec("UPDATE transactions SET payee_id = $1 WHERE book_id = $2 AND description LIKE '%Salary%'", [acmeCorp.id, bookId]);
   // Link groceries transactions to Whole Foods payee
-  await sql`UPDATE transactions SET payee_id = ${wholeFoods.id} WHERE book_id = ${bookId} AND description LIKE '%Groceries%'`;
+  await exec("UPDATE transactions SET payee_id = $1 WHERE book_id = $2 AND description LIKE '%Groceries%'", [wholeFoods.id, bookId]);
 
   // Investment accounts
-  const brokerage = await insertAccount(sql, bookId, { name: "Brokerage", type: "asset", subtype: "investment" });
-  const brokerageCash = await insertAccount(sql, bookId, { name: "Brokerage (Cash)", type: "asset", subtype: "cash", isInvestmentCash: true, parentId: brokerage.id });
-  const retirement = await insertAccount(sql, bookId, { name: "Retirement", type: "asset", subtype: "investment" });
-  await insertAccount(sql, bookId, { name: "Retirement (Cash)", type: "asset", subtype: "cash", isInvestmentCash: true, parentId: retirement.id });
+  const brokerage = await insertAccount(bookId, { name: "Brokerage", type: "asset", subtype: "investment" });
+  const brokerageCash = await insertAccount(bookId, { name: "Brokerage (Cash)", type: "asset", subtype: "cash", isInvestmentCash: true, parentId: brokerage.id });
+  const retirement = await insertAccount(bookId, { name: "Retirement", type: "asset", subtype: "investment" });
+  await insertAccount(bookId, { name: "Retirement (Cash)", type: "asset", subtype: "cash", isInvestmentCash: true, parentId: retirement.id });
 
   // Security
-  const vti = await insertSecurity(sql, bookId, { name: "Vanguard Total Stock Market", symbol: "VTI", securityType: "etf" });
+  const vti = await insertSecurity(bookId, { name: "Vanguard Total Stock Market", symbol: "VTI", securityType: "etf" });
 
   // Security price
-  await insertSecurityPrice(sql, bookId, {
+  await insertSecurityPrice(bookId, {
     securityId: vti.id,
     priceDate: seed.dates.currentMonth,
     priceMicros: 250_000_000,
@@ -266,33 +270,20 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
   const shareMicros = 4_000_000;
   const priceMicros = 250_000_000;
   const grossCents = 100_000; // $1,000
-  const buyTxn = await insertTransactionWithSplits(sql, bookId, {
+  // investment_lots is derived state: the server's lot rebuild is its only
+  // writer. A raw insert of a lot must duplicate the lot columns by hand, and
+  // they are all NOT NULL. Thus each investment transaction goes through the
+  // real write path, which rebuilds the lots of its pair.
+  await postInvestmentTransaction(post, bookId, {
     date: seed.dates.lastYear,
     description: "Buy VTI",
     splits: [
       { accountId: brokerage.id, amount: grossCents },
       { accountId: brokerageCash.id, amount: -grossCents },
     ],
+    investmentSplit: { securityId: vti.id, action: "buy", sharesMicros: shareMicros, priceMicros },
   });
-  await sql`
-    INSERT INTO investment_splits (book_id, transaction_id, account_id, security_id, action, shares_micros, price_micros, fees_cents)
-    VALUES (${bookId}, ${buyTxn.id}, ${brokerage.id}, ${vti.id}, 'buy', ${shareMicros}, ${priceMicros}, 0)
-  `;
-  // investment_lots is derived state (see lib/lots-db.ts) — rebuildLots() is its
-  // only writer. Hand-inserting a stub row here used to work, but the lot
-  // columns it skipped (account_id, acquired_date, original/remaining
-  // shares/basis) are all NOT NULL, so a raw stub insert now fails outright.
-  // Replaying the buy split through the real write path keeps this fixture in
-  // sync with the schema by construction instead of hand-duplicating it.
-  //
-  // Wrapping `sql` itself in drizzle() and reusing it here would work for this
-  // one call, but corrupts *later* raw `sql\`...\`` queries on the same
-  // connection: any subsequent tagged-template query with a Date parameter
-  // (e.g. insertRecurringRule's `created_at`) throws "Received an instance of
-  // Date" from deep inside postgres.js's bind serializer. Root cause not fully
-  // chased down, but reproduces reliably — mixing drizzle-orm/postgres-js and
-  // raw postgres.js tagged templates on one connection is the trigger, and a
-  // dedicated connection for the drizzle-wrapped call avoids it entirely.
+
   // A second security carrying two buys and one sell, so the realized gains
   // report has real disposals to render. Deliberately separate from VTI rather
   // than adding a sell to it: five other specs assert against VTI's single-buy,
@@ -307,12 +298,12 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
   // 1 of lot 2's 2 shares (basis $300, proceeds $400, gain $100 short), leaving
   // one open lot of 1 share. Dating the sell in the current month puts it inside
   // the report's default range, which runs Jan 1 to today.
-  const bnd = await insertSecurity(sql, bookId, {
+  const bnd = await insertSecurity(bookId, {
     name: "Vanguard Total Bond Market",
     symbol: "BND",
     securityType: "etf",
   });
-  await insertSecurityPrice(sql, bookId, {
+  await insertSecurityPrice(bookId, {
     securityId: bnd.id,
     priceDate: seed.dates.currentMonth,
     priceMicros: 400_000_000,
@@ -326,34 +317,23 @@ export async function seedBookData(sql: postgres.Sql, bookId: number) {
 
   for (const trade of bndTrades) {
     const isBuy = trade.action === "buy";
-    const txn = await insertTransactionWithSplits(sql, bookId, {
+    await postInvestmentTransaction(post, bookId, {
       date: trade.date,
       description: trade.desc,
       splits: [
         { accountId: brokerage.id, amount: isBuy ? trade.gross : -trade.gross },
         { accountId: brokerageCash.id, amount: isBuy ? -trade.gross : trade.gross },
       ],
+      investmentSplit: { securityId: bnd.id, action: trade.action, sharesMicros: trade.shares, priceMicros: trade.price },
     });
-    await sql`
-      INSERT INTO investment_splits (book_id, transaction_id, account_id, security_id, action, shares_micros, price_micros, fees_cents)
-      VALUES (${bookId}, ${txn.id}, ${brokerage.id}, ${bnd.id}, ${trade.action}, ${trade.shares}, ${trade.price}, 0)
-    `;
   }
-
-  const lotsSql = postgres(e2eDatabaseUrl(), { onnotice: () => {} });
-  const lotsDb = drizzle(lotsSql, { schema });
-  await lotsDb.transaction(async (tx) => {
-    await rebuildLots(tx, bookId, brokerage.id, vti.id);
-    await rebuildLots(tx, bookId, brokerage.id, bnd.id);
-  });
-  await lotsSql.end();
 
   // Recurring rule — Monthly Rent, due tomorrow
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowStr = formatDate(tomorrow);
 
-  await insertRecurringRule(sql, bookId, {
+  await insertRecurringRule(bookId, {
     name: "Monthly Rent",
     frequency: "monthly",
     startDate: seed.dates.lastYear,

@@ -1,9 +1,8 @@
-import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { securityPrices } from "../../db/schema";
 import {
-  createAccount, createSecurity, createSecurityPrice, db, resetTestDatabase, setupTestDatabase,
+  createAccount, createSecurity, createSecurityPrice, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
+import { rows } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 /**
@@ -74,7 +73,7 @@ describe("JSON numbers outside the double range", () => {
     await createSecurityPrice({ securityId: acme.id, priceDate: "2025-01-10", priceMicros: 5 });
     const path = `/api/b/1/securities/${acme.id}/prices/2025-01-10`;
     const source = async () =>
-      (await db.select().from(securityPrices).where(eq(securityPrices.securityId, acme.id)))[0].source;
+      (await rows<{ source: string | null }>("SELECT source FROM security_prices WHERE security_id = $1", [acme.id]))[0].source;
 
     expect(await send("PUT", path, `{"priceDate":"2025-01-10","priceMicros":5,"source":${HUGE}}`))
       .toEqual({ status: 200, body: { success: true } });

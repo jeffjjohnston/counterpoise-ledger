@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { books } from "@/db/schema";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 import {
-  addBookMember, createBook, createUser, db, resetTestDatabase, setupTestDatabase,
+  addBookMember, createBook, createUser, resetTestDatabase, setupTestDatabase,
 } from "@/tests/helpers/db-utils";
+import { rows } from "@/tests/helpers/sql";
+import type { Book } from "@/types/db";
 
 // The book gate of the MCP tools, with each role. callAs sends that user's key.
 let mcp: McpTestClient;
@@ -78,7 +78,7 @@ describe("book gate", () => {
 // update_book and delete_book do not use the book gate: the route checks for
 // the owner.
 describe("owner-only book tools", () => {
-  const storedBook = async () => (await db.select().from(books).where(eq(books.id, 1)))[0];
+  const storedBook = async () => (await rows<Book>("SELECT * FROM books WHERE id = $1", [1]))[0];
 
   it.each([
     ["an editor", () => editorId],

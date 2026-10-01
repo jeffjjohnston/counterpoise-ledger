@@ -1,15 +1,14 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { getSqlClient_raw } from "../../db";
-import { plaidTokens, plaidTransactionReconciliation, transactions } from "../../db/schema";
 import { toDateString } from "../../lib/formatters";
+import type { PlaidToken, PlaidTransactionReconciliation, Transaction } from "../../types/db";
 import {
   addBookMember, createAccount, createBook, createPayee, createPlaidAccount, createPlaidReconciliation,
-  createPlaidToken, createTransactionWithSplits, createUser, db, resetTestDatabase, setupTestDatabase,
+  createPlaidToken, createTransactionWithSplits, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { exec, row, rows } from "../helpers/sql";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 type Reply = { status: number; body?: unknown; raw?: string };
@@ -60,18 +59,23 @@ function page(fields: { added?: unknown[]; modified?: unknown[]; removed?: unkno
 async function startPlaidMock() {
   const replies = new Map<string, Reply[]>();
   const requests: Record<string, unknown>[] = [];
+  const gates = new Map<string, { arrived: () => void; released: Promise<void> }>();
   const server: Server = createServer((request, response) => {
     let text = "";
     request.on("data", (chunk) => { text += chunk; });
     request.on("end", () => {
       const body = JSON.parse(text) as { access_token: string; cursor?: string };
       requests.push(body);
-      const queue = replies.get(`${body.access_token}|${body.cursor ?? ""}`);
-      const reply = (queue && (queue.length > 1 ? queue.shift() : queue[0])) ?? {
-        status: 400, body: { error_message: "unexpected request", error_code: "UNEXPECTED" },
-      };
-      response.writeHead(reply.status, { "content-type": "application/json" });
-      response.end(reply.raw ?? JSON.stringify(reply.body));
+      const gate = gates.get(body.access_token);
+      gate?.arrived();
+      void (gate?.released ?? Promise.resolve()).then(() => {
+        const queue = replies.get(`${body.access_token}|${body.cursor ?? ""}`);
+        const reply = (queue && (queue.length > 1 ? queue.shift() : queue[0])) ?? {
+          status: 400, body: { error_message: "unexpected request", error_code: "UNEXPECTED" },
+        };
+        response.writeHead(reply.status, { "content-type": "application/json" });
+        response.end(reply.raw ?? JSON.stringify(reply.body));
+      });
     });
   });
   await new Promise<void>((resolveReady) => server.listen(0, "127.0.0.1", () => resolveReady()));
@@ -83,6 +87,24 @@ async function startPlaidMock() {
     reply(accessToken: string, cursor: string | null, ...queue: Reply[]) {
       replies.set(`${accessToken}|${cursor ?? ""}`, queue);
     },
+    /**
+     * Holds the replies for this access token until `release()`. `arrived`
+     * resolves when the first such request comes in.
+     */
+    hold(accessToken: string) {
+      let arrived = () => {};
+      let release = () => {};
+      const arrival = new Promise<void>((resolve) => { arrived = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      gates.set(accessToken, { arrived, released });
+      return {
+        arrived: arrival,
+        release() {
+          gates.delete(accessToken);
+          release();
+        },
+      };
+    },
     reset() {
       replies.clear();
       requests.length = 0;
@@ -91,11 +113,11 @@ async function startPlaidMock() {
 }
 
 async function stagedRows() {
-  const rows = await db.select().from(plaidTransactionReconciliation).orderBy(asc(plaidTransactionReconciliation.id));
+  const staged = await rows<PlaidTransactionReconciliation>("SELECT * FROM plaid_transaction_reconciliation ORDER BY id");
   // The timestamps are the sync's own; the row only reports whether it is resolved.
   const volatile = new Set(["createdAt", "updatedAt", "firstSeenAt", "lastSeenAt", "resolvedAt"]);
-  type Stable = Omit<(typeof rows)[number], "createdAt" | "updatedAt" | "firstSeenAt" | "lastSeenAt" | "resolvedAt">;
-  return rows.map((row) => ({
+  type Stable = Omit<PlaidTransactionReconciliation, "createdAt" | "updatedAt" | "firstSeenAt" | "lastSeenAt" | "resolvedAt">;
+  return staged.map((row) => ({
     ...(Object.fromEntries(Object.entries(row).filter(([key]) => !volatile.has(key))) as Stable),
     resolved: row.resolvedAt !== null,
   }));
@@ -161,7 +183,7 @@ describe("Plaid sync HTTP parity", () => {
     plaid.reply("access-1", null, page({ added: items, next_cursor: "cursor-1" }));
 
     const result = await sync(path);
-    const [stored] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, token.id));
+    const stored = await row<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
     expect(result).toEqual({
       synced: { added: 3, modified: 0, removed: 0 }, autoMatched: 0,
       lastSyncedAt: stored.lastSyncedAt!.toISOString(), pendingCount: 3, reviewCount: 0,
@@ -208,10 +230,14 @@ describe("Plaid sync HTTP parity", () => {
     await staged("pending-rm", "pending");
     await staged("created", "created", { reviewReason: "plaid_removed" });
     await staged("readd", "matched", { reviewReason: "plaid_modified" });
-    await db.update(plaidTransactionReconciliation).set({ reviewMetadataJson: "{\"kept\":true}", resolvedAt: new Date("2025-01-03T00:00:00Z") })
-      .where(eq(plaidTransactionReconciliation.plaidTransactionId, "created"));
-    await db.update(plaidTransactionReconciliation).set({ reviewMetadataJson: "{\"stale\":true}" })
-      .where(eq(plaidTransactionReconciliation.plaidTransactionId, "pending-mod"));
+    await exec(
+      "UPDATE plaid_transaction_reconciliation SET review_metadata_json = $1, resolved_at = $2 WHERE plaid_transaction_id = $3",
+      ["{\"kept\":true}", new Date("2025-01-03T00:00:00Z"), "created"],
+    );
+    await exec(
+      "UPDATE plaid_transaction_reconciliation SET review_metadata_json = $1 WHERE plaid_transaction_id = $2",
+      ["{\"stale\":true}", "pending-mod"],
+    );
 
     plaid.reply("access-1", "cursor-0", page({
       added: [plaidItem({ transaction_id: "readd", amount: 5, name: "Readded", date: "2025-01-02" })],
@@ -232,8 +258,8 @@ describe("Plaid sync HTTP parity", () => {
     const result = await sync(path);
     expect(result).toMatchObject({ synced: { added: 1, modified: 4, removed: 4 }, autoMatched: 0, pendingCount: 2, reviewCount: 3 });
     expect(plaid.requests.map((body) => [body.cursor, body.options])).toEqual([["cursor-0", undefined], ["cursor-1", undefined]]);
-    const rows = Object.fromEntries((await stagedRows()).map((row) => [row.plaidTransactionId, row]));
-    expect(rows.matched).toMatchObject({
+    const byId = Object.fromEntries((await stagedRows()).map((staged) => [staged.plaidTransactionId, staged]));
+    expect(byId.matched).toMatchObject({
       resolutionStatus: "matched", reviewReason: "plaid_modified", amountCents: 650, name: "New name",
       reviewMetadataJson: JSON.stringify({
         event: "modified",
@@ -241,16 +267,16 @@ describe("Plaid sync HTTP parity", () => {
         incoming: { date: "2025-01-04", amountCents: 650, name: "New name", merchantName: "New Merchant", originalDescription: null, categoryPrimary: "NEW", categoryDetailed: "NEW_DETAIL" },
       }),
     });
-    expect(rows["pending-mod"]).toMatchObject({ resolutionStatus: "pending", reviewReason: null, reviewMetadataJson: "{\"stale\":true}", amountCents: 700, date: "2025-01-06" });
-    expect(rows.created).toMatchObject({ resolutionStatus: "created", reviewReason: "plaid_modified", resolved: true, amountCents: 800 });
-    expect(rows["ignored-rm"]).toMatchObject({ resolutionStatus: "ignored", reviewReason: null });
-    expect(rows["pending-rm"]).toMatchObject({
+    expect(byId["pending-mod"]).toMatchObject({ resolutionStatus: "pending", reviewReason: null, reviewMetadataJson: "{\"stale\":true}", amountCents: 700, date: "2025-01-06" });
+    expect(byId.created).toMatchObject({ resolutionStatus: "created", reviewReason: "plaid_modified", resolved: true, amountCents: 800 });
+    expect(byId["ignored-rm"]).toMatchObject({ resolutionStatus: "ignored", reviewReason: null });
+    expect(byId["pending-rm"]).toMatchObject({
       resolutionStatus: "pending", reviewReason: "plaid_removed",
       reviewMetadataJson: JSON.stringify({ event: "removed", removedTransactionId: "pending-rm" }),
     });
-    expect(rows.readd).toMatchObject({ resolutionStatus: "matched", reviewReason: null, reviewMetadataJson: null, name: "Readded", amountCents: 500 });
-    expect(rows["brand-new"]).toMatchObject({ plaidAccountLinkId: cardLink.id, resolutionStatus: "pending", amountCents: 200 });
-    const [token] = await db.select().from(plaidTokens);
+    expect(byId.readd).toMatchObject({ resolutionStatus: "matched", reviewReason: null, reviewMetadataJson: null, name: "Readded", amountCents: 500 });
+    expect(byId["brand-new"]).toMatchObject({ plaidAccountLinkId: cardLink.id, resolutionStatus: "pending", amountCents: 200 });
+    const [token] = await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id");
     expect(token.syncCursor).toBe("cursor-2");
   });
 
@@ -280,8 +306,8 @@ describe("Plaid sync HTTP parity", () => {
       modified: [without({ transaction_id: "matched", amount: 7, date: "2025-01-04", merchant_name: null }, "original_description", "authorized_date")],
     }));
     await sync(path);
-    const rows = Object.fromEntries((await stagedRows()).map((row) => [row.plaidTransactionId, row]));
-    expect(rows.matched).toMatchObject({
+    const byId = Object.fromEntries((await stagedRows()).map((staged) => [staged.plaidTransactionId, staged]));
+    expect(byId.matched).toMatchObject({
       amountCents: 700, merchantName: null, originalDescription: "OLD DESCRIPTION", authorizedDate: "2025-01-01", isoCurrencyCode: "USD",
       reviewMetadataJson: JSON.stringify({
         event: "modified",
@@ -289,8 +315,8 @@ describe("Plaid sync HTTP parity", () => {
         incoming: { date: "2025-01-04", amountCents: 700, name: "Transaction", merchantName: null, categoryPrimary: null, categoryDetailed: null },
       }),
     });
-    expect(rows.readded).toMatchObject({ amountCents: 600, originalDescription: "OLD DESCRIPTION", authorizedDate: "2025-01-01", isoCurrencyCode: "USD", merchantName: null });
-    expect(rows.fresh).toMatchObject({ originalDescription: null, merchantName: null, isoCurrencyCode: "USD" });
+    expect(byId.readded).toMatchObject({ amountCents: 600, originalDescription: "OLD DESCRIPTION", authorizedDate: "2025-01-01", isoCurrencyCode: "USD", merchantName: null });
+    expect(byId.fresh).toMatchObject({ originalDescription: null, merchantName: null, isoCurrencyCode: "USD" });
   });
 
   it("restarts from the stored cursor after a mutation during pagination, at most twice", async () => {
@@ -300,16 +326,16 @@ describe("Plaid sync HTTP parity", () => {
     plaid.reply("access-1", "cursor-mid", mutation, page({ next_cursor: "cursor-end" }));
     expect((await sync(path)).synced).toEqual({ added: 0, modified: 0, removed: 0 });
     expect(plaid.requests.map((body) => body.cursor)).toEqual(["cursor-0", "cursor-mid", "cursor-0", "cursor-mid"]);
-    expect((await db.select().from(plaidTokens))[0].syncCursor).toBe("cursor-end");
+    expect((await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id"))[0].syncCursor).toBe("cursor-end");
 
     plaid.reset();
-    await db.update(plaidTokens).set({ syncCursor: "cursor-0" }).where(eq(plaidTokens.id, token.id));
+    await exec("UPDATE plaid_tokens SET sync_cursor = $1 WHERE id = $2", ["cursor-0", token.id]);
     plaid.reply("access-1", "cursor-0", page({ has_more: true, next_cursor: "cursor-mid" }));
     plaid.reply("access-1", "cursor-mid", mutation);
     const message = "Plaid /transactions/sync request failed: mutated (TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION)";
     await expectError(client, path, { method: "POST" }, 502, message);
     expect(plaid.requests).toHaveLength(6);
-    expect((await db.select().from(plaidTokens))[0]).toMatchObject({ syncCursor: "cursor-0", lastError: message });
+    expect((await rows("SELECT * FROM plaid_tokens ORDER BY id"))[0]).toMatchObject({ syncCursor: "cursor-0", lastError: message });
   });
 
   it("records a failed sync on the connection and reports it as Plaid's", async () => {
@@ -324,13 +350,13 @@ describe("Plaid sync HTTP parity", () => {
     ] as const) {
       plaid.reply("access-1", "cursor-0", reply as Reply);
       await expectError(client, path, { method: "POST" }, 502, error);
-      const [stored] = await db.select().from(plaidTokens).where(eq(plaidTokens.id, token.id));
+      const stored = await row("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
       expect(stored).toMatchObject({ lastError: error, syncCursor: "cursor-0", lastSyncedAt: null });
     }
     // A later sync clears the error.
     plaid.reply("access-1", "cursor-0", page({ next_cursor: null }));
     expect(await sync(path)).toMatchObject({ synced: { added: 0, modified: 0, removed: 0 } });
-    expect((await db.select().from(plaidTokens))[0]).toMatchObject({ lastError: null, syncCursor: null });
+    expect((await rows("SELECT * FROM plaid_tokens ORDER BY id"))[0]).toMatchObject({ lastError: null, syncCursor: null });
   });
 
   it("refuses a connection that cannot sync", async () => {
@@ -347,7 +373,7 @@ describe("Plaid sync HTTP parity", () => {
     ] as const) {
       await expectError(client, `/api/b/1/sync/tokens/${id}/sync`, { method: "POST" }, status, error);
     }
-    const errors = await db.select({ id: plaidTokens.id, lastError: plaidTokens.lastError }).from(plaidTokens).orderBy(asc(plaidTokens.id));
+    const errors = await rows("SELECT id, last_error FROM plaid_tokens ORDER BY id");
     expect(errors).toEqual([
       { id: bare.id, lastError: "No linked accounts found for this token" },
       { id: expense.id, lastError: "Only asset or liability Counterpoise accounts can be synchronized with Plaid" },
@@ -366,16 +392,29 @@ describe("Plaid sync HTTP parity", () => {
   });
 
   it("refuses a second sync of a connection while one runs", async () => {
-    const { token, path } = await connection();
-    const held = await getSqlClient_raw().reserve();
+    const { path } = await connection();
+    plaid.reply("access-1", null, page({ next_cursor: "cursor-1" }));
+    // The first sync holds the sync lock while it waits for Plaid. The mock
+    // keeps that request open until the second sync has its answer.
+    const gate = plaid.hold("access-1");
+    let first: Promise<Response> | undefined;
     try {
-      await held`select pg_advisory_lock(1000001, ${token.id})`;
+      first = client.request(path, { method: "POST" });
+      await gate.arrived;
       await expectError(client, path, { method: "POST" }, 409, "A sync is already running for this connection");
-      await held`select pg_advisory_unlock(1000001, ${token.id})`;
+      // The refused sync did not call Plaid and did not record an error.
+      expect(plaid.requests).toHaveLength(1);
+      expect((await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id"))[0].lastError).toBeNull();
     } finally {
-      held.release();
+      gate.release();
     }
-    expect((await db.select().from(plaidTokens))[0].lastError).toBeNull();
+    expect((await first).status).toBe(200);
+    // The lock is free again after the first sync ends.
+    plaid.reply("access-1", "cursor-1", page({ next_cursor: "cursor-2" }));
+    expect((await sync(path)).synced).toEqual({ added: 0, modified: 0, removed: 0 });
+    expect((await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id"))[0]).toMatchObject({
+      syncCursor: "cursor-2", lastError: null,
+    });
   });
 
   it("matches pending rows to transactions through the payees of earlier matches", async () => {
@@ -409,13 +448,13 @@ describe("Plaid sync HTTP parity", () => {
 
     const result = await sync(path);
     expect(result).toMatchObject({ synced: { added: 5, modified: 0, removed: 0 }, autoMatched: 3, pendingCount: 2, reviewCount: 0 });
-    const rows = Object.fromEntries((await stagedRows()).map((row) => [row.plaidTransactionId, row]));
-    expect(rows.delayed).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: postedDay.id, resolved: true });
-    expect(rows.floating).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: floating.id });
-    expect(rows.grocery).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: grocery.id });
-    expect(rows.far).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
-    expect(rows.stranger).toMatchObject({ resolutionStatus: "pending" });
-    const local = Object.fromEntries((await db.select().from(transactions)).map((row) => [row.id, row]));
+    const byId = Object.fromEntries((await stagedRows()).map((staged) => [staged.plaidTransactionId, staged]));
+    expect(byId.delayed).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: postedDay.id, resolved: true });
+    expect(byId.floating).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: floating.id });
+    expect(byId.grocery).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: grocery.id });
+    expect(byId.far).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
+    expect(byId.stranger).toMatchObject({ resolutionStatus: "pending" });
+    const local = Object.fromEntries((await rows<Transaction>("SELECT * FROM transactions ORDER BY id")).map((txn) => [txn.id, txn]));
     expect(local[postedDay.id]).toMatchObject({ isReconciled: true, isFloating: false, date: "2025-02-10" });
     expect(local[floating.id]).toMatchObject({ isReconciled: true, isFloating: false, date: daysAgo(1) });
     expect(local[grocery.id]).toMatchObject({ isReconciled: true, date: "2025-03-05" });

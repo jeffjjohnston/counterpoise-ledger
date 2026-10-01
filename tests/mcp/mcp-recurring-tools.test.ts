@@ -1,7 +1,4 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
-import { getDb } from "@/db";
-import { recurringRules, recurringTemplateSplits, transactions } from "@/db/schema";
-import { eq } from "drizzle-orm";
 import {
   setupTestDatabase,
   resetTestDatabase,
@@ -12,6 +9,8 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
+import { count, row, rows } from "@/tests/helpers/sql";
+import type { RecurringRule, Transaction } from "@/types/db";
 
 let mcp: McpTestClient;
 
@@ -139,7 +138,7 @@ describe("MCP Recurring Tools", () => {
       expect(isError).toBe(true);
       expect(data.error).toMatch(/sum to zero/i);
 
-      const rules = await getDb().select().from(recurringRules);
+      const rules = await rows<RecurringRule>("SELECT * FROM recurring_rules");
       expect(rules).toEqual([]);
     });
 
@@ -197,11 +196,7 @@ describe("MCP Recurring Tools", () => {
         data.templateSplits.map((s: { accountId: number }) => s.accountId).sort()
       ).toEqual([groceries.id, checking.id].sort());
 
-      const rows = await getDb()
-        .select()
-        .from(recurringTemplateSplits)
-        .where(eq(recurringTemplateSplits.recurringRuleId, rule.id));
-      expect(rows).toHaveLength(2);
+      expect(await count("recurring_template_splits", "recurring_rule_id = $1", [rule.id])).toBe(2);
     });
 
     it("errors on another book's rule AND leaves that rule unchanged", async () => {
@@ -230,10 +225,7 @@ describe("MCP Recurring Tools", () => {
       expect(isError).toBe(true);
       // The second half is the assertion that matters: "it errored" is also
       // satisfied by a tool that errors for the wrong reason.
-      const [still] = await getDb()
-        .select()
-        .from(recurringRules)
-        .where(eq(recurringRules.id, theirs.id));
+      const still = await row<RecurringRule>("SELECT * FROM recurring_rules WHERE id = $1", [theirs.id]);
       expect(still.name).toBe("Theirs");
     });
 
@@ -268,16 +260,10 @@ describe("MCP Recurring Tools", () => {
       const { isError } = await callTool("delete_recurring_rule", { bookId, ruleId: rule.id });
 
       expect(isError).toBe(false);
-      const rules = await getDb()
-        .select()
-        .from(recurringRules)
-        .where(eq(recurringRules.id, rule.id));
+      const rules = await rows<RecurringRule>("SELECT * FROM recurring_rules WHERE id = $1", [rule.id]);
       expect(rules).toEqual([]);
 
-      const [tx] = await getDb()
-        .select()
-        .from(transactions)
-        .where(eq(transactions.id, created.id));
+      const [tx] = await rows<Transaction>("SELECT * FROM transactions WHERE id = $1", [created.id]);
       expect(tx).toBeDefined();
       expect(tx.recurringRuleId).toBeNull();
     });
@@ -313,8 +299,7 @@ describe("MCP Recurring Tools", () => {
 
       // A projection tool that quietly created rows would pass every
       // assertion above.
-      const rows = await getDb().select().from(transactions);
-      expect(rows).toEqual([]);
+      expect(await rows("SELECT * FROM transactions")).toEqual([]);
     });
 
     it("filters by accountId, including a direct child of it", async () => {
@@ -394,7 +379,7 @@ describe("MCP Recurring Tools", () => {
         transactionIds: [],
         skipped: [],
       });
-      expect(await getDb().select().from(transactions)).toEqual([]);
+      expect(await rows("SELECT * FROM transactions")).toEqual([]);
     });
 
     it("creates due transactions with processAll, and a repeat call creates none", async () => {
@@ -404,11 +389,11 @@ describe("MCP Recurring Tools", () => {
       const first = await callTool("process_recurring_rules", { bookId, processAll: true });
       expect(first.isError).toBe(false);
       expect(first.data.transactionsCreated).toBeGreaterThan(0);
-      const afterFirst = await getDb().select().from(transactions);
+      const afterFirst = await rows("SELECT * FROM transactions");
 
       const second = await callTool("process_recurring_rules", { bookId, processAll: true });
       expect(second.data.transactionsCreated).toBe(0);
-      expect(await getDb().select().from(transactions)).toHaveLength(afterFirst.length);
+      expect(await rows("SELECT * FROM transactions")).toHaveLength(afterFirst.length);
     });
 
     it("forces an occurrence with ruleId even when the rule is not due", async () => {
@@ -422,17 +407,14 @@ describe("MCP Recurring Tools", () => {
       expect(forced.isError).toBe(false);
       expect(forced.data.transactionsCreated).toBe(1);
 
-      const [updated] = await getDb()
-        .select()
-        .from(recurringRules)
-        .where(eq(recurringRules.id, rule.id));
+      const updated = await row<RecurringRule>("SELECT * FROM recurring_rules WHERE id = $1", [rule.id]);
       expect(updated.nextDate).toBe("2030-10-15");
 
       // Not idempotent, which is why the tool is annotated CREATE and its
       // description warns that calling twice creates two transactions.
       const again = await callTool("process_recurring_rules", { bookId, ruleId: rule.id });
       expect(again.data.transactionsCreated).toBe(1);
-      expect(await getDb().select().from(transactions)).toHaveLength(2);
+      expect(await rows("SELECT * FROM transactions")).toHaveLength(2);
     });
 
     it("returns isError for an unknown ruleId", async () => {

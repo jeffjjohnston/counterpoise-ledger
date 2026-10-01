@@ -1,9 +1,8 @@
-import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { securities } from "../../db/schema";
 import {
-  addBookMember, createBook, createUser, db, resetTestDatabase, setupTestDatabase,
+  addBookMember, createBook, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
+import { rows } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { createInvestmentScenario, stable } from "../helpers/investment-scenario";
 
@@ -115,7 +114,7 @@ describe("security HTTP parity", () => {
     await expectError("/api/b/1/securities/999999", { method: "DELETE" }, 404, "Security not found");
     await expectError("/api/b/1/securities/abc", { method: "DELETE" }, 400, "Invalid security id");
     expect(await ok(path, { method: "DELETE" })).toEqual({ success: true });
-    expect(await db.select().from(securities).where(eq(securities.id, scenario.idle.id))).toEqual([]);
+    expect(await rows("SELECT * FROM securities WHERE id = $1", [scenario.idle.id])).toEqual([]);
   });
 
   it("returns detail with per-account positions, lot basis, and newest-first splits", async () => {

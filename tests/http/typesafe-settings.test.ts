@@ -1,14 +1,12 @@
-import { asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-  books, typesafeAggregates, typesafeDecisions, typesafeEvaluations, typesafeQuotas,
-} from "../../db/schema";
 import { summarizeTypeSafe } from "../../lib/typesafe/report";
 import type { MatchSnapshot } from "../../lib/typesafe/types";
+import type { TypeSafeDecision, TypeSafeEvaluation } from "../../types/db";
 import {
-  addBookMember, createBook, createUser, db, resetTestDatabase, setupTestDatabase,
+  addBookMember, createBook, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { insert, insertRows, rows, scalar } from "../helpers/sql";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 const SETTINGS = "/api/b/1/settings/typesafe";
@@ -60,9 +58,9 @@ const matchSnapshot = snapshot({
 });
 
 let sequence = 0;
-async function evaluation(values: Partial<typeof typesafeEvaluations.$inferInsert>) {
+async function evaluation(values: Partial<TypeSafeEvaluation>) {
   sequence += 1;
-  const [row] = await db.insert(typesafeEvaluations).values({
+  return insert<TypeSafeEvaluation>("typesafe_evaluations", {
     bookId: 1,
     reconciliationId: sequence,
     linkId: 1,
@@ -73,12 +71,11 @@ async function evaluation(values: Partial<typeof typesafeEvaluations.$inferInser
     status: "ready",
     startedAt: new Date(Date.now() - 40 * DAY),
     ...values,
-  }).returning();
-  return row;
+  });
 }
 
-async function decision(evaluationId: number, values: Partial<typeof typesafeDecisions.$inferInsert>) {
-  await db.insert(typesafeDecisions).values({
+async function decision(evaluationId: number, values: Partial<TypeSafeDecision>) {
+  await insert("typesafe_decisions", {
     bookId: 1,
     reconciliationId: 1,
     evaluationId,
@@ -118,7 +115,7 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     const pending = await evaluation({ status: "pending", startedAt: new Date() });
     const on = await client.request(SETTINGS, json("PATCH", { enabled: true }));
     expect(await on.json()).toEqual({ enabled: true, revision: 1, configured: true });
-    expect((await db.select().from(typesafeEvaluations).where(eq(typesafeEvaluations.id, pending.id)))[0].status).toBe("stale");
+    expect(await scalar("SELECT status FROM typesafe_evaluations WHERE id = $1", [pending.id])).toBe("stale");
     // No change of state: the revision stays.
     expect(await (await client.request(SETTINGS, json("PATCH", { enabled: true }))).json())
       .toEqual({ enabled: true, revision: 1, configured: true });
@@ -127,18 +124,18 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
 
     const kept = await evaluation({ startedAt: new Date() });
     await decision(kept.id, {});
-    await db.insert(typesafeAggregates).values({ bookId: 1, counts: { evaluations: 3 } });
+    await insert("typesafe_aggregates", { bookId: 1, counts: { evaluations: 3 } });
     const today = new Date().toISOString().slice(0, 10);
-    await db.insert(typesafeQuotas).values({ bookId: 1, day: today, attempts: 4 });
+    await insert("typesafe_quotas", { bookId: 1, day: today, attempts: 4 });
     const other = await createBook({ name: "Other" });
     await evaluation({ bookId: other.id });
 
     const cleared = await client.request(SETTINGS, { method: "DELETE" });
     expect(await cleared.json()).toEqual({ enabled: false, revision: 3, configured: true });
-    expect(await db.select().from(typesafeEvaluations)).toMatchObject([{ bookId: other.id }]);
-    expect(await db.select().from(typesafeDecisions)).toEqual([]);
-    expect(await db.select().from(typesafeAggregates)).toEqual([]);
-    expect(await db.select().from(typesafeQuotas)).toMatchObject([{ bookId: 1, day: today, attempts: 4 }]);
+    expect(await rows("SELECT * FROM typesafe_evaluations ORDER BY id")).toMatchObject([{ bookId: other.id }]);
+    expect(await rows("SELECT * FROM typesafe_decisions ORDER BY id")).toEqual([]);
+    expect(await rows("SELECT * FROM typesafe_aggregates ORDER BY book_id")).toEqual([]);
+    expect(await rows("SELECT * FROM typesafe_quotas ORDER BY book_id, day")).toMatchObject([{ bookId: 1, day: today, attempts: 4 }]);
   });
 
   it("validates the ID and the body, and enforces the access level", async () => {
@@ -150,7 +147,7 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     for (const body of [{ enabled: "yes" }, { enabled: true, extra: 1 }, {}, null, [true]]) {
       await expectError(client, SETTINGS, json("PATCH", body), 400, "Expected enabled: true or false");
     }
-    expect((await db.select().from(books).where(eq(books.id, 1)))[0].typesafeRevision).toBe(0);
+    expect(await scalar("SELECT typesafe_revision FROM books WHERE id = $1", [1])).toBe(0);
 
     await expectError(client, "/api/b/999999/settings/typesafe", {}, 404, "Book not found");
     const owner = await createUser({ username: "owner" });
@@ -183,7 +180,7 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: "Unauthorized" });
     }
-    expect(await db.select().from(typesafeEvaluations)).toHaveLength(1);
+    expect(await rows("SELECT * FROM typesafe_evaluations ORDER BY id")).toHaveLength(1);
   });
 
   it("archives the counts of expired evaluations per book, then deletes them and old quotas", async () => {
@@ -206,17 +203,17 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     const elsewhere = await evaluation({ bookId: other.id, snapshot: matchSnapshot, choice: "candidate_2", answers: { match: pick("candidate_2") } });
     await decision(elsewhere.id, { bookId: other.id, action: "match", transactionId: 41 });
     const recent = await evaluation({ startedAt: new Date() });
-    await db.insert(typesafeAggregates).values({ bookId: 1, counts: { evaluations: 5, ui_decisions: 2, legacy_key: 1 } });
+    await insert("typesafe_aggregates", { bookId: 1, counts: { evaluations: 5, ui_decisions: 2, legacy_key: 1 } });
     const oldDay = new Date(Date.now() - 31 * DAY).toISOString().slice(0, 10);
     const today = new Date().toISOString().slice(0, 10);
-    await db.insert(typesafeQuotas).values([
+    await insertRows("typesafe_quotas", [
       { bookId: 1, day: oldDay, attempts: 2 },
       { bookId: 1, day: today, attempts: 3 },
     ]);
 
     // The TypeScript summary of the same rows is the expected result.
-    const expired = await db.select().from(typesafeEvaluations).orderBy(asc(typesafeEvaluations.id));
-    const decisions = await db.select().from(typesafeDecisions).orderBy(asc(typesafeDecisions.id));
+    const expired = await rows<TypeSafeEvaluation>("SELECT * FROM typesafe_evaluations ORDER BY id");
+    const decisions = await rows<TypeSafeDecision>("SELECT * FROM typesafe_decisions ORDER BY id");
     const expected = (bookId: number, archived: Record<string, number>) => {
       const rows = expired.filter((row) => row.bookId === bookId && row.id !== recent.id);
       const counts = { ...archived };
@@ -230,11 +227,11 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     const response = await client.anonymous(CLEANUP, { headers: { authorization: "Bearer test-cron-secret" } });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ deleted: 8, batchLimit: 1000 });
-    const aggregates = await db.select().from(typesafeAggregates).orderBy(asc(typesafeAggregates.bookId));
+    const aggregates = await rows("SELECT * FROM typesafe_aggregates ORDER BY book_id");
     expect(aggregates).toEqual([{ bookId: 1, counts: book1 }, { bookId: other.id, counts: book2 }]);
-    expect(await db.select({ id: typesafeEvaluations.id }).from(typesafeEvaluations)).toEqual([{ id: recent.id }]);
-    expect(await db.select().from(typesafeDecisions)).toEqual([]);
-    expect(await db.select().from(typesafeQuotas)).toMatchObject([{ bookId: 1, day: today, attempts: 3 }]);
+    expect(await rows("SELECT id FROM typesafe_evaluations ORDER BY id")).toEqual([{ id: recent.id }]);
+    expect(await rows("SELECT * FROM typesafe_decisions ORDER BY id")).toEqual([]);
+    expect(await rows("SELECT * FROM typesafe_quotas ORDER BY book_id, day")).toMatchObject([{ bookId: 1, day: today, attempts: 3 }]);
 
     // A second run finds nothing more to archive.
     const again = await client.anonymous(CLEANUP, { headers: { authorization: "Bearer test-cron-secret" } });

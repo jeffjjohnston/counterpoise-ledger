@@ -4,9 +4,8 @@
 //! investment splits. It writes no lots and no allocations: those are derived
 //! state, and the lot rebuild writes them after the stock splits.
 
+use ledger_db::engine::DbConnection;
 use std::collections::HashMap;
-
-use sqlx::{Connection, PgConnection};
 
 use super::transactions::{payee_of, validation_errors};
 use super::values::{
@@ -215,7 +214,7 @@ impl Resolved<'_> {
 }
 
 pub async fn import_investment_transactions(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     transactions: &[&Item],
     all_items: &[&Item],
@@ -285,7 +284,7 @@ pub async fn import_investment_transactions(
                 }
             };
             let reinvestment = resolved.action == "dividend" && truthy(resolved.security().samt);
-            let mut savepoint = connection.begin().await?;
+            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
             let outcome = if reinvestment {
                 write_reinvestment(&mut savepoint, context.book_id, context.now, &resolved).await
             } else {
@@ -456,7 +455,7 @@ fn js_trim(text: &str) -> String {
 /// A dividend that bought shares becomes two transactions: the cash
 /// dividend, then a buy of the shares with that cash.
 async fn write_reinvestment(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     now: chrono::NaiveDateTime,
     resolved: &Resolved<'_>,
@@ -557,7 +556,7 @@ async fn write_reinvestment(
 
 /// A buy, a sell, a dividend, a capital gain or a fee in one transaction.
 async fn write_investment(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &ImportContext,
     resolved: &Resolved<'_>,
 ) -> Result<Counted, RowError> {

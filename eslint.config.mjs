@@ -28,6 +28,8 @@ const config = [
   {
     ignores: [
       ".next", "node_modules", "coverage", "dist", "build", "out", ".claude/worktrees", "lib/wasm/generated",
+      // Local generated output (gitignored), such as analysis bundles.
+      "output",
     ],
   },
   {

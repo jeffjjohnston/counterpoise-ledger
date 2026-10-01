@@ -3,8 +3,8 @@ use crate::{
     error::{ApiError, ApiResult, error, internal_error},
     state::AppState,
     validation::{
-        first_query_values, is_js_whitespace, local_today, parse_int_prefix_number,
-        parse_js_number, parse_json_body, validate_payee_create,
+        first_query_values, local_today, parse_int_prefix_number, parse_js_number, parse_json_body,
+        validate_payee_create,
     },
 };
 use axum::{
@@ -14,9 +14,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::{NaiveDateTime, SecondsFormat, Utc};
+use ledger_db::engine::DbPool;
 use serde::Serialize;
 use serde_json::{Value, json, to_value};
-use sqlx::PgPool;
 
 #[derive(sqlx::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,24 +35,9 @@ struct PayeeSummaryRow {
     transaction_count: i32,
 }
 
-/// `normalizePayeeName()`: trim, collapse whitespace runs, and straighten
-/// quote characters. It does not change case: "IKEA" and "Ikea" are two
-/// payees.
-pub(crate) fn normalize_name(input: &str) -> String {
-    input
-        .split(is_js_whitespace)
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .map(|character| match character {
-            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' | '\u{2032}' | '`' | '\u{00b4}' => {
-                '\''
-            }
-            other => other,
-        })
-        .collect()
-}
+/// `normalizePayeeName()`. It does not change case: "IKEA" and "Ikea" are
+/// two payees.
+pub(crate) use ledger_core::names::normalize_payee_name as normalize_name;
 
 fn search_pattern(input: &str) -> String {
     input
@@ -101,7 +86,7 @@ pub(crate) async fn list_payees(
                        WHEN lower(p.name) LIKE '% ' || $2 || '%' THEN 1
                        ELSE 2 END,
                   p.name
-         LIMIT $4",
+         LIMIT COALESCE($4, -1)",
     )
     .bind(book.book_id)
     .bind(pattern)
@@ -222,7 +207,7 @@ pub(crate) async fn create_payee(
 /// The route calls this after its case-insensitive lookup. The MCP tool
 /// `create_payee` calls it without that lookup.
 pub(crate) async fn create_exact(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     name: &str,
 ) -> sqlx::Result<Option<Value>> {

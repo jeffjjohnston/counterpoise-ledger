@@ -200,7 +200,7 @@ pub(super) async fn balance_history(
     }
     let limit_index = 2 + usize::from(start.is_some()) + usize::from(end.is_some());
     sql.push_str(&format!(
-        " ORDER BY {EFFECTIVE_DATE}, s.id LIMIT ${limit_index}"
+        " ORDER BY {EFFECTIVE_DATE}, s.id LIMIT COALESCE(${limit_index}, -1)"
     ));
     let mut query = sqlx::query_as::<_, (String, Option<String>, i32, i32)>(&sql).bind(id);
     if let Some(start) = start {

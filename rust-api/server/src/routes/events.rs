@@ -108,15 +108,9 @@ mod tests {
     use super::*;
     use crate::book_changes::BookChangeHub;
     use futures_util::StreamExt;
-    use sqlx::postgres::PgPoolOptions;
 
     fn hub() -> BookChangeHub {
-        BookChangeHub::new(
-            PgPoolOptions::new()
-                .connect_lazy("postgres://unused@127.0.0.1:1/unused")
-                .unwrap(),
-        )
-        .without_listener()
+        BookChangeHub::detached()
     }
 
     async fn next(

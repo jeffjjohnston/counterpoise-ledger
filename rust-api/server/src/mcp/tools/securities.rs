@@ -1,5 +1,6 @@
 //! The security tools.
 
+use ledger_db::sql;
 use std::collections::HashMap;
 
 use axum::http::{Method, StatusCode};
@@ -161,7 +162,7 @@ pub(super) async fn detail(
 
     let prices: Vec<(String, i64)> = sqlx::query_as(
         "SELECT price_date, price_micros FROM security_prices WHERE security_id = $1
-         ORDER BY price_date DESC LIMIT $2 OFFSET $3",
+         ORDER BY price_date DESC LIMIT COALESCE($2, -1) OFFSET COALESCE($3, 0)",
     )
     .bind(security_key)
     .bind(price_limit)
@@ -194,7 +195,7 @@ pub(super) async fn detail(
          JOIN transactions t ON t.id = s.transaction_id
          LEFT JOIN accounts a ON a.id = s.account_id
          WHERE s.security_id = $1
-         ORDER BY {EFFECTIVE_DATE} DESC"
+         ORDER BY {EFFECTIVE_DATE} DESC, s.id DESC"
     ))
     .bind(security_key)
     .fetch_all(pool)
@@ -209,12 +210,13 @@ pub(super) async fn detail(
         .collect();
     let mut cash: HashMap<i32, i64> = HashMap::new();
     if !income_ids.is_empty() {
-        let rows: Vec<(i32, i32)> = sqlx::query_as(
+        let rows: Vec<(i32, i32)> = sqlx::query_as(&format!(
             "SELECT ts.transaction_id, ts.amount FROM transaction_splits ts
              JOIN accounts a ON a.id = ts.account_id
-             WHERE ts.transaction_id = ANY($1) AND a.type = 'asset'",
-        )
-        .bind(&income_ids)
+             WHERE ts.transaction_id {in1} AND a.type = 'asset'",
+            in1 = sql::in_integers("$1")
+        ))
+        .bind(sql::json_array(&income_ids))
         .fetch_all(pool)
         .await
         .map_err(db_error)?;

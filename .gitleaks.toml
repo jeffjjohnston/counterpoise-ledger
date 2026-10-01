@@ -90,8 +90,9 @@ paths = [
   '''package-lock\.json$''',
 ]
 regexes = [
-  # gitleaks' built-in plaid-secret-key rule matches our table/identifier name.
-  '''plaidTransactionReconciliation''',
+  # gitleaks' built-in plaid-secret-key rule matches our table/identifier name,
+  # in camelCase and as the PascalCase row type in types/db.ts.
+  '''(?i)plaidTransactionReconciliation''',
   # The documented placeholder in .env.example's production DATABASE_URL. Kept
   # this narrow on purpose: .env.example is deliberately absent from the path
   # allowlist above, because it is the file a real secret is most likely to be

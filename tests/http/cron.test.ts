@@ -1,15 +1,17 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { asc, eq } from "drizzle-orm";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { getSqlClient_raw } from "../../db";
-import { plaidTokens, recurringRules, securityPrices, transactions } from "../../db/schema";
 import { toDateString } from "../../lib/formatters";
+import type { PlaidToken, RecurringRule, SecurityPrice } from "../../types/db";
 import {
   createAccount, createBook, createPlaidAccount, createPlaidToken, createRecurringRule, createSecurity,
-  createSecurityPrice, db, resetTestDatabase, setupTestDatabase,
+  createSecurityPrice, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { count, row, rows } from "../helpers/sql";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 type Reply = { status: number; body?: unknown; raw?: string };
@@ -34,17 +36,22 @@ async function cron(client: Client, path: string) {
 async function startMock(key: (path: string, body: string) => string) {
   const replies = new Map<string, Reply>();
   const requests: string[] = [];
+  const gates = new Map<string, { arrived: () => void; released: Promise<void> }>();
   const server: Server = createServer((request, response) => {
     let text = "";
     request.on("data", (chunk) => { text += chunk; });
     request.on("end", () => {
       const name = key(request.url ?? "/", text);
       requests.push(name);
-      const reply = replies.get(name) ?? {
-        status: 404, body: { error_message: "unexpected request", error_code: "UNEXPECTED", detail: "Not found." },
-      };
-      response.writeHead(reply.status, { "content-type": "application/json" });
-      response.end(reply.raw ?? JSON.stringify(reply.body));
+      const gate = gates.get(name);
+      gate?.arrived();
+      void (gate?.released ?? Promise.resolve()).then(() => {
+        const reply = replies.get(name) ?? {
+          status: 404, body: { error_message: "unexpected request", error_code: "UNEXPECTED", detail: "Not found." },
+        };
+        response.writeHead(reply.status, { "content-type": "application/json" });
+        response.end(reply.raw ?? JSON.stringify(reply.body));
+      });
     });
   });
   await new Promise<void>((resolveReady) => server.listen(0, "127.0.0.1", () => resolveReady()));
@@ -54,6 +61,24 @@ async function startMock(key: (path: string, body: string) => string) {
     server,
     requests,
     reply(name: string, reply: Reply) { replies.set(name, reply); },
+    /**
+     * Holds the replies to the requests of this name until `release()`.
+     * `arrived` resolves when the first such request comes in.
+     */
+    hold(name: string) {
+      let arrived = () => {};
+      let release = () => {};
+      const arrival = new Promise<void>((resolve) => { arrived = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      gates.set(name, { arrived, released });
+      return {
+        arrived: arrival,
+        release() {
+          gates.delete(name);
+          release();
+        },
+      };
+    },
     reset() { replies.clear(); requests.length = 0; },
   };
 }
@@ -97,21 +122,47 @@ describe("cron routes without Plaid or Tiingo", () => {
   let baseUrl: string;
   let stop: () => Promise<void>;
   let client: Client;
+  let statusDir: string;
 
   beforeAll(async () => {
-    ({ baseUrl, stop } = await startHttpTestServer(UNCONFIGURED));
+    statusDir = await mkdtemp(join(tmpdir(), "counterpoise-cron-status-"));
+    ({ baseUrl, stop } = await startHttpTestServer({ ...UNCONFIGURED, STATUS_DIR: statusDir }));
   }, 120_000);
   beforeEach(async () => {
     await resetTestDatabase();
     client = await sessionHttpClient(baseUrl);
   });
-  afterAll(async () => { await stop?.(); });
+  afterAll(async () => {
+    await stop?.();
+    if (statusDir) await rm(statusDir, { recursive: true, force: true });
+  });
 
   it("skips the bank sync and the price sync", async () => {
     await connection("access-1");
     await createSecurity({ name: "Total Market", symbol: "VTI", securityType: "etf", fetchPrices: true });
-    expect(await cron(client, "/api/cron/plaid-sync")).toEqual({ success: true, skipped: true, reason: "Plaid not configured" });
-    expect(await cron(client, "/api/cron/price-sync")).toEqual({ success: true, skipped: true, reason: "Tiingo not configured" });
+    expect(await cron(client, "/api/cron/plaid-sync")).toEqual({
+      success: true, skipped: true, reason: "Plaid not configured", missingSetting: "PLAID_CLIENT_ID",
+    });
+    expect(await cron(client, "/api/cron/price-sync")).toEqual({
+      success: true, skipped: true, reason: "Tiingo not configured", missingSetting: "TIINGO_API_KEY",
+    });
+  });
+
+  it("records a manual run as not configured, and the status route reports it", async () => {
+    await cron(client, "/api/cron/plaid-sync");
+    await cron(client, "/api/cron/price-sync");
+    await cron(client, "/api/cron/recurring");
+    const plaid = JSON.parse(await readFile(join(statusDir, "plaid-sync.json"), "utf8"));
+    expect(plaid).toMatchObject({
+      job: "plaid-sync", notConfigured: true, detail: "not configured: PLAID_CLIENT_ID is not set",
+    });
+    const recurring = JSON.parse(await readFile(join(statusDir, "recurring.json"), "utf8"));
+    expect(recurring.lastOk).toBe(recurring.lastRun);
+    expect(recurring.notConfigured).toBeUndefined();
+
+    const status = await (await client.request("/api/system/status")).json();
+    const states = Object.fromEntries(status.jobs.map((job: { job: string; state: string }) => [job.job, job.state]));
+    expect(states).toMatchObject({ "plaid-sync": "not_configured", "price-sync": "not_configured", recurring: "ok" });
   });
 });
 
@@ -166,7 +217,7 @@ describe("cron routes HTTP parity", () => {
     }
     expect(plaid.requests).toEqual([]);
     expect(tiingo.requests).toEqual([]);
-    expect(await db.select().from(transactions)).toEqual([]);
+    expect(await count("transactions")).toBe(0);
   });
 
   it("syncs each linked connection and reports an overlap and a failure", async () => {
@@ -180,15 +231,24 @@ describe("cron routes HTTP parity", () => {
     plaid.reply("access-synced", emptyPage);
     plaid.reply("access-failing", { status: 400, body: { error_message: "login required", error_code: "ITEM_LOGIN_REQUIRED" } });
 
-    const held = await getSqlClient_raw().reserve();
+    plaid.reply("access-busy", emptyPage);
+
+    // A manual sync of the busy connection holds the sync lock while it
+    // waits for Plaid. The mock keeps that request open until the cron ends.
+    const gate = plaid.hold("access-busy");
     let body: unknown;
+    let manual: Promise<Response> | undefined;
     try {
-      await held`select pg_advisory_lock(1000001, ${busy.id})`;
+      manual = client.request(`/api/b/1/sync/tokens/${busy.id}/sync`, { method: "POST" });
+      await gate.arrived;
       body = await cron(client, "/api/cron/plaid-sync");
-      await held`select pg_advisory_unlock(1000001, ${busy.id})`;
+      // The cron skipped the busy connection and wrote nothing to it.
+      expect(await row("SELECT sync_cursor, last_error FROM plaid_tokens WHERE id = $1", [busy.id]))
+        .toEqual({ syncCursor: null, lastError: null });
     } finally {
-      held.release();
+      gate.release();
     }
+    expect((await manual).status).toBe(200);
 
     expect(body).toEqual({
       success: true, tokensFound: 3, tokensSynced: 1, tokensSkipped: 1, tokensFailed: 1,
@@ -197,11 +257,14 @@ describe("cron routes HTTP parity", () => {
         error: "Plaid /transactions/sync request failed: login required (ITEM_LOGIN_REQUIRED)",
       }],
     });
-    expect([...plaid.requests].sort()).toEqual(["access-failing", "access-synced"]);
-    const stored = await db.select({ id: plaidTokens.id, syncCursor: plaidTokens.syncCursor, lastError: plaidTokens.lastError })
-      .from(plaidTokens).orderBy(asc(plaidTokens.id));
+    // The one request for the busy connection is the manual sync's.
+    expect([...plaid.requests].sort()).toEqual(["access-busy", "access-failing", "access-synced"]);
+    const stored = await rows<Pick<PlaidToken, "id" | "syncCursor" | "lastError">>(
+      "SELECT id, sync_cursor, last_error FROM plaid_tokens ORDER BY id",
+    );
     expect(stored.find((token) => token.id === synced.id)).toEqual({ id: synced.id, syncCursor: "cursor-next", lastError: null });
-    expect(stored.find((token) => token.id === busy.id)).toMatchObject({ syncCursor: null, lastError: null });
+    // The manual sync finished after the cron, and it saved the cursor.
+    expect(stored.find((token) => token.id === busy.id)).toMatchObject({ syncCursor: "cursor-next", lastError: null });
     expect(stored.find((token) => token.id === failing.id)?.lastError).toBe(
       "Plaid /transactions/sync request failed: login required (ITEM_LOGIN_REQUIRED)",
     );
@@ -234,7 +297,7 @@ describe("cron routes HTTP parity", () => {
       errors: [{ symbol: "MISSING", error: "Failed to fetch price for MISSING: Not Found" }],
     });
     expect([...tiingo.requests].sort()).toEqual(["MISSING", "TEXT", "VTI"]);
-    const prices = await db.select().from(securityPrices).orderBy(asc(securityPrices.securityId));
+    const prices = await rows<SecurityPrice>("SELECT * FROM security_prices ORDER BY security_id, price_date");
     expect(prices).toEqual([
       { securityId: kept.id, bookId: 1, priceDate: "2026-07-02", priceMicros: 5, source: "manual" },
       { securityId: added.id, bookId: other.id, priceDate: "2026-07-02", priceMicros: 299_123_456, source: "tiingo" },
@@ -270,7 +333,7 @@ describe("cron routes HTTP parity", () => {
       expect(response.status, JSON.stringify(reply)).toBe(500);
       expect(await response.json()).toEqual({ error: "Failed to run price sync cron" });
     }
-    expect(await db.select().from(securityPrices)).toEqual([]);
+    expect(await rows("SELECT * FROM security_prices ORDER BY security_id, price_date")).toEqual([]);
   });
 
   it("creates the due recurring transactions of every book", async () => {
@@ -287,16 +350,17 @@ describe("cron routes HTTP parity", () => {
     }
 
     const body = await cron(client, "/api/cron/recurring");
-    const created = await db.select({ id: transactions.id, bookId: transactions.bookId, date: transactions.date, recurringRuleId: transactions.recurringRuleId })
-      .from(transactions).orderBy(asc(transactions.id));
+    const created = await rows<{ id: number; bookId: number; date: string; recurringRuleId: number | null }>(
+      "SELECT id, book_id, date, recurring_rule_id FROM transactions ORDER BY id",
+    );
     expect(created).toEqual([
       { id: created[0].id, bookId: 1, date: today, recurringRuleId: rules[0].id },
       { id: created[1].id, bookId: other.id, date: today, recurringRuleId: rules[1].id },
     ]);
     expect(body).toEqual({
-      success: true, booksProcessed: 2, transactionsCreated: 2, transactionIds: created.map((row) => row.id),
+      success: true, booksProcessed: 2, transactionsCreated: 2, transactionIds: created.map((txn) => txn.id),
     });
-    const [advanced] = await db.select().from(recurringRules).where(eq(recurringRules.id, rules[0].id));
+    const advanced = await row<RecurringRule>("SELECT * FROM recurring_rules WHERE id = $1", [rules[0].id]);
     expect(advanced.nextDate > today).toBe(true);
 
     // Nothing is due on the second run.

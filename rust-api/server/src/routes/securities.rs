@@ -16,9 +16,11 @@ use axum::{
 };
 use chrono::{NaiveDateTime, SecondsFormat, Utc};
 use ledger_core::{accounting::round_js, collation::compare_names, investments::fixed_price_row};
+use ledger_db::engine::{Db, DbPool};
+use ledger_db::sql;
 use serde::Serialize;
 use serde_json::{Map, Value, json, to_value};
-use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
+use sqlx::{FromRow, QueryBuilder};
 use std::collections::HashMap;
 
 const SECURITY_COLUMNS: &str =
@@ -72,7 +74,7 @@ pub(super) fn security_path_id(raw: &str, failure: &'static str) -> Result<i32, 
 }
 
 pub(super) async fn find_security(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     security_id: i32,
     failure: &'static str,
@@ -229,7 +231,7 @@ pub(crate) async fn list_securities(
     let failed = |cause| internal_error(cause, FAILURE);
     let securities: Vec<(i32, String, String, String, bool, Option<i64>)> = sqlx::query_as(
         "SELECT id, name, symbol, security_type, fetch_prices, fixed_price_micros
-         FROM securities WHERE book_id = $1 ORDER BY name",
+         FROM securities WHERE book_id = $1 ORDER BY name, id",
     )
     .bind(book.book_id)
     .fetch_all(&state.pool)
@@ -258,13 +260,14 @@ pub(crate) async fn list_securities(
     let cash: HashMap<i32, i64> = if transaction_ids.is_empty() {
         HashMap::new()
     } else {
-        sqlx::query_as::<_, (i32, i64)>(
+        sqlx::query_as::<_, (i32, i64)>(&format!(
             "SELECT s.transaction_id, CAST(SUM(s.amount) AS bigint)
              FROM transaction_splits s JOIN accounts a ON a.id = s.account_id
-             WHERE s.transaction_id = ANY($1) AND a.type = 'asset' AND s.amount > 0
+             WHERE s.transaction_id {} AND a.type = 'asset' AND s.amount > 0
              GROUP BY s.transaction_id",
-        )
-        .bind(&transaction_ids)
+            sql::in_integers("$1")
+        ))
+        .bind(sql::json_array(&transaction_ids))
         .fetch_all(&state.pool)
         .await
         .map_err(failed)?
@@ -371,7 +374,7 @@ pub(crate) async fn get_security(
 /// `SecurityDuplicateError` that names this ID. The route answers with its
 /// 500 message; the MCP tool writes the library's message.
 pub(crate) async fn clashing_symbol(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     security_id: i32,
     symbol: &str,
@@ -415,7 +418,7 @@ pub(crate) async fn update_security(
             return Err(error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE));
         }
     }
-    let mut update = QueryBuilder::<Postgres>::new("UPDATE securities SET ");
+    let mut update = QueryBuilder::<Db>::new("UPDATE securities SET ");
     let mut fields = update.separated(", ");
     if let Some(name) = &input.name {
         fields.push("name = ").push_bind_unseparated(name);
@@ -771,7 +774,7 @@ pub(crate) async fn security_splits(
     let offset = page_param(params.get("offset"), 0.0).unwrap_or(0);
 
     let query = format!(
-        "{} ORDER BY {EFFECTIVE_DATE} DESC, s.id DESC LIMIT $3 OFFSET $4",
+        "{} ORDER BY {EFFECTIVE_DATE} DESC, s.id DESC LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)",
         security_split_query()
     );
     let splits: Vec<SecuritySplitRecord> = sqlx::query_as(&query)
@@ -804,13 +807,14 @@ pub(crate) async fn security_splits(
     let cash: HashMap<i32, i64> = if income_ids.is_empty() {
         HashMap::new()
     } else {
-        sqlx::query_as::<_, (i32, i64)>(
+        sqlx::query_as::<_, (i32, i64)>(&format!(
             "SELECT s.transaction_id, CAST(SUM(s.amount) AS bigint)
              FROM transaction_splits s JOIN accounts a ON a.id = s.account_id
-             WHERE s.transaction_id = ANY($1) AND a.type = 'asset' AND s.amount > 0
+             WHERE s.transaction_id {} AND a.type = 'asset' AND s.amount > 0
              GROUP BY s.transaction_id",
-        )
-        .bind(&income_ids)
+            sql::in_integers("$1")
+        ))
+        .bind(sql::json_array(&income_ids))
         .fetch_all(&state.pool)
         .await
         .map_err(failed)?

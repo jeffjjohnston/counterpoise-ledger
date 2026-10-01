@@ -4,6 +4,7 @@
 //! a transaction date through `occurrence_date`, and the rule advances from
 //! the scheduled date, never from the observed one.
 
+use crate::validation::parse_pg_int4;
 use crate::{
     book_auth::{AccessLevel, AuthenticatedBook, authenticate_book},
     error::{ApiError, ApiResult, error},
@@ -33,9 +34,12 @@ use ledger_core::{
         next_date, occurrence_date, schedule_key,
     },
 };
+use ledger_db::engine::{Db, DbConnection, DbPool};
+use ledger_db::sql;
+use ledger_db::sql::EFFECTIVE_DATE;
 use serde::Serialize;
 use serde_json::{Value, json, to_value};
-use sqlx::{FromRow, PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{FromRow, QueryBuilder};
 use std::collections::{HashMap, HashSet};
 
 const NOT_FOUND: &str = "Recurring rule not found";
@@ -124,26 +128,28 @@ struct LoadedRule {
 /// Loads the payee and the template splits of each rule, in the order of
 /// `rules`. A relational query has no ORDER BY for its children. Rust
 /// returns them in ID order, which is their insertion order.
-async fn attach(pool: &PgPool, rules: Vec<RuleRow>) -> Result<Vec<LoadedRule>, sqlx::Error> {
+async fn attach(pool: &DbPool, rules: Vec<RuleRow>) -> Result<Vec<LoadedRule>, sqlx::Error> {
     if rules.is_empty() {
         return Ok(Vec::new());
     }
     let rule_ids: Vec<i32> = rules.iter().map(|rule| rule.id).collect();
     let payee_ids: Vec<i32> = rules.iter().filter_map(|rule| rule.payee_id).collect();
-    let payees: HashMap<i32, Value> = sqlx::query_as::<_, PayeeRow>(
-        "SELECT id, book_id, name, created_at FROM payees WHERE id = ANY($1)",
-    )
-    .bind(&payee_ids)
+    let payees: HashMap<i32, Value> = sqlx::query_as::<_, PayeeRow>(&format!(
+        "SELECT id, book_id, name, created_at FROM payees WHERE id {in1}",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&payee_ids))
     .fetch_all(pool)
     .await?
     .into_iter()
     .map(|payee| (payee.id, to_value(&payee).expect("payee serializes")))
     .collect();
-    let splits: Vec<TemplateSplitRow> = sqlx::query_as(
+    let splits: Vec<TemplateSplitRow> = sqlx::query_as(&format!(
         "SELECT id, book_id, recurring_rule_id, account_id, amount FROM recurring_template_splits
-         WHERE recurring_rule_id = ANY($1) ORDER BY id",
-    )
-    .bind(&rule_ids)
+         WHERE recurring_rule_id {in1} ORDER BY id",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&rule_ids))
     .fetch_all(pool)
     .await?;
     let account_ids: Vec<i32> = splits
@@ -152,12 +158,13 @@ async fn attach(pool: &PgPool, rules: Vec<RuleRow>) -> Result<Vec<LoadedRule>, s
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let accounts: HashMap<i32, AccountRow> = sqlx::query_as::<_, AccountRow>(
+    let accounts: HashMap<i32, AccountRow> = sqlx::query_as::<_, AccountRow>(&format!(
         "SELECT id, book_id, name, type AS account_type, subtype, parent_id, is_active,
                 is_favorite, is_investment_cash, icon, created_at, updated_at
-         FROM accounts WHERE id = ANY($1)",
-    )
-    .bind(&account_ids)
+         FROM accounts WHERE id {in1}",
+        in1 = sql::in_integers("$1")
+    ))
+    .bind(sql::json_array(&account_ids))
     .fetch_all(pool)
     .await?
     .into_iter()
@@ -206,7 +213,7 @@ fn rule_json(loaded: &LoadedRule) -> Value {
 }
 
 async fn load_rule(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     rule_id: i32,
 ) -> Result<Option<LoadedRule>, sqlx::Error> {
@@ -222,7 +229,7 @@ async fn load_rule(
 
 /// The active rules of a book. Node reads them without an ORDER BY, which
 /// gives heap order. Rust uses ID order.
-async fn load_active_rules(pool: &PgPool, book_id: i32) -> Result<Vec<LoadedRule>, sqlx::Error> {
+async fn load_active_rules(pool: &DbPool, book_id: i32) -> Result<Vec<LoadedRule>, sqlx::Error> {
     let rules = sqlx::query_as(&format!(
         "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE book_id = $1 AND is_active ORDER BY id"
     ))
@@ -337,7 +344,7 @@ fn balanced_amounts(splits: &[TemplateSplit]) -> Option<Vec<i32>> {
 /// `validateTemplateSplitAccounts`. An ID outside the int4 range makes the
 /// Node query fail.
 async fn require_template_accounts(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     splits: &[TemplateSplit],
     failure: &'static str,
@@ -348,13 +355,15 @@ async fn require_template_accounts(
         .collect::<Result<HashSet<_>, _>>()?
         .into_iter()
         .collect::<Vec<_>>();
-    let found: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM accounts WHERE book_id = $1 AND id = ANY($2)")
-            .bind(book_id)
-            .bind(&ids)
-            .fetch_one(pool)
-            .await
-            .map_err(database_error(failure))?;
+    let found: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM accounts WHERE book_id = $1 AND id {in2}",
+        in2 = sql::in_integers("$2")
+    ))
+    .bind(book_id)
+    .bind(sql::json_array(&ids))
+    .fetch_one(pool)
+    .await
+    .map_err(database_error(failure))?;
     if found == ids.len() as i64 {
         Ok(())
     } else {
@@ -367,7 +376,7 @@ async fn require_template_accounts(
 /// name wins over it. Node binds the ID as text, so a fraction or a value
 /// outside the int4 range makes the query fail.
 async fn resolve_rule_payee(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     payee_id: Option<&Value>,
     payee_name: Option<&Value>,
@@ -376,13 +385,13 @@ async fn resolve_rule_payee(
     if let Some(value @ Value::Number(number)) = payee_id
         && js_number(number).is_finite()
     {
-        fallback = sqlx::query_scalar(
-            "SELECT id FROM payees WHERE id = $1::text::integer AND book_id = $2 LIMIT 1",
-        )
-        .bind(js_string(value))
-        .bind(book_id)
-        .fetch_optional(&mut *connection)
-        .await?;
+        let id = parse_pg_int4(&js_string(value)).map_err(sqlx::Error::Protocol)?;
+        fallback =
+            sqlx::query_scalar("SELECT id FROM payees WHERE id = $1 AND book_id = $2 LIMIT 1")
+                .bind(id)
+                .bind(book_id)
+                .fetch_optional(&mut *connection)
+                .await?;
     }
     match payee_name {
         Some(Value::String(name)) => Ok(resolve_payee_id(connection, book_id, name)
@@ -393,7 +402,7 @@ async fn resolve_rule_payee(
 }
 
 async fn insert_template_splits(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     rule_id: i32,
     splits: &[TemplateSplit],
@@ -405,7 +414,7 @@ async fn insert_template_splits(
         .zip(amounts)
         .map(|(split, amount)| Ok((database_integer(split.account_id, failure)?, *amount)))
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let mut insert = QueryBuilder::<Postgres>::new(
+    let mut insert = QueryBuilder::<Db>::new(
         "INSERT INTO recurring_template_splits (recurring_rule_id, account_id, amount, book_id) ",
     );
     insert.push_values(rows, |mut row, (account_id, amount)| {
@@ -473,7 +482,7 @@ pub(crate) async fn get_rule(
 /// `createRecurringRule`. The checks run in the Node order, so a request
 /// with several problems gets the message that Node gives.
 async fn create(
-    pool: &PgPool,
+    pool: &DbPool,
     book: &AuthenticatedBook,
     input: &CreateRule,
     failure: &'static str,
@@ -510,7 +519,9 @@ async fn create(
     )
     .map_err(schedule_error(failure))?;
 
-    let mut tx = pool.begin().await.map_err(database_error(failure))?;
+    let mut tx = ledger_db::locks::begin_pool(pool)
+        .await
+        .map_err(database_error(failure))?;
     // Resolved in the transaction, so a payee that `payeeName` creates rolls
     // back with a failed write.
     let payee_id = resolve_rule_payee(
@@ -522,20 +533,22 @@ async fn create(
     .await
     .map_err(database_error(failure))?;
     let truthy = |value: &Option<Value>| value.as_ref().filter(|value| js_truthy(value)).cloned();
-    // The interval is bound as text and cast, as Node sends it, so PostgreSQL
-    // accepts or refuses the same values.
+    // Node sent the interval as text for PostgreSQL to cast, so the same
+    // values are accepted and refused here.
+    let interval = parse_pg_int4(&interval.map_or_else(|| "1".to_owned(), js_string))
+        .map_err(|message| database_error(failure)(sqlx::Error::Protocol(message)))?;
     let rule_id: i32 = sqlx::query_scalar(
         "INSERT INTO recurring_rules (name, frequency, interval, days_of_week, week_of_month,
            days_of_month, start_date, end_date, next_date, business_days_only,
            auto_create_days_before, template_description, payee_id, is_active, book_id,
            created_at)
-         VALUES ($1, $2, $3::text::integer, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true,
            $14, $15)
          RETURNING id",
     )
     .bind(&input.name)
     .bind(&input.frequency)
-    .bind(interval.map_or_else(|| "1".to_owned(), js_string))
+    .bind(interval)
     .bind(truthy(&loose.days_of_week).map(|value| js_stringify(&value)))
     .bind(truthy(&loose.week_of_month).map(|value| js_string(&value)))
     .bind(truthy(&loose.days_of_month).map(|value| js_stringify(&value)))
@@ -627,14 +640,15 @@ fn updated_config(
 
 /// Adds each field that the request names to the SET list.
 fn push_updates(
-    set: &mut QueryBuilder<'_, Postgres>,
+    set: &mut QueryBuilder<'_, Db>,
     input: &UpdateRule,
+    interval: Option<Option<i32>>,
     next: Option<String>,
     payee_id: Option<Option<i32>>,
 ) -> bool {
     let loose = &input.loose;
     let mut any = false;
-    let mut column = |set: &mut QueryBuilder<'_, Postgres>, name: &str| {
+    let mut column = |set: &mut QueryBuilder<'_, Db>, name: &str| {
         if any {
             set.push(", ");
         }
@@ -649,9 +663,9 @@ fn push_updates(
         column(set, "frequency");
         set.push_bind(frequency.clone());
     }
-    if let Some(interval) = &loose.interval {
+    if let Some(interval) = interval {
         column(set, "interval");
-        set.push_bind(text_value(interval)).push("::text::integer");
+        set.push_bind(interval);
     }
     for (name, value) in [
         ("days_of_week", &loose.days_of_week),
@@ -704,7 +718,7 @@ fn push_updates(
 /// `updateRecurringRule`. It applies only the fields it is given, and it
 /// reads the stored rule only when the write needs it.
 async fn update(
-    pool: &PgPool,
+    pool: &DbPool,
     book: &AuthenticatedBook,
     rule_id: Option<i32>,
     input: &UpdateRule,
@@ -803,7 +817,9 @@ async fn update(
         None => computed,
     };
 
-    let mut tx = pool.begin().await.map_err(database_error(failure))?;
+    let mut tx = ledger_db::locks::begin_pool(pool)
+        .await
+        .map_err(database_error(failure))?;
     // Prove the rule is in this book before anything names its ID. Nothing
     // is written before this check, so a payee is not created for a rule
     // that is not the caller's.
@@ -830,8 +846,16 @@ async fn update(
     } else {
         None
     };
-    let mut set = QueryBuilder::<Postgres>::new("UPDATE recurring_rules SET ");
-    if push_updates(&mut set, input, next, payee_id) {
+    // Node sent the interval as text for PostgreSQL to cast.
+    let interval = input
+        .loose
+        .interval
+        .as_ref()
+        .map(|value| text_value(value).as_deref().map(parse_pg_int4).transpose())
+        .transpose()
+        .map_err(|message| database_error(failure)(sqlx::Error::Protocol(message)))?;
+    let mut set = QueryBuilder::<Db>::new("UPDATE recurring_rules SET ");
+    if push_updates(&mut set, input, interval, next, payee_id) {
         set.push(" WHERE id = ")
             .push_bind(rule_id)
             .push(" AND book_id = ")
@@ -917,7 +941,7 @@ pub(crate) struct Processed {
 /// `date`. It does not use the transaction service: a rule makes an ordinary
 /// transaction with no investment splits, check number, or notes.
 async fn create_transaction_from_rule(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     rule: &LoadedRule,
     date: &str,
@@ -952,13 +976,15 @@ async fn create_transaction_from_rule(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let found: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM accounts WHERE book_id = $1 AND id = ANY($2)")
-            .bind(book_id)
-            .bind(&account_ids)
-            .fetch_one(&mut *connection)
-            .await
-            .map_err(database_error(failure))?;
+    let found: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM accounts WHERE book_id = $1 AND id {in2}",
+        in2 = sql::in_integers("$2")
+    ))
+    .bind(book_id)
+    .bind(sql::json_array(&account_ids))
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(database_error(failure))?;
     if found != account_ids.len() as i64 {
         tracing::error!(
             rule = rule.rule.id,
@@ -981,7 +1007,7 @@ async fn create_transaction_from_rule(
     .fetch_one(&mut *connection)
     .await
     .map_err(database_error(failure))?;
-    let mut insert = QueryBuilder::<Postgres>::new(
+    let mut insert = QueryBuilder::<Db>::new(
         "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) ",
     );
     insert.push_values(&rule.splits, |mut row, split| {
@@ -1003,7 +1029,7 @@ async fn create_transaction_from_rule(
 /// matches no row once this one commits, so a due date never makes two
 /// transactions.
 async fn claim(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     book_id: i32,
     rule_id: i32,
     due: &str,
@@ -1031,7 +1057,7 @@ async fn claim(
 /// `processRecurringRuleById`: create the rule's next occurrence whether or
 /// not it is due, active, or past its end date, and advance the rule.
 async fn process_rule(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     rule_id: i32,
     failure: &'static str,
@@ -1054,7 +1080,9 @@ async fn process_rule(
     let schedule = schedule_error(failure);
     let occurrence = occurrence_date(due, rule.rule.business_days_only).map_err(&schedule)?;
     let next = next_date(due, &stored_config(&rule.rule).map_err(&schedule)?).map_err(&schedule)?;
-    let mut tx = pool.begin().await.map_err(database_error(failure))?;
+    let mut tx = ledger_db::locks::begin_pool(pool)
+        .await
+        .map_err(database_error(failure))?;
     let mut processed = Processed::default();
     if claim(&mut tx, book_id, rule_id, due, &next, false, failure).await? {
         processed.transaction_ids.extend(
@@ -1070,7 +1098,7 @@ async fn process_rule(
 /// A rule whose schedule passes its end date is deactivated. The end date
 /// bounds the scheduled date, not the observed one.
 pub(crate) async fn process_all(
-    pool: &PgPool,
+    pool: &DbPool,
     book_id: i32,
     failure: &'static str,
 ) -> Result<Processed, ApiError> {
@@ -1120,7 +1148,9 @@ pub(crate) async fn process_all(
             processed.skipped.push((row.id, DOES_NOT_ADVANCE));
             continue;
         }
-        let mut tx = pool.begin().await.map_err(database_error(failure))?;
+        let mut tx = ledger_db::locks::begin_pool(pool)
+            .await
+            .map_err(database_error(failure))?;
         if claim(
             &mut tx,
             book_id,
@@ -1342,17 +1372,15 @@ pub(crate) async fn rule_transactions(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     // Node gives no ORDER BY. Rust uses the transaction ID.
-    let rows: Vec<RecurringTransactionRow> = sqlx::query_as(
-        "SELECT t.id AS transaction_id,
-                (CASE WHEN t.is_floating THEN CURRENT_DATE::text ELSE t.date END) AS date,
+    let rows: Vec<RecurringTransactionRow> = sqlx::query_as(&format!(
+        "SELECT t.id AS transaction_id, {EFFECTIVE_DATE} AS date,
                 t.recurring_rule_id, r.name AS rule_name
          FROM transactions t
          JOIN recurring_rules r ON t.recurring_rule_id = r.id
          WHERE t.book_id = $1 AND t.recurring_rule_id IS NOT NULL
-           AND (CASE WHEN t.is_floating THEN CURRENT_DATE::text ELSE t.date END) >= $2
-           AND (CASE WHEN t.is_floating THEN CURRENT_DATE::text ELSE t.date END) <= $3
-         ORDER BY t.id",
-    )
+           AND {EFFECTIVE_DATE} >= $2 AND {EFFECTIVE_DATE} <= $3
+         ORDER BY t.id"
+    ))
     .bind(book.book_id)
     .bind(start_date)
     .bind(end_date)

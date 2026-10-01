@@ -1,0 +1,64 @@
+# The one-time move from PostgreSQL to SQLite. scripts/upgrade-to-sqlite.sh
+# runs it; do not start it by hand. See guides/upgrade-to-sqlite.md.
+#
+# A project of its own, so it never touches the containers of the
+# `counterpoise` project. It starts the old PostgreSQL on the existing
+# counterpoise_pgdata volume, and runs `ledger-cli import-postgres` from the
+# new image into the counterpoise_data volume. The converter only reads
+# PostgreSQL. Nothing here deletes or changes counterpoise_pgdata.
+#
+# The ${...} names below are for the script's own rehearsal on throwaway
+# volumes. An install uses the defaults.
+name: counterpoise-upgrade
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No host port: only the converter reaches it, on this project's network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U counterpoise"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  convert:
+    # The same image name as the `rust-api` service of docker-compose.yml.
+    image: ${COUNTERPOISE_IMAGE:-counterpoise-rust-api}
+    # The same build as the `rust-api` service of docker-compose.yml, with
+    # the same arguments from the same env file: `docker compose up` then
+    # uses this image, so without them the client would have no PostHog key.
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
+        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
+    # DATABASE_URL names the host `postgres`, which is the service above on
+    # this project's network.
+    env_file:
+      - path: ${COUNTERPOISE_ENV_FILE:-.env.production.local}
+        required: true
+    environment:
+      TZ: ${TZ:-America/New_York}
+      CONVERT_FLAGS: ${CONVERT_FLAGS:-}
+    volumes:
+      - data:/data
+    # $$ keeps the variables for the container's shell.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'exec ledger-cli import-postgres --from "$$DATABASE_URL" --to /data/counterpoise.db $$CONVERT_FLAGS'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["convert"]
+
+volumes:
+  pgdata:
+    name: ${COUNTERPOISE_PGDATA_VOLUME:-counterpoise_pgdata}
+    external: true
+  data:
+    name: ${COUNTERPOISE_DATA_VOLUME:-counterpoise_data}
+    external: true

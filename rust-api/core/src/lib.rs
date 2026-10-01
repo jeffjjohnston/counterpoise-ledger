@@ -10,6 +10,7 @@ pub mod formatters;
 pub mod investments;
 pub mod js;
 pub mod lots;
+pub mod names;
 pub mod recurring;
 
 #[cfg(feature = "wasm")]

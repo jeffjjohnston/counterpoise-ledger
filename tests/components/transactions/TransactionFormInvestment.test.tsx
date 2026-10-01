@@ -941,3 +941,92 @@ describe("TransactionForm investment mode", () => {
     });
   });
 });
+
+// Issue report 40: in the investment form, the securities that the investment
+// account holds come first in the Security list.
+describe("TransactionForm investment mode, held securities", () => {
+  const securities = [
+    { id: 10, name: "Acme Corp", symbol: "ACME", securityType: "stock" },
+    { id: 11, name: "Zeta Inc", symbol: "ZETA", securityType: "stock" },
+  ];
+  // Positions per investment account: Brokerage (1) holds ZETA, Retirement
+  // (5) holds nothing.
+  const positions: Record<string, unknown[]> = {
+    "1": [{ securityId: 11, securityName: "Zeta Inc", securitySymbol: "ZETA", sharesMicros: 5_000_000 }],
+    "5": [],
+  };
+  const fetchMock = vi.fn(async (url: string) => {
+    const accountId = /investments\/positions\?accountId=(\d+)$/.exec(url)?.[1];
+    const body = accountId !== undefined ? positions[accountId] : securities;
+    return { ok: true, json: async () => body } as Response;
+  });
+
+  beforeEach(() => {
+    fetchMock.mockClear();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const optionSymbols = () =>
+    screen
+      .getAllByRole("button")
+      .filter((button) => securities.some((s) => button.textContent?.startsWith(s.symbol)))
+      .map((button) => button.textContent?.slice(0, 4));
+
+  const openSecurityList = async (heldLabel: string | null) => {
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith("/api/b/1/securities", expect.anything())
+    );
+    fireEvent.focus(screen.getByLabelText("Security"));
+    if (heldLabel) expect(await screen.findByText(heldLabel)).toBeInTheDocument();
+  };
+
+  it("lists what the displayed account holds first", async () => {
+    renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={1} isInvestmentAccountSelected onSubmit={vi.fn()} />
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Investment" }));
+    await openSecurityList("Held in Brokerage");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/b/1/investments/positions?accountId=1",
+      expect.anything()
+    );
+    expect(optionSymbols()).toEqual(["ZETA", "ACME"]);
+  });
+
+  // On an investment account's register the form keeps that account, so the
+  // field changes only from another register. The form then starts on the
+  // first investment account, Brokerage.
+  it("follows the Investment Account field", async () => {
+    renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={null} isInvestmentAccountSelected onSubmit={vi.fn()} />
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Investment" }));
+    await openSecurityList("Held in Brokerage");
+    fireEvent.blur(screen.getByLabelText("Security"));
+    // The list closes after a delay; let it, so that it does not close the
+    // list that this test opens again below.
+    await waitFor(() => expect(screen.queryByText("Held in Brokerage")).not.toBeInTheDocument());
+
+    // "Inv. Account" in the compact layout, "Investment Account" in the other.
+    const account = screen.getByLabelText(/^Inv(\.|estment) Account$/);
+    fireEvent.focus(account);
+    fireEvent.change(account, { target: { value: "Retirement" } });
+    fireEvent.click(await screen.findByRole("button", { name: /^Retirement/ }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/b/1/investments/positions?accountId=5",
+        expect.anything()
+      )
+    );
+    fireEvent.focus(screen.getByLabelText("Security"));
+    await waitFor(() => expect(optionSymbols()).toEqual(["ACME", "ZETA"]));
+    expect(screen.queryByText(/^Held in/)).not.toBeInTheDocument();
+  });
+});

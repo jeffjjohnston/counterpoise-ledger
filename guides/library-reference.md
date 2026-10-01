@@ -148,23 +148,16 @@ enforces every level regardless of what the client shows
 ## Modules the Node scripts run (`lib/`)
 
 These run outside the web server. Do not import them from a component.
-- `/lib/accounting.ts` - the TypeScript accounting helpers, and
-  `effectiveDateSql`, the effective-date SQL expression that the lot rebuild
-  and the payee queries below use
+- `/lib/accounting.ts` - the TypeScript accounting helpers
 - `/lib/lots.ts` - `replayLots()`, the pure FIFO replay engine (no database)
-- `/lib/lots-db.ts` - `rebuildLots()`, `rebuildLotsForPairs()`,
-  `findAllLotPairs()`, `collectAffectedPairs()`. `scripts/rebuild-lots.ts`
-  runs them for `npm run db:migrate`. The Rust copy in
-  `rust-api/db/src/lots.rs` must write the same lots:
-  `tests/http/rebuild-lots.test.ts` compares the two
-- `/lib/investments.ts` - `aggregatePositions()`, `getPositions()`,
-  `getMarketValuesByAccount()`, `fixedPriceRow()`, and the position types
-  that the pages import as types
-- `/lib/payees.ts` - payee queries and `normalizePayeeName()`, for the
-  TypeSafe report
+- `/lib/investments.ts` - `aggregatePositions()`,
+  `aggregateMarketValuesByAccount()`, and the position types that the pages
+  import as types
+- `/lib/payees.ts` - `normalizePayeeName()`, for the TypeSafe questions
 - `/lib/typesafe/client.ts`, `/lib/typesafe/questions.ts`,
   `/lib/typesafe/report.ts`, `/lib/typesafe/settings.ts` - the TypeSafe
-  client and the report of `npm run typesafe:report`. The server's copies are
+  client and the report of `npm run typesafe:report`, which reads the
+  database file with `node:sqlite`. The server's copies are
   `rust-api/server/src/typesafe_client.rs`, `typesafe_questions.rs` and
   `typesafe.rs`
 - `/lib/plaid.ts` - the Plaid client of `npm run plaid:link`. The server's
@@ -200,8 +193,24 @@ Database code that the server and `ledger-cli` both run:
   Lots and allocations are derived state. The transaction routes call
   `collect_affected_pairs()` and `rebuild_lots_for_pairs()` inside the same
   transaction as the write
-- `seed.rs` - `seed_book()`, the sample dataset of `npm run db:seed` and of
-  `POST /api/books/demo`
+- `seed/` (a directory) - `seed_book()`, the sample datasets (`household`, `single`) of
+  `npm run db:seed` and of `POST /api/books/demo`. The dates are relative to
+  `today`. Snapshot and invariant tests: `rust-api/db/src/seed/tests.rs`
+- `database.rs` - `open()` (the pragmas and the SQL functions on each pooled
+  connection), `migrate()` (the embedded migrations of
+  `rust-api/db/migrations/`), and `lock_server()` (the `<database>.lock` file
+  lock)
+- `functions.rs` - the SQL functions that each connection registers:
+  Unicode `lower()`, case-sensitive `LIKE`, `cp_today()` and
+  `cp_merchant_key()`
+- `sql.rs` - the SQL helpers: `today!()`, `EFFECTIVE_DATE`, `in_integers()`,
+  `in_texts()`, `json()`, `json_array()` and `MERCHANT_KEY`
+- `locks.rs` - `begin()` and `begin_pool()` (`BEGIN IMMEDIATE`), and
+  `with_session_lock()`, a file lock under `<database>.locks/` that spans
+  several transactions
+- `backup.rs` - `snapshot()`: a `VACUUM INTO` copy, checked with
+  `PRAGMA integrity_check`
+- `testing.rs` - `TempDatabase`, a migrated database file for a Rust test
 
 ### `rust-api/server/src`
 Shared server modules:
@@ -227,12 +236,17 @@ Shared server modules:
   validators
 - `transaction_input.rs`, `recurring_input.rs` - the transaction and
   recurring-rule input rules, including `expected_updated_at()`
-- `db_scope.rs` - `with_advisory_lock()` holds a session lock on one reserved
-  connection and hands the callback that connection. Run the callback's
-  transaction and queries on it (`with_transaction()`), never on the pool
+- `db_scope.rs` - `with_transaction()` opens `BEGIN IMMEDIATE` on the
+  caller's connection. Inside `ledger_db::locks::with_session_lock()`, run
+  the callback's transaction and queries on the connection that it hands
+  over, never on the pool
 - `rate_limit.rs` - the login, registration, password, API-key and
   member-add limits. `client_ip()` reads the forwarded address
-- `book_changes.rs` - the change notifications behind the event stream
+- `book_changes.rs` - `BookChangeHub`, which polls `change_marks` for the
+  event stream
+- `scheduler.rs` - the scheduled jobs and their status files
+- `health_probe.rs` - `counterpoise-rust-api health`, the image's
+  healthcheck
 - `analytics.rs` - `capture_event()`. A route that runs for an MCP tool
   records nothing
 - `plaid.rs`, `tiingo.rs` - the Plaid and Tiingo clients
@@ -279,16 +293,16 @@ One module per route area. `routes/mod.rs` registers each entry of
 
 | File | Purpose |
 |------|---------|
-| `/db/schema.ts` | All table definitions and relations (meta + book-scoped). Drizzle is the only migrator |
-| `/db/index.ts` | Database connection (`getDb()`) with the postgres.js driver, and `runMigrations()` for explicit migration |
-| `/db/create-book.ts` | The migration folder path constant |
-| `/db/reset.ts` | `resetDatabase()`: drops the `public` and `drizzle` schemas and runs the migrations again. **Declarations only — no top-level side effects** |
-| `/db/seed-cli.ts` | CLI entry for `npm run db:seed`. For a full reset it runs `resetDatabase()`, then runs `ledger-cli seed` through `cargo run`. Holds the main-module guard. Keep the guard out of any module that another file imports: inlined into a bundle, it matches the bundle's own path and drops the database schemas when the bundle starts |
+| `/rust-api/db/migrations/` | The schema: `0001_baseline.sql` and each later numbered file. Never edit one that has run |
+| `/rust-api/db/src/database.rs` | Opening the file: pragmas, SQL functions, the server lock, the embedded migrations |
+| `/types/db.ts` | The TypeScript row types that the client and the test helpers use |
 | `/rust-api/routes.json` | The routes that `routes/mod.rs` registers from its handler table |
 | `/rust-api/server/src/routes/mod.rs` | The Axum router, and the routes that it registers by name (`/health`, `/api/health`, `/api/mcp`, WebMCP) |
 | `/rust-api/server/src/book_auth.rs` | Book access at a level |
 | `/rust-api/db/src/lots.rs` | The lot rebuild. Lots and allocations are derived state |
-| `/rust-api/cli/src/main.rs` | `ledger-cli`: `rebuild-lots [--force]`, `seed [--book-id N]`, `import-moneydance` |
+| `/rust-api/cli/src/main.rs` | `ledger-cli`: `migrate`, `seed [--book-id N \| --reset]`, `list-books`, `rebuild-lots [--force]`, `import-moneydance`, `backup [--dir D]`, `import-postgres --from <url> --to <path> [--allow-unbalanced]`. Each uses `DATABASE_PATH` (default `data/counterpoise.db`) |
+| `/rust-api/cli/src/import_postgres.rs` | The one-time PostgreSQL-to-SQLite converter and its checks. See [upgrade-to-sqlite.md](upgrade-to-sqlite.md) |
+| `/rust-api/server/src/scheduler.rs` | The scheduled jobs (recurring, Plaid, prices, TypeSafe cleanup, backup, prune, `VACUUM`), on when `COUNTERPOISE_SCHEDULER=on` |
 | `/rust-api/cli/src/import_moneydance/mod.rs` | Moneydance import orchestration, run by `ledger-cli import-moneydance` and `npm run import:moneydance` |
 | `/rust-api/server/src/mcp/` | The MCP server: the tool registry, the stdio and HTTP transports, WebMCP, and one handler module per tool group. See [mcp-server.md](mcp-server.md) |
 | `/rust-api/server/mcp-tools.json` | The source of each MCP tool's name, title, description, annotations and input schema |
@@ -300,9 +314,8 @@ One module per route area. `routes/mod.rs` registers each entry of
 | `/client/routes.tsx` | The route table of the client. Each page and the book layout load on demand |
 | `/lib/wasm-client.ts` | The browser adapter for `ledger-core` |
 | `/lib/api-client.ts` | Every browser API request |
-| `/scripts/rebuild-lots.ts` | Guarded lot backfill, run by `npm run db:migrate`. `ledger-cli rebuild-lots [--force]` is the Rust copy, with the same guard and messages; the Docker entrypoint runs it |
-| `/scripts/check-db-credential.sh` | Stops the app container (before the migrations) and the scheduler when `DATABASE_URL` uses the published default credential |
-| `/scripts/postgres-init/01-app-role.sh` | Creates the `counterpoise_app` role on first postgres initialization |
+| `/scripts/upgrade-to-sqlite.sh` | Converts an install's PostgreSQL data to SQLite, once. Uses `docker-compose.upgrade.yml`. See [upgrade-to-sqlite.md](upgrade-to-sqlite.md) |
+| `/scripts/verify-postgres-conversion.sh` | `--ref <commit>`: seeds PostgreSQL with the binaries of that commit, converts, and compares every GET response of every book |
 | `/scripts/release.sh` | Version bump, release branch, push, and PR creation. Creates no tag |
 | `/scripts/deploy.sh` | Publishes the version tag at one named commit, then builds and restarts. Rebases nothing |
 | `/scripts/posthog-export.ts` | CLI tool for exporting PostHog events |

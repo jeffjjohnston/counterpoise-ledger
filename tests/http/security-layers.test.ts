@@ -1,9 +1,9 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { apiKeys } from "../../db/schema";
 import { generateApiKey, hashApiKey } from "../helpers/api-keys";
-import { db, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { insert } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
@@ -48,7 +48,7 @@ describe("security layers HTTP parity", () => {
     await resetTestDatabase();
     client = await sessionHttpClient(baseUrl);
     key = generateApiKey();
-    await db.insert(apiKeys).values({
+    await insert("api_keys", {
       userId: 1, name: "Security layers", keyHash: await hashApiKey(key), keyPrefix: key.slice(0, 8),
     });
   });

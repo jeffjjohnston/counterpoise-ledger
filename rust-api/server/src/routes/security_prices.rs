@@ -22,6 +22,7 @@ use axum::{
 };
 use chrono::{Datelike, Local, Weekday};
 use ledger_core::collation::compare_names;
+use ledger_db::sql;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
@@ -100,8 +101,7 @@ fn price_item(item: &Value) -> Option<PriceItem> {
 fn is_unique_violation(cause: &sqlx::Error) -> bool {
     cause
         .as_database_error()
-        .and_then(|database| database.code())
-        .is_some_and(|code| code == "23505")
+        .is_some_and(|database| database.is_unique_violation())
 }
 
 pub(crate) async fn price_history(
@@ -123,7 +123,7 @@ pub(crate) async fn price_history(
     let prices: Vec<(String, i64, Option<String>)> = sqlx::query_as(
         "SELECT price_date, price_micros, source FROM security_prices
          WHERE security_id = $1 AND book_id = $2
-         ORDER BY price_date DESC LIMIT $3 OFFSET $4",
+         ORDER BY price_date DESC LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)",
     )
     .bind(security_id)
     .bind(book.book_id)
@@ -217,7 +217,7 @@ pub(crate) async fn update_price(
         return Err(conflict());
     }
     let moved: Result<(), sqlx::Error> = async {
-        let mut transaction = state.pool.begin().await?;
+        let mut transaction = ledger_db::locks::begin_pool(&state.pool).await?;
         sqlx::query("DELETE FROM security_prices WHERE security_id = $1 AND price_date = $2")
             .bind(security_id)
             .bind(&current_date)
@@ -426,7 +426,7 @@ pub(crate) struct SetPrices {
 /// item is valid, or when a security is not in this book. The bulk route
 /// reports only the count; the MCP tool also reports what it skipped.
 pub(crate) async fn set_prices(
-    pool: &sqlx::PgPool,
+    pool: &ledger_db::engine::DbPool,
     book_id: i32,
     items: &[Value],
 ) -> Result<SetPrices, SetPricesError> {
@@ -458,11 +458,12 @@ pub(crate) async fn set_prices(
         .map_err(|_| SetPricesError::OutOfRange)?;
     security_ids.sort_unstable();
     security_ids.dedup();
-    let owned: i32 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS integer) FROM securities WHERE book_id = $1 AND id = ANY($2)",
-    )
+    let owned: i32 = sqlx::query_scalar(&format!(
+        "SELECT CAST(COUNT(*) AS integer) FROM securities WHERE book_id = $1 AND id {in2}",
+        in2 = sql::in_integers("$2")
+    ))
     .bind(book_id)
-    .bind(&security_ids)
+    .bind(sql::json_array(&security_ids))
     .fetch_one(pool)
     .await
     .map_err(SetPricesError::Database)?;
@@ -472,7 +473,9 @@ pub(crate) async fn set_prices(
         ));
     }
 
-    let mut transaction = pool.begin().await.map_err(SetPricesError::Database)?;
+    let mut transaction = ledger_db::locks::begin_pool(pool)
+        .await
+        .map_err(SetPricesError::Database)?;
     for update in &updates {
         // The key is (security, date). The security belongs to this book,
         // so a conflicting row does too.

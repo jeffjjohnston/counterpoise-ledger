@@ -15,13 +15,13 @@ use axum::{
 };
 use chrono::{Duration, NaiveDateTime, SecondsFormat, Utc};
 use getrandom::fill;
+use ledger_db::locks::{TransactionLock, lock_transaction};
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
-const REGISTRATION_LOCK_ID: i64 = 4_242_424_242;
 
 fn json_response(body: Value) -> Response {
     Json(body).into_response()
@@ -42,10 +42,12 @@ async fn cookie_session(
     let Some(token) = cookie_token(headers) else {
         return Ok(None);
     };
-    let row = sqlx::query("SELECT id, user_id FROM sessions WHERE token_hash = $1 AND expires_at > (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')")
-        .bind(token_hash(&token))
-        .fetch_optional(&state.pool)
-        .await?;
+    let row =
+        sqlx::query("SELECT id, user_id FROM sessions WHERE token_hash = $1 AND expires_at > $2")
+            .bind(token_hash(&token))
+            .bind(Utc::now().naive_utc())
+            .fetch_optional(&state.pool)
+            .await?;
     Ok(row.map(|row| (row.get("user_id"), row.get("id"))))
 }
 
@@ -159,7 +161,7 @@ fn credentials(body: &Value, register: bool) -> Result<(String, String), ApiErro
 
 async fn registration_open<'e, E>(executor: E) -> Result<bool, sqlx::Error>
 where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    E: sqlx::Executor<'e, Database = ledger_db::engine::Db>,
 {
     match std::env::var("REGISTRATION_ENABLED").as_deref() {
         Ok("true") => Ok(true),
@@ -190,7 +192,8 @@ async fn create_session(
         tracing::error!(error = %cause, "Could not generate session token");
         error(StatusCode::INTERNAL_SERVER_ERROR, failure)
     })?;
-    sqlx::query("DELETE FROM sessions WHERE expires_at < (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')")
+    sqlx::query("DELETE FROM sessions WHERE expires_at < $1")
+        .bind(Utc::now().naive_utc())
         .execute(&state.pool)
         .await
         .map_err(|cause| db_error(cause, failure))?;
@@ -330,14 +333,10 @@ async fn register_inner(
         return Ok(denied.into_response());
     }
     let password_hash = hash_password(&state, password, "Failed to register").await?;
-    let mut tx = state
-        .pool
-        .begin()
+    let mut tx = ledger_db::locks::begin_pool(&state.pool)
         .await
         .map_err(|cause| db_error(cause, "Failed to register"))?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(REGISTRATION_LOCK_ID)
-        .execute(&mut *tx)
+    lock_transaction(&mut tx, TransactionLock::Registration)
         .await
         .map_err(|cause| db_error(cause, "Failed to register"))?;
     let open = registration_open(&mut *tx)

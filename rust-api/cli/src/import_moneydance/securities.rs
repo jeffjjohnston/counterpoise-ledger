@@ -1,6 +1,7 @@
 //! Phase 5 (security prices) and phase 6 (stock splits).
 
-use sqlx::{Connection, PgConnection, Postgres, QueryBuilder};
+use ledger_db::engine::{Db, DbConnection};
+use sqlx::QueryBuilder;
 
 use super::values::{
     Item, convert_date, convert_price_to_micros, field, int8, integer_text,
@@ -34,7 +35,7 @@ pub struct PhaseStats {
 }
 
 pub async fn import_security_prices(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     items: &[&Item],
 ) -> Result<PhaseStats, sqlx::Error> {
@@ -103,8 +104,8 @@ pub async fn import_security_prices(
             let outcome = match prices {
                 Err(message) => Err(message),
                 Ok(prices) => {
-                    let mut savepoint = connection.begin().await?;
-                    let mut insert: QueryBuilder<Postgres> = QueryBuilder::new(
+                    let mut savepoint = ledger_db::locks::savepoint(connection).await?;
+                    let mut insert: QueryBuilder<Db> = QueryBuilder::new(
                         "INSERT INTO security_prices (security_id, book_id, price_date, price_micros, source) ",
                     );
                     insert.push_values(prices, |mut row, (security_id, date, price)| {
@@ -151,7 +152,7 @@ pub async fn import_security_prices(
 }
 
 pub async fn import_stock_splits(
-    connection: &mut PgConnection,
+    connection: &mut DbConnection,
     context: &mut ImportContext,
     items: &[&Item],
 ) -> Result<PhaseStats, sqlx::Error> {
@@ -231,7 +232,7 @@ pub async fn import_stock_splits(
             let outcome = match parsed {
                 Err(message) => Err(message),
                 Ok((date, (numerator, denominator))) => {
-                    let mut savepoint = connection.begin().await?;
+                    let mut savepoint = ledger_db::locks::savepoint(connection).await?;
                     let outcome = async {
                         let transaction_id = insert_transaction(
                             &mut savepoint,

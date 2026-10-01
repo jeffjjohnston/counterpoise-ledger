@@ -1,9 +1,9 @@
 use crate::{
     auth::session_user,
     book_auth::{AccessLevel, authenticate_book_membership, parse_book_id},
-    error::{ApiError, ApiResult, error, internal_error},
+    error::{ApiError, ApiResult, error, error_owned, internal_error},
     state::AppState,
-    validation::{database_integer, parse_json_body},
+    validation::{database_integer, from_json_bytes, parse_json_body},
 };
 use axum::{
     Json,
@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::{Local, NaiveDateTime, SecondsFormat, Utc};
-use ledger_db::seed::{SeedError, seed_book};
+use ledger_db::seed::{DemoDataset, SeedError, seed_book};
 use serde_json::{Value, json};
 use sqlx::FromRow;
 
@@ -97,7 +97,7 @@ pub(crate) async fn list_books(State(state): State<AppState>, headers: HeaderMap
     );
     let rows: Vec<(BookRow, String)> = sqlx::query(&sql)
         .bind(user_id)
-        .try_map(|row: sqlx::postgres::PgRow| {
+        .try_map(|row: ledger_db::engine::DbRow| {
             use sqlx::Row;
             Ok((BookRow::from_row(&row)?, row.try_get("role")?))
         })
@@ -187,23 +187,50 @@ pub(crate) async fn delete_book(
     Ok(Json(json!({ "success": true })))
 }
 
-const DEMO_BOOK_NAME: &str = "Demo Book";
 const DEMO_FAILURE: &str = "Failed to create demo book";
 
-/// A name that no book of this user holds: "Demo Book", then "Demo Book 2",
-/// and so on. At most `taken.len()` names are in use, so one of the first
+/// A name that no book of this user holds: `base`, then "`base` 2", and so
+/// on. At most `taken.len()` names are in use, so one of the first
 /// `taken.len() + 1` candidates is free.
-fn next_demo_book_name(taken: &[String]) -> String {
+fn next_demo_book_name(base: &str, taken: &[String]) -> String {
     (1..=taken.len() + 1)
         .map(|n| {
             if n == 1 {
-                DEMO_BOOK_NAME.to_owned()
+                base.to_owned()
             } else {
-                format!("{DEMO_BOOK_NAME} {n}")
+                format!("{base} {n}")
             }
         })
         .find(|candidate| !taken.contains(candidate))
         .expect("one of the first taken.len() + 1 names is free")
+}
+
+/// The dataset of a demo request. An empty body or no `dataset` field means
+/// the household dataset, so older clients keep working. The route reads no
+/// other field.
+fn demo_dataset(body: &Bytes) -> Result<DemoDataset, ApiError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(DemoDataset::Household);
+    }
+    let value: Value =
+        from_json_bytes(body).map_err(|_| error(StatusCode::BAD_REQUEST, "Invalid JSON body"))?;
+    let object = value.as_object().ok_or_else(|| {
+        error(
+            StatusCode::BAD_REQUEST,
+            "Request body must be a JSON object",
+        )
+    })?;
+    match object.get("dataset") {
+        None | Some(Value::Null) => Ok(DemoDataset::Household),
+        Some(Value::String(id)) => DemoDataset::from_id(id).ok_or_else(|| {
+            let ids: Vec<&str> = DemoDataset::ALL.iter().map(|d| d.id()).collect();
+            error_owned(
+                StatusCode::BAD_REQUEST,
+                format!("Unknown dataset \"{id}\". Use one of: {}", ids.join(", ")),
+            )
+        }),
+        Some(_) => Err(error(StatusCode::BAD_REQUEST, "dataset must be a string")),
+    }
 }
 
 /// Creates a book for `user_id` and fills it with the sample dataset.
@@ -214,8 +241,12 @@ fn next_demo_book_name(taken: &[String]) -> String {
 ///
 /// One transaction holds the book and the seed. A failure leaves no book
 /// that holds part of a dataset.
-async fn seed_demo_book(pool: &sqlx::PgPool, user_id: i32) -> Result<BookRow, SeedError> {
-    let mut transaction = pool.begin().await?;
+async fn seed_demo_book(
+    pool: &ledger_db::engine::DbPool,
+    user_id: i32,
+    dataset: DemoDataset,
+) -> Result<BookRow, SeedError> {
+    let mut transaction = ledger_db::locks::begin_pool(pool).await?;
     let taken: Vec<String> = sqlx::query_scalar("SELECT name FROM books WHERE user_id = $1")
         .bind(user_id)
         .fetch_all(&mut *transaction)
@@ -225,12 +256,12 @@ async fn seed_demo_book(pool: &sqlx::PgPool, user_id: i32) -> Result<BookRow, Se
     );
     let book = sqlx::query_as::<_, BookRow>(&sql)
         .bind(user_id)
-        .bind(next_demo_book_name(&taken))
+        .bind(next_demo_book_name(dataset.book_name(), &taken))
         .bind(Utc::now().naive_utc())
         .fetch_one(&mut *transaction)
         .await?;
     let today = Local::now().date_naive();
-    seed_book(&mut transaction, book.id, today, &mut |_| {}).await?;
+    seed_book(&mut transaction, book.id, dataset, today, &mut |_| {}).await?;
     transaction.commit().await?;
     Ok(book)
 }
@@ -241,10 +272,12 @@ async fn seed_demo_book(pool: &sqlx::PgPool, user_id: i32) -> Result<BookRow, Se
 pub(crate) async fn create_demo_book(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> ApiResult {
     let user_id = session_user(&state, &headers, DEMO_FAILURE).await?;
+    let dataset = demo_dataset(&body)?;
     let pool = state.pool.clone();
-    let seeded = tokio::spawn(async move { seed_demo_book(&pool, user_id).await })
+    let seeded = tokio::spawn(async move { seed_demo_book(&pool, user_id, dataset).await })
         .await
         .map_err(|cause| cause.to_string())
         .and_then(|result| result.map_err(|cause| cause.to_string()));
@@ -255,6 +288,26 @@ pub(crate) async fn create_demo_book(
             Err(error(StatusCode::INTERNAL_SERVER_ERROR, DEMO_FAILURE))
         }
     }
+}
+
+/// The datasets that `POST /api/books/demo` accepts, in menu order.
+pub(crate) async fn list_demo_datasets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult {
+    session_user(&state, &headers, "Failed to list demo datasets").await?;
+    Ok(Json(Value::Array(
+        DemoDataset::ALL
+            .iter()
+            .map(|dataset| {
+                json!({
+                    "id": dataset.id(),
+                    "name": dataset.name(),
+                    "description": dataset.description(),
+                })
+            })
+            .collect(),
+    )))
 }
 
 #[cfg(test)]
@@ -280,15 +333,47 @@ mod tests {
 
     #[test]
     fn demo_book_name_skips_the_names_in_use() {
-        assert_eq!(next_demo_book_name(&[]), "Demo Book");
-        assert_eq!(next_demo_book_name(&["Family".into()]), "Demo Book");
+        let base = "Demo Book";
+        assert_eq!(next_demo_book_name(base, &[]), "Demo Book");
+        assert_eq!(next_demo_book_name(base, &["Family".into()]), "Demo Book");
         assert_eq!(
-            next_demo_book_name(&["Demo Book".into(), "Demo Book 3".into()]),
+            next_demo_book_name(base, &["Demo Book".into(), "Demo Book 3".into()]),
             "Demo Book 2"
         );
         assert_eq!(
-            next_demo_book_name(&["Demo Book".into(), "Demo Book 2".into()]),
+            next_demo_book_name(base, &["Demo Book".into(), "Demo Book 2".into()]),
             "Demo Book 3"
         );
+    }
+
+    #[test]
+    fn demo_dataset_reads_only_the_dataset_field() {
+        use super::demo_dataset;
+        use ledger_db::seed::DemoDataset;
+        assert_eq!(demo_dataset(&Bytes::new()).unwrap(), DemoDataset::Household);
+        assert_eq!(
+            demo_dataset(&Bytes::from_static(b"  ")).unwrap(),
+            DemoDataset::Household
+        );
+        assert_eq!(
+            demo_dataset(&Bytes::from_static(br#"{"dataset":"single","bookId":9}"#)).unwrap(),
+            DemoDataset::Single
+        );
+        assert_eq!(
+            demo_dataset(&Bytes::from_static(br#"{"dataset":null}"#)).unwrap(),
+            DemoDataset::Household
+        );
+        assert!(demo_dataset(&Bytes::from_static(br#"{"dataset":"nope"}"#)).is_err());
+        assert!(demo_dataset(&Bytes::from_static(b"null")).is_err());
+    }
+
+    #[test]
+    fn a_dataset_numbers_its_own_name() {
+        let taken = vec!["Demo Book - Single".to_owned()];
+        assert_eq!(
+            next_demo_book_name("Demo Book - Single", &taken),
+            "Demo Book - Single 2"
+        );
+        assert_eq!(next_demo_book_name("Demo Book", &taken), "Demo Book");
     }
 }

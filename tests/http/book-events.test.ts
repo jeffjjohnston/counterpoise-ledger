@@ -1,52 +1,16 @@
-import { sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { accounts, payees } from "../../db/schema";
-import { createBook, createPayee, db, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { createAccount, createBook, createPayee, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { count, exec, script, transaction } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { changeFrame, changeTables, frameReader, settle } from "../helpers/sse-frames";
 
-type Frame = { event?: string; data?: string; comment?: string };
-
-/** Reads SSE frames from a real response body, one blank-line block at a time. */
-function frameReader(response: Response) {
-  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
-  let buffered = "";
-  return {
-    async next(timeoutMs = 5000): Promise<Frame | undefined> {
-      const deadline = Date.now() + timeoutMs;
-      while (!buffered.includes("\n\n")) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) throw new Error(`No SSE frame within ${timeoutMs} ms; buffered ${JSON.stringify(buffered)}`);
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const chunk = await Promise.race([
-          reader.read(),
-          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("SSE read timed out")), remaining); }),
-        ]).finally(() => clearTimeout(timer));
-        if (chunk.done) return undefined;
-        buffered += chunk.value;
-      }
-      const end = buffered.indexOf("\n\n");
-      const block = buffered.slice(0, end);
-      buffered = buffered.slice(end + 2);
-      const frame: Frame = {};
-      for (const line of block.split("\n")) {
-        if (line.startsWith(":")) frame.comment = line.slice(1).trim();
-        else if (line.startsWith("event: ")) frame.event = line.slice(7);
-        else if (line.startsWith("data: ")) frame.data = line.slice(6);
-      }
-      return frame;
-    },
-    cancel: () => reader.cancel(),
-  };
+function json(method: string, body: unknown): RequestInit {
+  return { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
 }
 
-async function listenerPids(): Promise<number[]> {
-  const rows = await db.execute<{ pid: number }>(sql`
-    SELECT pid FROM pg_stat_activity
-    WHERE datname = current_database() AND lower(query) = 'listen "counterpoise_changes"'
-  `);
-  return rows.map((row) => row.pid);
-}
-
+// Triggers count the row changes of each book and table, and the server
+// polls the counts while a stream is open. So a write from any connection
+// sends a hint: the server's, and this process's node:sqlite writes too.
 describe("book events HTTP parity", () => {
   let baseUrl: string;
   let stop: () => Promise<void>;
@@ -64,9 +28,34 @@ describe("book events HTTP parity", () => {
 
   afterAll(async () => { await stop?.(); });
 
+  async function ok(path: string, init: RequestInit) {
+    const response = await client.request(path, init);
+    expect(response.status, `${init.method} ${path}`).toBe(200);
+    return response.json();
+  }
+
+  /** Opens the stream of a book and reads `ready`. Then waits until the hints of earlier writes have arrived. */
+  async function listen(bookId: number) {
+    const response = await client.request(`/api/b/${bookId}/events`);
+    expect(response.status).toBe(200);
+    const frames = frameReader(response);
+    expect(await frames.next()).toEqual({ event: "ready", data: "{}" });
+    await settle(frames);
+    return frames;
+  }
+
+  async function spendFixture() {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const food = await createAccount({ name: "Food", type: "expense" });
+    return (amount: number, payeeName: string) => ({
+      date: "2025-03-01", payeeName,
+      splits: [{ accountId: checking.id, amount: -amount }, { accountId: food.id, amount }],
+    });
+  }
+
   it("enforces read membership and rejects invalid book IDs before streaming", async () => {
     const other = await createBook({ name: "Other" });
-    await db.execute(sql`DELETE FROM book_members WHERE book_id = ${other.id}`);
+    await exec("DELETE FROM book_members WHERE book_id = $1", [other.id]);
     for (const [path, status, body] of [
       [`/api/b/${other.id}/events`, 404, { error: "Book not found" }],
       ["/api/b/999999/events", 404, { error: "Book not found" }],
@@ -79,8 +68,9 @@ describe("book events HTTP parity", () => {
     expect((await client.anonymous("/api/b/1/events")).status).toBe(401);
   });
 
-  it("streams ready, then windowed hints for this book only, then reset after a lost listener", async () => {
+  it("streams ready, then windowed hints for this book only", async () => {
     const other = await createBook({ name: "Other" });
+    const spend = await spendFixture();
     const response = await client.request("/api/b/1/events");
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe("text/event-stream");
@@ -89,44 +79,71 @@ describe("book events HTTP parity", () => {
     const frames = frameReader(response);
     try {
       expect(await frames.next()).toEqual({ event: "ready", data: "{}" });
+      await settle(frames);
+      const otherFrames = await listen(other.id);
+      try {
+        // A write to another book goes to the stream of that book only. It
+        // uses a table that the write to book 1 does not touch, so a leak
+        // into this stream cannot hide in the same frame.
+        await ok(`/api/b/${other.id}/accounts`, json("POST", { name: "Elsewhere", type: "asset" }));
+        // One commit writes a payee, a transaction and two splits: one
+        // frame, with each table once.
+        await ok("/api/b/1/transactions", json("POST", spend(500, "Grocer")));
+        expect(changeTables(await frames.next())).toEqual({
+          event: "change", tables: ["payees", "transaction_splits", "transactions"],
+        });
+        expect(await otherFrames.next()).toEqual(changeFrame("accounts"));
+      } finally {
+        await otherFrames.cancel();
+      }
 
-      // Hints for another book never reach this stream. Hints that arrive
-      // inside one window make one frame, with each table once, in first-seen order.
-      await db.transaction(async (tx) => {
-        await tx.insert(payees).values({ bookId: other.id, name: "Elsewhere" });
-        await tx.insert(accounts).values({ bookId: 1, name: "Checking", type: "asset" });
-        await tx.insert(payees).values({ bookId: 1, name: "Grocer" });
-        await tx.insert(accounts).values({ bookId: 1, name: "Savings", type: "asset" });
-      });
-      expect(await frames.next()).toEqual({ event: "change", data: '{"tables":["accounts","payees"]}' });
+      // Two commits in quick succession fall in one window: one frame.
+      await createPayee({ name: "Direct" });
+      await createAccount({ name: "Direct", type: "asset" });
+      expect(changeTables(await frames.next())).toEqual({ event: "change", tables: ["accounts", "payees"] });
 
-      // Losing the LISTEN connection loses the hints of the gap, so the
-      // server must send reset once it listens again.
-      const [pid] = await listenerPids();
-      expect(pid).toEqual(expect.any(Number));
-      await db.execute(sql`SELECT pg_terminate_backend(${pid})`);
-      let frame = await frames.next(15_000);
-      // A hint can arrive in the same window as the termination.
-      while (frame?.event === "change") frame = await frames.next(15_000);
-      expect(frame).toEqual({ event: "reset", data: '{"tables":[]}' });
-      await expect.poll(listenerPids, { timeout: 10_000 }).toHaveLength(1);
-      await createPayee({ name: "After reconnect" });
-      expect(await frames.next()).toEqual({ event: "change", data: '{"tables":["payees"]}' });
+      // The window closes after it sends its frame. The next write opens a new one.
+      await ok("/api/b/1/payees", json("POST", { name: "Later" }));
+      expect(await frames.next()).toEqual(changeFrame("payees"));
     } finally {
       await frames.cancel();
     }
-  }, 60_000);
+  });
 
-  it("shares one LISTEN connection between streams", async () => {
-    const first = frameReader(await client.request("/api/b/1/events"));
-    const second = frameReader(await client.request("/api/b/1/events"));
+  it("sends nothing for a write that rolls back", async () => {
+    const spend = await spendFixture();
+    const frames = await listen(1);
+    // The splits come after the payee and the transaction. Make them fail,
+    // so that the server rolls back rows that it already wrote.
+    await script(`CREATE TRIGGER fail_split BEFORE INSERT ON transaction_splits
+      WHEN NEW.amount = 777 BEGIN SELECT RAISE(ABORT, 'split refused'); END;`);
     try {
-      expect((await first.next())?.event).toBe("ready");
-      expect((await second.next())?.event).toBe("ready");
-      expect(await listenerPids()).toHaveLength(1);
-      await createPayee({ name: "Both" });
-      expect(await first.next()).toEqual({ event: "change", data: '{"tables":["payees"]}' });
-      expect(await second.next()).toEqual({ event: "change", data: '{"tables":["payees"]}' });
+      const failed = await client.request("/api/b/1/transactions", json("POST", spend(777, "Rolled Back")));
+      expect(failed.status).toBe(500);
+      expect(await count("transactions")).toBe(0);
+      expect(await count("payees")).toBe(0);
+      // A rollback on another connection is silent too.
+      await expect(transaction(async (tx) => {
+        await tx.insert("securities", { bookId: 1, name: "Gone", symbol: "GONE", securityType: "etf" });
+        throw new Error("roll back");
+      })).rejects.toThrow("roll back");
+
+      // A hint of a rolled-back write would come before this frame or in it.
+      await ok("/api/b/1/accounts", json("POST", { name: "After", type: "asset" }));
+      expect(await frames.next()).toEqual(changeFrame("accounts"));
+    } finally {
+      await script("DROP TRIGGER IF EXISTS fail_split");
+      await frames.cancel();
+    }
+  });
+
+  it("sends each hint to every stream of the book", async () => {
+    const first = await listen(1);
+    const second = await listen(1);
+    try {
+      await ok("/api/b/1/payees", json("POST", { name: "Both" }));
+      expect(await first.next()).toEqual(changeFrame("payees"));
+      expect(await second.next()).toEqual(changeFrame("payees"));
     } finally {
       await first.cancel();
       await second.cancel();

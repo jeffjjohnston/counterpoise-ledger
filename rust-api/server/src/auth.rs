@@ -5,6 +5,7 @@ use crate::{
     state::AppState,
 };
 use axum::http::{HeaderMap, header};
+use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use scrypt::{Params, scrypt};
 use sha2::{Digest, Sha256};
@@ -109,10 +110,14 @@ async fn stamp_if_due(state: &AppState, digest: KeyDigest, key_id: i32) {
     if !state.api_keys.stamp_due(digest) {
         return;
     }
-    if let Err(cause) = sqlx::query!(
-        "UPDATE api_keys SET last_used_at = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - INTERVAL '5 minutes')",
-        key_id
+    let now = Utc::now().naive_utc();
+    if let Err(cause) = sqlx::query(
+        "UPDATE api_keys SET last_used_at = $2
+         WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $3)",
     )
+    .bind(key_id)
+    .bind(now)
+    .bind(now - chrono::Duration::minutes(5))
     .execute(&state.pool)
     .await
     {
@@ -129,14 +134,12 @@ async fn resolve_api_key(
         stamp_if_due(state, digest, principal.key_id).await;
         return Ok(Some(principal));
     }
-    let candidates = sqlx::query!(
-        "SELECT id, user_id, key_hash FROM api_keys WHERE key_prefix = $1",
-        &key[..8]
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    for row in candidates {
-        let (key_id, user_id, hash) = (row.id, row.user_id, row.key_hash);
+    let candidates: Vec<(i32, i32, String)> =
+        sqlx::query_as("SELECT id, user_id, key_hash FROM api_keys WHERE key_prefix = $1")
+            .bind(&key[..8])
+            .fetch_all(&state.pool)
+            .await?;
+    for (key_id, user_id, hash) in candidates {
         // Node's scrypt is asynchronous. Keep its Rust equivalent off Tokio's
         // request workers and bound concurrent checks for known prefixes.
         #[cfg(test)]
@@ -158,13 +161,13 @@ pub(crate) async fn principal(
 ) -> Result<Option<i32>, sqlx::Error> {
     if let Some(token) = cookie_token(headers) {
         let digest = token_hash(&token);
-        let user_id = sqlx::query!(
-            "SELECT user_id FROM sessions WHERE token_hash = $1 AND expires_at > (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')",
-            digest
+        let user_id: Option<i32> = sqlx::query_scalar(
+            "SELECT user_id FROM sessions WHERE token_hash = $1 AND expires_at > $2",
         )
+        .bind(digest)
+        .bind(Utc::now().naive_utc())
         .fetch_optional(&state.pool)
-        .await?
-        .map(|row| row.user_id);
+        .await?;
         if user_id.is_some() {
             return Ok(user_id);
         }
@@ -235,7 +238,6 @@ pub(crate) async fn session_user(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
 
     #[test]
     fn cookie_parser_uses_last_valid_decoded_value() {
@@ -258,14 +260,8 @@ mod tests {
 
     #[tokio::test]
     async fn verified_key_is_coalesced_cached_and_checked_for_revocation() {
-        let Some(url) = crate::state::test_database_url() else {
-            return;
-        };
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
+        let database = ledger_db::testing::TempDatabase::new(1).await;
+        let pool = database.pool().clone();
         sqlx::query("CREATE TEMP TABLE api_keys (id integer, user_id integer, key_hash text, key_prefix text, last_used_at timestamp)")
             .execute(&pool).await.unwrap();
         let key = format!("cpk_{}", "a".repeat(48));
@@ -287,7 +283,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let mut state = AppState::new(&url, "UTC").unwrap();
+        let mut state = AppState::with_pool(
+            pool.clone(),
+            crate::book_changes::BookChangeHub::new(pool.clone()),
+        );
         state.pool = pool.clone();
         let mut headers = HeaderMap::new();
         headers.insert(

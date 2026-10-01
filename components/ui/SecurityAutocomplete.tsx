@@ -20,6 +20,12 @@ interface SecurityAutocompleteProps {
   allowClear?: boolean;
   dropUp?: boolean;
   size?: "default" | "compact";
+  /**
+   * Securities to list first, under their own heading: for example, the ones
+   * that the selected account holds. Each shows once, not also in its type
+   * group.
+   */
+  held?: { label: string; ids: ReadonlySet<number> };
 }
 
 const securityTypeLabels: Record<string, string> = {
@@ -38,6 +44,7 @@ export function SecurityAutocomplete({
   allowClear = true,
   dropUp = false,
   size = "default",
+  held,
 }: SecurityAutocompleteProps) {
   const isCompact = size === "compact";
   const [searchTerm, setSearchTerm] = useState("");
@@ -73,13 +80,27 @@ export function SecurityAutocomplete({
 
   const groupedSecurities: SecurityGroup[] = [];
   const typeMap = new Map<string, Security[]>();
+  const heldSecurities: Security[] = [];
 
   filteredSecurities.forEach((security) => {
+    if (held?.ids.has(security.id)) {
+      heldSecurities.push(security);
+      return;
+    }
     if (!typeMap.has(security.securityType)) {
       typeMap.set(security.securityType, []);
     }
     typeMap.get(security.securityType)!.push(security);
   });
+
+  if (held && heldSecurities.length > 0) {
+    groupedSecurities.push({
+      // Not a security type, so it cannot collide with a type group's key.
+      type: "__held",
+      label: held.label,
+      securities: heldSecurities.sort((a, b) => a.symbol.localeCompare(b.symbol)),
+    });
+  }
 
   typeMap.forEach((securities, type) => {
     groupedSecurities.push({

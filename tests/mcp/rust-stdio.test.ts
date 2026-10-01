@@ -2,9 +2,9 @@ import { spawn } from "node:child_process";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { apiKeys } from "@/db/schema";
 import { generateApiKey, getKeyPrefix, hashApiKey } from "@/tests/helpers/api-keys";
-import { db, resetTestDatabase, setupTestDatabase } from "@/tests/helpers/db-utils";
+import { resetTestDatabase, setupTestDatabase } from "@/tests/helpers/db-utils";
+import { exec, insert } from "@/tests/helpers/sql";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import {
   RUST_SERVER_BINARY, mcpTestTransport, stdioServerParameters,
@@ -33,7 +33,7 @@ describe.skipIf(mcpTestTransport() !== "stdio")("Rust MCP over stdio", () => {
   beforeEach(async () => {
     await resetTestDatabase();
     key = generateApiKey();
-    await db.insert(apiKeys).values({ userId: 1, name: "t", keyHash: await hashApiKey(key), keyPrefix: getKeyPrefix(key) });
+    await insert("api_keys", { userId: 1, name: "t", keyHash: await hashApiKey(key), keyPrefix: getKeyPrefix(key) });
   });
   afterEach(async () => {
     await client?.close();
@@ -62,7 +62,7 @@ describe.skipIf(mcpTestTransport() !== "stdio")("Rust MCP over stdio", () => {
   it("stops a revoked key at the next call, without a restart", async () => {
     const mcp = await connect(key);
     expect((await callMcpTool(mcp, "list_books")).isError).toBe(false);
-    await db.delete(apiKeys);
+    await exec("DELETE FROM api_keys");
     const result = await callMcpTool(mcp, "list_books");
     expect(result.isError).toBe(true);
     expect(result.data).toEqual({ error: "A valid COUNTERPOISE_API_KEY is required" });

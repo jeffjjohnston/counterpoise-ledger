@@ -54,6 +54,8 @@ const ACCOUNTS_REPLIES: Record<string, { status: number; body?: unknown; raw?: s
   "access-bad-payload": { status: 200, body: { accounts: "none" } },
   "access-null-body": { status: 200, body: null },
   "access-null-account": { status: 200, body: { accounts: [null] } },
+  // `name` is NOT NULL in plaid_accounts, so the insert fails in SQLite.
+  "access-null-name": { status: 200, body: { accounts: [{ account_id: "x", type: "depository" }] } },
 };
 
 async function startPlaidMock(): Promise<{ url: string; requests: unknown[]; server: Server }> {
@@ -237,6 +239,11 @@ describe("Plaid connection HTTP parity", () => {
       await expectError(client, `${base}/${token.id}`, json("PUT", { financialInstitution: "A", itemId: "b" }), 403, owner);
       await expectError(client, `${base}/${token.id}`, { method: "DELETE" }, 403, owner);
       await expectError(client, `${base}/${token.id}/accounts`, json("PUT", { assignments: [] }), 403, owner);
+      // The refresh is a GET, so the route authenticates at Read; the owner
+      // check is by hand. It rewrites the mappings and calls Plaid with the
+      // owner's token, so it must not run for anyone else.
+      await expectError(client, `${base}/${token.id}/accounts?refresh=true`, {}, 403, owner);
+      expect(plaid.requests).toEqual([]);
       expect(await ok(client, base)).toHaveLength(1);
       expect(await ok(client, `${base}/${token.id}/accounts`)).toEqual([]);
     }
@@ -291,6 +298,9 @@ describe("Plaid connection HTTP parity", () => {
       ["access-bad-payload", "Plaid /accounts/get returned an invalid accounts payload"],
       ["access-null-body", "Cannot read properties of null (reading 'accounts')"],
       ["access-null-account", "Cannot read properties of null (reading 'account_id')"],
+      // A database failure gives a fixed message. The SQLite text names
+      // tables and constraints; the server log gets it, the client does not.
+      ["access-null-name", "A database error stopped the operation. The server log has the cause."],
     ]) {
       await exec("UPDATE plaid_tokens SET access_token = $1 WHERE id = $2", [accessToken, token.id]);
       await expectError(client, path, {}, 502, error);

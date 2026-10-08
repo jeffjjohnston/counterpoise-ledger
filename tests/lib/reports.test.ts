@@ -3,6 +3,8 @@ import {
   buildTopParentMap,
   computeGrandTotal,
   groupSplits,
+  isMixedReport,
+  reportAmount,
   type ReportAccount,
   type ReportSplit,
 } from "@/lib/reports";
@@ -74,7 +76,7 @@ describe("groupSplits", () => {
     },
   ];
 
-  it("groups by month and collapses child accounts to their top parent", () => {
+  it("groups by month and collapses child accounts to their top parent, with a signed net in a mixed report", () => {
     const groups = groupSplits(splits, ["month", "account"], accountMap, true);
 
     expect(groups.map((group) => group.label)).toEqual([
@@ -84,7 +86,7 @@ describe("groupSplits", () => {
 
     expect(groups[0].children).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ label: "Expenses", total: 12_500 }),
+        expect.objectContaining({ label: "Expenses", total: -12_500 }),
         expect.objectContaining({ label: "Income", total: 50_000 }),
       ])
     );
@@ -95,7 +97,7 @@ describe("groupSplits", () => {
 
     expect(groups).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ label: "(No payee)", total: 12_500 }),
+        expect.objectContaining({ label: "(No payee)", total: -12_500 }),
         expect.objectContaining({ label: "Acme Corp", total: 50_000 }),
       ])
     );
@@ -103,7 +105,7 @@ describe("groupSplits", () => {
 });
 
 describe("computeGrandTotal", () => {
-  it("sums display balances across account types", () => {
+  it("gives income less expense for a report with income and expense", () => {
     const splits: ReportSplit[] = [
       {
         splitId: 1,
@@ -131,6 +133,73 @@ describe("computeGrandTotal", () => {
       },
     ];
 
-    expect(computeGrandTotal(splits)).toBe(95_000);
+    expect(computeGrandTotal(splits)).toBe(55_000);
+  });
+});
+
+describe("signed net in a mixed report", () => {
+  let nextId = 1;
+  function split(date: string, accountId: number, accountType: string, amount: number): ReportSplit {
+    const id = nextId++;
+    return {
+      splitId: id, transactionId: id, date, amount, accountId,
+      accountName: `Account ${accountId}`, accountType, accountParentId: null,
+      payeeId: null, payeeName: null,
+    };
+  }
+  const accountMap = buildAccountMap([
+    { id: 1, name: "Salary", type: "income", parentId: null },
+    { id: 2, name: "Rent", type: "expense", parentId: null },
+    { id: 3, name: "Checking", type: "asset", parentId: null },
+    { id: 4, name: "Card", type: "liability", parentId: null },
+  ]);
+
+  it("gives each month the income less the expense, and the grand total the sum of the months", () => {
+    const splits = [
+      split("2026-01-05", 1, "income", -500_000),
+      split("2026-01-10", 2, "expense", 300_000),
+      split("2026-02-10", 2, "expense", 300_000),
+    ];
+    const groups = groupSplits(splits, ["month"], accountMap, false);
+
+    expect(groups.map((group) => group.total)).toEqual([200_000, -300_000]);
+    expect(computeGrandTotal(splits)).toBe(-100_000);
+  });
+
+  it("gives each split the sign of the net, so that the splits of a group add to its total", () => {
+    const splits = [
+      split("2026-01-05", 1, "income", -500_000),
+      split("2026-01-10", 2, "expense", 300_000),
+      split("2026-01-12", 2, "expense", -20_000),
+    ];
+    const [group] = groupSplits(splits, ["month"], accountMap, false);
+    const mixed = isMixedReport(splits);
+
+    expect(mixed).toBe(true);
+    expect(group.splits.map((s) => reportAmount(s, mixed))).toEqual([500_000, -300_000, 20_000]);
+    expect(group.splits.reduce((sum, s) => sum + reportAmount(s, mixed), 0)).toBe(group.total);
+  });
+
+  it("gives assets less liabilities for a report with assets and liabilities", () => {
+    const splits = [
+      split("2026-01-05", 3, "asset", 900_000),
+      split("2026-01-06", 4, "liability", -150_000),
+    ];
+
+    expect(computeGrandTotal(splits)).toBe(750_000);
+  });
+
+  it("keeps the display balance, positive, in a report with one account type", () => {
+    const splits = [
+      split("2026-01-10", 2, "expense", 300_000),
+      split("2026-02-10", 2, "expense", 100_000),
+      split("2026-02-12", 2, "expense", -25_000),
+    ];
+    const groups = groupSplits(splits, ["month"], accountMap, false);
+
+    expect(isMixedReport(splits)).toBe(false);
+    expect(groups.map((group) => group.total)).toEqual([300_000, 75_000]);
+    expect(computeGrandTotal(splits)).toBe(375_000);
+    expect(reportAmount(splits[2], false)).toBe(-25_000);
   });
 });

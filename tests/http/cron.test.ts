@@ -7,8 +7,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { toDateString } from "../../lib/formatters";
 import type { PlaidToken, RecurringRule, SecurityPrice } from "../../types/db";
 import {
-  createAccount, createBook, createPlaidAccount, createPlaidToken, createRecurringRule, createSecurity,
-  createSecurityPrice, resetTestDatabase, setupTestDatabase,
+  createAccount, createBook, createInvestmentSplit, createPlaidAccount, createPlaidToken, createRecurringRule,
+  createSecurity, createSecurityPrice, createTransactionWithSplits, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { count, row, rows } from "../helpers/sql";
@@ -112,6 +112,28 @@ async function connection(accessToken: string, options: { type?: "asset" | "liab
     counterpoiseAccountId: options.linked === false ? null : account.id,
   });
   return token;
+}
+
+/**
+ * Buys 10 shares of the security in a new brokerage account. With `sold`,
+ * a later sell of all 10 shares closes the position.
+ */
+async function hold(securityId: number, options: { bookId?: number; sold?: boolean } = {}) {
+  const bookId = options.bookId ?? 1;
+  const brokerage = await createAccount({ name: `Brokerage ${securityId}`, type: "asset", subtype: "investment", bookId });
+  const cash = await createAccount({ name: `Cash ${securityId}`, type: "asset", bookId });
+  const trades = options.sold ? (["buy", "sell"] as const) : (["buy"] as const);
+  for (const [index, action] of trades.entries()) {
+    const amount = action === "buy" ? 100_000 : -100_000;
+    const transaction = await createTransactionWithSplits({
+      date: `2026-06-0${index + 1}`, bookId,
+      splits: [{ accountId: brokerage.id, amount }, { accountId: cash.id, amount: -amount }],
+    });
+    await createInvestmentSplit({
+      transactionId: transaction.id, accountId: brokerage.id, securityId, action, bookId,
+      sharesMicros: 10_000_000, priceMicros: 100_000_000,
+    });
+  }
 }
 
 beforeAll(async () => {
@@ -285,7 +307,13 @@ describe("cron routes HTTP parity", () => {
     const text = await createSecurity({ name: "Text", symbol: "TEXT", securityType: "stock", fetchPrices: true });
     const manual = await createSecurity({ name: "Bonds", symbol: "BND", securityType: "etf", fetchPrices: false });
     const fixed = await createSecurity({ name: "Money Market", symbol: "MM", securityType: "mutual_fund", fetchPrices: true, fixedPriceMicros: 1_000_000 });
-    await createSecurity({ name: "Missing", symbol: "MISSING", securityType: "stock", fetchPrices: true });
+    const missing = await createSecurity({ name: "Missing", symbol: "MISSING", securityType: "stock", fetchPrices: true });
+    await hold(kept.id);
+    await hold(added.id, { bookId: other.id });
+    await hold(text.id);
+    await hold(manual.id);
+    await hold(fixed.id);
+    await hold(missing.id);
     await createSecurityPrice({ securityId: kept.id, priceDate: "2026-07-02", priceMicros: 5, source: "manual" });
     tiingo.reply("VTI", { status: 200, body: [{ ticker: "VTI", date: "2026-07-02T00:00:00.000Z", close: 300.1, adjClose: 299.123456 }] });
     tiingo.reply("TEXT", { status: 200, body: [{ date: "2026-07-01", adjClose: "12.5" }] });
@@ -295,6 +323,7 @@ describe("cron routes HTTP parity", () => {
     expect(await cron(client, "/api/cron/price-sync")).toEqual({
       success: true, securitiesFound: 4, pricesInserted: 2, pricesSkipped: 1,
       errors: [{ symbol: "MISSING", error: "Failed to fetch price for MISSING: Not Found" }],
+      fetchDisabled: ["MISSING"],
     });
     expect([...tiingo.requests].sort()).toEqual(["MISSING", "TEXT", "VTI"]);
     const prices = await rows<SecurityPrice>("SELECT * FROM security_prices ORDER BY security_id, price_date");
@@ -305,9 +334,70 @@ describe("cron routes HTTP parity", () => {
     ]);
     expect(prices.some((price) => price.securityId === manual.id || price.securityId === fixed.id)).toBe(false);
 
+    // Tiingo does not know MISSING, so the cron stops asking for it.
+    expect(await row("SELECT fetch_prices FROM securities WHERE id = $1", [missing.id])).toEqual({ fetchPrices: false });
+
     // Tiingo sends the same close again after a holiday.
     tiingo.requests.length = 0;
-    expect(await cron(client, "/api/cron/price-sync")).toMatchObject({ pricesInserted: 0, pricesSkipped: 3 });
+    expect(await cron(client, "/api/cron/price-sync")).toEqual({
+      success: true, securitiesFound: 3, pricesInserted: 0, pricesSkipped: 3,
+    });
+    expect([...tiingo.requests].sort()).toEqual(["TEXT", "VTI"]);
+  });
+
+  it("turns off fetching on a 404 only", async () => {
+    const other = await createBook({ name: "Other" });
+    const gone = await createSecurity({ name: "Gone", symbol: "GONE", securityType: "stock", fetchPrices: true });
+    const goneOther = await createSecurity({ name: "Gone", symbol: "gone", securityType: "stock", fetchPrices: true, bookId: other.id });
+    const failing = await createSecurity({ name: "Failing", symbol: "FAILING", securityType: "stock", fetchPrices: true });
+    const empty = await createSecurity({ name: "Empty", symbol: "EMPTY", securityType: "stock", fetchPrices: true });
+    // The last one, because the cron stops at a 429.
+    const limited = await createSecurity({ name: "Limited", symbol: "LIMITED", securityType: "stock", fetchPrices: true });
+    for (const security of [gone, limited, failing, empty]) await hold(security.id);
+    await hold(goneOther.id, { bookId: other.id });
+    tiingo.reply("GONE", { status: 404, body: { detail: "Error: Ticker 'GONE' not found" } });
+    tiingo.reply("LIMITED", { status: 429, body: { detail: "Error: You have run over your hourly request allocation." } });
+    tiingo.reply("FAILING", { status: 500, body: { detail: "Server Error" } });
+    tiingo.reply("EMPTY", { status: 200, body: [] });
+
+    expect(await cron(client, "/api/cron/price-sync")).toMatchObject({
+      success: true, securitiesFound: 5, pricesInserted: 0, fetchDisabled: ["GONE"],
+    });
+    const flags = await rows<{ id: number; fetchPrices: boolean }>("SELECT id, fetch_prices FROM securities ORDER BY id");
+    expect(flags).toEqual([
+      { id: gone.id, fetchPrices: false },
+      { id: goneOther.id, fetchPrices: false },
+      { id: failing.id, fetchPrices: true },
+      { id: empty.id, fetchPrices: true },
+      { id: limited.id, fetchPrices: true },
+    ]);
+    expect(tiingo.requests).toEqual(["GONE", "FAILING", "EMPTY", "LIMITED"]);
+  });
+
+  it("stops at the first 429 and reports the symbols it did not fetch", async () => {
+    const securities = [];
+    for (const symbol of ["FIRST", "LIMITED", "LATER", "LAST"]) {
+      const security = await createSecurity({ name: symbol, symbol, securityType: "stock", fetchPrices: true });
+      await hold(security.id);
+      securities.push(security);
+    }
+    tiingo.reply("FIRST", { status: 200, body: [{ date: "2026-07-02", adjClose: 10 }] });
+    tiingo.reply("LIMITED", { status: 429, body: { detail: "Error: You have run over your hourly request allocation." } });
+    tiingo.reply("LATER", { status: 200, body: [{ date: "2026-07-02", adjClose: 20 }] });
+
+    const notFetched = "Not fetched: the Tiingo request limit was reached";
+    expect(await cron(client, "/api/cron/price-sync")).toEqual({
+      success: true, securitiesFound: 4, pricesInserted: 1, pricesSkipped: 0, rateLimited: true,
+      errors: [
+        { symbol: "LIMITED", error: "Failed to fetch price for LIMITED: Too Many Requests" },
+        { symbol: "LATER", error: notFetched },
+        { symbol: "LAST", error: notFetched },
+      ],
+    });
+    // One request at a time: nothing after the 429 goes to Tiingo.
+    expect(tiingo.requests).toEqual(["FIRST", "LIMITED"]);
+    expect(await rows("SELECT security_id FROM security_prices")).toEqual([{ securityId: securities[0].id }]);
+    expect(await count("securities", "fetch_prices = false")).toBe(0);
   });
 
   it("reports no securities without calling Tiingo", async () => {
@@ -318,9 +408,39 @@ describe("cron routes HTTP parity", () => {
     expect(tiingo.requests).toEqual([]);
   });
 
+  it("fetches only the securities that a book holds", async () => {
+    const other = await createBook({ name: "Other" });
+    const held = await createSecurity({ name: "Total Market", symbol: "VTI", securityType: "etf", fetchPrices: true });
+    // The other book has the same symbol and no shares of it.
+    await createSecurity({ name: "Total Market", symbol: "VTI", securityType: "etf", fetchPrices: true, bookId: other.id });
+    const sold = await createSecurity({ name: "Sold", symbol: "SOLD", securityType: "stock", fetchPrices: true });
+    await createSecurity({ name: "Never Held", symbol: "NEVER", securityType: "stock", fetchPrices: true });
+    await hold(held.id);
+    await hold(sold.id, { sold: true });
+    tiingo.reply("VTI", { status: 200, body: [{ date: "2026-07-02", adjClose: 300 }] });
+
+    expect(await cron(client, "/api/cron/price-sync")).toEqual({
+      success: true, securitiesFound: 1, pricesInserted: 1, pricesSkipped: 0,
+    });
+    expect(tiingo.requests).toEqual(["VTI"]);
+    expect(await rows("SELECT security_id, book_id FROM security_prices")).toEqual([
+      { securityId: held.id, bookId: 1 },
+    ]);
+  });
+
+  it("reports no held securities without calling Tiingo", async () => {
+    await createSecurity({ name: "Never Held", symbol: "NEVER", securityType: "stock", fetchPrices: true });
+    expect(await cron(client, "/api/cron/price-sync")).toEqual({
+      success: true, securitiesFound: 0, pricesInserted: 0, pricesSkipped: 0,
+    });
+    expect(tiingo.requests).toEqual([]);
+  });
+
   it("stores no price when one close is not a number", async () => {
-    await createSecurity({ name: "Total Market", symbol: "VTI", securityType: "etf", fetchPrices: true });
-    await createSecurity({ name: "Broken", symbol: "BROKEN", securityType: "stock", fetchPrices: true });
+    const vti = await createSecurity({ name: "Total Market", symbol: "VTI", securityType: "etf", fetchPrices: true });
+    const broken = await createSecurity({ name: "Broken", symbol: "BROKEN", securityType: "stock", fetchPrices: true });
+    await hold(vti.id);
+    await hold(broken.id);
     tiingo.reply("VTI", { status: 200, body: [{ date: "2026-07-02", adjClose: 1 }] });
     for (const reply of [
       { status: 200, body: [{ date: "2026-07-02", adjClose: "abc" }] },

@@ -1041,7 +1041,7 @@ export function TransactionList({
 
   if (isLoading) {
     return (
-      <table className="w-full table-fixed">
+      <table aria-label="Transactions" className="w-full table-fixed">
         <colgroup>
           {isInvestmentRegister ? (
             <>
@@ -1460,7 +1460,7 @@ export function TransactionList({
 
   return (
     <>
-      <table className="w-full table-fixed">
+      <table aria-label="Transactions" className="w-full table-fixed">
         <colgroup>
           {isInvestmentRegister ? (
             <>

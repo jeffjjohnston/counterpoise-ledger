@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { LoginForm } from "@/app/login/LoginForm";
+import { LoginForm, returnPath } from "@/app/login/LoginForm";
 import { REGISTRATION_STATUS_TIMEOUT_MS } from "@/hooks/useRegistrationOpen";
 
 vi.mock("@/lib/navigation", async () =>
@@ -112,5 +112,17 @@ describe("LoginForm", () => {
     });
     expect(warn).toHaveBeenCalled();
     expect(screen.queryByRole("link", { name: /register/i })).toBeNull();
+  });
+});
+
+describe("returnPath", () => {
+  it("returns to the OAuth consent page only", () => {
+    expect(returnPath("/oauth/consent?client_id=cpc_1&state=s")).toBe("/oauth/consent?client_id=cpc_1&state=s");
+    expect(returnPath("/oauth/consent")).toBe("/oauth/consent");
+    expect(returnPath(null)).toBe("/");
+    expect(returnPath("https://evil.example/oauth/consent")).toBe("/");
+    expect(returnPath("//evil.example/oauth/consent")).toBe("/");
+    expect(returnPath("/oauth/consentx")).toBe("/");
+    expect(returnPath("/b/1/transactions")).toBe("/");
   });
 });

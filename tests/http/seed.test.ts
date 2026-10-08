@@ -1,33 +1,11 @@
-import { execFile } from "node:child_process";
-import path from "node:path";
-import { promisify } from "node:util";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { verifyPassword } from "../helpers/password";
 import { createAccount, createBook, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
 import { count as countWhere, row, scalar, script } from "../helpers/sql";
-import { workerDatabasePath } from "../helpers/test-database";
+import { PINNED_TODAY, rustSeed } from "../helpers/rust-seed";
 import { dumpTables as dump } from "../helpers/table-dump";
 
-const run = promisify(execFile);
-const CLI = path.resolve("rust-api/target/debug/ledger-cli");
 const SEED_TIMEOUT = 180_000;
-
-/** The date that the seed tests pin. The household rows at this date are the rows of the fixed 2023-2025 seed. */
-const PINNED_TODAY = "2025-12-31";
-
-/** Run the Rust seed against this worker's database, in this process's zone. */
-async function rustSeed(...args: string[]) {
-  // The pin goes first, so that a flag with a missing value still reads the end of the list.
-  const pinned = args.includes("--today") ? args : ["--today", PINNED_TODAY, ...args];
-  return run(CLI, ["seed", ...pinned], {
-    env: {
-      ...process.env,
-      DATABASE_PATH: workerDatabasePath(),
-      DATABASE_URL: "",
-      TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    },
-  });
-}
 
 async function count(table: string, bookId: number) {
   return countWhere(table, "book_id = $1", [bookId]);
@@ -46,7 +24,7 @@ describe("the Rust seed", () => {
     const first = await dump();
     expect(first.transactions).toHaveLength(2235);
     expect(first.accounts).toHaveLength(62);
-    expect(first.payees).toHaveLength(46);
+    expect(first.payees).toHaveLength(50);
     expect(first.securities).toHaveLength(4);
     expect(first.investment_lot_allocations.length).toBeGreaterThan(0);
     expect(first.plaid_transaction_reconciliation).toHaveLength(6);
@@ -123,7 +101,7 @@ describe("the Rust seed", () => {
     expect(stdout).toContain("with the Single homeowner dataset");
     const first = await dump();
     expect(first.accounts).toHaveLength(38);
-    expect(first.payees).toHaveLength(23);
+    expect(first.payees).toHaveLength(26);
     expect(first.securities).toHaveLength(3);
     expect(first.recurring_rules).toHaveLength(7);
     expect(first.plaid_transaction_reconciliation).toHaveLength(6);

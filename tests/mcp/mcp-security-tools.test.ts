@@ -736,7 +736,7 @@ describe("MCP Security and Investment Tools", () => {
     it("update_security refuses another security's symbol with the library's message", async () => {
       // The library throws SecurityDuplicateError, which the tool does not
       // catch, so the SDK reports its text as a plain-text error. The HTTP
-      // route answers the same case with a generic 500.
+      // route answers the same case with a 409 and the same text in a JSON error body.
       const vti = await createSecurity({ bookId: 1, name: "Total", symbol: "VTI", securityType: "etf" });
       const bnd = await createSecurity({ bookId: 1, name: "Bond", symbol: "BND", securityType: "etf" });
 

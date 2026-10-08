@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useBookId } from "@/hooks/useBookId";
 import { AccountCard } from "@/components/accounts/AccountCard";
+import { IncomeStatementCharts } from "@/components/reports/IncomeStatementCharts";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
@@ -254,6 +255,28 @@ export default function IncomeStatementPage() {
     : 0;
   const netIncome = totalIncome - totalExpenses;
 
+  // The inputs of the charts. A balance is the own balance of one account.
+  const expenseRows = incomeStatementLoading
+    ? []
+    : (incomeStatementGroups["expense"]?.accounts ?? []).map((account) => ({
+        accountId: account.id,
+        balance: account.balance,
+      }));
+  const activeAccountIds = useMemo(
+    () => new Set(accounts.filter((account) => account.isActive).map((account) => account.id)),
+    [accounts],
+  );
+  const reportAccounts = useMemo(
+    () =>
+      accounts.map((account) => ({
+        id: account.id,
+        name: account.name,
+        type: account.type,
+        parentId: account.parentId ?? null,
+      })),
+    [accounts],
+  );
+
   const handleDownloadCsv = () => {
     const periodLabel =
       INCOME_PERIOD_OPTIONS.find((o) => o.value === incomePeriod)?.label ??
@@ -332,7 +355,7 @@ export default function IncomeStatementPage() {
 
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
         <h1 className="text-2xl font-bold text-fg">Income Statement</h1>
         <div className="flex items-center gap-3">
           <Button
@@ -393,6 +416,20 @@ export default function IncomeStatementPage() {
           </p>
         </div>
       </div>
+
+      <IncomeStatementCharts
+        bookId={bookId}
+        monthlyRange={
+          incomePeriod === "all"
+            ? {}
+            : incomePeriodRange.startDate && incomePeriodRange.endDate
+              ? { startDate: incomePeriodRange.startDate, endDate: incomePeriodRange.endDate }
+              : null
+        }
+        expenseRows={expenseRows}
+        accounts={reportAccounts}
+        activeAccountIds={activeAccountIds}
+      />
 
       {incomeStatementLoading ? (
         <div className="text-sm text-fg-tertiary">Loading income statement...</div>

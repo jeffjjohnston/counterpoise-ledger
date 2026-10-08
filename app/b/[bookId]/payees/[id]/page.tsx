@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams, useRouter } from "@/lib/navigation";
+import { PayeeSpendingChart } from "@/components/payees/PayeeSpendingChart";
 import { TransactionList } from "@/components/transactions/TransactionList";
 import { TransactionForm } from "@/components/transactions/TransactionForm";
 import { Modal } from "@/components/ui/Modal";
@@ -47,6 +48,7 @@ export default function PayeeDetailPage() {
   const [editingTransaction, setEditingTransaction] =
     useState<TransactionWithSplits | null>(null);
   const [loading, setLoading] = useState(true);
+  const [chartVersion, setChartVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   // Set when a "load more" fetch fails; stops the IntersectionObserver
@@ -205,6 +207,12 @@ export default function PayeeDetailPage() {
     };
   }, [handleLoadMore, loadingMore, loadMoreFailed, totalCount, transactions.length]);
 
+  // A save or a delete changes the monthly totals, so the chart fetches them again.
+  const refreshAfterChange = async () => {
+    setChartVersion((version) => version + 1);
+    await refreshData(false);
+  };
+
   const handleUpdateTransaction = async (data: {
     date: string;
     description: string;
@@ -222,12 +230,12 @@ export default function PayeeDetailPage() {
     try {
       await putTransaction(bookId, editingTransaction, data);
       setEditingTransaction(null);
-      await refreshData(false);
+      await refreshAfterChange();
     } catch (e) {
       if (isTransactionConflict(e)) {
         toast.error(TRANSACTION_CONFLICT_MESSAGE);
         setEditingTransaction(null);
-        await refreshData(false);
+        await refreshAfterChange();
         return;
       }
       toast.error(toMessage(e, "Failed to update transaction"));
@@ -244,12 +252,12 @@ export default function PayeeDetailPage() {
     try {
       await deleteTransactionRequest(bookId, editingTransaction);
       setEditingTransaction(null);
-      await refreshData(false);
+      await refreshAfterChange();
     } catch (e) {
       if (isTransactionConflict(e)) {
         toast.error(TRANSACTION_CONFLICT_MESSAGE);
         setEditingTransaction(null);
-        await refreshData(false);
+        await refreshAfterChange();
         return;
       }
       toast.error(toMessage(e, "Failed to delete transaction"));
@@ -331,6 +339,10 @@ export default function PayeeDetailPage() {
             </Button>
           )}
         </div>
+      </div>
+
+      <div className="mb-6">
+        <PayeeSpendingChart bookId={bookId} payeeId={payeeId} refreshKey={chartVersion} />
       </div>
 
       <div className="bg-surface rounded-lg border border-border overflow-hidden">

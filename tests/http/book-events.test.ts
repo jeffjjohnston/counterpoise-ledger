@@ -110,6 +110,34 @@ describe("book events HTTP parity", () => {
     }
   });
 
+  it("names the investment tables when a security, a price or a trade changes", async () => {
+    const brokerage = await createAccount({ name: "Brokerage", type: "asset", subtype: "investment" });
+    const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank" });
+    const frames = await listen(1);
+    try {
+      const security = await ok("/api/b/1/securities", json("POST", { name: "Total Market", symbol: "VTI", securityType: "etf" }));
+      expect(await frames.next()).toEqual(changeFrame("securities"));
+
+      await ok("/api/b/1/security-prices/bulk", json("POST", {
+        priceUpdates: [{ securityId: security.id, priceMicros: 5_000_000, priceDate: "2025-01-10" }],
+      }));
+      expect(await frames.next()).toEqual(changeFrame("security_prices"));
+
+      // The write path rebuilds the lots in the same commit as the trade.
+      await ok("/api/b/1/transactions", json("POST", {
+        date: "2025-01-11",
+        splits: [{ accountId: brokerage.id, amount: 5_000 }, { accountId: checking.id, amount: -5_000 }],
+        investmentSplits: [{ securityId: security.id, action: "buy", sharesMicros: 1_000_000, priceMicros: 5_000_000 }],
+      }));
+      expect(changeTables(await frames.next())).toEqual({
+        event: "change",
+        tables: ["investment_lots", "investment_splits", "transaction_splits", "transactions"],
+      });
+    } finally {
+      await frames.cancel();
+    }
+  });
+
   it("sends nothing for a write that rolls back", async () => {
     const spend = await spendFixture();
     const frames = await listen(1);

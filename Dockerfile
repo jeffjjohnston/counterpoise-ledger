@@ -65,7 +65,7 @@ RUN --mount=type=cache,id=counterpoise-rust-registry,target=/usr/local/cargo/reg
 # --- Runtime ---
 # No Node and no shell tools are needed: the binaries are static (musl), and
 # reqwest carries its own TLS roots. Alpine gives `sh` for `docker exec`.
-FROM alpine:3.22
+FROM alpine:3.24
 # chrono::Local reads TZ from these files. Without them it uses UTC in silence.
 RUN apk add --no-cache tzdata
 # The server runs as uid 1000. /data holds counterpoise.db with its -wal,

@@ -18,7 +18,9 @@ export async function dumpTables() {
   for (const { table, column, timestamp } of await tableColumns()) {
     // change_marks counts every row change for the live-update hints. It is
     // not data, and each write moves it, also a write that changes nothing.
-    if (table === "change_marks") continue;
+    // transaction_changes logs each row change for the delta sync, for the
+    // same reason.
+    if (table === "change_marks" || table === "transaction_changes") continue;
     if (timestamp || column === "password_hash") continue;
     tables.set(table, [...(tables.get(table) ?? []), column]);
   }

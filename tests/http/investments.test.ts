@@ -1,10 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { createBook, createUser, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { createInvestmentScenario, stable } from "../helpers/investment-scenario";
 import { contract } from "../helpers/contract";
 
 const accountMarketValueListSchema = contract("AccountMarketValueList");
+const positionListSchema = contract("InvestmentPositionList");
+const realizedGainsSchema = contract("RealizedGainsReport");
 
 // Each full body is a snapshot. The snapshots were recorded while Node and
 // Rust gave the same bodies, so a change to a body fails here. The explicit
@@ -43,8 +45,10 @@ describe("investment and realized-gain HTTP parity", () => {
     expect(book.map((row: { securitySymbol: string }) => row.securitySymbol)).toEqual(["BND", "VTI"]);
     const bnd = book.find((row: { securitySymbol: string }) => row.securitySymbol === "BND");
     expect(bnd).toMatchObject({ priceMicros: 1_000_000, sharesMicros: 2_500_000, marketValueCents: 250 });
+    positionListSchema.parse(book);
     expect(stable(book)).toMatchSnapshot("book");
     const brokerage = await ok(`/api/b/1/investments/positions?accountId=${scenario.brokerage.id}`);
+    positionListSchema.parse(brokerage);
     expect(stable(brokerage)).toMatchSnapshot("brokerage");
     expect(await ok("/api/b/1/investments/positions?accountId=0")).toEqual(book);
     expect(await ok("/api/b/1/investments/positions?accountId=-3")).toEqual([]);
@@ -73,6 +77,7 @@ describe("investment and realized-gain HTTP parity", () => {
     expect(report.rows.map((row: { term: string }) => row.term)).toEqual(
       expect.arrayContaining(["short", "long", "unknown"])
     );
+    realizedGainsSchema.parse(report);
     expect(report.totals.unknownBasisRows).toBe(1);
     const boundary = report.rows
       .filter((row: { accountName: string }) => row.accountName === "Closed Brokerage")
@@ -81,8 +86,12 @@ describe("investment and realized-gain HTTP parity", () => {
       "2025-02-20 short", "2025-02-21 long", "2025-03-01 short", "2025-03-02 long",
     ]);
     expect(stable(report)).toMatchSnapshot("all");
-    expect(stable(await ok("/api/b/1/reports/realized-gains?startDate=2025-01-01&endDate=2025-12-31"))).toMatchSnapshot("2025");
-    expect(stable(await ok(`/api/b/1/reports/realized-gains?accountId=${scenario.ira.id}`))).toMatchSnapshot("ira");
+    const year = await ok("/api/b/1/reports/realized-gains?startDate=2025-01-01&endDate=2025-12-31");
+    realizedGainsSchema.parse(year);
+    expect(stable(year)).toMatchSnapshot("2025");
+    const ira = await ok(`/api/b/1/reports/realized-gains?accountId=${scenario.ira.id}`);
+    realizedGainsSchema.parse(ira);
+    expect(stable(ira)).toMatchSnapshot("ira");
     expect(await ok(`/api/b/1/reports/realized-gains?accountId=%EF%BB%BF${scenario.ira.id}%C2%A0`))
       .toEqual(await ok(`/api/b/1/reports/realized-gains?accountId=${scenario.ira.id}`));
     expect(await ok(`/api/b/1/reports/realized-gains?accountId=%20${scenario.ira.id}%20`))
@@ -107,5 +116,15 @@ describe("investment and realized-gain HTTP parity", () => {
       await expectError(path, 404, "Book not found");
     }
     expect((await client.anonymous("/api/b/1/investments/positions")).status).toBe(401);
+  });
+
+  it("answers 404 for a book of which the user is not a member", async () => {
+    const other = await createUser({ username: "other" });
+    const book = await createBook({ name: "Other Book", userId: other.id });
+    for (const path of [
+      `/api/b/${book.id}/investments/positions`, `/api/b/${book.id}/reports/realized-gains`,
+    ]) {
+      await expectError(path, 404, "Book not found");
+    }
   });
 });

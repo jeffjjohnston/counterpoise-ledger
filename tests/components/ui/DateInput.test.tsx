@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { DateInput } from "@/components/ui/DateInput";
 
@@ -343,5 +343,36 @@ describe("DateInput assistive-tech semantics", () => {
     for (const cell of screen.getAllByRole("gridcell", { name: /2025/ })) {
       expect(cell).toHaveAttribute("tabindex", "-1");
     }
+  });
+
+  describe("calendar position", () => {
+    const innerWidth = window.innerWidth;
+    afterEach(() => {
+      vi.restoreAllMocks();
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: innerWidth });
+    });
+
+    /** Opens the calendar of a field whose left edge is at `left`, on a 390 px screen. */
+    function openAt(left: number) {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+        { left, right: left + 170, top: 0, bottom: 36, width: 170, height: 36, x: left, y: 0, toJSON: () => ({}) },
+      );
+      render(<DateInput id="date" value="2025-01-15" onChange={vi.fn()} />);
+      const input: HTMLInputElement = screen.getByRole("combobox");
+      fireEvent.mouseDown(input);
+      act(() => input.focus());
+      fireEvent.click(input);
+      return screen.getByRole("grid").closest("[data-align]");
+    }
+
+    it("opens at the left edge of the field when the calendar fits", () => {
+      expect(openAt(16)).toHaveAttribute("data-align", "left");
+    });
+
+    it("opens at the right edge of the field when the calendar would go past the screen", () => {
+      // 201 + 272 (17rem) is past 390.
+      expect(openAt(201)).toHaveAttribute("data-align", "right");
+    });
   });
 });

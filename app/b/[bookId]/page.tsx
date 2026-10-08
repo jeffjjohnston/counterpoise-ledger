@@ -4,14 +4,12 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "@/lib/navigation";
 import { useBookId } from "@/hooks/useBookId";
 import { AccountCard } from "@/components/accounts/AccountCard";
+import { NetWorthCard } from "@/components/dashboard/NetWorthCard";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { formatCurrency, formatDate, getAccountShortName, toDateString } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
-import {
-  getDisplayBalance,
-  BALANCE_SHEET_TYPES,
-  flattenAccounts,
-} from "@/lib/wasm-client";
+import { flattenAccounts } from "@/lib/wasm-client";
+import { computeNetWorth, effectiveBalance } from "@/lib/net-worth";
 import { apiGet } from "@/lib/api-client";
 import type { AccountWithBalance, TransactionWithSplits } from "@/types";
 import type { AccountMarketValue } from "@/lib/investments";
@@ -76,20 +74,9 @@ export default function HomePage() {
     marketValues.map((mv) => [mv.accountId, mv.marketValueCents])
   );
 
-  // Helper to get the effective balance for an account
-  // For investment accounts, use market value + cash child balance
-  const getEffectiveBalance = (account: AccountWithBalance): number => {
-    if (account.subtype === "investment") {
-      const marketValue = marketValueMap.get(account.id) ?? 0;
-      // Find the investment cash child account
-      const cashChild = accounts.find(
-        (a) => a.parentId === account.id && a.isInvestmentCash
-      );
-      const cashBalance = cashChild?.balance ?? 0;
-      return marketValue + cashBalance;
-    }
-    return account.balance;
-  };
+  // For an investment account, the balance is market value plus the cash child
+  const getEffectiveBalance = (account: AccountWithBalance): number =>
+    effectiveBalance(account, accounts, marketValueMap);
 
   const accountsByType = activeAccounts.reduce(
     (acc, account) => {
@@ -111,18 +98,7 @@ export default function HomePage() {
     {} as Record<string, AccountSummary>
   );
 
-  // Calculate totals - use display balance for proper signs
-  const assets = BALANCE_SHEET_TYPES.filter((t) => t === "asset")
-    .map((t) => accountsByType[t])
-    .filter(Boolean)
-    .reduce((sum, g) => sum + getDisplayBalance(g.total, g.type), 0);
-
-  const liabilities = BALANCE_SHEET_TYPES.filter((t) => t === "liability")
-    .map((t) => accountsByType[t])
-    .filter(Boolean)
-    .reduce((sum, g) => sum + getDisplayBalance(g.total, g.type), 0);
-
-  const netWorth = assets - liabilities;
+  const { assets, liabilities, netWorth } = computeNetWorth(accounts, marketValues);
 
   // Split balance sheet into left (assets) and right (liabilities + equity)
   const leftTypes = ["asset"].filter((t) => accountsByType[t]);
@@ -185,6 +161,7 @@ export default function HomePage() {
             </p>
           </div>
         </div>
+        <NetWorthCard bookId={bookId} />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 md:gap-8 mb-6 md:mb-8">

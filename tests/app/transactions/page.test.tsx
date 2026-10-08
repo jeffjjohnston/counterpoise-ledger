@@ -78,6 +78,15 @@ vi.mock("@/components/transactions/TransactionForm", () => ({
   },
 }));
 
+let balanceChartProps: Record<string, unknown> | null = null;
+
+vi.mock("@/components/transactions/AccountBalanceChart", () => ({
+  AccountBalanceChart: (props: Record<string, unknown>) => {
+    balanceChartProps = props;
+    return <div data-testid="account-balance-chart" />;
+  },
+}));
+
 vi.mock("@/components/transactions/InvestmentPositionsSection", () => ({
   InvestmentPositionsSection: () => (
     <div data-testid="investment-positions" />
@@ -186,6 +195,7 @@ describe("TransactionsPage", () => {
     replaceMock.mockReset();
     transactionListProps = null;
     transactionFormProps = null;
+    balanceChartProps = null;
     toast.error.mockClear();
     toast.success.mockClear();
     searchParamsValue = new URLSearchParams("accountId=1");
@@ -1227,5 +1237,94 @@ describe("TransactionsPage", () => {
     // than the stale value the row had when the modal first opened.
     expect(putBodies).toHaveLength(2);
     expect(putBodies[1].expectedUpdatedAt).toBe(afterToggle.updatedAt.toISOString());
+  });
+  describe("balance chart", () => {
+    const checking = {
+      id: 3,
+      name: "Checking",
+      type: "asset",
+      subtype: "bank",
+      parentId: null,
+      isFavorite: false,
+      isInvestmentCash: false,
+      icon: null,
+      balance: 0,
+    };
+
+    function stubFetch() {
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.startsWith("/api/b/1/accounts")) {
+          return { ok: true, json: async () => [...accountsPayload, checking] } as Response;
+        }
+        if (url.startsWith("/api/b/1/transactions")) {
+          return { ok: true, json: async () => transactionsPayload } as Response;
+        }
+        const standard = standardFetchResponse(url);
+        if (standard) return standard;
+        throw new Error(`Unexpected fetch url: ${url}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+    }
+
+    it("shows the chart for one selected account that is not an investment account", async () => {
+      searchParamsValue = new URLSearchParams("accountId=3");
+      stubFetch();
+      render(<TransactionsPage />);
+      expect(await screen.findByTestId("account-balance-chart")).toBeInTheDocument();
+      expect(balanceChartProps).toMatchObject({ bookId: "1", accountId: 3, accountType: "asset" });
+      expect(typeof balanceChartProps?.refreshKey).toBe("number");
+    });
+
+    it("gives the chart a new refreshKey after a reconcile toggle", async () => {
+      searchParamsValue = new URLSearchParams("accountId=3");
+      const transaction = makeTransaction({ id: 9, isReconciled: false });
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "/api/b/1/transactions/9" && method === "PUT") {
+          return { ok: true, json: async () => ({ ...transaction, isReconciled: true }) } as Response;
+        }
+        if (url.startsWith("/api/b/1/accounts")) {
+          return { ok: true, json: async () => [...accountsPayload, checking] } as Response;
+        }
+        if (url.startsWith("/api/b/1/transactions")) {
+          return {
+            ok: true,
+            json: async () => ({ transactions: [transaction], startingBalance: 0, totalCount: 1 }),
+          } as Response;
+        }
+        const standard = standardFetchResponse(url);
+        if (standard) return standard;
+        throw new Error(`Unexpected fetch url: ${url}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      render(<TransactionsPage />);
+      await screen.findByTestId("account-balance-chart");
+      await waitFor(() => expect(transactionListProps?.onToggleReconciled).toBeTypeOf("function"));
+      const before = balanceChartProps?.refreshKey as number;
+      await act(async () => {
+        await (transactionListProps!.onToggleReconciled as (id: number, reconciled: boolean) => Promise<void>)(9, true);
+      });
+      await waitFor(() => expect(balanceChartProps?.refreshKey).toBe(before + 1));
+    });
+
+    it("shows no chart for All Transactions", async () => {
+      searchParamsValue = new URLSearchParams("");
+      stubFetch();
+      render(<TransactionsPage />);
+      await waitFor(() => expect(transactionListProps?.isLoading).toBe(false));
+      expect(screen.getByRole("heading", { name: "All Transactions" })).toBeInTheDocument();
+      expect(screen.queryByTestId("account-balance-chart")).not.toBeInTheDocument();
+    });
+
+    it("shows no chart for an investment account", async () => {
+      searchParamsValue = new URLSearchParams("accountId=1");
+      stubFetch();
+      render(<TransactionsPage />);
+      expect(await screen.findByRole("heading", { name: "Vanguard 401(k)" })).toBeInTheDocument();
+      await waitFor(() => expect(transactionListProps?.isLoading).toBe(false));
+      expect(screen.queryByTestId("account-balance-chart")).not.toBeInTheDocument();
+    });
   });
 });

@@ -14,10 +14,12 @@ use crate::{
     cron_auth::require_cron_secret,
     error::{ApiResult, error},
     routes::{
+        investments::positions,
         plaid_sync::{SyncError, sync_token},
         recurring::process_all,
     },
     state::AppState,
+    tiingo::FailureKind,
     validation::{js_round, js_to_number},
 };
 use axum::{
@@ -28,7 +30,7 @@ use axum::{
 use ledger_db::engine::Db;
 use serde_json::{Value, json};
 use sqlx::QueryBuilder;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 const PRICE_SCALE: f64 = 1_000_000.0;
 
@@ -126,8 +128,8 @@ fn price_micros(price: Option<&Value>) -> Option<i64> {
         .then_some(micros as i64)
 }
 
-/// Adds the newest Tiingo close of each security that fetches prices. A
-/// price already stored for that security and date stays, so a manual entry
+/// Adds the newest Tiingo close of each security that fetches prices and has
+/// an open position in its book. A price already stored for that security and date stays, so a manual entry
 /// is never replaced. After a holiday Tiingo sends the close of the market
 /// day before, which is already stored, so the job can run again safely.
 pub(crate) async fn price_sync(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
@@ -155,7 +157,7 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
     // Tiingo has no feed for a fixed-price security, such as the fixed NAV of
     // a money market fund. A fixed price also sets fetch_prices off, so this
     // filter only applies if the two disagree.
-    let fetchable: Vec<(i32, i32, String)> = sqlx::query_as(
+    let mut fetchable: Vec<(i32, i32, String)> = sqlx::query_as(
         "SELECT id, book_id, symbol FROM securities
          WHERE fetch_prices = true AND fixed_price_micros IS NULL
          ORDER BY id",
@@ -163,6 +165,19 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
     .fetch_all(&state.pool)
     .await
     .map_err(|cause| failed(cause.to_string()))?;
+    // A security that no book holds needs no price. Each request counts
+    // against the hourly Tiingo limit, and an old security, such as an
+    // expired option, can use all of it. A position is open when
+    // `positions()` gives it, as for the prices-due pill.
+    let books: BTreeSet<i32> = fetchable.iter().map(|(_, book_id, _)| *book_id).collect();
+    let mut held = HashSet::new();
+    for book_id in books {
+        let open = positions(&state.pool, book_id, None)
+            .await
+            .map_err(|cause| failed(cause.to_string()))?;
+        held.extend(open.into_iter().map(|position| position.security_id));
+    }
+    fetchable.retain(|(id, _, _)| held.contains(&i64::from(*id)));
     if fetchable.is_empty() {
         return Ok(Json(json!({
             "success": true,
@@ -182,7 +197,8 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
     }
     let (prices, errors) = state
         .tiingo
-        .fetch_latest_prices(&symbols)
+        // One request at a time, so that no request goes out after a 429.
+        .fetch_latest_prices(&symbols, 1)
         .await
         .map_err(|cause| failed(cause.to_string()))?;
     let by_symbol: HashMap<String, _> = prices
@@ -206,26 +222,78 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
         micros.push(value);
     }
 
-    let mut inserted = 0;
-    if !security_ids.is_empty() {
-        let mut insert = QueryBuilder::<Db>::new(
-            "INSERT INTO security_prices (security_id, book_id, price_date, price_micros, source) ",
-        );
-        insert.push_values(0..security_ids.len(), |mut row, index| {
-            row.push_bind(security_ids[index])
-                .push_bind(book_ids[index])
-                .push_bind(dates[index].clone())
-                .push_bind(micros[index])
-                .push_bind("tiingo");
-        });
-        insert.push(" ON CONFLICT (security_id, price_date) DO NOTHING");
-        inserted = insert
-            .build()
-            .execute(&state.pool)
-            .await
-            .map_err(|cause| failed(cause.to_string()))?
-            .rows_affected();
+    // Tiingo answers 404 when it has no ticker of that name, such as an
+    // expired option. Such a security never gets a price from Tiingo, and
+    // each request for it uses one of the hourly requests, so fetching stops.
+    // The prices-due pill then asks for its price if a book holds it.
+    let not_found: Vec<&str> = errors
+        .iter()
+        .filter(|error| error.kind == FailureKind::NotFound)
+        .filter_map(|error| error.symbol.as_str())
+        .collect();
+    let disabled: Vec<i32> = fetchable
+        .iter()
+        .filter(|(_, _, symbol)| not_found.contains(&symbol.to_uppercase().as_str()))
+        .map(|(id, _, _)| *id)
+        .collect();
+
+    let written: Result<u64, sqlx::Error> = async {
+        let mut transaction = ledger_db::locks::begin_pool(&state.pool).await?;
+        let mut inserted = 0;
+        if !security_ids.is_empty() {
+            let mut insert = QueryBuilder::<Db>::new(
+                "INSERT INTO security_prices (security_id, book_id, price_date, price_micros, source) ",
+            );
+            insert.push_values(0..security_ids.len(), |mut row, index| {
+                row.push_bind(security_ids[index])
+                    .push_bind(book_ids[index])
+                    .push_bind(dates[index].clone())
+                    .push_bind(micros[index])
+                    .push_bind("tiingo");
+            });
+            insert.push(" ON CONFLICT (security_id, price_date) DO NOTHING");
+            inserted = insert
+                .build()
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+        }
+        if !disabled.is_empty() {
+            let mut update =
+                QueryBuilder::<Db>::new("UPDATE securities SET fetch_prices = false WHERE id IN (");
+            let mut ids = update.separated(", ");
+            for id in &disabled {
+                ids.push_bind(*id);
+            }
+            update.push(")");
+            update.build().execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
+        Ok(inserted)
     }
+    .await;
+    let inserted = written.map_err(|cause| failed(cause.to_string()))?;
+    for failure in &errors {
+        tracing::warn!(symbol = %failure.symbol, error = %failure.error, "Tiingo price fetch failed");
+    }
+    for symbol in &not_found {
+        tracing::warn!(
+            symbol,
+            "Tiingo has no such ticker; price fetching turned off"
+        );
+    }
+    let rate_limited = errors
+        .iter()
+        .any(|error| error.kind == FailureKind::RateLimited);
+    tracing::info!(
+        securities = fetchable.len(),
+        inserted,
+        skipped = security_ids.len() as u64 - inserted,
+        errors = errors.len(),
+        rate_limited,
+        "Price sync results"
+    );
+
     let mut result = json!({
         "success": true,
         "securitiesFound": fetchable.len(),
@@ -234,6 +302,12 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
     });
     if !errors.is_empty() {
         result["errors"] = json!(errors);
+    }
+    if !not_found.is_empty() {
+        result["fetchDisabled"] = json!(not_found);
+    }
+    if rate_limited {
+        result["rateLimited"] = json!(true);
     }
     Ok(Json(result))
 }

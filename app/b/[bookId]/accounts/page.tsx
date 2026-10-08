@@ -5,6 +5,7 @@ import { Link } from "@/lib/navigation";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { EmptyState } from "@/components/ui/EmptyState";
+import { Input } from "@/components/ui/Input";
 import { AccountForm } from "@/components/accounts/AccountForm";
 import { CategoryIcon } from "@/components/ui/CategoryIcon";
 import { formatCurrency, getAccountShortName } from "@/lib/wasm-client";
@@ -26,6 +27,51 @@ import { useToast } from "@/components/ui/ToastProvider";
 import type { AccountMarketValue } from "@/lib/investments";
 import type { AccountWithBalance } from "@/types";
 
+// Keep each account whose full name contains the search term, and all its
+// sub-accounts, because the name of a sub-account does not always contain the
+// name of its parent. Also keep the ancestors of each match, so that the match
+// keeps its position in the tree, and the investment cash child of each kept
+// investment account, because its row shows the cash balance.
+function filterAccountsByName(
+  accounts: AccountWithBalance[],
+  searchTerm: string
+): AccountWithBalance[] {
+  const accountsById = new Map(accounts.map((account) => [account.id, account]));
+  const childrenByParentId = new Map<number, AccountWithBalance[]>();
+  for (const account of accounts) {
+    if (!account.parentId) continue;
+    const children = childrenByParentId.get(account.parentId) ?? [];
+    children.push(account);
+    childrenByParentId.set(account.parentId, children);
+  }
+
+  const keptIds = new Set<number>();
+  const expandedIds = new Set<number>();
+  for (const account of accounts) {
+    if (!account.name.toLowerCase().includes(searchTerm)) continue;
+    let ancestor: AccountWithBalance | undefined = account;
+    while (ancestor && !keptIds.has(ancestor.id)) {
+      keptIds.add(ancestor.id);
+      ancestor = ancestor.parentId ? accountsById.get(ancestor.parentId) : undefined;
+    }
+    const pending = [account];
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      if (expandedIds.has(current.id)) continue;
+      expandedIds.add(current.id);
+      keptIds.add(current.id);
+      pending.push(...(childrenByParentId.get(current.id) ?? []));
+    }
+  }
+  return accounts.filter(
+    (account) =>
+      keptIds.has(account.id) ||
+      (account.isInvestmentCash &&
+        account.parentId !== null &&
+        keptIds.has(account.parentId))
+  );
+}
+
 export default function AccountsPage() {
   const bookId = useBookId();
   const { canWrite } = useBookRole();
@@ -37,6 +83,7 @@ export default function AccountsPage() {
   const [editingAccount, setEditingAccount] =
     useState<AccountWithBalance | null>(null);
   const [showInactive, setShowInactive] = useState(false);
+  const [searchTerm, setSearchTerm] = useState("");
   const [marketValues, setMarketValues] = useState<AccountMarketValue[]>([]);
   const [expandedSubtypes, setExpandedSubtypes] = useState<Set<string>>(
     new Set(["bank", "investment", "credit_card", "loan", "cash", "other"])
@@ -153,9 +200,13 @@ export default function AccountsPage() {
     }
   };
 
-  const filteredAccounts = showInactive
+  const visibleAccounts = showInactive
     ? accounts
     : accounts.filter((a) => a.isActive);
+  const normalizedSearchTerm = searchTerm.trim().toLowerCase();
+  const filteredAccounts = normalizedSearchTerm
+    ? filterAccountsByName(visibleAccounts, normalizedSearchTerm)
+    : visibleAccounts;
 
   const groupedAccounts = filteredAccounts.reduce(
     (acc, account) => {
@@ -224,6 +275,23 @@ export default function AccountsPage() {
           {canWrite && <Button onClick={() => setShowModal(true)} size="sm">New Account</Button>}
         </div>
       </div>
+
+      {accounts.length > 0 && (
+        <div className="mb-4">
+          <Input
+            id="account-search"
+            label="Search accounts"
+            type="text"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            placeholder="Filter by name..."
+            autoCorrect="off"
+            autoCapitalize="off"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </div>
+      )}
 
       <div className="space-y-6">
         {sortedTypes.map((type) => {
@@ -397,7 +465,9 @@ export default function AccountsPage() {
                   );
 
                   return Object.entries(accountsBySubtype).map(([subtype, rows]) => {
-                    const isExpanded = expandedSubtypes.has(subtype);
+                    // A search shows all groups, so that no match stays hidden.
+                    const isExpanded =
+                      normalizedSearchTerm !== "" || expandedSubtypes.has(subtype);
                     return (
                       <div key={subtype} className="border-b border-border-secondary last:border-b-0">
                         <button
@@ -441,7 +511,13 @@ export default function AccountsPage() {
           );
         })}
 
-        {sortedTypes.length === 0 && (
+        {sortedTypes.length === 0 && normalizedSearchTerm !== "" && (
+          <div className="bg-surface rounded-lg border border-border p-6 text-fg-tertiary">
+            No accounts match your search.
+          </div>
+        )}
+
+        {sortedTypes.length === 0 && normalizedSearchTerm === "" && (
           <EmptyState
             title="No accounts yet"
             description="Create your chart of accounts to start tracking finances."

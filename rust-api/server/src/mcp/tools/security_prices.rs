@@ -127,7 +127,7 @@ pub(super) async fn tiingo(
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
     let (prices, errors) = tiingo
-        .fetch_latest_prices(symbols)
+        .fetch_latest_prices(symbols, 8)
         .await
         .map_err(|cause| thrown(&cause.to_string()))?;
     Ok(ok(&json!({ "prices": prices, "errors": errors })))

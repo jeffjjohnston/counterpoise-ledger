@@ -380,6 +380,14 @@ describe("transaction write HTTP parity", () => {
       "Transaction not found");
   });
 
+  it("answers 404 for a book of which the user is not a member", async () => {
+    const stranger = await createUser({ username: "stranger" });
+    const book = await createBook({ name: "Private", userId: stranger.id });
+    const buy = { securityId: a.vti, action: "buy", sharesMicros: 1_000_000, priceMicros: 1_000_000 };
+    await expectError(`/api/b/${book.id}/transactions`, json("POST", { date: "2025-01-01", splits: spend(), investmentSplits: [buy] }), 404, "Book not found");
+    await expectError(`/api/b/${book.id}/transactions/1`, json("PUT", { investmentSplits: [buy] }), 404, "Book not found");
+  });
+
   it("lets a viewer read and refuses a viewer's writes", async () => {
     const owner = await createUser({ username: "owner" });
     const shared = await createBook({ name: "Shared", userId: owner.id });

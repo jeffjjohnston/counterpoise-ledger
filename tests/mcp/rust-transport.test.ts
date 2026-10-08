@@ -50,6 +50,51 @@ describe.skipIf(mcpTestTransport() !== "http")("Rust MCP transport", () => {
     expect(await response.json()).toMatchObject({ result: { serverInfo: { name: "counterpoise" } } });
   });
 
+  // Claude Code uses the stateless lifecycle of 2026-07-28: server/discover,
+  // then requests that carry the version in their _meta, with no initialize.
+  // That version requires ttlMs and cacheScope on a list result (SEP-2549),
+  // and the client rejects a tools/list result without them. The SDK client
+  // of the other tests stops at an older version, so this test sends the
+  // JSON-RPC itself.
+  it("serves a 2026-07-28 client that skips initialize, with ttlMs and cacheScope on tools/list", async () => {
+    const meta = {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "io.modelcontextprotocol/clientInfo": { name: "t", version: "1" },
+    };
+    const rpc = async (id: number, method: string, params: Record<string, unknown> = {}) => {
+      const response = await fetch(new URL("/api/mcp", baseUrl), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${key}`,
+          "mcp-protocol-version": "2026-07-28",
+          "mcp-method": method,
+          // SEP-2243: a tools/call names its tool in a header too.
+          ...(typeof params.name === "string" ? { "mcp-name": params.name } : {}),
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method, params: { ...params, _meta: meta } }),
+      });
+      expect(response.status, `${method}: ${response.status}`).toBe(200);
+      const body = await response.json();
+      expect(body.error, `${method}: ${JSON.stringify(body.error)}`).toBeUndefined();
+      return body.result;
+    };
+
+    const discover = await rpc(1, "server/discover");
+    expect(discover.supportedVersions ?? discover.protocolVersions).toContain("2026-07-28");
+
+    const list = await rpc(2, "tools/list");
+    expect(list.tools.length).toBeGreaterThan(0);
+    expect(typeof list.ttlMs).toBe("number");
+    expect(list.ttlMs).toBeGreaterThanOrEqual(0);
+    expect(["public", "private"]).toContain(list.cacheScope);
+
+    const call = await rpc(3, "tools/call", { name: "list_books", arguments: {} });
+    expect(call.isError).not.toBe(true);
+  });
+
   it("refuses a request without a key, with a Bearer challenge", async () => {
     const response = await post({});
     expect(response.status).toBe(401);

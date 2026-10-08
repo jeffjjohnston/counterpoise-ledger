@@ -1,11 +1,13 @@
+pub(crate) mod account_balance;
 pub(crate) mod accounts;
-mod auth;
+pub(crate) mod auth;
 mod books;
 pub(crate) mod cron;
 mod events;
 pub(crate) mod investments;
 mod issue_reports;
 mod members;
+pub(crate) mod net_worth;
 pub(crate) mod payees;
 pub(crate) mod plaid_sync;
 pub(crate) mod realized_gains;
@@ -17,11 +19,13 @@ pub(crate) mod securities;
 pub(crate) mod security_prices;
 pub(crate) mod sync;
 pub(crate) mod system;
+mod transaction_changes;
 pub(crate) mod transactions;
 pub(crate) mod typesafe;
 mod typesafe_suggestion;
 
 use self::{
+    account_balance::account_balance_history,
     accounts::{create_account, delete_account, get_account, list_accounts, update_account},
     auth::{
         change_password, create_key, delete_key, list_keys, login, logout, me, register,
@@ -37,6 +41,7 @@ use self::{
     investments::{account_values, get_positions},
     issue_reports::{create_report, delete_report, list_reports, update_report},
     members::{add_member, change_member, list_members, remove_member},
+    net_worth::net_worth_history,
     payees::{create_payee, delete_payee, get_payee, last_account, list_payees},
     plaid_sync::sync_now,
     realized_gains::realized_gains,
@@ -60,6 +65,7 @@ use self::{
         transaction_plaid_link, unlink_transaction, update_token,
     },
     system::{api_health, health, status, version},
+    transaction_changes::list_transaction_changes,
     transactions::{
         create_transaction, delete_transaction, get_transaction, list_transactions,
         update_transaction,
@@ -94,7 +100,9 @@ pub(crate) fn routes() -> Router<AppState> {
             .route(
                 "/api/b/{book_id}/webmcp",
                 get(crate::mcp::webmcp::list).post(crate::mcp::webmcp::call),
-            ),
+            )
+            // OAuth for MCP: the discovery documents and /api/oauth/*.
+            .merge(crate::oauth::routes()),
         |router, route| match (
             route.method.as_str(),
             route.path.as_str(),
@@ -166,6 +174,12 @@ pub(crate) fn routes() -> Router<AppState> {
                 "/api/b/{book_id}/accounts/{id}",
                 axum::routing::delete(delete_account),
             ),
+            ("GET", "/api/b/[bookId]/accounts/[id]/balance-history", "accounts.balancehistory") => {
+                router.route(
+                    "/api/b/{book_id}/accounts/{id}/balance-history",
+                    get(account_balance_history),
+                )
+            }
             (
                 "POST",
                 "/api/b/[bookId]/sync/accounts/[id]/reconcile/suggestion",
@@ -388,6 +402,11 @@ pub(crate) fn routes() -> Router<AppState> {
                     "/api/b/{book_id}/reports/realized-gains",
                     get(realized_gains),
                 ),
+            ("GET", "/api/b/[bookId]/reports/net-worth-history", "reports.networth") => router
+                .route(
+                    "/api/b/{book_id}/reports/net-worth-history",
+                    get(net_worth_history),
+                ),
             ("GET", "/api/b/[bookId]/transactions", "transactions.list") => {
                 router.route("/api/b/{book_id}/transactions", get(list_transactions))
             }
@@ -395,6 +414,11 @@ pub(crate) fn routes() -> Router<AppState> {
                 "/api/b/{book_id}/transactions",
                 axum::routing::post(create_transaction),
             ),
+            ("GET", "/api/b/[bookId]/transactions/changes", "transactions.changes") => router
+                .route(
+                    "/api/b/{book_id}/transactions/changes",
+                    get(list_transaction_changes),
+                ),
             ("GET", "/api/b/[bookId]/transactions/[id]", "transactions.get") => {
                 router.route("/api/b/{book_id}/transactions/{id}", get(get_transaction))
             }

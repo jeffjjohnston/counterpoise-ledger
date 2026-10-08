@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Counterpoise API",
-    "description": "The routes a native client uses. Money is integer cents. Shares and prices are integer micros. Dates are YYYY-MM-DD strings.",
-    "version": "1.50.0",
+    "description": "The routes a native client uses. Money is integer cents. Shares and prices are integer micros, except that fetchTiingoPrices returns prices as decimal dollars. Dates are YYYY-MM-DD strings.",
+    "version": "1.53.0",
     "x-api-contract": 1
   },
   "servers": [
@@ -1225,6 +1225,102 @@
               }
             }
           },
+          "400": {
+            "description": "The request is not valid. The message names the problem: a missing or invalid date, splits that do not sum to zero, an account that is not in this book, a check number on a transaction with no bank account, or \"Investment transactions require investmentSplits\" (a split on an investment account and no investmentSplits). A malformed investment split item first fails with the message of its field, for example \"Invalid input: expected number, received undefined\" or \"Too small: expected number to be >=0\". An unknown action fails with an \"Invalid option\" message, and an investmentSplits value that is not an array fails with \"investmentSplits must be an array when provided\". An item that passes then fails with one of these messages: \"Invalid investment split values\" (a stock split lacks a splitNumerator or splitDenominator above 0); \"Invalid investment actions\" (a buy or sell with no gross amount, a fee with no amount, a gross amount that is too large, or a stock split with no ratio); \"One or more investment split securities do not belong to this book\"; \"Investment splits require a transaction split on an investment account\" (a buy or sell without a split on an investment account).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/transactions/changes": {
+      "get": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "Delta sync. Without since, pages all transactions by ID. With since, gives the transactions that changed after that cursor.",
+        "operationId": "listTransactionChanges",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "The cursor of an earlier response. Selects delta mode. Do not send it with afterId or limit.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "afterId",
+            "in": "query",
+            "description": "Full mode: give the transactions with a larger ID. Default 0.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Full mode: page size. Default 2000, maximum 5000.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionChanges"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The cursor is not usable: it is newer than the change log, the database was restored from a snapshot after the cursor was given, or more than 5000 transactions changed after it. Download all transactions again in full mode.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "default": {
             "description": "Error. The body carries a message.",
             "content": {
@@ -1343,6 +1439,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request is not valid. The message names the problem. It can be any message of createTransaction. Also: \"At least 2 splits are required, even for stock splits\" (you send investmentSplits for a transaction with fewer than two splits and send no splits, or `splits` has fewer than 2 items). A malformed investment split item first fails with the message of its field, for example \"Invalid input: expected number, received undefined\" or \"Too small: expected number to be >=0\". An unknown action fails with an \"Invalid option\" message, and an investmentSplits value that is not an array fails with \"investmentSplits must be an array when provided\". An item that passes then fails with one of these messages: \"Invalid investment split values\" (a stock split lacks a splitNumerator or splitDenominator above 0); \"Invalid investment actions\" (a buy or sell with no gross amount, a fee with no amount, a gross amount that is too large, or a stock split with no ratio); \"One or more investment split securities do not belong to this book\"; \"Investment splits require a transaction split on an investment account\" (a buy or sell without a split on an investment account).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no transaction with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -1686,6 +1802,1284 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AccountMarketValueList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/investments/positions": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Positions: shares, cost basis and market value of each security.",
+        "operationId": "listInvestmentPositions",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "accountId",
+            "in": "query",
+            "description": "Count only this investment account. Zero or omitted means the whole book.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvestmentPositionList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The accountId is not an integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/securities": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Securities with position, price and income.",
+        "operationId": "listSecurities",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Create a security.",
+        "operationId": "createSecurity",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSecurityBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityRow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A field is missing or not valid. The message names it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The book already has a security with this symbol, compared without case.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/securities/{id}": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "One security.",
+        "operationId": "getSecurity",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityRow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Update a security.",
+        "operationId": "updateSecurity",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSecurityBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityRow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer, no field is present, or a field is not valid. The message names it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another security of the book has this symbol, compared without case.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Delete a security that has no investment transactions. Its prices are deleted with it.",
+        "operationId": "deleteSecurity",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer, or the security has investment transactions (\"Cannot delete security with investment transactions\").",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/securities/{id}/detail": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "A security with its latest price, positions by account and all splits.",
+        "operationId": "getSecurityDetail",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/securities/{id}/lots": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Open lots of a security, oldest first.",
+        "operationId": "listSecurityLots",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityLotList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/securities/{id}/splits": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Investment splits of a security, newest first, in pages.",
+        "operationId": "listSecuritySplits",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Rows per page. The default is 50. The maximum is 200. A value that is not a positive integer gives the default.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip. The default is 0. A value that is not a non-negative integer gives the default.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecuritySplitPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/reports/realized-gains": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Realized gains and losses of sells, by lot, with totals.",
+        "operationId": "getRealizedGainsReport",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "First sell date as YYYY-MM-DD. Send it with endDate.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "Last sell date as YYYY-MM-DD. Send it with startDate.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "accountId",
+            "in": "query",
+            "description": "Count only this investment account. Must be positive.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RealizedGainsReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A date is not valid, only one of startDate and endDate is present, or accountId is not a positive integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/securities/{id}/prices": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Price entries of a security, newest first, in pages. A date range can limit them.",
+        "operationId": "listSecurityPrices",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Rows per page. The default is 50. The maximum is 5000. A value that is not a positive integer gives the default.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip. The default is 0. A value that is not a non-negative integer gives the default.",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "First price date as YYYY-MM-DD, included. An empty value means no lower bound.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "Last price date as YYYY-MM-DD, included. An empty value means no upper bound.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityPricePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer, a date is not valid, or startDate is after endDate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/securities/{id}/prices/{date}": {
+      "put": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Change the price entry of a date, or move it to another date. This is not an upsert: it never adds an entry. Use bulkUpdatePrices to add one.",
+        "operationId": "putSecurityPrice",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "date",
+            "in": "path",
+            "description": "A calendar date as YYYY-MM-DD.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutSecurityPriceBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer, or priceDate or priceMicros is not valid. The message names it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id, or the security has no price entry on the path date (\"Price entry not found\").",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The body priceDate differs from the path date, and the security already has an entry on it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Delete the price entry of a date.",
+        "operationId": "deleteSecurityPrice",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "date",
+            "in": "path",
+            "description": "A calendar date as YYYY-MM-DD.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The security id is not an integer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no security with this id, or the security has no price entry on the path date (\"Price entry not found\").",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/securities/prices-due": {
+      "get": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Manually priced securities with an open position and no price on the last market day.",
+        "operationId": "listPricesDue",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PricesDue"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/security-prices/bulk": {
+      "post": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Write many manual prices in one transaction. An entry on the same date is replaced and keeps its source. A new entry gets the source manual.",
+        "operationId": "bulkUpdatePrices",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkUpdatePricesBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkUpdatePricesResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "priceUpdates is not an array, no item is valid, or a security is not in this book. Nothing is written.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/security-prices/tiingo": {
+      "post": {
+        "tags": [
+          "investments"
+        ],
+        "summary": "Fetch the latest Tiingo price of each symbol. The server writes no price.",
+        "operationId": "fetchTiingoPrices",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchTiingoPricesBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FetchTiingoPricesResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "symbols is missing or empty.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server has no Tiingo key. The message is \"TIINGO_API_KEY environment variable not configured\".",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -2282,6 +3676,62 @@
           "$ref": "#/components/schemas/BookMember"
         }
       },
+      "BulkPriceUpdate": {
+        "type": "object",
+        "required": [
+          "securityId",
+          "priceMicros",
+          "priceDate"
+        ],
+        "properties": {
+          "securityId": {
+            "type": "integer",
+            "description": "A security of the book.",
+            "exclusiveMinimum": 0
+          },
+          "priceMicros": {
+            "type": "integer",
+            "description": "Price per share, in micros. Must be positive.",
+            "exclusiveMinimum": 0
+          },
+          "priceDate": {
+            "$ref": "#/components/schemas/LedgerDate",
+            "description": "The date of the price. An entry on this date is replaced."
+          }
+        }
+      },
+      "BulkUpdatePricesBody": {
+        "type": "object",
+        "required": [
+          "priceUpdates"
+        ],
+        "properties": {
+          "priceUpdates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkPriceUpdate"
+            },
+            "description": "Prices to write. The server drops an item that is not valid and does not report it."
+          }
+        }
+      },
+      "BulkUpdatePricesResult": {
+        "type": "object",
+        "required": [
+          "message",
+          "count"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "A sentence that gives the count."
+          },
+          "count": {
+            "type": "integer",
+            "description": "How many valid items the server wrote."
+          }
+        }
+      },
       "Cents": {
         "type": "integer",
         "description": "Money in integer cents. Positive is a debit, negative is a credit."
@@ -2384,6 +3834,50 @@
             "type": "string",
             "description": "The payee's name. Normalized on save: whitespace runs collapse to one space and curly quotes straighten to '. Case is NOT changed — \"IKEA\" and \"Ikea\" stay two different payees.",
             "minLength": 1
+          }
+        }
+      },
+      "CreateSecurityBody": {
+        "type": "object",
+        "required": [
+          "name",
+          "symbol",
+          "securityType"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the security. Leading and trailing white space is removed. It must not be empty after that.",
+            "minLength": 1
+          },
+          "symbol": {
+            "type": "string",
+            "description": "Ticker symbol. Leading and trailing white space is removed. The book must not have another security with this symbol, compared without case.",
+            "minLength": 1
+          },
+          "securityType": {
+            "type": "string",
+            "enum": [
+              "etf",
+              "mutual_fund",
+              "stock"
+            ]
+          },
+          "fetchPrices": {
+            "type": "boolean",
+            "description": "True to fetch prices for this security. The default is true. A fixed price turns it off."
+          },
+          "fixedPriceMicros": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A fixed price per share, in micros, for a security that has no price feed, such as a money market fund. It must be at most 9007199254740991. When set, the server stores fetchPrices as false."
           }
         }
       },
@@ -2503,6 +3997,123 @@
             },
             "description": "Investment splits (required if transaction involves investment accounts)"
           }
+        }
+      },
+      "FetchTiingoPricesBody": {
+        "type": "object",
+        "required": [
+          "symbols"
+        ],
+        "properties": {
+          "symbols": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ticker symbols to look up. Each item is a ticker string.",
+            "minItems": 1
+          }
+        }
+      },
+      "FetchTiingoPricesResult": {
+        "type": "object",
+        "required": [
+          "prices",
+          "errors"
+        ],
+        "properties": {
+          "prices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TiingoPrice"
+            },
+            "description": "The latest price of each symbol that Tiingo knows, in request order. The server writes none of them."
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TiingoPriceError"
+            },
+            "description": "One entry for each symbol with no price, in request order."
+          },
+          "fetchDisabled": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Present only when Tiingo does not know a symbol (404) of a security with price fetching on. The server turned fetching off for the securities of this book with that symbol."
+          }
+        }
+      },
+      "InvestmentPosition": {
+        "type": "object",
+        "required": [
+          "securityId",
+          "securityName",
+          "securitySymbol",
+          "sharesMicros",
+          "costBasisCents",
+          "priceMicros",
+          "priceDate",
+          "marketValueCents"
+        ],
+        "properties": {
+          "securityId": {
+            "type": "integer"
+          },
+          "securityName": {
+            "type": "string"
+          },
+          "securitySymbol": {
+            "type": "string"
+          },
+          "sharesMicros": {
+            "$ref": "#/components/schemas/Micros",
+            "description": "Shares held now, from the replay of all buys, sells and splits."
+          },
+          "costBasisCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Cost basis of the position: the sum of the remaining basis of its open lots. Zero when no open lot exists."
+          },
+          "priceMicros": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Micros"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Price per share of the newest price entry. For a fixed-price security, the fixed price. Null when the security has no price."
+          },
+          "priceDate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LedgerDate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The date of the newest price entry. For a fixed-price security, today. Null when the security has no price."
+          },
+          "marketValueCents": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cents"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Market value of the position: shares times the newest price. Null when the security has no price."
+          }
+        }
+      },
+      "InvestmentPositionList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/InvestmentPosition"
         }
       },
       "InvestmentSplitRow": {
@@ -2682,6 +4293,246 @@
           },
           "createdAt": {
             "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "PricesDue": {
+        "type": "object",
+        "required": [
+          "dueDate",
+          "securities"
+        ],
+        "properties": {
+          "dueDate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LedgerDate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The market day that each listed security lacks a price for. Null when the book has no manually priced security."
+          },
+          "securities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PricesDueItem"
+            },
+            "description": "Manually priced securities with an open position and no price on the due date, sorted by name."
+          }
+        }
+      },
+      "PricesDueItem": {
+        "type": "object",
+        "required": [
+          "securityId",
+          "name",
+          "symbol",
+          "lastPriceMicros",
+          "lastPriceDate"
+        ],
+        "properties": {
+          "securityId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "lastPriceMicros": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Micros"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Price per share of the newest price entry. Null when the security has no price."
+          },
+          "lastPriceDate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LedgerDate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The date of the newest price entry. Null when the security has no price."
+          }
+        }
+      },
+      "PutSecurityPriceBody": {
+        "type": "object",
+        "required": [
+          "priceDate",
+          "priceMicros"
+        ],
+        "properties": {
+          "priceDate": {
+            "$ref": "#/components/schemas/LedgerDate",
+            "description": "The new date of the entry. The path date when the entry stays on its date. A different date moves the entry."
+          },
+          "priceMicros": {
+            "type": "integer",
+            "description": "Price per share, in micros. Must be positive.",
+            "exclusiveMinimum": 0
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where the price came from. Leave it out, or send null, to clear the source."
+          }
+        }
+      },
+      "RealizedGainRow": {
+        "type": "object",
+        "required": [
+          "sellDate",
+          "transactionId",
+          "securityId",
+          "securitySymbol",
+          "securityName",
+          "accountId",
+          "accountName",
+          "sharesMicros",
+          "acquiredDate",
+          "proceedsCents",
+          "basisCents",
+          "gainCents",
+          "term"
+        ],
+        "properties": {
+          "sellDate": {
+            "$ref": "#/components/schemas/LedgerDate",
+            "description": "The effective date of the sell. A floating sell has today's date."
+          },
+          "transactionId": {
+            "type": "integer",
+            "description": "The transaction that holds the sell."
+          },
+          "securityId": {
+            "type": "integer"
+          },
+          "securitySymbol": {
+            "type": "string"
+          },
+          "securityName": {
+            "type": "string"
+          },
+          "accountId": {
+            "type": "integer",
+            "description": "The investment account that sold the shares."
+          },
+          "accountName": {
+            "type": "string"
+          },
+          "sharesMicros": {
+            "$ref": "#/components/schemas/Micros",
+            "description": "Shares sold from this lot, or the sold shares that no lot covered."
+          },
+          "acquiredDate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LedgerDate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The date the lot was bought. Null on an unknown-basis row."
+          },
+          "proceedsCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Net proceeds of these shares, after fees."
+          },
+          "basisCents": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cents"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cost basis of these shares. Null on an unknown-basis row."
+          },
+          "gainCents": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cents"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Proceeds minus basis. Null on an unknown-basis row."
+          },
+          "term": {
+            "type": "string",
+            "description": "short: held one year or less. long: held more than one year. unknown: no lot covers these shares, so the basis and the holding period are not known.",
+            "enum": [
+              "short",
+              "long",
+              "unknown"
+            ]
+          }
+        }
+      },
+      "RealizedGainsReport": {
+        "type": "object",
+        "required": [
+          "rows",
+          "totals"
+        ],
+        "properties": {
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RealizedGainRow"
+            },
+            "description": "One row for each lot that a sell drew from, and one row for sold shares that no lot covered. In order of sell date."
+          },
+          "totals": {
+            "$ref": "#/components/schemas/RealizedGainsTotals"
+          }
+        }
+      },
+      "RealizedGainsTotals": {
+        "type": "object",
+        "required": [
+          "shortTermGainCents",
+          "longTermGainCents",
+          "proceedsCents",
+          "basisCents",
+          "unknownBasisRows"
+        ],
+        "properties": {
+          "shortTermGainCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Sum of the gains of the short rows."
+          },
+          "longTermGainCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Sum of the gains of the long rows."
+          },
+          "proceedsCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Sum of the proceeds of the rows with a known basis."
+          },
+          "basisCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Sum of the basis of the rows with a known basis."
+          },
+          "unknownBasisRows": {
+            "type": "integer",
+            "description": "How many rows have an unknown basis. These rows are not in the other totals."
           }
         }
       },
@@ -2929,6 +4780,346 @@
           }
         }
       },
+      "SecurityAccountPosition": {
+        "type": "object",
+        "required": [
+          "accountId",
+          "accountName",
+          "isActive",
+          "sharesMicros",
+          "costBasisCents",
+          "marketValueCents"
+        ],
+        "properties": {
+          "accountId": {
+            "type": "integer"
+          },
+          "accountName": {
+            "type": "string"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "sharesMicros": {
+            "$ref": "#/components/schemas/Micros",
+            "description": "Shares of the security held in this account now."
+          },
+          "costBasisCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Cost basis of the shares in this account: the sum of the remaining basis of its open lots."
+          },
+          "marketValueCents": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cents"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Shares times the latest price. Null when the security has no price."
+          }
+        }
+      },
+      "SecurityDetail": {
+        "type": "object",
+        "required": [
+          "security",
+          "positionsByAccount",
+          "splits"
+        ],
+        "properties": {
+          "security": {
+            "$ref": "#/components/schemas/SecurityDetailSecurity"
+          },
+          "positionsByAccount": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecurityAccountPosition"
+            },
+            "description": "The accounts that hold shares now, in order of account name."
+          },
+          "splits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecuritySplit"
+            },
+            "description": "All investment splits of the security, newest first. A row has no cashAmountCents."
+          }
+        }
+      },
+      "SecurityDetailSecurity": {
+        "type": "object",
+        "required": [
+          "id",
+          "bookId",
+          "name",
+          "symbol",
+          "securityType",
+          "fetchPrices",
+          "fixedPriceMicros",
+          "createdAt",
+          "latestPriceMicros",
+          "latestPriceDate"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "bookId": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "securityType": {
+            "type": "string",
+            "enum": [
+              "etf",
+              "mutual_fund",
+              "stock"
+            ]
+          },
+          "fetchPrices": {
+            "type": "boolean"
+          },
+          "fixedPriceMicros": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Micros"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "latestPriceMicros": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Micros"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Price per share of the newest price entry. For a fixed-price security, the fixed price. Null when the security has no price."
+          },
+          "latestPriceDate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LedgerDate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The date of the newest price entry. For a fixed-price security, today. Null when the security has no price."
+          }
+        }
+      },
+      "SecurityList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/SecurityListItem"
+        },
+        "description": "The securities of the book, in order of name."
+      },
+      "SecurityListItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "symbol",
+          "securityType",
+          "fetchPrices",
+          "fixedPriceMicros",
+          "sharesMicros",
+          "costBasisCents",
+          "priceMicros",
+          "priceDate",
+          "marketValueCents",
+          "incomeCents"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "securityType": {
+            "type": "string",
+            "enum": [
+              "etf",
+              "mutual_fund",
+              "stock"
+            ]
+          },
+          "fetchPrices": {
+            "type": "boolean"
+          },
+          "fixedPriceMicros": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Micros"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Fixed price per share. Null when the security has none."
+          },
+          "sharesMicros": {
+            "$ref": "#/components/schemas/Micros",
+            "description": "Shares held now in all accounts of the book, also inactive ones. Zero when none."
+          },
+          "costBasisCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Cost basis of the position: the sum of the remaining basis of its open lots. Zero when no open lot exists."
+          },
+          "priceMicros": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Micros"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Price per share of the newest price entry, or the fixed price. Null when the book holds no shares of the security, or it has no price."
+          },
+          "priceDate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LedgerDate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The date of the newest price entry. For a fixed-price security, today. Null when the book holds no shares of the security, or it has no price."
+          },
+          "marketValueCents": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cents"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Market value of the position: shares times the newest price. Null when the book holds no shares of the security, or it has no price."
+          },
+          "incomeCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Cash received from dividends and capital gains of this security, all time. It counts the positive asset legs of those transactions."
+          }
+        }
+      },
+      "SecurityLot": {
+        "type": "object",
+        "required": [
+          "lotId",
+          "accountId",
+          "accountName",
+          "acquiredDate",
+          "sharesMicros",
+          "basisCents"
+        ],
+        "properties": {
+          "lotId": {
+            "type": "integer"
+          },
+          "accountId": {
+            "type": "integer"
+          },
+          "accountName": {
+            "type": "string"
+          },
+          "acquiredDate": {
+            "$ref": "#/components/schemas/LedgerDate",
+            "description": "The date the lot was bought."
+          },
+          "sharesMicros": {
+            "$ref": "#/components/schemas/Micros",
+            "description": "Shares that remain in the lot."
+          },
+          "basisCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Cost basis of the remaining shares."
+          }
+        }
+      },
+      "SecurityLotList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/SecurityLot"
+        },
+        "description": "The open lots of the security, oldest first."
+      },
+      "SecurityPrice": {
+        "type": "object",
+        "required": [
+          "priceDate",
+          "priceMicros",
+          "source"
+        ],
+        "properties": {
+          "priceDate": {
+            "$ref": "#/components/schemas/LedgerDate",
+            "description": "The date of the price."
+          },
+          "priceMicros": {
+            "$ref": "#/components/schemas/Micros",
+            "description": "Price per share on that date."
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the price came from, such as manual or tiingo. Null when the entry has no source."
+          }
+        }
+      },
+      "SecurityPricePage": {
+        "type": "object",
+        "required": [
+          "prices",
+          "totalCount",
+          "hasMore"
+        ],
+        "properties": {
+          "prices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecurityPrice"
+            },
+            "description": "One page of the price entries of the security, newest first."
+          },
+          "totalCount": {
+            "type": "integer",
+            "description": "How many price entries match the date range. Without a range, all entries of the security."
+          },
+          "hasMore": {
+            "type": "boolean",
+            "description": "True when more entries follow this page. Request the next page with offset set to offset plus the number of rows received."
+          }
+        }
+      },
       "SecurityRow": {
         "type": "object",
         "required": [
@@ -2980,6 +5171,129 @@
           }
         }
       },
+      "SecuritySplit": {
+        "type": "object",
+        "required": [
+          "id",
+          "transactionId",
+          "transactionDate",
+          "transactionDescription",
+          "accountId",
+          "accountName",
+          "action",
+          "sharesMicros",
+          "priceMicros",
+          "feesCents",
+          "splitNumerator",
+          "splitDenominator"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "The ID of the investment split."
+          },
+          "transactionId": {
+            "type": "integer"
+          },
+          "transactionDate": {
+            "$ref": "#/components/schemas/LedgerDate",
+            "description": "The effective date of the transaction. A floating transaction has today's date."
+          },
+          "transactionDescription": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "accountId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The investment account. Null on a stock split that applies to all accounts."
+          },
+          "accountName": {
+            "type": "string",
+            "description": "The account name. \"All Accounts\" when accountId is null."
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "buy",
+              "sell",
+              "dividend",
+              "capGain",
+              "fee",
+              "split"
+            ]
+          },
+          "sharesMicros": {
+            "$ref": "#/components/schemas/Micros"
+          },
+          "priceMicros": {
+            "$ref": "#/components/schemas/Micros",
+            "description": "Price per share."
+          },
+          "feesCents": {
+            "$ref": "#/components/schemas/Cents"
+          },
+          "splitNumerator": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Numerator of the split ratio. Set on a split action only."
+          },
+          "splitDenominator": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Denominator of the split ratio. Set on a split action only."
+          },
+          "cashAmountCents": {
+            "$ref": "#/components/schemas/Cents",
+            "description": "Cash received by a dividend or capital gain: the positive asset legs of its transaction. Present only in the response of listSecuritySplits, and only on a dividend or capGain row."
+          }
+        }
+      },
+      "SecuritySplitPage": {
+        "type": "object",
+        "required": [
+          "splits",
+          "totalCount",
+          "hasMore"
+        ],
+        "properties": {
+          "splits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecuritySplit"
+            },
+            "description": "One page of the investment splits of the security, newest first."
+          },
+          "totalCount": {
+            "type": "integer",
+            "description": "How many investment splits the security has."
+          },
+          "hasMore": {
+            "type": "boolean",
+            "description": "True when more splits follow this page. Request the next page with offset set to offset plus the number of rows received."
+          }
+        }
+      },
       "Success": {
         "type": "object",
         "required": [
@@ -2989,6 +5303,47 @@
           "success": {
             "type": "boolean",
             "const": true
+          }
+        }
+      },
+      "TiingoPrice": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "date"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "The symbol in upper case."
+          },
+          "price": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Adjusted close in dollars, as a decimal number, not micros. Null when the value is not finite. Absent when Tiingo sent no adjusted close."
+          },
+          "date": {
+            "$ref": "#/components/schemas/LedgerDate",
+            "description": "The date of the price."
+          }
+        }
+      },
+      "TiingoPriceError": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "error"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "The symbol as the caller sent it."
+          },
+          "error": {
+            "type": "string",
+            "description": "Why this symbol has no price. After a Tiingo rate limit (429), the server sends no more requests and gives each remaining symbol the message \"Not fetched: the Tiingo request limit was reached\"."
           }
         }
       },
@@ -3120,6 +5475,39 @@
             "items": {
               "$ref": "#/components/schemas/InvestmentSplitRow"
             }
+          }
+        }
+      },
+      "TransactionChanges": {
+        "type": "object",
+        "required": [
+          "cursor",
+          "transactions",
+          "deletedIds",
+          "hasMore"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "integer",
+            "description": "The newest sequence number of the change log, or 0 when the log is empty. It can be larger than 2^32; store it as a 64-bit integer. Send it as since in the next delta request. During a paged full download, keep the cursor of the first page."
+          },
+          "transactions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Transaction"
+            },
+            "description": "Full mode: the page of transactions, in ID order. Delta mode: the changed transactions that still exist, in ID order. A change to a payee, an account or a security does not put the transactions that embed it in a delta, so the embedded payee, account and security objects can be old. Look them up by payeeId, accountId and securityId in your copy of those tables."
+          },
+          "deletedIds": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "Delta mode: the IDs of changed transactions that no longer exist. Always empty in full mode."
+          },
+          "hasMore": {
+            "type": "boolean",
+            "description": "Full mode: true when transactions with a larger ID follow. Request the next page with afterId set to the last ID. Always false in delta mode."
           }
         }
       },
@@ -3271,6 +5659,45 @@
               "editor",
               "viewer"
             ]
+          }
+        }
+      },
+      "UpdateSecurityBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "New name. Leading and trailing white space is removed. It must not be empty after that.",
+            "minLength": 1
+          },
+          "symbol": {
+            "type": "string",
+            "description": "New ticker symbol. Leading and trailing white space is removed. Another security of the book must not have it, compared without case.",
+            "minLength": 1
+          },
+          "securityType": {
+            "type": "string",
+            "enum": [
+              "etf",
+              "mutual_fund",
+              "stock"
+            ]
+          },
+          "fetchPrices": {
+            "type": "boolean",
+            "description": "True to fetch prices for this security."
+          },
+          "fixedPriceMicros": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A new fixed price per share, in micros. It must be at most 9007199254740991. Setting it turns fetchPrices off. Send null to remove the fixed price; fetchPrices stays as it is."
           }
         }
       },

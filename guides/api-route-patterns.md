@@ -192,7 +192,31 @@ The investment and security routes are in
 `investments/positions`, `investments/account-values`, `securities` GET and
 POST, `securities/[id]` GET, PUT and DELETE, `securities/[id]/detail`,
 `securities/[id]/lots`, `securities/[id]/splits`, and
-`reports/realized-gains`. The security `[id]` routes use `parseInt(id, 10)`,
+`reports/realized-gains`. The net worth chart reads
+`GET /api/b/[bookId]/reports/net-worth-history` (`routes/net_worth.rs`).
+With `groupBy=account`, the response adds `groups` (the top-level asset and
+liability accounts with a value that is not zero at one or more points,
+ordered by name) and each point adds `groups` (one value for each group, in
+the same order). Each account value, and the market value of an investment
+account, goes to its top-level ancestor. Another `groupBy` value is 400
+`Invalid groupBy`. Without `groupBy`, the response has `points` only. The
+register chart reads `GET /api/b/[bookId]/accounts/[id]/balance-history`
+(`routes/account_balance.rs`): the balance at each month end and at
+`endDate`, from the month of the later of `startDate` and the first split.
+It takes the dates as the net worth route does. The balance is the ledger
+sum of the own splits of the account by effective date, as the register
+running balance is; the splits of a child account are not added. An ID that
+`parse_int_auto_radix` cannot read as an int4 value is 400
+`Invalid account id`, and an account of another book is 404
+`Account not found`. `find_book_account()` and
+`balance_before()` in that file are shared with the MCP tool
+`get_account_balance_history`. The
+payee page chart reads `GET /api/b/[bookId]/reports/data?payeeId=N`. The
+`payeeId` is optional. A value that is not a positive integer gives 400
+`Invalid payeeId`. The filter works on the rows of this book, so a payee of
+another book gives `{"splits": [...]}` with no rows. The MCP tool
+`get_report_data` has no payee filter. The
+security `[id]` routes use `parseInt(id, 10)`,
 so an unparsable ID is a 400 there, not a 500. `PUT` validates the body
 before an out-of-range ID fails at the database, and a clashing symbol on
 `PUT` is a 500 because the Node route does not map that error.
@@ -219,6 +243,12 @@ They keep these Node rules:
   variable, so the test compares only the end of those messages. A Tiingo
   body that is not JSON gets a different message in Rust.
 - `prices-due` falls back to the last weekday in the server time zone.
+- `GET prices` takes `limit` (default 50, cap 5000), `offset`, and the
+  optional `startDate` and `endDate`. Both dates are inclusive and filter
+  `price_date`. `totalCount` and `hasMore` count only the rows in the range.
+  A bad date is 400 `Invalid ISO date`. A `startDate` after `endDate` is 400
+  `startDate must not be after endDate`. The security price chart reads up to
+  5000 rows with this route. The order stays newest first.
 
 `tests/http/security-prices.test.ts` starts a Tiingo mock and gives the
 server its URL.
@@ -327,7 +357,11 @@ temporarily unavailable`, as `typeSafeHttpError` does.
 The routes keep these Node rules:
 
 - A connection write needs the owner. Clearing the staged rows of a
-  connection needs only write access.
+  connection needs only write access. The account refresh
+  (`GET .../tokens/[id]/accounts?refresh=true`) is a connection write: it
+  rewrites the mappings and calls Plaid with the stored token. The route is
+  a GET at `Read` for the plain list, so the handler checks the owner role
+  by hand when `refresh` is set.
 - The `[id]` routes read the ID with `parseInt(id, 10)`. A value that is not a
   finite number is a 400. An ID outside the int4 range fails only when a
   query binds it, so a `PUT` validates its body first. `transactions/[id]/plaid`
@@ -339,7 +373,9 @@ The routes keep these Node rules:
 - A refresh repeats the message of its failure. A message that names a Plaid
   variable is a 500, and every other message is a 502. The messages for a
   Plaid error body, an invalid account list, a JSON null body, a null account,
-  and a network failure are the Node messages.
+  and a network failure are the Node messages. A database failure is the
+  exception: the client gets `DATABASE_FAILURE` (`plaid_sync.rs`), and the
+  SQLite text, which names tables and constraints, goes to the log.
 - The account assignments report the first zod issue in element and key
   order, then the duplicate checks. The unknown-account check comes before
   the account-type and mapping checks. Every mapping in the request is
@@ -406,11 +442,12 @@ page does not send:
   and the counterpart splits of a suggestion without an ORDER BY. Rust reads
   them in ID order. The pending list is then sorted by date, newest first,
   with a stable sort in both.
-- A database failure in a sync or in the reconciliation routes gets the
-  SQLite message in Rust. Node reported the Drizzle "Failed query" text,
-  and the per-link queue and the reconcile POST repeat it. A reconcile body
-  that is not JSON is a 500 with the route's message; Node repeats the V8
-  SyntaxError.
+- A database failure in a sync or in the account refresh gets the fixed
+  `DATABASE_FAILURE` message in Rust, in the response and in
+  `plaid_tokens.last_error`; `database_failure()` logs the SQLite text. Node
+  reported the Drizzle "Failed query" text, and the per-link queue and the
+  reconcile POST repeat it. A reconcile body that is not JSON is a 500 with
+  the route's message; Node repeats the V8 SyntaxError.
 - A field of a Plaid transaction that has another JSON type is stored as
   JavaScript `String(value)`.
 
@@ -438,7 +475,10 @@ missing, failed, stale, unverified, and unreadable states as the Node handler.
 A Plaid sync or price sync with no secret writes `notConfigured: true` and the
 missing setting in `detail`. `evaluate` gives that job the state
 `not_configured`. It does not cause `overall: "attention"`. A manual
-`/api/cron/*` run writes the same status record as a scheduled run.
+`/api/cron/*` run writes the same status record as a scheduled run, but only
+when the install has a status directory: `STATUS_DIR`, or `/backups`
+(`job_status::configured_status_dir`). Without one, as in development and CI,
+the run writes nothing and logs nothing.
 `ledger-cli backup` writes the record only when the backup goes to the
 scheduler's own backup directory. That means no `--dir`, or the same directory
 (`ledger_db::job_status`).

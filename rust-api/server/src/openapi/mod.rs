@@ -87,13 +87,18 @@ fn operation(op: &Operation) -> utoipa::openapi::path::Operation {
         .split('/')
         .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'));
     for name in placeholders {
-        builder = builder.parameter(
-            ParameterBuilder::new()
-                .name(name)
-                .parameter_in(ParameterIn::Path)
-                .required(Required::True)
-                .schema(Some(integer())),
-        );
+        // `{date}` is a calendar date. Every other placeholder is an id.
+        let parameter = ParameterBuilder::new()
+            .name(name)
+            .parameter_in(ParameterIn::Path)
+            .required(Required::True);
+        builder = builder.parameter(if name == "date" {
+            parameter
+                .description(Some("A calendar date as YYYY-MM-DD."))
+                .schema(Some(string().format(KnownFormat::Date)))
+        } else {
+            parameter.schema(Some(integer()))
+        });
     }
     for query in op.query {
         builder = builder.parameter(
@@ -177,7 +182,7 @@ pub(crate) fn document() -> OpenApi {
         .title("Counterpoise API")
         .version(version)
         .description(Some(
-            "The routes a native client uses. Money is integer cents. Shares and prices are integer micros. Dates are YYYY-MM-DD strings.",
+            "The routes a native client uses. Money is integer cents. Shares and prices are integer micros, except that fetchTiingoPrices returns prices as decimal dollars. Dates are YYYY-MM-DD strings.",
         ))
         .extensions(Some(Extensions::from_iter([(
             "x-api-contract",
@@ -238,6 +243,7 @@ pub(crate) fn command(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use utoipa::openapi::HttpMethod;
 
     #[test]
@@ -303,6 +309,32 @@ mod tests {
                 "{method} {path} is not in rust-api/routes.json"
             );
         }
+    }
+
+    #[test]
+    fn a_date_placeholder_is_a_date_string_and_every_other_one_an_integer() {
+        let document = serde_json::to_value(document()).expect("the document is JSON");
+        let parameters = &document["paths"]["/api/b/{bookId}/securities/{id}/prices/{date}"]["delete"]
+            ["parameters"];
+        let path_parameter = |name: &str| {
+            parameters
+                .as_array()
+                .expect("a parameter list")
+                .iter()
+                .find(|parameter| parameter["name"] == name)
+                .unwrap_or_else(|| panic!("no {name} parameter"))
+        };
+        for name in ["bookId", "id"] {
+            assert_eq!(path_parameter(name)["schema"], json!({ "type": "integer" }));
+            assert_eq!(path_parameter(name)["required"], true);
+        }
+        let date = path_parameter("date");
+        assert_eq!(date["in"], "path");
+        assert_eq!(date["required"], true);
+        assert_eq!(
+            date["schema"],
+            json!({ "type": "string", "format": "date" })
+        );
     }
 
     #[test]

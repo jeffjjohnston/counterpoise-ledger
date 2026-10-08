@@ -221,7 +221,7 @@ fn rules(a: &Accounts, next_paycheck: NaiveDate) -> Vec<RuleSeed> {
     ]
 }
 
-const PAYEES: [&str; 46] = [
+const PAYEES: [&str; 50] = [
     // Employers
     "Meridian Health Systems",
     "NovaTech Solutions",
@@ -281,6 +281,12 @@ const PAYEES: [&str; 46] = [
     // Miscellaneous
     "Venmo",
     "Zelle",
+    // Credit card issuers
+    "Chase Bank",
+    "American Express",
+    "Citi",
+    // Checking bank
+    "Main Street Bank",
 ];
 
 /// The accounts that the transaction generator refers to.
@@ -1374,11 +1380,18 @@ async fn seed_months(
             if *balance > 0
                 && let Some(day) = on(25)
             {
+                let bank = if *card == a.chase_sapphire {
+                    "Chase Bank"
+                } else if *card == a.amex_blue {
+                    "American Express"
+                } else {
+                    "Citi"
+                };
                 seeder
                     .transaction(
                         &day,
                         "Credit Card Payment",
-                        None,
+                        payee(bank),
                         &[split(*card, *balance), split(a.checking, -*balance)],
                     )
                     .await?;
@@ -1444,7 +1457,7 @@ async fn seed_months(
                     .transaction(
                         &day,
                         &format!("IRA Contribution - {person}"),
-                        None,
+                        payee("Main Street Bank"),
                         &[split(ira_cash, limit), split(a.checking, -limit)],
                     )
                     .await?;
@@ -1472,7 +1485,7 @@ async fn seed_months(
                     .transaction(
                         &day,
                         "Transfer to Brokerage",
-                        None,
+                        payee("Main Street Bank"),
                         &[split(a.brokerage_cash, amount), split(a.checking, -amount)],
                     )
                     .await?;

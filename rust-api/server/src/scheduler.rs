@@ -22,7 +22,8 @@
 //! reads: `job`, `lastRun`, `lastOk`, `verified`, `bytes` and `detail`. A job
 //! that has no secret to work with (Plaid sync, price sync) runs nothing and
 //! records `notConfigured: true`, with the missing setting in `detail`. The
-//! manual `/api/cron/*` routes record a run the same way (`record_run`).
+//! manual `/api/cron/*` routes record a run the same way (`record_run`), but
+//! only when the install has a status directory.
 
 use crate::{
     routes::{
@@ -50,6 +51,11 @@ struct Report {
 /// missing setting is "not configured". Any other `Ok` is a success.
 fn report_of(result: &crate::error::ApiResult) -> Result<Report, String> {
     match result {
+        // A price sync that Tiingo stopped with a 429 left prices out.
+        Ok(body) if body.0["rateLimited"] == true => Err(format!(
+            "Tiingo request limit reached: {} of {} securities have a new price",
+            body.0["pricesInserted"], body.0["securitiesFound"]
+        )),
         Ok(body) => Ok(match body.0["missingSetting"].as_str() {
             Some(setting) if body.0["skipped"] == true => Report {
                 detail: Some(format!("not configured: {setting} is not set")),
@@ -72,9 +78,12 @@ async fn route_job(run: impl Future<Output = crate::error::ApiResult>) -> Result
 
 /// Records a manual run of a route job, with the rules of a scheduled run.
 /// The scheduler records its own runs in `run_once`, so a run is never
-/// recorded twice.
+/// recorded twice. Without a status directory (a development checkout or a
+/// CI runner), the run records nothing and logs nothing.
 pub(crate) async fn record_run(job: &str, result: &crate::error::ApiResult) {
-    record_outcome(&status_dir(), job, &report_of(result)).await;
+    if let Some(dir) = ledger_db::job_status::configured_status_dir() {
+        record_outcome(&dir, job, &report_of(result)).await;
+    }
 }
 
 fn backup_dir() -> PathBuf {
@@ -423,6 +432,33 @@ mod tests {
         let record = read_record(&dir, "recurring");
         assert_eq!(record["lastOk"], serde_json::Value::Null);
         assert_eq!(record["detail"], "Failed to process recurring rules");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_price_sync_records_a_failure() {
+        let dir = std::env::temp_dir().join(format!("counterpoise-limited-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let limited: crate::error::ApiResult = Ok(axum::Json(json!({
+            "success": true, "securitiesFound": 5, "pricesInserted": 1, "pricesSkipped": 0,
+            "errors": [{}, {}, {}], "rateLimited": true,
+        })));
+        record_outcome(&dir, "price-sync", &report_of(&limited)).await;
+        let record = read_record(&dir, "price-sync");
+        assert_eq!(record["lastOk"], serde_json::Value::Null);
+        assert_eq!(
+            record["detail"],
+            "Tiingo request limit reached: 1 of 5 securities have a new price"
+        );
+
+        // Other symbol errors leave the run ok. The log has each of them.
+        let partial: crate::error::ApiResult = Ok(axum::Json(json!({
+            "success": true, "securitiesFound": 5, "pricesInserted": 3, "pricesSkipped": 0,
+            "errors": [{}, {}],
+        })));
+        record_outcome(&dir, "price-sync", &report_of(&partial)).await;
+        let record = read_record(&dir, "price-sync");
+        assert_eq!(record["lastOk"], record["lastRun"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

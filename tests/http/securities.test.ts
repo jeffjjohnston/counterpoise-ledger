@@ -5,6 +5,15 @@ import {
 import { rows } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { createInvestmentScenario, stable } from "../helpers/investment-scenario";
+import { contract } from "../helpers/contract";
+
+const securityListSchema = contract("SecurityList");
+const securitySchema = contract("SecurityRow");
+const securityDetailSchema = contract("SecurityDetail");
+const securityLotListSchema = contract("SecurityLotList");
+const securitySplitPageSchema = contract("SecuritySplitPage");
+const successSchema = contract("Success");
+const apiErrorSchema = contract("ApiError");
 
 function json(method: string, body: unknown): RequestInit {
   return { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
@@ -37,7 +46,9 @@ describe("security HTTP parity", () => {
   async function expectError(path: string, init: RequestInit, status: number, error: string) {
     const response = await client.request(path, init);
     expect(response.status, `${init.method ?? "GET"} ${path}`).toBe(status);
-    expect(await response.json()).toEqual({ error });
+    const body = await response.json();
+    apiErrorSchema.parse(body);
+    expect(body).toEqual({ error });
   }
 
   it("lists securities by name with book-wide positions and asset-leg income", async () => {
@@ -47,6 +58,7 @@ describe("security HTTP parity", () => {
     expect(list.find((row: { symbol: string }) => row.symbol === "IDLE")).toMatchObject({
       sharesMicros: 0, costBasisCents: 0, priceMicros: null, marketValueCents: null, incomeCents: 0,
     });
+    securityListSchema.parse(list);
     expect(stable(list)).toMatchSnapshot();
   });
 
@@ -55,12 +67,14 @@ describe("security HTTP parity", () => {
       name: "﻿ Money Market ", symbol: " mmf", securityType: "mutual_fund",
       fetchPrices: true, fixedPriceMicros: 1_000_000, bookId: 999,
     }));
+    securitySchema.parse(created);
     expect(created).toMatchObject({
       bookId: 1, name: "Money Market", symbol: "mmf", securityType: "mutual_fund",
       fetchPrices: false, fixedPriceMicros: 1_000_000,
     });
     expect(Math.abs(Date.parse(created.createdAt) - Date.now())).toBeLessThan(60_000);
     const plain = await ok("/api/b/1/securities", json("POST", { name: "Plain", symbol: "PLN", securityType: "stock" }));
+    securitySchema.parse(plain);
     expect(plain).toMatchObject({ fetchPrices: true, fixedPriceMicros: null });
     await expectError("/api/b/1/securities", json("POST", { name: "Again", symbol: " VTi ", securityType: "etf" }),
       409, `A security with symbol "VTi" already exists (id ${scenario.vti.id})`);
@@ -82,6 +96,7 @@ describe("security HTTP parity", () => {
 
   it("reads, updates, and deletes one security with the Node errors", async () => {
     const path = `/api/b/1/securities/${scenario.idle.id}`;
+    securitySchema.parse(await ok(path));
     expect(stable(await ok(path))).toMatchSnapshot("read");
     expect((await ok(`/api/b/1/securities/${scenario.idle.id}abc`)).id).toBe(scenario.idle.id);
     await expectError("/api/b/1/securities/abc", {}, 400, "Invalid security id");
@@ -89,8 +104,10 @@ describe("security HTTP parity", () => {
     await expectError("/api/b/1/securities/3000000000", {}, 500, "Failed to fetch security");
 
     const updated = await ok(path, json("PUT", { name: " Renamed ", fixedPriceMicros: 2_000_000, fetchPrices: true }));
+    securitySchema.parse(updated);
     expect(updated).toMatchObject({ name: "Renamed", symbol: "IDLE", fetchPrices: false, fixedPriceMicros: 2_000_000 });
     const cleared = await ok(path, json("PUT", { fixedPriceMicros: null }));
+    securitySchema.parse(cleared);
     expect(cleared).toMatchObject({ fetchPrices: false, fixedPriceMicros: null });
     for (const [id, body, status, error] of [
       [scenario.idle.id, null, 400, "Invalid input: expected object, received null"],
@@ -98,7 +115,7 @@ describe("security HTTP parity", () => {
       [scenario.idle.id, { symbol: " " }, 400, "Symbol is required"],
       [scenario.idle.id, { fetchPrices: "x" }, 400, "Fetch prices must be a boolean"],
       [scenario.idle.id, { securityType: null }, 400, "securityType must be one of: etf, mutual_fund, stock"],
-      [scenario.idle.id, { symbol: "vti" }, 500, "Failed to update security"],
+      [scenario.idle.id, { symbol: "vti" }, 409, `A security with symbol "vti" already exists (id ${scenario.vti.id})`],
       ["abc", { name: "X" }, 400, "Invalid security id"],
       ["abc", null, 400, "Invalid security id"],
       ["999999", { name: "X" }, 404, "Security not found"],
@@ -113,7 +130,9 @@ describe("security HTTP parity", () => {
       "Cannot delete security with investment transactions");
     await expectError("/api/b/1/securities/999999", { method: "DELETE" }, 404, "Security not found");
     await expectError("/api/b/1/securities/abc", { method: "DELETE" }, 400, "Invalid security id");
-    expect(await ok(path, { method: "DELETE" })).toEqual({ success: true });
+    const deleted = await ok(path, { method: "DELETE" });
+    successSchema.parse(deleted);
+    expect(deleted).toEqual({ success: true });
     expect(await rows("SELECT * FROM securities WHERE id = $1", [scenario.idle.id])).toEqual([]);
   });
 
@@ -122,9 +141,11 @@ describe("security HTTP parity", () => {
     expect(detail.security).toMatchObject({ symbol: "VTI", latestPriceMicros: 120_333_333, latestPriceDate: "2025-06-02" });
     expect(detail.positionsByAccount.map((row: { accountName: string }) => row.accountName))
       .toEqual(["Brokerage", "Closed Brokerage"]);
+    securityDetailSchema.parse(detail);
     expect(stable(detail)).toMatchSnapshot("vti");
     const fixed = await ok(`/api/b/1/securities/${scenario.bnd.id}/detail`);
     expect(stable(fixed.security)).toMatchObject({ latestPriceMicros: 1_000_000, latestPriceDate: "<today>" });
+    securityDetailSchema.parse(fixed);
     expect(stable(fixed)).toMatchSnapshot("bnd");
     await expectError("/api/b/1/securities/abc/detail", {}, 400, "Invalid security id");
     await expectError("/api/b/1/securities/999999/detail", {}, 404, "Security not found");
@@ -132,6 +153,7 @@ describe("security HTTP parity", () => {
 
   it("lists open lots oldest first", async () => {
     const lots = await ok(`/api/b/1/securities/${scenario.vti.id}/lots`);
+    securityLotListSchema.parse(lots);
     expect(lots.length).toBeGreaterThan(0);
     expect(lots.every((lot: { sharesMicros: number }) => lot.sharesMicros > 0)).toBe(true);
     expect(lots).toMatchSnapshot();
@@ -146,14 +168,32 @@ describe("security HTTP parity", () => {
     const income = first.splits.find((row: { action: string }) => row.action === "dividend");
     expect(income.cashAmountCents).toBe(950);
     expect(first.splits.find((row: { action: string }) => row.action !== "dividend")).not.toHaveProperty("cashAmountCents");
+    securitySplitPageSchema.parse(first);
     expect(stable(first)).toMatchSnapshot("first page");
-    expect(stable(await ok(`${path}?limit=4&offset=12`))).toMatchSnapshot("last page");
+    const last = await ok(`${path}?limit=4&offset=12`);
+    securitySplitPageSchema.parse(last);
+    expect(stable(last)).toMatchSnapshot("last page");
     expect(await ok(`${path}?limit=1e300&offset=-1`)).toEqual(await ok(path));
     expect((await ok(`${path}?limit=1000`)).splits).toHaveLength(14);
     // Number() trims U+FEFF, and U+0085 makes the value NaN, so the default applies.
     expect((await ok(`${path}?limit=%EF%BB%BF3`)).splits).toHaveLength(3);
     expect((await ok(`${path}?limit=%C2%853`)).splits).toHaveLength(14);
     await expectError("/api/b/1/securities/999999/splits", {}, 404, "Security not found");
+  });
+
+  it("answers 404 for a book of which the user is not a member", async () => {
+    const other = await createUser({ username: "other" });
+    const book = await createBook({ name: "Other Book", userId: other.id });
+    for (const path of [
+      `/api/b/${book.id}/securities`, `/api/b/${book.id}/securities/1`,
+      `/api/b/${book.id}/securities/1/detail`, `/api/b/${book.id}/securities/1/lots`,
+      `/api/b/${book.id}/securities/1/splits`,
+    ]) {
+      await expectError(path, {}, 404, "Book not found");
+    }
+    await expectError(`/api/b/${book.id}/securities`, json("POST", { name: "X", symbol: "X", securityType: "etf" }), 404, "Book not found");
+    await expectError(`/api/b/${book.id}/securities/1`, json("PUT", { name: "X" }), 404, "Book not found");
+    await expectError(`/api/b/${book.id}/securities/1`, { method: "DELETE" }, 404, "Book not found");
   });
 
   it("denies viewers every security write", async () => {

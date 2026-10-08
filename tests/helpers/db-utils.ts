@@ -30,12 +30,16 @@ export const setupTestDatabase = async () => {
 /**
  * Clears every row and restarts every ID sequence, then writes the baseline
  * rows again. Every application table depends on users through books or a
- * direct foreign key, so the cascade clears them without a table order.
+ * direct foreign key, so the cascade clears them without a table order. The
+ * exceptions have no user: the transaction change log, which the cascade
+ * adds rows to, so it is cleared after the cascade, and the OAuth clients.
  */
 export const resetTestDatabase = async () => {
   if (!didSetup) throw new Error("Call setupTestDatabase before resetting test data");
   await script(`
     DELETE FROM users;
+    DELETE FROM transaction_changes;
+    DELETE FROM oauth_clients;
     DELETE FROM sqlite_sequence;
     ${BASELINE}
   `);

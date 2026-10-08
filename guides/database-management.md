@@ -159,6 +159,10 @@ book every 100 ms, and a count that moved is a hint. The triggers run for
 every writer: the server, `ledger-cli`, MCP over stdio and the `sqlite3`
 shell. A write that rolls back also rolls back its count.
 
+The table `transaction_changes` logs the ID of each changed transaction for
+the delta sync of a native client. Its triggers run for every writer too. See
+[api-contract.md](api-contract.md#delta-sync).
+
 ## Backups and restore
 
 The server makes the backups itself (`rust-api/server/src/scheduler.rs`):
@@ -187,6 +191,16 @@ the snapshot over the database file, delete the `-wal` and `-shm` files, and
 start the server. [upgrade-to-sqlite.md](upgrade-to-sqlite.md) has the
 production command. A restored file with splits and no lots gets its lots
 back at startup, from the lot backfill guard.
+
+A restore also brings back an older `transaction_changes` log, which gives
+again `seq` values that a native client already has. To stop a client from
+missing the changes that the restore removed, `backup::snapshot` writes a
+floor marker (a log row of book 0) into each copy, 2^32 above the newest
+`seq` of the copy. A delta cursor below the newest marker gets 410, and the
+client downloads the book again. Migration 0003 starts the log with a marker
+at the current time in microseconds, so a restored snapshot from before that
+migration also gets a marker above the old cursors. Restore only from a
+snapshot. A copy of the database file made in another way has no marker.
 
 ## Separate development and production
 

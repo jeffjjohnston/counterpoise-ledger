@@ -4,6 +4,7 @@ import { ThemeProvider } from "@/components/ThemeProvider";
 import { ToastProvider } from "@/components/ui/ToastProvider";
 import { PostHogProvider } from "@/app/posthog-provider";
 import { PostHogPageview } from "@/app/posthog-pageview";
+import { UpdateBanner } from "@/client/UpdateBanner";
 
 /**
  * The root route of `client/routes.tsx`. The document head, the theme script
@@ -18,6 +19,7 @@ export default function RootLayout() {
       <ThemeProvider>
         <ToastProvider>
           <Outlet />
+          <UpdateBanner />
         </ToastProvider>
       </ThemeProvider>
       {/* A navigation goes to the top of the page, and Back and Forward

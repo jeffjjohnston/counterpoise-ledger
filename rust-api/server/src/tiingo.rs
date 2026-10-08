@@ -10,7 +10,15 @@ use crate::validation::{from_json_bytes, js_json, js_string};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::Semaphore;
 
 const DEFAULT_BASE_URL: &str = "https://api.tiingo.com";
 
@@ -59,6 +67,35 @@ pub(crate) struct SymbolError {
     /// infinity is null, as `JSON.stringify` writes it.
     pub(crate) symbol: Value,
     pub(crate) error: String,
+    /// The response does not include it.
+    #[serde(skip)]
+    pub(crate) kind: FailureKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailureKind {
+    /// Tiingo answered 404: it has no ticker of this name.
+    NotFound,
+    /// Tiingo answered 429: the hourly or daily request limit is used up.
+    RateLimited,
+    /// No request was sent, because Tiingo answered 429 before.
+    NotSent,
+    Other,
+}
+
+/// The failure of one symbol, before the symbol is attached.
+struct Failure {
+    error: String,
+    kind: FailureKind,
+}
+
+impl From<String> for Failure {
+    fn from(error: String) -> Self {
+        Self {
+            error,
+            kind: FailureKind::Other,
+        }
+    }
 }
 
 impl Tiingo {
@@ -91,41 +128,74 @@ impl Tiingo {
     }
 
     /// `fetchLatestTiingoPrices`: the newest adjusted close of each symbol.
-    /// The requests run at the same time. A failure goes into the errors for
-    /// its symbol and does not stop the batch. Both lists keep the input
-    /// order.
+    /// At most `concurrency` requests run at the same time, in the input
+    /// order. A failure goes into the errors for its symbol and does not stop
+    /// the batch, except a 429: each request counts against the Tiingo limit,
+    /// so no request starts after one. The symbols not sent get a `NotSent`
+    /// error. Both lists keep the input order.
     pub(crate) async fn fetch_latest_prices(
         &self,
         symbols: &[Value],
+        concurrency: usize,
     ) -> Result<(Vec<LatestPrice>, Vec<SymbolError>), NotConfigured> {
         let key = self.key.as_deref().ok_or(NotConfigured)?;
-        let tasks: Vec<_> = symbols
-            .iter()
-            .map(|symbol| {
-                // The symbol goes into the URL as JavaScript writes it, with
-                // no encoding. URL parsing then encodes it as `fetch` does.
-                let url = format!(
-                    "{}/tiingo/daily/{}/prices?token={key}",
-                    self.base_url,
-                    js_string(symbol)
-                );
-                let client = self.client.clone();
-                let symbol = symbol.clone();
-                tokio::spawn(async move { fetch_symbol(&client, &url, &symbol).await })
-            })
-            .collect();
+        // This loop takes each permit before it starts the request, so the
+        // requests start in the input order. A task that gets a 429 sets
+        // `limited` before it gives its permit back, so the loop sees it
+        // before the next request starts.
+        let permits = Arc::new(Semaphore::new(concurrency.max(1)));
+        let limited = Arc::new(AtomicBool::new(false));
+        let mut tasks = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            let permit = permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the semaphore is never closed");
+            if limited.load(Ordering::SeqCst) {
+                tasks.push(None);
+                continue;
+            }
+            // The symbol goes into the URL as JavaScript writes it, with no
+            // encoding. URL parsing then encodes it as `fetch` does.
+            let url = format!(
+                "{}/tiingo/daily/{}/prices?token={key}",
+                self.base_url,
+                js_string(symbol)
+            );
+            let client = self.client.clone();
+            let symbol = symbol.clone();
+            let limited = limited.clone();
+            tasks.push(Some(tokio::spawn(async move {
+                let result = fetch_symbol(&client, &url, &symbol).await;
+                if matches!(&result, Err(failure) if failure.kind == FailureKind::RateLimited) {
+                    limited.store(true, Ordering::SeqCst);
+                }
+                drop(permit);
+                result
+            })));
+        }
         let mut prices = Vec::new();
         let mut errors = Vec::new();
         for (task, symbol) in tasks.into_iter().zip(symbols) {
-            match task.await {
+            let outcome = match task {
+                Some(task) => task.await,
+                None => Ok(Err(Failure {
+                    error: "Not fetched: the Tiingo request limit was reached".to_owned(),
+                    kind: FailureKind::NotSent,
+                })),
+            };
+            match outcome {
                 Ok(Ok(price)) => prices.push(price),
-                Ok(Err(error)) => errors.push(SymbolError {
+                Ok(Err(failure)) => errors.push(SymbolError {
                     symbol: js_json(symbol),
-                    error,
+                    error: failure.error,
+                    kind: failure.kind,
                 }),
                 Err(_) => errors.push(SymbolError {
                     symbol: js_json(symbol),
                     error: "Unknown error".to_owned(),
+                    kind: FailureKind::Other,
                 }),
             }
         }
@@ -184,7 +254,7 @@ fn unreadable(value: Option<&Value>, name: &str) -> String {
 
 /// The body of the async callback in `fetchLatestTiingoPrices`, in its
 /// order of evaluation.
-async fn fetch_symbol(client: &Client, url: &str, symbol: &Value) -> Result<LatestPrice, String> {
+async fn fetch_symbol(client: &Client, url: &str, symbol: &Value) -> Result<LatestPrice, Failure> {
     let text = js_string(symbol);
     // `fetch` rejects every network failure with this message.
     let response = client
@@ -201,8 +271,21 @@ async fn fetch_symbol(client: &Client, url: &str, symbol: &Value) -> Result<Late
             .map(|reason| String::from_utf8_lossy(reason.as_bytes()).into_owned())
             .or_else(|| status.canonical_reason().map(str::to_owned))
             .unwrap_or_default();
-        return Err(format!("Failed to fetch price for {text}: {reason}"));
+        return Err(Failure {
+            error: format!("Failed to fetch price for {text}: {reason}"),
+            kind: match status {
+                reqwest::StatusCode::NOT_FOUND => FailureKind::NotFound,
+                reqwest::StatusCode::TOO_MANY_REQUESTS => FailureKind::RateLimited,
+                _ => FailureKind::Other,
+            },
+        });
     }
+    Ok(latest_price(response, symbol).await?)
+}
+
+/// The newest price in a successful response.
+async fn latest_price(response: reqwest::Response, symbol: &Value) -> Result<LatestPrice, String> {
+    let text = js_string(symbol);
     let body = response
         .bytes()
         .await
@@ -256,20 +339,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn starts_no_request_after_a_429() {
+        use axum::{Router, extract::Path, http::StatusCode, response::IntoResponse, routing::get};
+        use std::sync::Mutex;
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let app = Router::new().route(
+            "/tiingo/daily/{symbol}/prices",
+            get(move |Path(symbol): Path<String>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(symbol.clone());
+                    match symbol.as_str() {
+                        "LIMITED" => StatusCode::TOO_MANY_REQUESTS.into_response(),
+                        // Still running when the 429 comes back.
+                        _ => {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            axum::Json(json!([{ "date": "2026-07-02", "adjClose": 1 }]))
+                                .into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+
+        let tiingo = Tiingo::new(Some("key".into()), Some(host));
+        let symbols = [
+            json!("LIMITED"),
+            json!("SLOW"),
+            json!("LATER"),
+            json!("LAST"),
+        ];
+        let (prices, errors) = tiingo.fetch_latest_prices(&symbols, 2).await.unwrap();
+        server.abort();
+
+        // Two requests start at once. The third waits for a permit, and the
+        // 429 gives one back first.
+        let mut requested = requests.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(requested, ["LIMITED", "SLOW"]);
+        assert_eq!(prices.len(), 1);
+        let kinds: Vec<_> = errors.iter().map(|error| error.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                FailureKind::RateLimited,
+                FailureKind::NotSent,
+                FailureKind::NotSent
+            ]
+        );
+        assert_eq!(
+            errors[1].error,
+            "Not fetched: the Tiingo request limit was reached"
+        );
+    }
+
+    #[tokio::test]
     async fn needs_a_key_and_reports_a_network_failure_as_fetch_does() {
         let unset = Tiingo::new(Some(String::new()), None);
         assert!(!unset.is_configured());
-        assert!(unset.fetch_latest_prices(&[json!("VTI")]).await.is_err());
+        assert!(unset.fetch_latest_prices(&[json!("VTI")], 1).await.is_err());
 
         // Nothing listens on the discard port of the loopback address.
         let tiingo = Tiingo::new(Some("key".into()), Some("http://127.0.0.1:9".into()));
-        let (prices, errors) = tiingo.fetch_latest_prices(&[json!("VTI")]).await.unwrap();
+        let (prices, errors) = tiingo
+            .fetch_latest_prices(&[json!("VTI")], 1)
+            .await
+            .unwrap();
         assert!(prices.is_empty());
         assert_eq!(
             errors,
             vec![SymbolError {
                 symbol: json!("VTI"),
-                error: "fetch failed".into()
+                error: "fetch failed".into(),
+                kind: FailureKind::Other,
             }]
         );
     }

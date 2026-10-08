@@ -8,9 +8,10 @@
 //! field descriptions.
 //!
 //! The HTTP transport is stateless: no session IDs, and a new handler for each
-//! request. A caller authenticates with `Authorization: Bearer cpk_...` only.
-//! The session cookie is removed before anything reads it, so a browser
-//! session cannot drive this endpoint.
+//! request. A caller authenticates with a bearer header only: an API key
+//! (`cpk_...`), or an OAuth access token (`cpo_...`, see `oauth/`) when
+//! `COUNTERPOISE_PUBLIC_URL` turns OAuth on. The session cookie is removed
+//! before anything reads it, so a browser session cannot drive this endpoint.
 //!
 //! The stdio transport takes its key from `COUNTERPOISE_API_KEY` and sends it
 //! as the bearer header of each tool's requests, as the HTTP transport sends
@@ -36,8 +37,8 @@ use axum::{
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -47,12 +48,13 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use crate::{
-    auth::{bearer_token, principal},
+    auth::{bearer_token, principal, principal_with},
+    oauth::Issuer,
     state::AppState,
 };
 
 pub(crate) use call::Caller;
-pub(crate) use call::in_tool_call;
+pub(crate) use call::{in_oauth_tool_call, in_tool_call};
 
 /// The manifest's tools that have a Rust handler, and a validator for each
 /// input schema.
@@ -238,7 +240,13 @@ struct Handler {
 
 impl Handler {
     async fn call(&self, request: CallToolRequestParams, headers: &HeaderMap) -> CallToolResult {
-        let caller = Caller::new(self.state.clone(), headers);
+        // Over HTTP the bearer value may be an OAuth access token; the stdio
+        // credential is always the key of the environment.
+        let caller = if self.credential.is_some() {
+            Caller::new(self.state.clone(), headers)
+        } else {
+            Caller::for_mcp_endpoint(self.state.clone(), headers)
+        };
         call_tool(
             &caller,
             request.name.as_ref(),
@@ -247,6 +255,9 @@ impl Handler {
         .await
     }
 }
+
+/// How long a client can keep the tool list: 5 minutes.
+const TOOLS_TTL_MS: u64 = 300_000;
 
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
@@ -260,10 +271,14 @@ impl ServerHandler for Handler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult {
-            tools: registry().tools.clone(),
-            ..Default::default()
-        })
+        // Protocol 2026-07-28 requires ttlMs and cacheScope on a list result
+        // (SEP-2549). A client on that version, such as Claude Code, rejects
+        // the result without them. Older clients ignore the two fields. The
+        // list changes only with a deploy. It is private because the result
+        // goes to an authenticated caller.
+        Ok(ListToolsResult::with_all_items(registry().tools.clone())
+            .with_ttl_ms(TOOLS_TTL_MS)
+            .with_cache_scope(CacheScope::Private))
     }
 
     async fn call_tool(
@@ -281,15 +296,35 @@ impl ServerHandler for Handler {
     }
 }
 
-fn unauthorized() -> Response {
+/// The 401 of `/api/mcp`. With OAuth on, its `WWW-Authenticate` header names
+/// the protected resource metadata (RFC 9728 section 5.1) and the scope, so
+/// that a client can start the authorization flow. A client that sent a
+/// value that is not good also gets `error="invalid_token"` (RFC 6750
+/// section 3.1).
+fn unauthorized(issuer: Option<&Issuer>, sent_credential: bool) -> Response {
     let mut response = (
         StatusCode::UNAUTHORIZED,
         axum::Json(json!({ "error": "A valid COUNTERPOISE_API_KEY is required" })),
     )
         .into_response();
-    response
-        .headers_mut()
-        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    let challenge = match issuer {
+        Some(issuer) => {
+            let error = if sent_credential {
+                "error=\"invalid_token\", "
+            } else {
+                ""
+            };
+            format!(
+                "Bearer {error}resource_metadata=\"{}\", scope=\"mcp\"",
+                issuer.resource_metadata_url()
+            )
+        }
+        None => "Bearer".to_owned(),
+    };
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_str(&challenge).expect("an origin is a valid header value"),
+    );
     response
 }
 
@@ -343,12 +378,13 @@ pub(crate) async fn http(State(state): State<AppState>, mut request: Request<Bod
             .into_response();
     }
     request.headers_mut().remove(header::COOKIE);
+    let issuer = state.oauth.clone();
     if bearer_token(request.headers()).is_none() {
-        return unauthorized();
+        return unauthorized(issuer.as_deref(), false);
     }
-    match principal(&state, request.headers()).await {
+    match principal_with(&state, request.headers(), true).await {
         Ok(Some(_)) => {}
-        Ok(None) => return unauthorized(),
+        Ok(None) => return unauthorized(issuer.as_deref(), true),
         Err(cause) => {
             tracing::error!(error = %cause, "MCP key check failed");
             return (
@@ -400,6 +436,16 @@ pub(crate) async fn stdio(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rmcp::ServiceExt;
 
+    // An OAuth access token is for the HTTP endpoint only (its audience).
+    let key = key.filter(|key| {
+        let token = key.trim().starts_with(crate::oauth::ACCESS_TOKEN_PREFIX);
+        if token {
+            tracing::warn!(
+                "COUNTERPOISE_API_KEY holds an OAuth access token, which is for /api/mcp only"
+            );
+        }
+        !token
+    });
     let headers = key_headers(key);
     match principal(&state, &headers).await {
         Ok(Some(user_id)) => tracing::info!(user_id, "MCP authenticated"),

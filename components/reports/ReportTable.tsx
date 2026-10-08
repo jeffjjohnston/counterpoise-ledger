@@ -3,15 +3,17 @@
 import { useState, useCallback } from "react";
 import { formatCurrency, formatDate } from "@/lib/wasm-client";
 import { Button } from "@/components/ui/Button";
-import type { ReportGroupNode, ReportSplit } from "@/lib/reports";
+import { reportAmount, type ReportGroupNode, type ReportSplit } from "@/lib/reports";
 
 interface ReportTableProps {
   groups: ReportGroupNode[];
   grandTotal: number;
+  /** True when the report has more than one account type. Then each amount is a signed net. */
+  mixed: boolean;
   dimensions: string[];
 }
 
-export function ReportTable({ groups, grandTotal, dimensions }: ReportTableProps) {
+export function ReportTable({ groups, grandTotal, mixed, dimensions }: ReportTableProps) {
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
 
   const toggle = useCallback((key: string) => {
@@ -58,7 +60,7 @@ export function ReportTable({ groups, grandTotal, dimensions }: ReportTableProps
         </td>
         <td className="py-1.5 px-3 text-fg-tertiary text-xs">{split.accountName}</td>
         <td className="py-1.5 px-3 text-right tabular-nums">
-          {formatCurrency(Math.abs(split.amount))}
+          {formatCurrency(reportAmount(split, mixed))}
         </td>
       </tr>
     ));

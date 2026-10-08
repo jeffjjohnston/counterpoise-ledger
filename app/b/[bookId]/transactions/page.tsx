@@ -12,6 +12,7 @@ import {
 import { TransactionList } from "@/components/transactions/TransactionList";
 import { TransactionForm } from "@/components/transactions/TransactionForm";
 import type { TransactionFormHandle } from "@/components/transactions/TransactionForm";
+import { AccountBalanceChart } from "@/components/transactions/AccountBalanceChart";
 import { InvestmentPositionsSection } from "@/components/transactions/InvestmentPositionsSection";
 import { StaleSyncBanner } from "@/components/transactions/StaleSyncBanner";
 import { PRICES_SAVED_EVENT } from "@/lib/events";
@@ -1086,6 +1087,19 @@ function TransactionsPageInner() {
             cashBalanceCents={investmentCashBalance}
             bookId={bookId}
           />
+          {/* The positions section shows an investment account. A cash-only line would mislead. */}
+          {selectedAccount && !isInvestmentAccount && (
+            <div className="mx-4 mt-3">
+              <AccountBalanceChart
+                bookId={bookId}
+                accountId={selectedAccount.id}
+                accountType={selectedAccount.type}
+                // Reconciling a floating transaction moves its date, so reconcileVersion counts too.
+                // Both counters only grow, so their sum changes whenever one of them changes.
+                refreshKey={positionsVersion + reconcileVersion}
+              />
+            </div>
+          )}
           <TransactionList
             isLoading={transactionsLoading}
             transactions={mergeTransactionsForDisplay(

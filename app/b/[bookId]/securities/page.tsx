@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
+import { AllocationChart } from "@/components/securities/AllocationChart";
 import { SecurityForm } from "@/components/securities/SecurityForm";
 import { UpdatePricesModal } from "@/components/securities/UpdatePricesModal";
 import { cn } from "@/lib/utils";
@@ -208,9 +209,9 @@ export default function SecuritiesPage() {
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
         <h1 className="text-2xl font-bold text-fg">Securities</h1>
-        <div className="flex gap-3">
+        <div className="flex flex-wrap gap-3">
           {activeSecurities.length > 0 && (
             <>
               <Button variant="secondary" onClick={handleDownloadCsv}>
@@ -243,6 +244,11 @@ export default function SecuritiesPage() {
           />
         </div>
       )}
+
+      {/* The chart follows the search, as the table and its total row do. */}
+      <div className="mb-6 empty:hidden">
+        <AllocationChart securities={filteredActiveSecurities} />
+      </div>
 
       {/* Active Securities */}
       {filteredActiveSecurities.length > 0 && (

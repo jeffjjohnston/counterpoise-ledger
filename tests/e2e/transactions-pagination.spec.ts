@@ -5,9 +5,9 @@ test("paginates transactions for a selected account", async ({ page, bookId }) =
   await page.goto(`/b/${bookId}/transactions`);
 
   await page.getByRole("link", { name: "Checking" }).first().click();
-  await expect(page.getByRole("columnheader", { name: "Balance" })).toBeVisible();
+  await expect(page.getByRole("table", { name: "Transactions" }).getByRole("columnheader", { name: "Balance" })).toBeVisible();
 
-  const rows = page.locator("tbody tr");
+  const rows = page.getByRole("table", { name: "Transactions" }).locator("tbody tr");
   await expect(rows).toHaveCount(50);
 
   // Scroll to bottom to trigger infinite scroll loading

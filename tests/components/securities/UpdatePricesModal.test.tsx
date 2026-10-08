@@ -289,6 +289,34 @@ describe("UpdatePricesModal", () => {
     });
   });
 
+  it("clears the fetch checkbox of a symbol that Tiingo does not know", async () => {
+    const gone = { ...securities[1], id: 4, name: "Gone Corp", symbol: "gone" };
+    renderWithToast(
+      <UpdatePricesModal
+        isOpen
+        onClose={vi.fn()}
+        securities={[securities[1], gone]}
+        onUpdate={vi.fn()}
+      />
+    );
+    // The route has already turned fetching off for the security.
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        prices: [],
+        errors: [{ symbol: "gone", error: "Failed to fetch price for gone: Not Found" }],
+        fetchDisabled: ["gone"],
+      }),
+    });
+
+    const checkboxes = await screen.findAllByRole("checkbox");
+    expect(checkboxes[1]).toBeChecked();
+    fireEvent.click(await screen.findByRole("button", { name: /Retrieve Latest Prices/i }));
+
+    await waitFor(() => expect(checkboxes[1]).not.toBeChecked());
+    expect(checkboxes[0]).toBeChecked();
+  });
+
   it("reports an unusable price-service response instead of crashing", async () => {
     // The component reads `prices` inside a setState updater, which React runs
     // outside the try/catch around the fetch. A response the component cannot

@@ -36,12 +36,17 @@ async function waitUntilReady(child: ChildProcess, baseUrl: string, output: () =
   throw new Error(`HTTP server did not become ready:\n${output()}`);
 }
 
-/** Start the Rust HTTP server against this Vitest worker's leased database. */
+/**
+ * Start the Rust HTTP server against this Vitest worker's leased database.
+ * `overrides` can be a function of the base URL, for a setting that names
+ * the server itself (`COUNTERPOISE_PUBLIC_URL`).
+ */
 export async function startHttpTestServer(
-  overrides: Record<string, string> = {}
+  overrides: Record<string, string> | ((baseUrl: string) => Record<string, string>) = {}
 ): Promise<{ baseUrl: string; stop: () => Promise<void> }> {
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
+  const settings = typeof overrides === "function" ? overrides(baseUrl) : overrides;
   const child = spawn(resolve("rust-api/target/debug/counterpoise-rust-api"), [], {
     cwd: resolve("."),
     env: {
@@ -52,7 +57,7 @@ export async function startHttpTestServer(
       COUNTERPOISE_TEST_SHARED_DATABASE: "1",
       RUST_BIND: `127.0.0.1:${port}`,
       NODE_ENV: "production",
-      ...overrides,
+      ...settings,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

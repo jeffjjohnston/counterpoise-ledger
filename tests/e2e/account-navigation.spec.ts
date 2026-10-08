@@ -6,5 +6,5 @@ test("account links navigate to filtered transactions", async ({ page }) => {
 
   await expect(page).toHaveURL(/\/b\/1\/transactions\?accountId=\d+/);
   await expect(page.getByRole("heading", { name: "Checking" })).toBeVisible();
-  await expect(page.getByRole("columnheader", { name: "Balance" })).toBeVisible();
+  await expect(page.getByRole("table", { name: "Transactions" }).getByRole("columnheader", { name: "Balance" })).toBeVisible();
 });

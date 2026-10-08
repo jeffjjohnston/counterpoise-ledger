@@ -194,9 +194,11 @@ struct TransactionJson<'a> {
 
 /// Loads the full transactions of this book with these IDs, in the order of
 /// `ids`. A relational query has no ORDER BY for its children. Rust returns
-/// them in ID order, which is their insertion order.
-async fn load_transactions(
-    pool: &DbPool,
+/// them in ID order, which is their insertion order. An ID that is not a
+/// transaction of this book gives no value. All the queries run on
+/// `connection`, so a caller in a read transaction gets one snapshot.
+pub(crate) async fn load_transactions(
+    connection: &mut DbConnection,
     book_id: i32,
     ids: &[i32],
 ) -> Result<Vec<Value>, sqlx::Error> {
@@ -210,7 +212,7 @@ async fn load_transactions(
     let transactions: Vec<TransactionRow> = sqlx::query_as(&query)
         .bind(book_id)
         .bind(sql::json_array(ids))
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await?;
     let payee_ids: Vec<i32> = transactions
         .iter()
@@ -221,7 +223,7 @@ async fn load_transactions(
         in1 = sql::in_integers("$1")
     ))
     .bind(sql::json_array(&payee_ids))
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?
     .into_iter()
     .map(|payee| (payee.id, payee))
@@ -232,7 +234,7 @@ async fn load_transactions(
         in1 = sql::in_integers("$1")
     ))
     .bind(sql::json_array(ids))
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     let investment_splits: Vec<InvestmentSplitRow> = sqlx::query_as(&format!(
         "SELECT id, book_id, transaction_id, account_id, security_id, action, shares_micros,
@@ -241,7 +243,7 @@ async fn load_transactions(
         in1 = sql::in_integers("$1")
     ))
     .bind(sql::json_array(ids))
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     let account_ids: Vec<i32> = splits
         .iter()
@@ -261,7 +263,7 @@ async fn load_transactions(
         in1 = sql::in_integers("$1")
     ))
     .bind(sql::json_array(&account_ids))
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?
     .into_iter()
     .map(|account| (account.id, account))
@@ -279,7 +281,7 @@ async fn load_transactions(
         in1 = sql::in_integers("$1")
     ))
     .bind(sql::json_array(&security_ids))
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?
     .into_iter()
     .map(|security| (security.id, security))
@@ -331,7 +333,10 @@ async fn load_transaction(
     book_id: i32,
     id: i32,
 ) -> Result<Option<Value>, sqlx::Error> {
-    Ok(load_transactions(pool, book_id, &[id]).await?.pop())
+    let mut connection = pool.acquire().await?;
+    Ok(load_transactions(&mut connection, book_id, &[id])
+        .await?
+        .pop())
 }
 
 /// `parseInt(id)` with no radix. NaN or a value outside the int4 range makes
@@ -621,9 +626,13 @@ pub(crate) async fn list_transactions(
     };
 
     let ids: Vec<i32> = rows.iter().map(|row| row.id).collect();
-    let transactions = load_transactions(pool, book.book_id, &ids)
-        .await
-        .map_err(db_error)?;
+    // The connection goes back to the pool before the balance query.
+    let transactions = {
+        let mut connection = pool.acquire().await.map_err(db_error)?;
+        load_transactions(&mut connection, book.book_id, &ids)
+            .await
+            .map_err(db_error)?
+    };
 
     if !query.include_meta {
         return Ok(Json(Value::Array(transactions)));

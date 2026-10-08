@@ -140,6 +140,15 @@ pub async fn begin_pool(pool: &DbPool) -> Result<Transaction<'static, Db>, sqlx:
     pool.begin_with("BEGIN IMMEDIATE").await
 }
 
+/// Opens a read transaction: `BEGIN DEFERRED`. In WAL mode, the first read
+/// takes a snapshot, and each later read in the transaction sees that
+/// snapshot. Do not write in it: a deferred transaction that changes to a
+/// write can fail with `SQLITE_BUSY`. Use [`begin`] for a write.
+pub async fn begin_read(connection: &mut DbConnection) -> Result<Transaction<'_, Db>, sqlx::Error> {
+    #[allow(clippy::disallowed_methods)]
+    connection.begin_with("BEGIN DEFERRED").await
+}
+
 /// Opens a savepoint inside the transaction that `connection` is already in.
 /// A rollback of the savepoint keeps the outer transaction.
 pub async fn savepoint(connection: &mut DbConnection) -> Result<Transaction<'_, Db>, sqlx::Error> {

@@ -17,13 +17,14 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::{auth::principal, routes::routes, state::AppState, validation::js_number_string};
+use crate::{auth::principal_with, routes::routes, state::AppState, validation::js_number_string};
 
 tokio::task_local! {
     /// Set while a tool's request runs through the router. Only the
     /// dispatcher sets it, and no header can, so an HTTP client cannot forge
-    /// it.
-    static TOOL_CALL: ();
+    /// it. The value is true when the tool runs for `/api/mcp`, where an
+    /// OAuth access token is good.
+    static TOOL_CALL: bool;
 }
 
 /// True while a route runs for an MCP tool. A route checks this to record no
@@ -31,7 +32,14 @@ tokio::task_local! {
 /// to Rust they called the library, not the route, and the library records
 /// neither.
 pub(crate) fn in_tool_call() -> bool {
-    TOOL_CALL.try_with(|()| ()).is_ok()
+    TOOL_CALL.try_with(|_| ()).is_ok()
+}
+
+/// True while a route runs for a tool of `/api/mcp`. `auth::principal`
+/// then accepts an OAuth access token. The stdio server and WebMCP do not
+/// set it: a token is not for them.
+pub(crate) fn in_oauth_tool_call() -> bool {
+    TOOL_CALL.try_with(|oauth| *oauth).unwrap_or(false)
 }
 
 /// A route response body is at most this large.
@@ -122,6 +130,9 @@ pub(crate) struct Caller {
     /// only WebMCP sends one.
     headers: HeaderMap,
     router: OnceLock<Router>,
+    /// True for a caller of `/api/mcp`, whose bearer value may be an OAuth
+    /// access token.
+    oauth: bool,
 }
 
 impl Caller {
@@ -143,6 +154,16 @@ impl Caller {
             state,
             headers,
             router: OnceLock::new(),
+            oauth: false,
+        }
+    }
+
+    /// A caller of `/api/mcp`: as [`Caller::new`], and an OAuth access token
+    /// is good for its tools.
+    pub(crate) fn for_mcp_endpoint(state: AppState, request_headers: &HeaderMap) -> Self {
+        Self {
+            oauth: true,
+            ..Self::new(state, request_headers)
         }
     }
 
@@ -153,7 +174,7 @@ impl Caller {
     /// The user of the key, as `requireAuth()` resolves it. The check runs on
     /// every call, so a revoked key stops working at once.
     pub(crate) async fn user(&self) -> ToolResult<i32> {
-        match principal(&self.state, &self.headers).await {
+        match principal_with(&self.state, &self.headers, self.oauth).await {
             Ok(Some(user_id)) => Ok(user_id),
             Ok(None) => Err(compact_error(AUTH_ERROR).into()),
             Err(cause) => Err(thrown(&cause.to_string()).into()),
@@ -249,7 +270,7 @@ impl Caller {
         }
         .map_err(|cause| thrown(&cause.to_string()))?;
         let response = TOOL_CALL
-            .scope((), router.oneshot(request))
+            .scope(self.oauth, router.oneshot(request))
             .await
             .map_err(|cause| thrown(&cause.to_string()))?;
         let status = response.status();
@@ -395,7 +416,10 @@ mod tests {
     #[tokio::test]
     async fn only_a_tool_request_is_a_tool_call() {
         assert!(!in_tool_call());
-        assert!(TOOL_CALL.scope((), async { in_tool_call() }).await);
+        assert!(!in_oauth_tool_call());
+        assert!(TOOL_CALL.scope(false, async { in_tool_call() }).await);
+        assert!(!TOOL_CALL.scope(false, async { in_oauth_tool_call() }).await);
+        assert!(TOOL_CALL.scope(true, async { in_oauth_tool_call() }).await);
     }
 
     #[test]

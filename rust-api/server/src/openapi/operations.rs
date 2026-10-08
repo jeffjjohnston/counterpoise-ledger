@@ -4,6 +4,14 @@
 
 use utoipa::openapi::HttpMethod;
 
+/// The investment-split 400 messages. `createTransaction` and
+/// `updateTransaction` share them.
+macro_rules! investment_split_errors {
+    () => {
+        "A malformed investment split item first fails with the message of its field, for example \"Invalid input: expected number, received undefined\" or \"Too small: expected number to be >=0\". An unknown action fails with an \"Invalid option\" message, and an investmentSplits value that is not an array fails with \"investmentSplits must be an array when provided\". An item that passes then fails with one of these messages: \"Invalid investment split values\" (a stock split lacks a splitNumerator or splitDenominator above 0); \"Invalid investment actions\" (a buy or sell with no gross amount, a fee with no amount, a gross amount that is too large, or a stock split with no ratio); \"One or more investment split securities do not belong to this book\"; \"Investment splits require a transaction split on an investment account\" (a buy or sell without a split on an investment account)."
+    };
+}
+
 /// Who may call an operation.
 #[derive(Clone, Copy)]
 pub(super) enum Security {
@@ -33,7 +41,8 @@ pub(super) struct Query {
 pub(super) struct Operation {
     pub(super) method: HttpMethod,
     /// The path, with `{bookId}` and `{id}` placeholders. Each placeholder is
-    /// a required integer path parameter.
+    /// a required integer path parameter, except `{date}`: that one is a
+    /// required string with the `date` format.
     pub(super) path: &'static str,
     pub(super) operation_id: &'static str,
     pub(super) summary: &'static str,
@@ -401,7 +410,47 @@ pub(super) const OPERATIONS: &[Operation] = &[
         query: &[],
         body: Some("CreateTransactionBody"),
         response: &["Transaction"],
-        errors: &[],
+        errors: &[(
+            400,
+            concat!(
+                "The request is not valid. The message names the problem: a missing or invalid date, splits that do not sum to zero, an account that is not in this book, a check number on a transaction with no bank account, or \"Investment transactions require investmentSplits\" (a split on an investment account and no investmentSplits). ",
+                investment_split_errors!()
+            ),
+        )],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/transactions/changes",
+        operation_id: "listTransactionChanges",
+        summary: "Delta sync. Without since, pages all transactions by ID. With since, gives the transactions that changed after that cursor.",
+        tag: "transactions",
+        security: Security::BearerOrCookie,
+        query: &[
+            Query {
+                name: "since",
+                kind: QueryKind::Integer,
+                description: "The cursor of an earlier response. Selects delta mode. Do not send it with afterId or limit.",
+                required: false,
+            },
+            Query {
+                name: "afterId",
+                kind: QueryKind::Integer,
+                description: "Full mode: give the transactions with a larger ID. Default 0.",
+                required: false,
+            },
+            Query {
+                name: "limit",
+                kind: QueryKind::Integer,
+                description: "Full mode: page size. Default 2000, maximum 5000.",
+                required: false,
+            },
+        ],
+        body: None,
+        response: &["TransactionChanges"],
+        errors: &[(
+            410,
+            "The cursor is not usable: it is newer than the change log, the database was restored from a snapshot after the cursor was given, or more than 5000 transactions changed after it. Download all transactions again in full mode.",
+        )],
     },
     Operation {
         method: HttpMethod::Get,
@@ -425,10 +474,20 @@ pub(super) const OPERATIONS: &[Operation] = &[
         query: &[],
         body: Some("UpdateTransactionBody"),
         response: &["Transaction"],
-        errors: &[(
-            409,
-            "The transaction changed after you loaded it. The server makes no change. This occurs only when you send expectedUpdatedAt.",
-        )],
+        errors: &[
+            (
+                400,
+                concat!(
+                    "The request is not valid. The message names the problem. It can be any message of createTransaction. Also: \"At least 2 splits are required, even for stock splits\" (you send investmentSplits for a transaction with fewer than two splits and send no splits, or `splits` has fewer than 2 items). ",
+                    investment_split_errors!()
+                ),
+            ),
+            (404, "The book has no transaction with this id."),
+            (
+                409,
+                "The transaction changed after you loaded it. The server makes no change. This occurs only when you send expectedUpdatedAt.",
+            ),
+        ],
     },
     Operation {
         method: HttpMethod::Delete,
@@ -534,5 +593,333 @@ pub(super) const OPERATIONS: &[Operation] = &[
         body: None,
         response: &["AccountMarketValueList"],
         errors: &[],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/investments/positions",
+        operation_id: "listInvestmentPositions",
+        summary: "Positions: shares, cost basis and market value of each security.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[Query {
+            name: "accountId",
+            kind: QueryKind::Integer,
+            description: "Count only this investment account. Zero or omitted means the whole book.",
+            required: false,
+        }],
+        body: None,
+        response: &["InvestmentPositionList"],
+        errors: &[(400, "The accountId is not an integer.")],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/securities",
+        operation_id: "listSecurities",
+        summary: "Securities with position, price and income.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &["SecurityList"],
+        errors: &[],
+    },
+    Operation {
+        method: HttpMethod::Post,
+        path: "/api/b/{bookId}/securities",
+        operation_id: "createSecurity",
+        summary: "Create a security.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: Some("CreateSecurityBody"),
+        response: &["SecurityRow"],
+        errors: &[
+            (
+                400,
+                "A field is missing or not valid. The message names it.",
+            ),
+            (
+                409,
+                "The book already has a security with this symbol, compared without case.",
+            ),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/securities/{id}",
+        operation_id: "getSecurity",
+        summary: "One security.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &["SecurityRow"],
+        errors: &[
+            (400, "The security id is not an integer."),
+            (404, "The book has no security with this id."),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Put,
+        path: "/api/b/{bookId}/securities/{id}",
+        operation_id: "updateSecurity",
+        summary: "Update a security.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: Some("UpdateSecurityBody"),
+        response: &["SecurityRow"],
+        errors: &[
+            (
+                400,
+                "The security id is not an integer, no field is present, or a field is not valid. The message names it.",
+            ),
+            (404, "The book has no security with this id."),
+            (
+                409,
+                "Another security of the book has this symbol, compared without case.",
+            ),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Delete,
+        path: "/api/b/{bookId}/securities/{id}",
+        operation_id: "deleteSecurity",
+        summary: "Delete a security that has no investment transactions. Its prices are deleted with it.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &["Success"],
+        errors: &[
+            (
+                400,
+                "The security id is not an integer, or the security has investment transactions (\"Cannot delete security with investment transactions\").",
+            ),
+            (404, "The book has no security with this id."),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/securities/{id}/detail",
+        operation_id: "getSecurityDetail",
+        summary: "A security with its latest price, positions by account and all splits.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &["SecurityDetail"],
+        errors: &[
+            (400, "The security id is not an integer."),
+            (404, "The book has no security with this id."),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/securities/{id}/lots",
+        operation_id: "listSecurityLots",
+        summary: "Open lots of a security, oldest first.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &["SecurityLotList"],
+        errors: &[
+            (400, "The security id is not an integer."),
+            (404, "The book has no security with this id."),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/securities/{id}/splits",
+        operation_id: "listSecuritySplits",
+        summary: "Investment splits of a security, newest first, in pages.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[
+            Query {
+                name: "limit",
+                kind: QueryKind::Integer,
+                description: "Rows per page. The default is 50. The maximum is 200. A value that is not a positive integer gives the default.",
+                required: false,
+            },
+            Query {
+                name: "offset",
+                kind: QueryKind::Integer,
+                description: "Rows to skip. The default is 0. A value that is not a non-negative integer gives the default.",
+                required: false,
+            },
+        ],
+        body: None,
+        response: &["SecuritySplitPage"],
+        errors: &[
+            (400, "The security id is not an integer."),
+            (404, "The book has no security with this id."),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/reports/realized-gains",
+        operation_id: "getRealizedGainsReport",
+        summary: "Realized gains and losses of sells, by lot, with totals.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[
+            Query {
+                name: "startDate",
+                kind: QueryKind::String,
+                description: "First sell date as YYYY-MM-DD. Send it with endDate.",
+                required: false,
+            },
+            Query {
+                name: "endDate",
+                kind: QueryKind::String,
+                description: "Last sell date as YYYY-MM-DD. Send it with startDate.",
+                required: false,
+            },
+            Query {
+                name: "accountId",
+                kind: QueryKind::Integer,
+                description: "Count only this investment account. Must be positive.",
+                required: false,
+            },
+        ],
+        body: None,
+        response: &["RealizedGainsReport"],
+        errors: &[(
+            400,
+            "A date is not valid, only one of startDate and endDate is present, or accountId is not a positive integer.",
+        )],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/securities/{id}/prices",
+        operation_id: "listSecurityPrices",
+        summary: "Price entries of a security, newest first, in pages. A date range can limit them.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[
+            Query {
+                name: "limit",
+                kind: QueryKind::Integer,
+                description: "Rows per page. The default is 50. The maximum is 5000. A value that is not a positive integer gives the default.",
+                required: false,
+            },
+            Query {
+                name: "offset",
+                kind: QueryKind::Integer,
+                description: "Rows to skip. The default is 0. A value that is not a non-negative integer gives the default.",
+                required: false,
+            },
+            Query {
+                name: "startDate",
+                kind: QueryKind::String,
+                description: "First price date as YYYY-MM-DD, included. An empty value means no lower bound.",
+                required: false,
+            },
+            Query {
+                name: "endDate",
+                kind: QueryKind::String,
+                description: "Last price date as YYYY-MM-DD, included. An empty value means no upper bound.",
+                required: false,
+            },
+        ],
+        body: None,
+        response: &["SecurityPricePage"],
+        errors: &[
+            (
+                400,
+                "The security id is not an integer, a date is not valid, or startDate is after endDate.",
+            ),
+            (404, "The book has no security with this id."),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Put,
+        path: "/api/b/{bookId}/securities/{id}/prices/{date}",
+        operation_id: "putSecurityPrice",
+        summary: "Change the price entry of a date, or move it to another date. This is not an upsert: it never adds an entry. Use bulkUpdatePrices to add one.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: Some("PutSecurityPriceBody"),
+        response: &["Success"],
+        errors: &[
+            (
+                400,
+                "The security id is not an integer, or priceDate or priceMicros is not valid. The message names it.",
+            ),
+            (
+                404,
+                "The book has no security with this id, or the security has no price entry on the path date (\"Price entry not found\").",
+            ),
+            (
+                409,
+                "The body priceDate differs from the path date, and the security already has an entry on it.",
+            ),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Delete,
+        path: "/api/b/{bookId}/securities/{id}/prices/{date}",
+        operation_id: "deleteSecurityPrice",
+        summary: "Delete the price entry of a date.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &["Success"],
+        errors: &[
+            (400, "The security id is not an integer."),
+            (
+                404,
+                "The book has no security with this id, or the security has no price entry on the path date (\"Price entry not found\").",
+            ),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/securities/prices-due",
+        operation_id: "listPricesDue",
+        summary: "Manually priced securities with an open position and no price on the last market day.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &["PricesDue"],
+        errors: &[],
+    },
+    Operation {
+        method: HttpMethod::Post,
+        path: "/api/b/{bookId}/security-prices/bulk",
+        operation_id: "bulkUpdatePrices",
+        summary: "Write many manual prices in one transaction. An entry on the same date is replaced and keeps its source. A new entry gets the source manual.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: Some("BulkUpdatePricesBody"),
+        response: &["BulkUpdatePricesResult"],
+        errors: &[(
+            400,
+            "priceUpdates is not an array, no item is valid, or a security is not in this book. Nothing is written.",
+        )],
+    },
+    Operation {
+        method: HttpMethod::Post,
+        path: "/api/b/{bookId}/security-prices/tiingo",
+        operation_id: "fetchTiingoPrices",
+        summary: "Fetch the latest Tiingo price of each symbol. The server writes no price.",
+        tag: "investments",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: Some("FetchTiingoPricesBody"),
+        response: &["FetchTiingoPricesResult"],
+        errors: &[
+            (400, "symbols is missing or empty."),
+            (
+                500,
+                "The server has no Tiingo key. The message is \"TIINGO_API_KEY environment variable not configured\".",
+            ),
+        ],
     },
 ];

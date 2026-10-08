@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { toDateString } from "../../lib/formatters";
 import {
-  createAccount, createTransactionWithSplits, resetTestDatabase, setupTestDatabase,
+  createAccount, createBook, createPayee, createTransactionWithSplits, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
@@ -46,6 +46,40 @@ describe("report HTTP parity", () => {
       accountType: "expense", accountParentId: null, payeeId: null, payeeName: null,
     }]);
     expect(body.splits[0]).not.toHaveProperty("description");
+  });
+
+  it("filters the splits by payeeId and keeps the filter inside the book", async () => {
+    const checking = await createAccount({ name: "Checking", type: "asset" });
+    const groceries = await createAccount({ name: "Groceries", type: "expense" });
+    const market = await createPayee({ name: "Market" });
+    const cafe = await createPayee({ name: "Cafe" });
+    for (const [payee, amount] of [[market, 300], [cafe, 500]] as const) {
+      await createTransactionWithSplits({
+        date: "2025-01-10", payeeId: payee.id, splits: [
+          { accountId: checking.id, amount: -amount }, { accountId: groceries.id, amount },
+        ],
+      });
+    }
+    const otherBook = await createBook({ name: "Other" });
+    const foreign = await createPayee({ name: "Foreign", bookId: otherBook.id });
+
+    const own = await client.request(`/api/b/1/reports/data?payeeId=${market.id}&accountTypes=expense`);
+    expect(own.status).toBe(200);
+    const ownBody = await own.json();
+    expect(ownBody.splits).toHaveLength(1);
+    expect(ownBody.splits[0]).toMatchObject({ amount: 300, payeeId: market.id, payeeName: "Market" });
+
+    const foreignResponse = await client.request(`/api/b/1/reports/data?payeeId=${foreign.id}`);
+    expect(foreignResponse.status).toBe(200);
+    expect((await foreignResponse.json()).splits).toEqual([]);
+  });
+
+  it("rejects a payeeId that is not a positive integer", async () => {
+    for (const value of ["abc", "0", "-3", "1.5", "", "2x"]) {
+      const response = await client.request(`/api/b/1/reports/data?payeeId=${value}`);
+      expect(response.status, value).toBe(400);
+      expect(await response.json()).toEqual({ error: "Invalid payeeId" });
+    }
   });
 
   it("keeps signed income and expense totals, including zero-balance accounts", async () => {

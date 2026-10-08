@@ -36,3 +36,11 @@ lib/wasm/generated/
 # `docker compose build` run by hand in this directory, where these patterns
 # are still the only thing between the working tree and the image.
 worktrees/
+.worktrees/
+
+# The gitignored secrets and private records of a dev checkout. The final
+# image does not keep the `COPY . .` layer, but the local build cache does.
+# A repository test checks this list with the matcher it models.
+*-key.txt
+.superpowers/
+tmp/

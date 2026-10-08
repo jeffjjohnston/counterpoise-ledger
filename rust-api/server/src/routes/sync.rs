@@ -1,9 +1,10 @@
 //! Plaid connections, account mappings, and the sync read routes.
 
 use crate::{
-    book_auth::{AccessLevel, authenticate_book},
+    book_auth::{AccessLevel, BookRole, authenticate_book},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
     plaid::is_configuration_error,
+    routes::plaid_sync::database_failure,
     routes::transactions::{AccountRow, now_millis, serialize_timestamp},
     state::AppState,
     typesafe::record_unlink,
@@ -460,7 +461,7 @@ async fn refresh_accounts(
     let now = now_millis();
     let mut transaction = ledger_db::locks::begin_pool(&state.pool)
         .await
-        .map_err(|cause| cause.to_string())?;
+        .map_err(database_failure)?;
     if !accounts.is_empty() {
         let columns = [
             column("name"),
@@ -493,7 +494,7 @@ async fn refresh_accounts(
             .build()
             .execute(transaction.as_mut())
             .await
-            .map_err(|cause| cause.to_string())?;
+            .map_err(database_failure)?;
     }
     // `NOT IN` a list that holds a null matches no row, as `<> ALL` does.
     sqlx::query(&format!(
@@ -504,11 +505,8 @@ async fn refresh_accounts(
     .bind(sql::json_array(&incoming_ids))
     .execute(transaction.as_mut())
     .await
-    .map_err(|cause| cause.to_string())?;
-    transaction
-        .commit()
-        .await
-        .map_err(|cause| cause.to_string())
+    .map_err(database_failure)?;
+    transaction.commit().await.map_err(database_failure)
 }
 
 pub(crate) async fn list_token_accounts(
@@ -524,6 +522,12 @@ pub(crate) async fn list_token_accounts(
     let refresh = first_query_values(raw_query.as_deref())
         .get("refresh")
         .is_some_and(|value| value == "true");
+    // A refresh rewrites the account mappings and calls Plaid with the
+    // owner's token: a connection write, which needs the owner. The route is
+    // a GET at `Read` for the plain list, so the check is by hand here.
+    if refresh && book.role != BookRole::Owner {
+        return Err(error(StatusCode::FORBIDDEN, "Only an owner can do this"));
+    }
     let token = token_in_book(&state, book.book_id, token_id, FAILURE)
         .await?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND))?;

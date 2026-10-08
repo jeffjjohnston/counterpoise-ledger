@@ -11,7 +11,7 @@ use crate::{
     state::AppState,
     validation::{
         first_query_values, js_number, js_string, parse_int_prefix, parse_json_body,
-        valid_iso_date, zod_type_name,
+        query_date_param, valid_iso_date, zod_type_name,
     },
 };
 use axum::{
@@ -22,8 +22,9 @@ use axum::{
 };
 use chrono::{Datelike, Local, Weekday};
 use ledger_core::collation::compare_names;
-use ledger_db::sql;
+use ledger_db::{engine::Db, sql};
 use serde_json::{Value, json};
+use sqlx::QueryBuilder;
 use std::collections::HashSet;
 
 const PRICE_DATE_REQUIRED: &str = "priceDate is required";
@@ -117,27 +118,41 @@ pub(crate) async fn price_history(
     let security_id = security_path_id(&raw_id, FAILURE)?;
     find_security(&state.pool, book.book_id, security_id, FAILURE).await?;
     let params = first_query_values(raw_query.as_deref());
-    let limit = page_param(params.get("limit"), 1.0).map_or(50, |limit| limit.min(200));
+    // The price chart asks for up to 5000 rows. The price list pages by 50.
+    let limit = page_param(params.get("limit"), 1.0).map_or(50, |limit| limit.min(5000));
     let offset = page_param(params.get("offset"), 0.0).unwrap_or(0);
+    let start_date = query_date_param(&params, "startDate")?;
+    let end_date = query_date_param(&params, "endDate")?;
+    if let (Some(start), Some(end)) = (&start_date, &end_date)
+        && start > end
+    {
+        return Err(bad_request("startDate must not be after endDate"));
+    }
 
     let prices: Vec<(String, i64, Option<String>)> = sqlx::query_as(
         "SELECT price_date, price_micros, source FROM security_prices
          WHERE security_id = $1 AND book_id = $2
+           AND ($5 IS NULL OR price_date >= $5) AND ($6 IS NULL OR price_date <= $6)
          ORDER BY price_date DESC LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)",
     )
     .bind(security_id)
     .bind(book.book_id)
     .bind(limit)
     .bind(offset)
+    .bind(&start_date)
+    .bind(&end_date)
     .fetch_all(&state.pool)
     .await
     .map_err(failed)?;
     let total: i32 = sqlx::query_scalar(
         "SELECT CAST(COUNT(*) AS integer) FROM security_prices
-         WHERE security_id = $1 AND book_id = $2",
+         WHERE security_id = $1 AND book_id = $2
+           AND ($3 IS NULL OR price_date >= $3) AND ($4 IS NULL OR price_date <= $4)",
     )
     .bind(security_id)
     .bind(book.book_id)
+    .bind(&start_date)
+    .bind(&end_date)
     .fetch_one(&state.pool)
     .await
     .map_err(failed)?;
@@ -532,7 +547,9 @@ pub(crate) async fn bulk_prices(
 }
 
 /// The Update Prices modal fetches here, then saves the reviewed values
-/// through the bulk route. Nothing is written.
+/// through the bulk route. No price is written. A symbol that Tiingo does not
+/// know (404) turns off price fetching for the securities of this book with
+/// that symbol, as in the price-sync cron, and `fetchDisabled` lists it.
 pub(crate) async fn tiingo_prices(
     State(state): State<AppState>,
     Path(raw_book_id): Path<String>,
@@ -540,7 +557,8 @@ pub(crate) async fn tiingo_prices(
     body: Bytes,
 ) -> ApiResult {
     const FAILURE: &str = "Failed to fetch prices from Tiingo";
-    authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let book =
+        authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let not_configured = |cause: crate::tiingo::NotConfigured| {
         error_owned(StatusCode::INTERNAL_SERVER_ERROR, cause.to_string())
     };
@@ -557,10 +575,53 @@ pub(crate) async fn tiingo_prices(
         .ok_or_else(|| bad_request("symbols must be a non-empty array"))?;
     let (prices, errors) = state
         .tiingo
-        .fetch_latest_prices(symbols)
+        .fetch_latest_prices(symbols, 8)
         .await
         .map_err(not_configured)?;
-    Ok(Json(json!({ "prices": prices, "errors": errors })))
+
+    let not_found: Vec<&str> = errors
+        .iter()
+        .filter(|error| error.kind == crate::tiingo::FailureKind::NotFound)
+        .filter_map(|error| error.symbol.as_str())
+        .collect();
+    let mut result = json!({ "prices": prices, "errors": errors });
+    if not_found.is_empty() {
+        return Ok(Json(result));
+    }
+    let failed = |cause| internal_error(cause, FAILURE);
+    let fetching: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT id, symbol FROM securities WHERE book_id = $1 AND fetch_prices = true",
+    )
+    .bind(book.book_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(failed)?;
+    let mut disabled_ids = Vec::new();
+    let mut disabled_symbols = Vec::new();
+    for symbol in not_found {
+        let upper = symbol.to_uppercase();
+        let ids: Vec<i32> = fetching
+            .iter()
+            .filter(|(_, stored)| stored.to_uppercase() == upper)
+            .map(|(id, _)| *id)
+            .collect();
+        if !ids.is_empty() {
+            disabled_ids.extend(ids);
+            disabled_symbols.push(symbol);
+        }
+    }
+    if !disabled_ids.is_empty() {
+        let mut update =
+            QueryBuilder::<Db>::new("UPDATE securities SET fetch_prices = false WHERE id IN (");
+        let mut ids = update.separated(", ");
+        for id in &disabled_ids {
+            ids.push_bind(*id);
+        }
+        update.push(")");
+        update.build().execute(&state.pool).await.map_err(failed)?;
+        result["fetchDisabled"] = json!(disabled_symbols);
+    }
+    Ok(Json(result))
 }
 
 #[cfg(test)]

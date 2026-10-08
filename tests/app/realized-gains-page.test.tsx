@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, within, fireEvent } from "@testing-library/react";
 import RealizedGainsPage from "@/app/b/[bookId]/reports/realized-gains/page";
+import { stubResizeObserver } from "@/tests/helpers/resize-observer";
 
 vi.mock("@/lib/navigation", async () =>
   (await import("@/tests/helpers/navigation")).mockNavigation({
@@ -79,6 +80,7 @@ describe("RealizedGainsPage", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it("renders one row per allocation with its term", async () => {
@@ -89,6 +91,59 @@ describe("RealizedGainsPage", () => {
     });
     expect(screen.getByText("Long")).toBeInTheDocument();
     expect(screen.getByText("Short")).toBeInTheDocument();
+  });
+
+  it("draws the gains of each month of the range above the table", async () => {
+    stubResizeObserver(600);
+    global.fetch = routeFetch(
+      reportOk({
+        ...payload,
+        rows: payload.rows.map((row) => ({ ...row, sellDate: "2026-02-10" })),
+      })
+    );
+
+    render(<RealizedGainsPage />);
+
+    expect(
+      await screen.findByRole("img", {
+        name: "Realized gains by month, January 2026 to March 2026: short term $200.00, long term $2,000.00",
+      })
+    ).toBeInTheDocument();
+    expect(screen.getByText("Short term")).toBeInTheDocument();
+  });
+
+  it("hides the chart while the rows of a new range load", async () => {
+    stubResizeObserver(600);
+    let reportCalls = 0;
+    global.fetch = routeFetch(() => {
+      reportCalls += 1;
+      // The second request does not settle: the page keeps the old result while it waits.
+      return reportCalls === 1
+        ? okJson({ ...payload, rows: payload.rows.map((row) => ({ ...row, sellDate: "2026-02-10" })) })
+        : new Promise<Response>(() => {});
+    });
+
+    render(<RealizedGainsPage />);
+    expect(await screen.findByRole("button", { name: "Hide chart" })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: "08/12/2026" } });
+    await waitFor(() => expect(reportCalls).toBe(2));
+    expect(screen.queryByRole("button", { name: "Hide chart" })).not.toBeInTheDocument();
+  });
+
+  it("draws no chart when no row has a known gain", async () => {
+    stubResizeObserver(600);
+    global.fetch = routeFetch(
+      reportOk({
+        rows: [{ ...payload.rows[0], sellDate: "2026-02-10", basisCents: null, gainCents: null, term: "unknown" }],
+        totals: { ...payload.totals, shortTermGainCents: 0, longTermGainCents: 0, unknownBasisRows: 1 },
+      })
+    );
+
+    render(<RealizedGainsPage />);
+
+    expect(await screen.findByText("Basis unknown")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Hide chart" })).not.toBeInTheDocument();
   });
 
   it("shows short-term and long-term totals separately", async () => {

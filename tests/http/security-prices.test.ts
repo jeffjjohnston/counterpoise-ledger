@@ -8,6 +8,14 @@ import {
 } from "../helpers/db-utils";
 import { rows } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { contract } from "../helpers/contract";
+
+const pricePageSchema = contract("SecurityPricePage");
+const pricesDueSchema = contract("PricesDue");
+const bulkResultSchema = contract("BulkUpdatePricesResult");
+const tiingoResultSchema = contract("FetchTiingoPricesResult");
+const successSchema = contract("Success");
+const apiErrorSchema = contract("ApiError");
 
 function json(method: string, body: unknown): RequestInit {
   return { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
@@ -24,7 +32,9 @@ async function ok(client: Client, path: string, init?: RequestInit) {
 async function expectError(client: Client, path: string, init: RequestInit, status: number, error: string) {
   const response = await client.request(path, init);
   expect(response.status, `${init.method ?? "GET"} ${path} ${String(init.body)}`).toBe(status);
-  expect(await response.json()).toEqual({ error });
+  const body = await response.json();
+  apiErrorSchema.parse(body);
+  expect(body).toEqual({ error });
 }
 
 async function pricesOf(securityId: number) {
@@ -138,7 +148,7 @@ describe("security price HTTP parity", () => {
       totalCount: 3,
       hasMore: false,
     };
-    expect(await ok(client, path)).toEqual(all);
+    expect(pricePageSchema.parse(await ok(client, path))).toEqual(all);
     expect(await ok(client, `${path}?limit=2`)).toEqual({ ...all, prices: all.prices.slice(0, 2), hasMore: true });
     expect(await ok(client, `${path}?limit=2&offset=2`)).toEqual({ ...all, prices: all.prices.slice(2) });
     expect(await ok(client, `${path}?offset=5`)).toEqual({ ...all, prices: [] });
@@ -153,13 +163,67 @@ describe("security price HTTP parity", () => {
     await expectError(client, "/api/b/1/securities/3000000000/prices", {}, 500, "Failed to fetch security price history");
   });
 
+  it("filters the price history to an inclusive date range", async () => {
+    const acme = await createSecurity({ name: "Acme", symbol: "ACME", securityType: "stock" });
+    for (const [priceDate, priceMicros] of [
+      ["2024-01-10", 10_000_000], ["2024-02-10", 11_000_000], ["2024-03-10", 12_000_000], ["2024-04-10", 13_000_000],
+    ] as const) {
+      await createSecurityPrice({ securityId: acme.id, priceDate, priceMicros });
+    }
+    const path = `/api/b/1/securities/${acme.id}/prices`;
+    const dates = (body: { prices: { priceDate: string }[] }) => body.prices.map((price) => price.priceDate);
+
+    // Both bounds are inclusive. The count is the count in the range.
+    const both = pricePageSchema.parse(await ok(client, `${path}?startDate=2024-02-10&endDate=2024-03-10`));
+    expect(dates(both)).toEqual(["2024-03-10", "2024-02-10"]);
+    expect(both).toMatchObject({ totalCount: 2, hasMore: false });
+    // One bound is enough.
+    const fromFeb = await ok(client, `${path}?startDate=2024-02-11`);
+    expect(dates(fromFeb)).toEqual(["2024-04-10", "2024-03-10"]);
+    expect(fromFeb.totalCount).toBe(2);
+    const toFeb = await ok(client, `${path}?endDate=2024-02-10`);
+    expect(dates(toFeb)).toEqual(["2024-02-10", "2024-01-10"]);
+    expect(toFeb.totalCount).toBe(2);
+    // Paging counts only rows in the range.
+    const paged = await ok(client, `${path}?startDate=2024-02-10&limit=2`);
+    expect(dates(paged)).toEqual(["2024-04-10", "2024-03-10"]);
+    expect(paged).toMatchObject({ totalCount: 3, hasMore: true });
+    // A range with no row is empty. An equal start and end is one day.
+    expect(await ok(client, `${path}?startDate=2025-01-01`)).toEqual({ prices: [], totalCount: 0, hasMore: false });
+    expect(dates(await ok(client, `${path}?startDate=2024-03-10&endDate=2024-03-10`))).toEqual(["2024-03-10"]);
+
+    await expectError(client, `${path}?startDate=2024-13-01`, {}, 400, "Invalid ISO date");
+    await expectError(client, `${path}?endDate=yesterday`, {}, 400, "Invalid ISO date");
+    await expectError(client, `${path}?startDate=2024-03-10&endDate=2024-03-09`, {}, 400,
+      "startDate must not be after endDate");
+  });
+
+  it("returns up to 5000 price rows for one request", async () => {
+    const acme = await createSecurity({ name: "Acme", symbol: "ACME", securityType: "stock" });
+    const first = Date.UTC(2020, 0, 1);
+    for (let day = 0; day < 300; day += 1) {
+      const priceDate = new Date(first + day * 86_400_000).toISOString().slice(0, 10);
+      await createSecurityPrice({ securityId: acme.id, priceDate, priceMicros: 1_000_000 + day });
+    }
+    const path = `/api/b/1/securities/${acme.id}/prices`;
+
+    const all = await ok(client, `${path}?limit=300`);
+    expect(all.prices).toHaveLength(300);
+    expect(all).toMatchObject({ totalCount: 300, hasMore: false });
+    // The default page stays 50.
+    expect((await ok(client, path)).prices).toHaveLength(50);
+    // A limit above the cap is capped, not refused.
+    expect((await ok(client, `${path}?limit=999999`)).prices).toHaveLength(300);
+  });
+
   it("updates a price in place or moves it to another date", async () => {
     const acme = await createSecurity({ name: "Acme", symbol: "ACME", securityType: "stock" });
     await createSecurityPrice({ securityId: acme.id, priceDate: "2025-01-10", priceMicros: 5_000_000, source: "manual" });
     await createSecurityPrice({ securityId: acme.id, priceDate: "2025-01-11", priceMicros: 6_000_000, source: "manual" });
     const path = `/api/b/1/securities/${acme.id}/prices/2025-01-10`;
 
-    expect(await ok(client, path, json("PUT", { priceDate: "2025-01-10", priceMicros: 7_000_000, source: "tiingo" })))
+    // The same date: the entry changes in place.
+    expect(successSchema.parse(await ok(client, path, json("PUT", { priceDate: "2025-01-10", priceMicros: 7_000_000, source: "tiingo" }))))
       .toEqual({ success: true });
     expect((await pricesOf(acme.id))[0]).toEqual({ priceDate: "2025-01-10", priceMicros: 7_000_000, source: "tiingo" });
     // An absent source clears it.
@@ -168,7 +232,8 @@ describe("security price HTTP parity", () => {
 
     await expectError(client, path, json("PUT", { priceDate: "2025-01-11", priceMicros: 1 }), 409,
       "A price already exists for 2025-01-11");
-    expect(await ok(client, path, json("PUT", { priceDate: "2025-01-20", priceMicros: 8_000_000, source: "manual" })))
+    // A new date: the entry moves. PUT never adds an entry for a date that has none.
+    expect(successSchema.parse(await ok(client, path, json("PUT", { priceDate: "2025-01-20", priceMicros: 8_000_000, source: "manual" }))))
       .toEqual({ success: true });
     expect(await pricesOf(acme.id)).toEqual([
       { priceDate: "2025-01-11", priceMicros: 6_000_000, source: "manual" },
@@ -237,7 +302,7 @@ describe("security price HTTP parity", () => {
     await createSecurityPrice({ securityId: acme.id, priceDate: "2025-01-11", priceMicros: 6_000_000 });
     const path = `/api/b/1/securities/${acme.id}/prices/2025-01-10`;
 
-    expect(await ok(client, path, { method: "DELETE" })).toEqual({ success: true });
+    expect(successSchema.parse(await ok(client, path, { method: "DELETE" }))).toEqual({ success: true });
     expect(await pricesOf(acme.id)).toEqual([{ priceDate: "2025-01-11", priceMicros: 6_000_000, source: null }]);
     await expectError(client, path, { method: "DELETE" }, 404, "Price entry not found");
     await expectError(client, "/api/b/1/securities/abc/prices/2025-01-11", { method: "DELETE" }, 400, "Invalid security id");
@@ -251,7 +316,7 @@ describe("security price HTTP parity", () => {
     const beta = await createSecurity({ name: "Beta", symbol: "BETA", securityType: "stock" });
     await createSecurityPrice({ securityId: acme.id, priceDate: "2025-01-01", priceMicros: 10_000_000, source: "tiingo" });
 
-    expect(await ok(client, "/api/b/1/security-prices/bulk", json("POST", {
+    expect(bulkResultSchema.parse(await ok(client, "/api/b/1/security-prices/bulk", json("POST", {
       bookId: 99,
       priceUpdates: [
         { securityId: acme.id, priceMicros: 11_500_000, priceDate: "2025-01-01" },
@@ -264,7 +329,7 @@ describe("security price HTTP parity", () => {
         [beta.id, 3, "2025-01-05"],
         null,
       ],
-    }))).toEqual({ message: "Successfully updated 4 price(s)", count: 4 });
+    })))).toEqual({ message: "Successfully updated 4 price(s)", count: 4 });
     expect(await pricesOf(acme.id)).toEqual([
       { priceDate: "2025-01-01", priceMicros: 11_500_000, source: "tiingo" },
       { priceDate: "2025-01-02", priceMicros: 12_250_000, source: "manual" },
@@ -326,7 +391,7 @@ describe("security price HTTP parity", () => {
     });
     await trade(brokerage.id, fixed.id, "buy", 5_000_000, "2026-06-01");
 
-    expect(await ok(client, "/api/b/1/securities/prices-due")).toEqual({
+    expect(pricesDueSchema.parse(await ok(client, "/api/b/1/securities/prices-due"))).toEqual({
       dueDate: "2026-07-02",
       securities: [
         { securityId: umlaut.id, name: "Äpfel", symbol: "APF", lastPriceMicros: 7, lastPriceDate: "2026-06-01" },
@@ -337,13 +402,14 @@ describe("security price HTTP parity", () => {
   });
 
   it("falls back to the last weekday and returns nothing without manual securities", async () => {
-    expect(await ok(client, "/api/b/1/securities/prices-due")).toEqual({ dueDate: null, securities: [] });
+    expect(pricesDueSchema.parse(await ok(client, "/api/b/1/securities/prices-due")))
+      .toEqual({ dueDate: null, securities: [] });
     const brokerage = await createAccount({ name: "Brokerage", type: "asset", subtype: "investment" });
     const option = await createSecurity({ name: "Option", symbol: "OPT", securityType: "stock", fetchPrices: false });
     await trade(brokerage.id, option.id, "buy", 1_000_000, "2026-06-01");
     // A price on a security that no longer fetches does not set the due date.
     await createSecurityPrice({ securityId: option.id, priceDate: "2000-01-03", priceMicros: 9 });
-    expect(await ok(client, "/api/b/1/securities/prices-due")).toEqual({
+    expect(pricesDueSchema.parse(await ok(client, "/api/b/1/securities/prices-due"))).toEqual({
       dueDate: lastWeekday(),
       securities: [{ securityId: option.id, name: "Option", symbol: "OPT", lastPriceMicros: 9, lastPriceDate: "2000-01-03" }],
     });
@@ -395,6 +461,46 @@ describe("security price HTTP parity", () => {
     expect([...tiingo.requests].sort()).toMatchSnapshot();
   });
 
+  it("returns Tiingo prices and per-symbol errors in the contract shape", async () => {
+    const body = tiingoResultSchema.parse(await ok(client, "/api/b/1/security-prices/tiingo",
+      json("POST", { symbols: ["VTI", "bnd", "MISS", "NOADJ", "NULLADJ", "EMPTY"] })));
+    expect(body).toEqual({
+      prices: [
+        { symbol: "VTI", price: 299.123456, date: "2026-07-02" },
+        { symbol: "BND", price: 73, date: "2026-07-01" },
+        { symbol: "NOADJ", date: "2026-07-02" },
+        { symbol: "NULLADJ", price: null, date: "2026-07-02" },
+      ],
+      errors: [
+        { symbol: "MISS", error: "Failed to fetch price for MISS: Not Found" },
+        { symbol: "EMPTY", error: "No price data available for EMPTY" },
+      ],
+    });
+    expect(await rows("SELECT * FROM security_prices")).toEqual([]);
+  });
+
+  it("turns off fetching in this book for a symbol that Tiingo does not know", async () => {
+    const other = await createBook({ name: "Other" });
+    const gone = await createSecurity({ name: "Gone", symbol: "gone", securityType: "stock", fetchPrices: true });
+    const goneOther = await createSecurity({ name: "Gone", symbol: "GONE", securityType: "stock", fetchPrices: true, bookId: other.id });
+    const broke = await createSecurity({ name: "Broke", symbol: "BROKE", securityType: "stock", fetchPrices: true });
+    const empty = await createSecurity({ name: "Empty", symbol: "EMPTY", securityType: "stock", fetchPrices: true });
+    const vti = await createSecurity({ name: "Total Market", symbol: "VTI", securityType: "etf", fetchPrices: true });
+
+    const body = await ok(client, "/api/b/1/security-prices/tiingo",
+      json("POST", { symbols: ["GONE", "BROKE", "EMPTY", "VTI", "NOSECURITY"] }));
+    // Only a 404 for a security of this book turns its fetching off.
+    tiingoResultSchema.parse(body);
+    expect(body).toMatchObject({ fetchDisabled: ["GONE"] });
+    expect(await rows("SELECT id, fetch_prices FROM securities ORDER BY id")).toEqual([
+      { id: gone.id, fetchPrices: false },
+      { id: goneOther.id, fetchPrices: true },
+      { id: broke.id, fetchPrices: true },
+      { id: empty.id, fetchPrices: true },
+      { id: vti.id, fetchPrices: true },
+    ]);
+  });
+
   it("writes an infinite Tiingo price and an infinite symbol as null", async () => {
     const response = await client.request("/api/b/1/security-prices/tiingo", {
       method: "POST", headers: { "content-type": "application/json" }, body: '{"symbols":["OVER",1e400]}',
@@ -415,6 +521,24 @@ describe("security price HTTP parity", () => {
       await expectError(client, path, json("POST", body), 400, "symbols must be a non-empty array");
     }
     await expectError(client, path, { method: "POST", body: "{" }, 500, "Failed to fetch prices from Tiingo");
+    expect(tiingo.requests).toEqual([]);
+  });
+
+  it("answers 404 for a book of which the user is not a member", async () => {
+    const other = await createUser({ username: "other" });
+    const book = await createBook({ name: "Other Book", userId: other.id });
+    const security = await createSecurity({ name: "Held", symbol: "HLD", securityType: "stock", bookId: book.id });
+    await createSecurityPrice({ securityId: security.id, priceDate: "2025-01-10", priceMicros: 5, bookId: book.id });
+    const prices = `/api/b/${book.id}/securities/${security.id}/prices`;
+    for (const path of [prices, `${prices}?startDate=2025-01-01`, `/api/b/${book.id}/securities/prices-due`]) {
+      await expectError(client, path, {}, 404, "Book not found");
+    }
+    await expectError(client, `${prices}/2025-01-10`, json("PUT", { priceDate: "2025-01-10", priceMicros: 1 }), 404, "Book not found");
+    await expectError(client, `${prices}/2025-01-10`, { method: "DELETE" }, 404, "Book not found");
+    await expectError(client, `/api/b/${book.id}/security-prices/bulk`,
+      json("POST", { priceUpdates: [{ securityId: security.id, priceMicros: 1, priceDate: "2025-01-11" }] }), 404, "Book not found");
+    await expectError(client, `/api/b/${book.id}/security-prices/tiingo`, json("POST", { symbols: ["VTI"] }), 404, "Book not found");
+    expect(await pricesOf(security.id)).toEqual([{ priceDate: "2025-01-10", priceMicros: 5, source: null }]);
     expect(tiingo.requests).toEqual([]);
   });
 

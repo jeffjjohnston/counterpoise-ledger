@@ -34,10 +34,10 @@ test("external commits refresh the register and badge, defer edits, and recover 
     return created;
   });
   await page.goto(`/b/${bookId}/transactions?accountId=${checking.id}`);
-  await expect(page.locator("tbody tr").filter({ hasText: "External live entry" })).toBeVisible();
+  await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: "External live entry" })).toBeVisible();
   await page.waitForFunction(() => (window as unknown as { bookEventCounts: { ready: number } }).bookEventCounts.ready > 0);
   await exec("update transactions set description = 'Changed remotely', check_number = 'Changed remotely' where id = $1 and book_id = $2", [txn.id, bookId]);
-  const changedRow = page.locator("tbody tr").filter({ hasText: "Changed remotely" });
+  const changedRow = page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: "Changed remotely" });
   await expect(changedRow).toBeVisible();
   expect(await page.evaluate(() => (window as unknown as { bookEventCounts: { connections: number } }).bookEventCounts.connections)).toBe(1);
 
@@ -57,7 +57,7 @@ test("external commits refresh the register and badge, defer edits, and recover 
   await page.waitForFunction((count) => (window as unknown as { bookEventCounts: { change: number } }).bookEventCounts.change > count, before);
   await expect(page.getByLabel("Description")).toHaveValue("Unsaved draft survives");
   await page.keyboard.press("Escape");
-  await expect(page.locator("tbody tr").filter({ hasText: "Queued during editing" })).toBeVisible();
+  await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: "Queued during editing" })).toBeVisible();
 
   await transaction(async (tx) => {
     const token = await tx.insert<{ id: number }>("plaid_tokens", {
@@ -74,13 +74,13 @@ test("external commits refresh the register and badge, defer edits, and recover 
     });
   });
   await expect(page.getByRole("link", { name: "Sync 1", exact: true })).toBeVisible();
-  await expect(page.locator("tbody tr").filter({ hasText: "External pending purchase" })).toBeVisible();
+  await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: "External pending purchase" })).toBeVisible();
 
   // An update from another process: the triggers count it, so the server
   // sends a hint although it did not write the row.
   await exec(`update transactions set description = 'Changed by another writer', check_number = 'Changed by another writer'
     where id = $1 and book_id = $2`, [txn.id, bookId]);
-  await expect(page.locator("tbody tr").filter({ hasText: "Changed by another writer" })).toBeVisible();
+  await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: "Changed by another writer" })).toBeVisible();
   // One stream serves the whole test, and the proxy must not cut it: a
   // timeout on the proxied body once did.
   expect(await page.evaluate(() => (window as unknown as { bookEventCounts: { connections: number; error: number } }).bookEventCounts))

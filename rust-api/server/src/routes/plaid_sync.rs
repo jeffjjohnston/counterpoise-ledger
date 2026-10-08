@@ -54,21 +54,26 @@ impl SyncError {
     }
 }
 
-/// The message of a database error, as the PostgreSQL error carries it. A
-/// protocol error carries the message of a check that the Rust code does
-/// for the database, as `parse_pg_int4`.
-fn database_message(cause: &sqlx::Error) -> String {
-    if let sqlx::Error::Protocol(message) = cause {
-        return message.clone();
-    }
-    cause
-        .as_database_error()
-        .map(|error| error.message().to_owned())
-        .unwrap_or_else(|| cause.to_string())
+/// What a book member reads when a database operation fails. The SQLite
+/// text names tables, columns and constraints, so it goes to the log only.
+pub(crate) const DATABASE_FAILURE: &str =
+    "A database error stopped the operation. The server log has the cause.";
+
+/// Logs a database error and gives the fixed message for the client. The
+/// routes store the same message in `plaid_tokens.last_error`.
+pub(crate) fn database_failure(cause: sqlx::Error) -> String {
+    tracing::error!(error = %cause, "Database error in a Plaid operation");
+    DATABASE_FAILURE.to_owned()
 }
 
+/// A protocol error carries the message of a check that the Rust code does
+/// for the database, as `parse_pg_int4`; it is the route's own text. Any
+/// other error gets the fixed message.
 fn failed(cause: sqlx::Error) -> SyncError {
-    SyncError::Failed(database_message(&cause))
+    SyncError::Failed(match cause {
+        sqlx::Error::Protocol(message) => message,
+        other => database_failure(other),
+    })
 }
 
 /// `SyncTokenResult`.

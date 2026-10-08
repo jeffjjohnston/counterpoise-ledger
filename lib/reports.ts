@@ -31,7 +31,7 @@ export type ReportGroupNode = {
   depth: number;
 };
 
-const MONTH_NAMES = [
+export const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
@@ -92,10 +92,33 @@ function extractKey(
   }
 }
 
-function computeDisplayTotal(splits: ReportSplit[]): number {
+/** The sign of each account type in a signed net. Income less expense, and assets less liabilities and equity. */
+const NET_SIGN: Record<string, number> = {
+  income: 1,
+  asset: 1,
+  expense: -1,
+  liability: -1,
+  equity: -1,
+};
+
+/** True when the splits have more than one account type. Then the report shows a signed net. */
+export function isMixedReport(splits: ReportSplit[]): boolean {
+  return new Set(splits.map((split) => split.accountType)).size > 1;
+}
+
+/**
+ * The amount of one split in the report. In a report with one account type, it is the display
+ * balance. In a mixed report, it is the signed net, so that income and expense do not add together.
+ */
+export function reportAmount(split: ReportSplit, mixed: boolean): number {
+  const display = getDisplayBalance(split.amount, split.accountType);
+  return mixed ? display * (NET_SIGN[split.accountType] ?? 1) : display;
+}
+
+function computeDisplayTotal(splits: ReportSplit[], mixed: boolean): number {
   let total = 0;
   for (const s of splits) {
-    total += getDisplayBalance(s.amount, s.accountType);
+    total += reportAmount(s, mixed);
   }
   return total;
 }
@@ -132,6 +155,8 @@ export function groupSplits(
   if (dimensions.length === 0) return [];
 
   const topParentMap = collapseToParent ? buildTopParentMap(accountMap) : null;
+  // All the groups use the sign convention of the full report, so that each group adds to its parent.
+  const mixed = isMixedReport(splits);
 
   function recurse(
     items: ReportSplit[],
@@ -166,7 +191,7 @@ export function groupSplits(
       return {
         key: fullPath,
         label: group.label,
-        total: computeDisplayTotal(group.splits),
+        total: computeDisplayTotal(group.splits, mixed),
         children,
         splits: group.splits,
         depth,
@@ -178,5 +203,5 @@ export function groupSplits(
 }
 
 export function computeGrandTotal(splits: ReportSplit[]): number {
-  return computeDisplayTotal(splits);
+  return computeDisplayTotal(splits, isMixedReport(splits));
 }

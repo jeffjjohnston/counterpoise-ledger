@@ -524,6 +524,13 @@ async fn copy(
         .execute(transaction.as_mut())
         .await
         .map_err(fail)?;
+    // The copy also logged each transaction for the delta sync. Only the
+    // floor marker of the migration (book 0) stays: a native client
+    // downloads the full book first.
+    sqlx::query("DELETE FROM transaction_changes WHERE book_id <> 0")
+        .execute(transaction.as_mut())
+        .await
+        .map_err(fail)?;
     transaction.commit().await.map_err(|cause| {
         format!("the copy does not satisfy a foreign key, or cannot commit: {cause}")
     })
@@ -1214,14 +1221,17 @@ mod tests {
     }
 
     /// A table that the baseline adds and `TABLES` does not name is not
-    /// copied. `change_marks` is derived state: the converter clears it.
+    /// copied. `change_marks` and `transaction_changes` are derived state:
+    /// the converter clears them. The OAuth tables (migration 0004) came
+    /// after the last PostgreSQL release, so the source has none.
     #[tokio::test]
     async fn tables_names_every_table_of_the_baseline() {
         let database = TempDatabase::new(1).await;
         let mut baseline: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table'
                AND substr(name, 1, 7) <> 'sqlite_'
-               AND name NOT IN ('_sqlx_migrations', 'change_marks')",
+               AND substr(name, 1, 6) <> 'oauth_'
+               AND name NOT IN ('_sqlx_migrations', 'change_marks', 'transaction_changes')",
         )
         .fetch_all(database.pool())
         .await

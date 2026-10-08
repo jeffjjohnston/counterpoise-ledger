@@ -11,6 +11,13 @@ vi.mock("@/lib/navigation", async () =>
   })
 );
 
+// The chart has its own test (tests/components/payees/PayeeSpendingChart.test.tsx).
+vi.mock("@/components/payees/PayeeSpendingChart", () => ({
+  PayeeSpendingChart: ({ bookId, payeeId, refreshKey }: { bookId: string; payeeId: number; refreshKey: number }) => (
+    <div data-testid="payee-spending-chart" data-refresh-key={refreshKey}>{bookId}/{payeeId}</div>
+  ),
+}));
+
 vi.mock("@/components/transactions/TransactionList", () => ({
   TransactionList: ({
     transactions,
@@ -35,11 +42,19 @@ vi.mock("@/components/transactions/TransactionList", () => ({
 vi.mock("@/components/transactions/TransactionForm", () => ({
   TransactionForm: ({
     editingTransaction,
+    onSubmit,
+    onDelete,
   }: {
     editingTransaction?: TransactionWithSplits | null;
+    onSubmit: (data: unknown) => void;
+    onDelete?: () => void;
   }) => (
     <div data-testid="transaction-form">
       Editing transaction {editingTransaction?.id ?? "none"}
+      <button type="button" onClick={() => onSubmit({ date: "2026-02-05", description: "Changed", splits: [] })}>
+        Save transaction
+      </button>
+      <button type="button" onClick={() => onDelete?.()}>Delete transaction</button>
     </div>
   ),
 }));
@@ -133,6 +148,12 @@ describe("PayeeDetailPage", () => {
       "/api/b/1/transactions?payeeId=1&limit=50&offset=0&includeMeta=true",
     ]);
 
+    // The chart goes between the header and the transaction list.
+    const chart = screen.getByTestId("payee-spending-chart");
+    expect(chart).toHaveTextContent("1/1");
+    expect(chart.compareDocumentPosition(screen.getByTestId("transaction-count")))
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+
     expect(screen.queryByTestId("modal")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Open transaction editor"));
@@ -140,6 +161,39 @@ describe("PayeeDetailPage", () => {
     expect(screen.getByTestId("modal")).toBeInTheDocument();
     expect(screen.getByText("Edit Transaction")).toBeInTheDocument();
     expect(screen.getByTestId("transaction-form")).toHaveTextContent("Editing transaction 101");
+  });
+
+  it("gives the chart a new refreshKey after a save and after a delete", async () => {
+    const transaction = buildTransaction(101);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "PUT") return { ok: true, json: async () => transaction } as Response;
+      if (method === "DELETE") return { ok: true, json: async () => ({}) } as Response;
+      if (url === "/api/b/1/payees/1") {
+        return { ok: true, json: async () => ({ id: 1, name: "Blue Bottle", transactionCount: 1 }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions?")) {
+        return { ok: true, json: async () => ({ transactions: [transaction], totalCount: 1 }) } as Response;
+      }
+      if (url === "/api/b/1/accounts?includeInactive=true") return { ok: true, json: async () => [] } as Response;
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("confirm", () => true);
+    render(<PayeeDetailPage />);
+    await waitFor(() => expect(screen.getByText("Open transaction editor")).toBeInTheDocument());
+    const key = () => screen.getByTestId("payee-spending-chart").getAttribute("data-refresh-key");
+    expect(key()).toBe("0");
+
+    fireEvent.click(screen.getByText("Open transaction editor"));
+    fireEvent.click(screen.getByText("Save transaction"));
+    await waitFor(() => expect(key()).toBe("1"));
+    await waitFor(() => expect(screen.queryByTestId("modal")).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("Open transaction editor"));
+    fireEvent.click(screen.getByText("Delete transaction"));
+    await waitFor(() => expect(key()).toBe("2"));
   });
 
   it("loads additional transactions when the infinite-scroll sentinel intersects", async () => {

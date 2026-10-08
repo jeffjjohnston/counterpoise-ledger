@@ -62,7 +62,7 @@ fn push_effective_date(query: &mut QueryBuilder<'_, Db>, today: &str) {
 /// copies each column value of each row. In the production image (musl), the
 /// 4,041 splits of a large book took about 10 ms as rows and 2.2 ms as one
 /// array, and the query without its output took 0.9 ms.
-async fn investment_splits(
+pub(super) async fn investment_splits(
     pool: &DbPool,
     book_id: i32,
     account_id: Option<i32>,

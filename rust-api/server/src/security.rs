@@ -69,7 +69,7 @@ const PUBLIC_PAGES: [&str; 2] = ["/login", "/register"];
 /// The public API paths. The API gate lets a request to these paths through
 /// with no credentials, and the route does its own authentication.
 const PUBLIC_API_ROUTES: [&str; 2] = ["/api/health", "/api/version"];
-const PUBLIC_API_PREFIXES: [&str; 2] = ["/api/auth/", "/api/cron/"];
+const PUBLIC_API_PREFIXES: [&str; 3] = ["/api/auth/", "/api/cron/", "/api/oauth/"];
 
 /// API routes that the API gate lets through with no credentials, because
 /// the route refuses each request without a key itself and its refusal is

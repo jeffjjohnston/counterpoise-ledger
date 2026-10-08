@@ -72,6 +72,7 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 ### AI Integration (MCP)
 - **MCP Server** - Read/write access to accounting data for AI assistants, over stdio or HTTP (see [guides/mcp-server.md](guides/mcp-server.md))
 - **API Keys** - Per-user `cpk_` keys managed on the Account page, scrypt-hashed at rest
+- **Claude Connectors (OAuth)** - Set `COUNTERPOISE_PUBLIC_URL` to your public `https` origin, then add `https://<host>/api/mcp` as a custom connector in claude.ai, Claude Desktop or Claude Code and approve it on a consent page. The Account page lists the connected apps and disconnects them. The hosted Claude apps reach the server from Anthropic's cloud, so the server must be on public HTTPS (see [guides/mcp-server.md](guides/mcp-server.md#oauth-for-custom-connectors))
 - **Usage Analytics** - Optional PostHog integration for usage events. Custom events carry no financial values, but `$pageview` sends the full URL including its query string, and the search page puts the typed query in `?q=` — see [guides/posthog-analytics.md](guides/posthog-analytics.md)
 
 ### User Experience
@@ -181,6 +182,7 @@ in the Docker image. The server applies the migrations when it starts. See
 - **recurring_rules** / **recurring_template_splits** - Recurring transaction templates
 - **plaid_tokens** / **plaid_accounts** / **plaid_transaction_reconciliation** - Bank sync via Plaid
 - **api_keys** - User API keys for MCP access
+- **oauth_clients** / **oauth_grants** / **oauth_codes** / **oauth_tokens** - OAuth for MCP custom connectors
 - **issue_reports** - In-app issue reports (meta table, scoped to user)
 
 ## Docker Deployment

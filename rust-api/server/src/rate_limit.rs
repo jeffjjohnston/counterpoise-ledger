@@ -72,6 +72,10 @@ pub(crate) enum Scope {
     Password,
     ApiKey,
     BookMemberAdd,
+    /// Each Dynamic Client Registration counts (`oauth/clients.rs`).
+    OAuthRegister,
+    /// Each failed code or refresh token exchange counts (`oauth/token.rs`).
+    OAuthToken,
 }
 
 impl Scope {
@@ -82,6 +86,8 @@ impl Scope {
             Self::Password => "password",
             Self::ApiKey => "apikey",
             Self::BookMemberAdd => "book-member-add",
+            Self::OAuthRegister => "oauth-register",
+            Self::OAuthToken => "oauth-token",
         }
     }
 }

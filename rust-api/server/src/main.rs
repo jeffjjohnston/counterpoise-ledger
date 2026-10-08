@@ -13,6 +13,7 @@ mod health_probe;
 #[cfg(test)]
 mod http_contract_tests;
 mod mcp;
+mod oauth;
 mod openapi;
 mod plaid;
 mod posthog_query;
@@ -164,6 +165,10 @@ async fn serve() -> Result<(), Box<dyn Error>> {
             "TCP peer"
         }
     );
+    match &config.public_url {
+        Some(issuer) => tracing::info!(issuer = issuer.origin(), "OAuth for MCP is on"),
+        None => tracing::info!("OAuth for MCP is off: COUNTERPOISE_PUBLIC_URL is not set"),
+    }
     axum::serve(
         listener,
         client_ip::service(app, config.trust_proxy.trusted),

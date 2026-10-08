@@ -178,6 +178,7 @@ export function UpdatePricesModal({
       const data = await apiPost<{
         prices: { symbol: string; price: number; date: string }[];
         errors: { symbol: string; error: string }[];
+        fetchDisabled?: string[];
       }>(`/api/b/${bookId}/security-prices/tiingo`, { symbols: symbolsToFetch });
 
       // apiPost resolves with whatever the response carried, including null for
@@ -216,6 +217,24 @@ export function UpdatePricesModal({
         }
         return updated;
       });
+
+      // Tiingo does not know these symbols, and the route has turned off
+      // fetching for their securities. Show that in the checkboxes.
+      const disabled = new Set(
+        (Array.isArray(data.fetchDisabled) ? data.fetchDisabled : []).map((symbol) =>
+          String(symbol).toUpperCase()
+        )
+      );
+      const disabledIds = securities
+        .filter((s) => disabled.has(s.symbol.toUpperCase()))
+        .map((s) => s.id);
+      if (disabledIds.length > 0) {
+        setFetchState((prev) => {
+          const next = { ...prev };
+          for (const id of disabledIds) next[id] = false;
+          return next;
+        });
+      }
 
       // Show errors if any
       if (errors.length > 0) {

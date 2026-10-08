@@ -8,11 +8,14 @@
 //! `counterpoise-<UTC time>.db.bad`. Thus a file with the normal name is
 //! always complete and checked. A copy is a normal database file: to
 //! restore, stop the server and put the copy at `DATABASE_PATH`.
+//!
+//! Before the check, the copy gets a floor marker in its transaction change
+//! log (see [`mark_sync_floor`]). The live database does not get it.
 
 use crate::engine::DbPool;
 use sqlx::{
     ConnectOptions, Connection,
-    sqlite::{SqliteConnectOptions, SqliteConnection},
+    sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqliteSynchronous},
 };
 use std::{
     path::{Path, PathBuf},
@@ -32,6 +35,13 @@ pub struct Snapshot {
     /// The first problem that the check found, when it found one.
     pub problem: Option<String>,
 }
+
+/// The `book_id` of a floor marker in `transaction_changes`. No book has
+/// this ID. A delta cursor below the newest marker is from before a restore.
+pub const SYNC_FLOOR_BOOK_ID: i32 = 0;
+/// The distance from the newest `seq` of a copy to its floor marker. The live
+/// database must log fewer changes than this before the copy is restored.
+const SYNC_FLOOR_GAP: i64 = 1 << 32;
 
 /// The suffix of a copy that SQLite still writes or that is not checked yet.
 const PARTIAL: &str = ".partial";
@@ -65,7 +75,41 @@ pub async fn snapshot(pool: &DbPool, dir: &Path) -> Result<Snapshot, String> {
         let _ = std::fs::remove_file(&partial);
         return Err(format!("VACUUM INTO failed: {cause}"));
     }
+    if let Err(cause) = mark_sync_floor(&partial).await {
+        let _ = std::fs::remove_file(&partial);
+        return Err(cause);
+    }
     finish(&partial, &path).await
+}
+
+/// Adds a floor marker to the transaction change log of the copy at `path`,
+/// [`SYNC_FLOOR_GAP`] above its newest `seq`. The next change after a restore
+/// of the copy gets a `seq` above the marker. Every cursor that a native
+/// client got from the live database is below the marker, so the delta route
+/// answers 410 and the client downloads the book again. Without the marker,
+/// the restored log gives again `seq` values that a client already has, and
+/// the client does not see the changes that the restore removed.
+async fn mark_sync_floor(path: &Path) -> Result<(), String> {
+    let fail =
+        |cause: sqlx::Error| format!("cannot mark the sync floor of {}: {cause}", path.display());
+    let mut connection: SqliteConnection = SqliteConnectOptions::new()
+        .filename(path)
+        .journal_mode(SqliteJournalMode::Delete)
+        .synchronous(SqliteSynchronous::Full)
+        .connect()
+        .await
+        .map_err(fail)?;
+    let result = sqlx::query(
+        "INSERT INTO transaction_changes (seq, book_id, transaction_id)
+         SELECT coalesce(max(seq), 0) + $1, $2, 0 FROM transaction_changes",
+    )
+    .bind(SYNC_FLOOR_GAP)
+    .bind(SYNC_FLOOR_BOOK_ID)
+    .execute(&mut connection)
+    .await;
+    let closed = connection.close().await;
+    result.map_err(fail)?;
+    closed.map_err(fail)
 }
 
 /// Checks the copy at `partial`, syncs it, and gives it the name `path` when
@@ -221,6 +265,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(users, 1);
+        // The copy has a floor marker above the newest seq of the live log,
+        // and the live log has no new marker.
+        let newest = "SELECT max(seq) FROM transaction_changes";
+        let markers = "SELECT count(*) FROM transaction_changes WHERE book_id = 0";
+        let live: i64 = sqlx::query_scalar(newest)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        let floor: i64 =
+            sqlx::query_scalar("SELECT max(seq) FROM transaction_changes WHERE book_id = 0")
+                .fetch_one(&copy)
+                .await
+                .unwrap();
+        assert_eq!(floor, live + SYNC_FLOOR_GAP);
+        let copy_markers: i64 = sqlx::query_scalar(markers).fetch_one(&copy).await.unwrap();
+        let live_markers: i64 = sqlx::query_scalar(markers)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!((copy_markers, live_markers), (2, 1));
+        // The next change after a restore is above the marker.
+        sqlx::query("INSERT INTO transaction_changes (book_id, transaction_id) VALUES (1, 1)")
+            .execute(&copy)
+            .await
+            .unwrap();
+        let next: i64 = sqlx::query_scalar(newest).fetch_one(&copy).await.unwrap();
+        assert_eq!(next, floor + 1);
         copy.close().await;
 
         // A copy with a damaged page fails the check.

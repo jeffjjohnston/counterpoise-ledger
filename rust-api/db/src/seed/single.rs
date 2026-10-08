@@ -18,7 +18,7 @@ use super::{
     split,
 };
 
-const PAYEES: [&str; 23] = [
+const PAYEES: [&str; 26] = [
     "Summit Software",
     "Front Range Mortgage",
     "Xcel Energy",
@@ -42,6 +42,9 @@ const PAYEES: [&str; 23] = [
     "Spotify",
     "UCHealth",
     "Walgreens",
+    "Capital One",
+    "Main Street Bank",
+    "Transfer",
 ];
 
 const GROSS_PAY: i64 = 479_167;
@@ -588,7 +591,7 @@ async fn seed_months(
                 .transaction(
                     &format_date(day),
                     "Roth IRA Contribution",
-                    None,
+                    payee("Main Street Bank"),
                     &[split(a.roth_cash, roth), split(a.checking, -roth)],
                 )
                 .await?;
@@ -615,7 +618,7 @@ async fn seed_months(
                 .transaction(
                     &format_date(day),
                     "Transfer to Brokerage",
-                    None,
+                    payee("Main Street Bank"),
                     &[
                         split(a.brokerage_cash, BROKERAGE_TRANSFER),
                         split(a.checking, -BROKERAGE_TRANSFER),
@@ -692,7 +695,7 @@ async fn seed_months(
                 .transaction(
                     &format_date(day),
                     "Transfer to Savings",
-                    None,
+                    payee("Transfer"),
                     &[
                         split(a.savings, SAVINGS_TRANSFER),
                         split(a.checking, -SAVINGS_TRANSFER),
@@ -762,7 +765,7 @@ async fn seed_months(
                     .transaction(
                         &format_date(day),
                         "Credit Card Payment",
-                        None,
+                        payee("Capital One"),
                         &[split(a.card, statement), split(a.checking, -statement)],
                     )
                     .await?;
@@ -877,7 +880,7 @@ async fn seed_months(
                 .transaction(
                     &format_date(day),
                     "Interest Payment",
-                    None,
+                    payee("Main Street Bank"),
                     &[
                         split(a.savings, interest),
                         split(a.interest_income, -interest),
@@ -971,21 +974,21 @@ fn rules(a: &Accounts, end: &End) -> Vec<RuleSeed> {
         rule(
             "Credit Card Payment",
             monthly(22),
-            "",
+            "Capital One",
             false,
             pair(a.card, a.checking, CARD_PAYMENT_ESTIMATE),
         ),
         rule(
             "Transfer to Savings",
             monthly(16),
-            "",
+            "Transfer",
             false,
             pair(a.savings, a.checking, SAVINGS_TRANSFER),
         ),
         rule(
             "Roth IRA Contribution",
             monthly(3),
-            "",
+            "Main Street Bank",
             false,
             pair(a.roth_cash, a.checking, ROTH_CONTRIBUTION),
         ),

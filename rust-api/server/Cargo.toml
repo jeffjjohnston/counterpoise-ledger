@@ -8,6 +8,8 @@ ledger-core = { path = "../core" }
 ledger-db = { path = "../db" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
+# The S256 PKCE digest of the OAuth token endpoint (oauth/token.rs).
+base64 = "0.22"
 chrono = "0.4"
 futures-util = { version = "0.3", default-features = false }
 hex = "0.4"

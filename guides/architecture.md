@@ -208,7 +208,8 @@ counterpoise.db (SQLite)
 ├── payees                          (+ book_id FK)
 ├── plaid_tokens, plaid_accounts, plaid_transaction_reconciliation (+ book_id FK)
 ├── typesafe_evaluations, typesafe_decisions, typesafe_quotas, typesafe_aggregates (+ book_id FK)
-└── change_marks                    (live-update counts)
+├── change_marks                    (live-update counts)
+└── transaction_changes             (delta-sync log of a native client)
 ```
 
 - **Schema**: the numbered SQL files in `rust-api/db/migrations/`. The server
@@ -284,6 +285,13 @@ server, `ledger-cli`, MCP over stdio and the `sqlite3` shell. Thus the import,
 the seed and the MCP tools need no event calls. A write that rolls back also
 rolls back its count. The `books` triggers count under the book's own id, so a
 change of the projection settings also invalidates the register.
+
+A native client keeps a local copy of the transactions. It reads the
+changes from `GET /api/b/[bookId]/transactions/changes`
+(`rust-api/server/src/routes/transaction_changes.rs`). Triggers on
+`transactions`, `transaction_splits` and `investment_splits` log the ID of
+each changed transaction in `transaction_changes`, for every writer, as the
+`change_marks` triggers do. The SSE hint tells the client when to read.
 
 Rust serves `/api/b/[bookId]/events` from
 `rust-api/server/src/routes/events.rs`. At the first subscription,

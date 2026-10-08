@@ -185,48 +185,77 @@ pub struct MarketValueInput {
     pub prices: Vec<SecurityPriceRow>,
 }
 
-pub fn aggregate_market_values_by_account(input: &MarketValueInput) -> Vec<AccountMarketValue> {
-    let prices = latest_prices(&input.prices);
-    let mut ordered: Vec<(usize, &InvestmentSplitRow)> = input.splits.iter().enumerate().collect();
+/// The splits in replay order: by date, then by their place in the list.
+pub fn replay_order(splits: &[InvestmentSplitRow]) -> Vec<&InvestmentSplitRow> {
+    let mut ordered: Vec<(usize, &InvestmentSplitRow)> = splits.iter().enumerate().collect();
     ordered.sort_by(|a, b| {
         a.1.transaction_date
             .cmp(&b.1.transaction_date)
             .then(a.0.cmp(&b.0))
     });
-    let mut account_ids = Vec::new();
-    for (_, split) in &ordered {
-        if let Some(id) = split.account_id
-            && !account_ids.contains(&id)
-        {
-            account_ids.push(id);
+    ordered.into_iter().map(|(_, split)| split).collect()
+}
+
+/// Shares by (account, security), replayed one split at a time. A stock
+/// split has no account and applies to each account in the split list.
+pub struct PositionReplay {
+    account_ids: Vec<i64>,
+    positions: HashMap<(i64, i64), i64>,
+}
+
+impl PositionReplay {
+    pub fn new(splits: &[InvestmentSplitRow]) -> Self {
+        let mut account_ids = Vec::new();
+        for split in splits {
+            if let Some(id) = split.account_id
+                && !account_ids.contains(&id)
+            {
+                account_ids.push(id);
+            }
+        }
+        Self {
+            account_ids,
+            positions: HashMap::new(),
         }
     }
-    let mut positions: HashMap<(i64, i64), i64> = HashMap::new();
-    for (_, split) in ordered {
+
+    pub fn apply(&mut self, split: &InvestmentSplitRow) {
         let targets: Vec<i64> = split
             .account_id
-            .map_or_else(|| account_ids.clone(), |id| vec![id]);
+            .map_or_else(|| self.account_ids.clone(), |id| vec![id]);
         for account_id in targets {
             let key = (account_id, split.security_id);
-            let current = positions.get(&key).copied().unwrap_or(0);
+            let current = self.positions.get(&key).copied().unwrap_or(0);
             match split.action {
                 InvestmentAction::Split => {
                     if let Some(ratio) = split_ratio(split) {
-                        positions.insert(key, round_js(current as f64 * ratio));
+                        self.positions.insert(key, round_js(current as f64 * ratio));
                     }
                 }
                 InvestmentAction::Buy => {
-                    positions.insert(key, current + split.shares_micros);
+                    self.positions.insert(key, current + split.shares_micros);
                 }
                 InvestmentAction::Sell => {
-                    positions.insert(key, current - split.shares_micros);
+                    self.positions.insert(key, current - split.shares_micros);
                 }
                 _ => {}
             }
         }
     }
+
+    pub fn positions(&self) -> &HashMap<(i64, i64), i64> {
+        &self.positions
+    }
+}
+
+pub fn aggregate_market_values_by_account(input: &MarketValueInput) -> Vec<AccountMarketValue> {
+    let prices = latest_prices(&input.prices);
+    let mut replay = PositionReplay::new(&input.splits);
+    for split in replay_order(&input.splits) {
+        replay.apply(split);
+    }
     let mut totals: HashMap<i64, i64> = HashMap::new();
-    for ((account_id, security_id), shares) in positions {
+    for (&(account_id, security_id), &shares) in replay.positions() {
         if shares <= 0 {
             continue;
         }

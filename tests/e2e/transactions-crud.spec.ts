@@ -68,7 +68,7 @@ test.describe("transaction CRUD", () => {
     ).toBeVisible();
 
     // Wait for table rows to appear
-    await expect(page.locator("tbody tr").first()).toBeVisible();
+    await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").first()).toBeVisible();
 
     // Date input uses MM/DD/YYYY text format — use today's date so it appears at top
     const dateInput = page.locator("#date");
@@ -101,7 +101,7 @@ test.describe("transaction CRUD", () => {
 
     // Wait for the transaction to appear — the page refreshes data after create
     // Look for $42.50 amount which is unique in the dataset
-    await expect(page.locator("tbody tr").filter({ hasText: "$42.50" }).first()).toBeVisible({ timeout: 10000 });
+    await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: "$42.50" }).first()).toBeVisible({ timeout: 10000 });
   });
 
   test("edits an existing transaction", async ({ page, bookId }) => {
@@ -116,9 +116,9 @@ test.describe("transaction CRUD", () => {
     ).toBeVisible();
 
     // Wait for transaction list to load
-    await expect(page.locator("tbody tr").first()).toBeVisible();
+    await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").first()).toBeVisible();
 
-    await page.locator("tbody tr").filter({ hasText: payeeName }).first().click();
+    await page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: payeeName }).first().click();
 
     // The edit modal should appear
     await expect(page.getByRole("heading", { name: "Edit Transaction", level: 2 })).toBeVisible();
@@ -135,7 +135,7 @@ test.describe("transaction CRUD", () => {
     expect(saved.ok()).toBe(true);
     expect((await saved.json()).description).toBe("Updated grocery trip");
     await page.reload();
-    await page.locator("tbody tr").filter({ hasText: payeeName }).first().click();
+    await page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: payeeName }).first().click();
     await expect(page.getByLabel("Description")).toHaveValue("Updated grocery trip");
   });
 
@@ -151,15 +151,15 @@ test.describe("transaction CRUD", () => {
     ).toBeVisible();
 
     // Wait for transaction list to load
-    await expect(page.locator("tbody tr").first()).toBeVisible();
+    await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").first()).toBeVisible();
 
-    await page.locator("tbody tr").filter({ hasText: payeeName }).first().click();
+    await page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: payeeName }).first().click();
     await expect(page.getByRole("heading", { name: "Edit Transaction", level: 2 })).toBeVisible();
 
     page.on("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Delete" }).click();
 
-    await expect(page.locator("tbody tr").filter({ hasText: payeeName })).toHaveCount(0, {
+    await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: payeeName })).toHaveCount(0, {
       timeout: 10000,
     });
   });

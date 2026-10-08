@@ -40,7 +40,10 @@ test.describe("securities", () => {
     // The seeded security. seed-book.ts buys 4 shares of it, so it holds a
     // position — this spec asserts that positions table further down.
     await expect(page.getByText("Vanguard Total Stock Market")).toBeVisible();
-    await expect(page.getByText("VTI")).toBeVisible();
+    // The allocation chart above the list also labels its bar "VTI", so look in the row.
+    await expect(
+      page.getByRole("link", { name: /Vanguard Total Stock Market/ }).getByText("VTI", { exact: true })
+    ).toBeVisible();
   });
 
   test("creates a new security", async ({ page, bookId }) => {

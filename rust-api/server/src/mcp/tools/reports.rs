@@ -9,8 +9,9 @@ use serde_json::{Map, Value, json};
 use crate::{
     mcp::call::{Caller, Level, ToolResult, compact_error, integer, ok, thrown},
     routes::{
+        account_balance::{balance_before, find_book_account},
         investments::EFFECTIVE_DATE,
-        reports::{income_rows, report_splits},
+        reports::{ReportFilter, income_rows, report_splits},
     },
 };
 
@@ -108,10 +109,13 @@ pub(super) async fn report_data(
     let (splits, total) = report_splits(
         &caller.state().pool,
         book_key(book_id)?,
-        text(arguments, "startDate"),
-        text(arguments, "endDate"),
-        &account_ids,
-        &account_types,
+        &ReportFilter {
+            start_date: text(arguments, "startDate"),
+            end_date: text(arguments, "endDate"),
+            account_ids: &account_ids,
+            account_types: &account_types,
+            payee_id: None,
+        },
         Some(limit),
     )
     .await
@@ -139,7 +143,8 @@ pub(super) async fn report_data(
 }
 
 /// The running balance of one account, entry by entry, oldest first. No
-/// route gives this.
+/// route gives the entries. The `balance-history` route gives the balance at
+/// each month end, and it shares the account lookup and the starting balance.
 pub(super) async fn balance_history(
     caller: &Caller,
     arguments: &Map<String, Value>,
@@ -156,33 +161,23 @@ pub(super) async fn balance_history(
     let end = text(arguments, "endDate");
     let pool = &caller.state().pool;
 
-    let account: Option<(i32, String, String)> = match i32::try_from(account_id) {
-        Ok(key) => {
-            sqlx::query_as("SELECT id, name, type FROM accounts WHERE book_id = $1 AND id = $2")
-                .bind(book_key(book_id)?)
-                .bind(key)
-                .fetch_optional(pool)
-                .await
-                .map_err(db_error)?
-        }
+    let book_id = book_key(book_id)?;
+    let account = match i32::try_from(account_id) {
+        Ok(key) => find_book_account(pool, book_id, key)
+            .await
+            .map_err(db_error)?,
         Err(_) => None,
     };
-    let Some((id, name, account_type)) = account else {
+    let Some(account) = account else {
         // This failure is compact JSON, unlike `fail()`. Clients see the text.
         return Err(compact_error(&format!("Account {account_id} not found")).into());
     };
+    let (id, name, account_type) = (account.id, account.name, account.account_type);
 
-    let starting: i32 = match start {
-        Some(start) => sqlx::query_scalar(&format!(
-            "SELECT CAST(COALESCE(SUM(s.amount), 0) AS INTEGER) FROM transaction_splits s
-             JOIN transactions t ON s.transaction_id = t.id
-             WHERE s.account_id = $1 AND {EFFECTIVE_DATE} < $2"
-        ))
-        .bind(id)
-        .bind(start)
-        .fetch_one(pool)
-        .await
-        .map_err(db_error)?,
+    let starting = match start {
+        Some(start) => balance_before(pool, book_id, id, start)
+            .await
+            .map_err(db_error)?,
         None => 0,
     };
 
@@ -211,7 +206,7 @@ pub(super) async fn balance_history(
     }
     let rows = query.bind(limit).fetch_all(pool).await.map_err(db_error)?;
 
-    let mut running = i64::from(starting);
+    let mut running = starting;
     let entries: Vec<Value> = rows
         .into_iter()
         .map(|(date, description, amount, transaction_id)| {

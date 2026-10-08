@@ -7,7 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// The hash of the household rows at 2025-12-31, before the dates became
 /// relative. Tasks that only move code must not change it.
-const HOUSEHOLD_2025_12_31: &str = "001d9ba8b9cf1331";
+const HOUSEHOLD_2025_12_31: &str = "27b9e8b5f1a61256";
 
 #[test]
 fn mulberry32_matches_javascript() {
@@ -54,11 +54,12 @@ async fn database_with_books(count: i32) -> TempDatabase {
 /// FNV-1a over every row of the book, table by table in name order and
 /// row by row in `id` order. A table without `id` is in the order of all its
 /// columns. Columns that end in `_at` are timestamps
-/// and are left out.
+/// and are left out. `transaction_changes` is a log that the triggers write,
+/// not seed data, so it is left out too.
 async fn dump_hash(pool: &DbPool, book_id: i32) -> String {
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT m.name FROM sqlite_master m
-         WHERE m.type = 'table'
+         WHERE m.type = 'table' AND m.name <> 'transaction_changes'
            AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = 'book_id')
          ORDER BY m.name",
     )
@@ -145,7 +146,7 @@ async fn the_household_rows_at_2025_12_31_do_not_change() {
 }
 
 /// The hash of the household rows at 2026-09-15.
-const HOUSEHOLD_2026_09_15: &str = "7190cb63593238e6";
+const HOUSEHOLD_2026_09_15: &str = "5fc6252dedc279ca";
 
 #[tokio::test]
 async fn the_household_rows_at_2026_09_15_do_not_change() {
@@ -344,7 +345,7 @@ async fn the_household_keeps_the_invariants_on_every_today() {
 }
 
 /// The hash of the single dataset at 2026-09-15.
-const SINGLE_2026_09_15: &str = "d9178d7fa9a7b183";
+const SINGLE_2026_09_15: &str = "e700c95679005b31";
 
 #[tokio::test]
 async fn the_single_rows_at_2026_09_15_do_not_change() {

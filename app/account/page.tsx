@@ -5,6 +5,7 @@ import { Link } from "@/lib/navigation";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { ApiKeyManager } from "@/components/account/ApiKeyManager";
+import { ConnectedApps } from "@/components/account/ConnectedApps";
 import { apiGet, apiPut, toMessage } from "@/lib/api-client";
 
 type User = {
@@ -145,6 +146,17 @@ export default function AccountPage() {
           </p>
           <div className="mt-4">
             <ApiKeyManager />
+          </div>
+        </div>
+
+        <div className="bg-surface rounded-lg border border-border shadow-soft p-6 sm:p-8 mt-6">
+          <h2 className="text-xl font-bold text-fg">Connected Apps</h2>
+          <p className="text-sm text-fg-tertiary mt-1">
+            Apps that you connected with a sign-in, such as a Claude custom connector. Disconnect an
+            app to stop its access at once.
+          </p>
+          <div className="mt-4">
+            <ConnectedApps />
           </div>
         </div>
       </div>

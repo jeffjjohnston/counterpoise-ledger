@@ -15,6 +15,11 @@ export function PostHogProvider({ children }: { children: React.ReactNode }) {
       api_host: process.env.NEXT_PUBLIC_POSTHOG_HOST,
       defaults: "2025-11-30",
       capture_pageview: false,
+      // Autocapture sends the text of a clicked element. A payee link, an
+      // account row and a position row carry names and balances, which must
+      // not leave the instance (guides/posthog-analytics.md). The app
+      // captures its own events, so autocapture adds nothing it needs.
+      autocapture: false,
     });
 
     const identifyReturningUser = async () => {

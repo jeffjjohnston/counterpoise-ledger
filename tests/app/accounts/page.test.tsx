@@ -282,6 +282,159 @@ describe("AccountsPage", () => {
     expect(within(checkingRow!).queryByText("🏦")).not.toBeInTheDocument();
   });
 
+  describe("account search", () => {
+    const searchPayload = [
+      ...accountsPayload,
+      {
+        id: 4,
+        name: "Auto",
+        type: "expense",
+        subtype: null,
+        parentId: null,
+        isInvestmentCash: false,
+        icon: null,
+        isActive: true,
+        balance: 0,
+      },
+      {
+        id: 5,
+        name: "Auto:Fuel",
+        type: "expense",
+        subtype: null,
+        parentId: 4,
+        isInvestmentCash: false,
+        icon: null,
+        isActive: true,
+        balance: 4000,
+      },
+      {
+        id: 6,
+        name: "Auto:Insurance",
+        type: "expense",
+        subtype: null,
+        parentId: 4,
+        isInvestmentCash: false,
+        icon: null,
+        isActive: true,
+        balance: 9000,
+      },
+      // A child name does not always contain the parent name: the API
+      // accepts it, and a rename of the parent changes only that row.
+      {
+        id: 7,
+        name: "Car",
+        type: "expense",
+        subtype: null,
+        parentId: null,
+        isInvestmentCash: false,
+        icon: null,
+        isActive: true,
+        balance: 0,
+      },
+      {
+        id: 8,
+        name: "Tolls",
+        type: "expense",
+        subtype: null,
+        parentId: 7,
+        isInvestmentCash: false,
+        icon: null,
+        isActive: true,
+        balance: 1500,
+      },
+    ];
+
+    const renderWithAccounts = async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url.startsWith("/api/b/1/accounts")) {
+            return { ok: true, json: async () => searchPayload } as Response;
+          }
+          if (url.startsWith("/api/b/1/investments/account-values")) {
+            return {
+              ok: true,
+              json: async () => [{ accountId: 1, marketValueCents: 50000 }],
+            } as Response;
+          }
+          throw new Error(`Unexpected fetch url: ${url}`);
+        })
+      );
+      render(<AccountsPage />);
+      await screen.findByText("Checking");
+      return screen.getByLabelText("Search accounts");
+    };
+
+    it("filters the accounts by name, ignoring case", async () => {
+      const searchInput = await renderWithAccounts();
+
+      fireEvent.change(searchInput, { target: { value: "cHECK" } });
+
+      expect(screen.getByText("Checking")).toBeInTheDocument();
+      expect(screen.queryByText("Fidelity 401(k)")).not.toBeInTheDocument();
+      expect(screen.queryByText("Fuel")).not.toBeInTheDocument();
+    });
+
+    it("keeps the parent of a matching sub-account", async () => {
+      const searchInput = await renderWithAccounts();
+
+      fireEvent.change(searchInput, { target: { value: "fuel" } });
+
+      // The parent stays, so the match keeps its place in the tree.
+      expect(screen.getByText("Auto")).toBeInTheDocument();
+      expect(screen.getByText("Fuel")).toBeInTheDocument();
+      expect(screen.queryByText("Insurance")).not.toBeInTheDocument();
+      expect(screen.queryByText("Checking")).not.toBeInTheDocument();
+    });
+
+    it("keeps the sub-accounts of a matching parent", async () => {
+      const searchInput = await renderWithAccounts();
+
+      fireEvent.change(searchInput, { target: { value: "car" } });
+
+      expect(screen.getByText("Tolls")).toBeInTheDocument();
+      // Without its sub-account, the parent looks empty and offers Delete.
+      const carRow = screen
+        .getByText("Car")
+        .closest<HTMLElement>('[data-testid="account-row"]');
+      expect(carRow).not.toBeNull();
+      expect(
+        within(carRow!).queryByRole("button", { name: "Delete" })
+      ).not.toBeInTheDocument();
+    });
+
+    it("keeps the cash balance of a matching investment account", async () => {
+      const searchInput = await renderWithAccounts();
+
+      fireEvent.change(searchInput, { target: { value: "401" } });
+
+      expect(screen.getByText("Fidelity 401(k)")).toBeInTheDocument();
+      expect(screen.getByText("Cash $10.00")).toBeInTheDocument();
+      expect(screen.getByText("$510.00")).toBeInTheDocument();
+    });
+
+    it("shows a match in a collapsed subtype group", async () => {
+      const searchInput = await renderWithAccounts();
+
+      fireEvent.click(screen.getByRole("button", { name: /Bank Account/ }));
+      expect(screen.queryByText("Checking")).not.toBeInTheDocument();
+
+      fireEvent.change(searchInput, { target: { value: "checking" } });
+
+      expect(screen.getByText("Checking")).toBeInTheDocument();
+    });
+
+    it("tells the user when no account matches", async () => {
+      const searchInput = await renderWithAccounts();
+
+      fireEvent.change(searchInput, { target: { value: "mortgage" } });
+
+      expect(screen.getByText("No accounts match your search.")).toBeInTheDocument();
+      expect(screen.queryByText("No accounts yet")).not.toBeInTheDocument();
+    });
+  });
+
   it("shows an error when the accounts fetch fails", async () => {
     // The bug this guards: fetchAccounts called setLoading(false) only on the
     // success path, so a rejected fetch left the page on its skeleton forever.

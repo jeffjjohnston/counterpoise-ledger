@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useBookId } from "@/hooks/useBookId";
 import { Button } from "@/components/ui/Button";
+import { RealizedGainsChart } from "@/components/reports/RealizedGainsChart";
 import { DateInput } from "@/components/ui/DateInput";
 import { Select } from "@/components/ui/Select";
 import { flattenAccounts } from "@/lib/wasm-client";
@@ -184,7 +185,7 @@ export default function RealizedGainsPage() {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
       <div className="flex items-end justify-between gap-4 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-fg">Realized Gains</h1>
@@ -192,8 +193,9 @@ export default function RealizedGainsPage() {
             One row per lot disposed of, matching how a 1099-B reports sales.
           </p>
         </div>
-        <div className="flex items-end gap-3">
-          <div className="min-w-[12rem]">
+        {/* On a phone, two columns: the account, then the dates, then the export. */}
+        <div className="grid grid-cols-2 items-end gap-3 w-full sm:flex sm:w-auto">
+          <div className="col-span-2 sm:min-w-[12rem]">
             <Select
               id="realized-gains-account"
               label="Account"
@@ -217,7 +219,7 @@ export default function RealizedGainsPage() {
             value={range.endDate}
             onChange={(endDate) => setRange((r) => ({ ...r, endDate }))}
           />
-          <Button onClick={exportCsv} variant="secondary" disabled={!result?.rows.length}>
+          <Button onClick={exportCsv} variant="secondary" disabled={!result?.rows.length} className="col-span-2">
             Export CSV
           </Button>
         </div>
@@ -255,6 +257,9 @@ export default function RealizedGainsPage() {
           Their proceeds are shown but excluded from the totals above.
         </div>
       )}
+
+      {/* While a new request loads, result holds the rows of the old filters. The table shows "Loading" then. */}
+      {result && !loading && <RealizedGainsChart rows={result.rows} range={range} />}
 
       <section className="bg-surface rounded-lg border border-border shadow-soft overflow-hidden">
         <div className="overflow-x-auto">

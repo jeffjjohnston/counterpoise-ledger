@@ -35,6 +35,7 @@ export const routes: RouteObject[] = [
       { path: "login", ...page(() => import("@/app/login/page")) },
       { path: "register", ...page(() => import("@/app/register/page")) },
       { path: "account", ...page(() => import("@/app/account/page")) },
+      { path: "oauth/consent", ...page(() => import("@/app/oauth/consent/page")) },
       {
         path: "b/:bookId",
         ...page(() => import("@/app/b/[bookId]/layout")),

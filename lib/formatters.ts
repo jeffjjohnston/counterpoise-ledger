@@ -14,6 +14,68 @@ export function formatCurrency(cents: number): string {
 }
 
 /**
+ * A short money label for a chart axis: "$999", "$1.2k", "$12k", "$1.2M".
+ * A negative value uses the U+2212 minus sign, as formatCurrency does.
+ * Tooltips use formatCurrency. `decimals` sets the maximum decimals of the
+ * number: of the dollars below $1,000 ("$0.5"), else of the k and M forms.
+ */
+export function formatCurrencyCompact(cents: number, decimals?: number): string {
+  if (decimals === undefined) {
+    const dollars = Math.round(Math.abs(cents) / 100);
+    const sign = cents < 0 && dollars > 0 ? "−" : "";
+    if (dollars < 1000) return `${sign}$${dollars}`;
+    if (dollars < 999_500) return `${sign}$${shortNumber(dollars / 1000)}k`;
+    return `${sign}$${shortNumber(dollars / 1_000_000)}M`;
+  }
+  const dollars = Math.abs(cents) / 100;
+  const unit = compactUnit(dollars, decimals);
+  const number = shortNumber(dollars / unit.size, decimals);
+  const sign = cents < 0 && number !== "0" ? "−" : "";
+  return `${sign}$${number}${unit.suffix}`;
+}
+
+const COMPACT_UNITS = [
+  { size: 1, suffix: "" },
+  { size: 1000, suffix: "k" },
+  { size: 1_000_000, suffix: "M" },
+];
+
+function roundTo(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+}
+
+/** The smallest unit in which the rounded number stays below 1000, so that no label is "$1000k". */
+function compactUnit(dollars: number, decimals: number) {
+  return COMPACT_UNITS.find((unit) => roundTo(dollars / unit.size, decimals) < 1000)
+    ?? COMPACT_UNITS[COMPACT_UNITS.length - 1];
+}
+
+/**
+ * The decimals that formatCurrencyCompact needs to show `cents` exactly
+ * when the values are whole multiples of `stepCents`. Then two values one
+ * step apart always have different labels.
+ */
+export function compactDecimals(cents: number, stepCents: number): number {
+  const dollars = Math.abs(cents) / 100;
+  // The decimals of one step in a unit: 0.05 needs 2. The tolerance stops a
+  // floating point error from adding a decimal.
+  const decimalsIn = (size: number) => Math.max(0, Math.ceil(-Math.log10(stepCents / 100 / size) - 1e-9));
+  const unit = COMPACT_UNITS.find((item) => roundTo(dollars / item.size, decimalsIn(item.size)) < 1000)
+    ?? COMPACT_UNITS[COMPACT_UNITS.length - 1];
+  return decimalsIn(unit.size);
+}
+
+/**
+ * Without `decimals`: one decimal below 10, else a whole number.
+ * With `decimals`: that many decimals at most. A trailing zero is dropped.
+ */
+function shortNumber(value: number, decimals?: number): string {
+  if (decimals !== undefined) return String(roundTo(value, decimals));
+  return value < 10 ? String(Math.round(value * 10) / 10) : String(Math.round(value));
+}
+
+/**
  * Returns true only for a strictly well-formed `YYYY-MM-DD` calendar date that
  * is safe to pass to formatDate/formatDateShort (which throw a RangeError on an
  * invalid Date). Use this to guard untrusted input such as URL query params

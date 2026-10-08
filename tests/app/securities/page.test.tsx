@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import SecuritiesPage from "@/app/b/[bookId]/securities/page";
+import { stubResizeObserver } from "@/tests/helpers/resize-observer";
 
 vi.mock("@/lib/navigation", async () =>
   (await import("@/tests/helpers/navigation")).mockNavigation({
@@ -128,6 +129,24 @@ describe("SecuritiesPage", () => {
       "href",
       "/b/1/securities/2"
     );
+  });
+
+  it("draws the market value of each priced security, and follows the search", async () => {
+    stubResizeObserver(600);
+    await renderLoadedPage();
+
+    // ACME has no price, so it has no bar.
+    expect(
+      screen.getByRole("img", {
+        name: "Market value by security, largest VMFXX at $2,500.00 (89.3%), all $2,800.00",
+      })
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Search securities"), {
+      target: { value: "vanguard total" },
+    });
+    // One security is left. One bar has no allocation to show.
+    expect(screen.queryByRole("button", { name: "Hide chart" })).not.toBeInTheDocument();
   });
 
   it("filters securities by name across active and inactive lists", async () => {

@@ -24,6 +24,19 @@ This was not always true: before v1.39.6 the full query string was sent, so an
 instance that had analytics enabled before then may hold real search text in
 its captured URLs.
 
+**Autocapture is off.** posthog-js turns it on by default, and the
+`defaults: "2025-11-30"` preset does not change that. Autocapture sends the
+text of each clicked element as `$el_text`, so a click on a payee link, an
+account row or a position row would send the name and the balance, and the
+redaction above would have a second channel around it. `app/posthog-provider.tsx`
+passes `autocapture: false`, and `tests/app/posthog-provider.test.tsx` keeps
+it so. The one-time API key panel in `components/account/ApiKeyManager.tsx`
+carries `ph-no-capture` as well: posthog-js leaves such an element out of
+dead-click and copy capture, and masks it in session replay, so the key does
+not reach PostHog even if an operator turns those on in the project. Until
+this change, an instance with analytics enabled may hold payee and account
+names in its `$autocapture` events.
+
 ## Environment Variables
 
 | Variable | Context | Purpose |

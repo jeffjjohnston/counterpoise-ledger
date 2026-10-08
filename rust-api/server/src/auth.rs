@@ -155,9 +155,27 @@ async fn resolve_api_key(
     Ok(None)
 }
 
+/// The user of a request: the session cookie, else a bearer API key. An
+/// OAuth access token counts only during a request of an MCP tool that
+/// `/api/mcp` runs (see [`principal_with`]).
 pub(crate) async fn principal(
     state: &AppState,
     headers: &HeaderMap,
+) -> Result<Option<i32>, sqlx::Error> {
+    principal_with(state, headers, crate::mcp::in_oauth_tool_call()).await
+}
+
+/// [`principal`], with the choice whether an OAuth access token counts.
+///
+/// An access token's audience is the MCP endpoint (RFC 8707). Thus only
+/// `/api/mcp` and the route requests of the tools that it runs accept one:
+/// the same token sent to `/api/books` gets 401. The tool requests go
+/// through the router in the same process, so they are part of the MCP
+/// request, not a second use of the token.
+pub(crate) async fn principal_with(
+    state: &AppState,
+    headers: &HeaderMap,
+    accept_oauth: bool,
 ) -> Result<Option<i32>, sqlx::Error> {
     if let Some(token) = cookie_token(headers) {
         let digest = token_hash(&token);
@@ -194,6 +212,20 @@ pub(crate) async fn principal(
         .is_some()
     {
         return Ok(None);
+    }
+    if key.starts_with(crate::oauth::ACCESS_TOKEN_PREFIX) {
+        let user_id = if accept_oauth {
+            crate::oauth::access_token_user(state, key).await?
+        } else {
+            None
+        };
+        match user_id {
+            Some(_) => state.rate_limits.clear_ip(Scope::ApiKey, &keys),
+            None => state
+                .rate_limits
+                .failure(Scope::ApiKey, &keys, Instant::now()),
+        }
+        return Ok(user_id);
     }
     if !valid_key_shape(key) {
         state

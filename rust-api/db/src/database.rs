@@ -160,6 +160,28 @@ mod tests {
 
     /// Every pooled connection gets the pragmas and the SQL functions, not
     /// only the first one.
+    /// The migration starts the transaction change log with a floor marker
+    /// (book 0) at the current time in microseconds. A restore of a snapshot
+    /// from before the migration runs it again with a larger time.
+    #[tokio::test]
+    async fn the_change_log_starts_at_a_floor_of_the_current_time() {
+        let before = chrono::Utc::now().timestamp() * 1_000_000;
+        let database = TempDatabase::new(1).await;
+        let after = chrono::Utc::now().timestamp() * 1_000_000;
+        let rows: Vec<(i64, i64, i64)> =
+            sqlx::query_as("SELECT seq, book_id, transaction_id FROM transaction_changes")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (seq, book_id, transaction_id) = rows[0];
+        assert_eq!((book_id, transaction_id), (0, 0));
+        assert!(
+            (before..=after).contains(&seq),
+            "{seq} not in {before}..={after}"
+        );
+    }
+
     #[tokio::test]
     async fn every_pooled_connection_has_the_pragmas_and_the_functions() {
         let database = TempDatabase::new(4).await;

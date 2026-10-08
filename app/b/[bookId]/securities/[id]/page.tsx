@@ -7,6 +7,7 @@ import { Modal } from "@/components/ui/Modal";
 import { Tabs } from "@/components/ui/Tabs";
 import { SecurityForm } from "@/components/securities/SecurityForm";
 import { StockSplitEditForm } from "@/components/securities/StockSplitEditForm";
+import { PriceHistoryChart } from "@/components/securities/PriceHistoryChart";
 import { PriceHistoryEditForm } from "@/components/securities/PriceHistoryEditForm";
 import { SecurityLotsTable, type OpenLot } from "@/components/securities/SecurityLotsTable";
 import { formatCurrency, formatDate } from "@/lib/wasm-client";
@@ -124,6 +125,8 @@ export default function SecurityDetailPage() {
   const [totalSplitsCount, setTotalSplitsCount] = useState(0);
   const [priceHistory, setPriceHistory] = useState<SecurityPriceHistoryRow[]>([]);
   const [totalPriceCount, setTotalPriceCount] = useState(0);
+  // The chart fetches its own prices. A new key makes it fetch again.
+  const [chartRefreshKey, setChartRefreshKey] = useState(0);
   const [lots, setLots] = useState<OpenLot[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingMorePrices, setLoadingMorePrices] = useState(false);
@@ -420,6 +423,7 @@ export default function SecurityDetailPage() {
     );
 
     setEditingPrice(null);
+    setChartRefreshKey((key) => key + 1);
     await Promise.all([fetchSecurityDetail(), fetchPriceHistory(0, false)]);
   };
 
@@ -436,6 +440,7 @@ export default function SecurityDetailPage() {
     );
 
     setEditingPrice(null);
+    setChartRefreshKey((key) => key + 1);
     await Promise.all([fetchSecurityDetail(), fetchPriceHistory(0, false)]);
   };
 
@@ -517,6 +522,10 @@ export default function SecurityDetailPage() {
           <p className="text-xs text-fg-tertiary">Across all accounts</p>
         </div>
       </div>
+
+      {!security.fixedPriceMicros && (
+        <PriceHistoryChart bookId={bookId} securityId={securityId} refreshKey={chartRefreshKey} />
+      )}
 
       <section className="bg-surface rounded-lg border border-border shadow-soft overflow-hidden">
         <div className="px-6 py-4 border-b border-border">

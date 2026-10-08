@@ -27,6 +27,13 @@ pub fn status_dir() -> PathBuf {
     PathBuf::from(std::env::var("STATUS_DIR").unwrap_or_else(|_| "/backups/status".to_owned()))
 }
 
+/// The directory of the records, when this install has one: `STATUS_DIR`,
+/// else `/backups/status` when `/backups` exists. A development checkout or a
+/// CI runner has neither. A manual run there records nothing.
+pub fn configured_status_dir() -> Option<PathBuf> {
+    (std::env::var_os("STATUS_DIR").is_some() || Path::new("/backups").is_dir()).then(status_dir)
+}
+
 /// The text of the record file.
 pub fn record_text(job: &str, status: &Status<'_>, at: DateTime<Utc>) -> String {
     let now = at.format("%Y-%m-%dT%H:%M:%SZ").to_string();

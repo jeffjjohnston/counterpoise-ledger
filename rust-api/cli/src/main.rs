@@ -149,15 +149,12 @@ fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
 /// into the scheduler's own directory (no `--dir`, or a `--dir` that is that
 /// directory). A copy in any other directory, such as a snapshot for a
 /// development copy, must not replace the record of the scheduled backup.
-/// The status directory is
-/// `STATUS_DIR`, else `/backups/status` when `/backups` exists. With neither,
-/// this does nothing: a development checkout has no status directory. A
-/// failure to write is not an error of the backup.
+/// Without a status directory (`job_status::configured_status_dir`), this
+/// does nothing. A failure to write is not an error of the backup.
 fn record_backup(snapshot: &Result<ledger_db::backup::Snapshot, String>) {
-    if env::var_os("STATUS_DIR").is_none() && !std::path::Path::new("/backups").is_dir() {
-        return;
+    if let Some(dir) = ledger_db::job_status::configured_status_dir() {
+        record_backup_in(&dir, snapshot);
     }
-    record_backup_in(&ledger_db::job_status::status_dir(), snapshot);
 }
 
 fn record_backup_in(dir: &std::path::Path, snapshot: &Result<ledger_db::backup::Snapshot, String>) {

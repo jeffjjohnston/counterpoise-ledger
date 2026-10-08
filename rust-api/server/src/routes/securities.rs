@@ -370,9 +370,7 @@ pub(crate) async fn get_security(
 }
 
 /// The ID of another security in the book that has this symbol, compared
-/// without case. `updateSecurity()` refuses such a symbol with a
-/// `SecurityDuplicateError` that names this ID. The route answers with its
-/// 500 message; the MCP tool writes the library's message.
+/// without case. The route answers with a 409 that names this ID.
 pub(crate) async fn clashing_symbol(
     pool: &DbPool,
     book_id: i32,
@@ -409,13 +407,15 @@ pub(crate) async fn update_security(
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
     find_security(&state.pool, book.book_id, security_id, FAILURE).await?;
     if let Some(symbol) = &input.symbol {
-        // The route does not map the duplicate error of updateSecurity(), so
-        // a clash is its 500 message.
+        // A clash is a 409, as on create.
         let clash = clashing_symbol(&state.pool, book.book_id, security_id, symbol)
             .await
             .map_err(|cause| internal_error(cause, FAILURE))?;
-        if clash.is_some() {
-            return Err(error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE));
+        if let Some(existing) = clash {
+            return Err(error_owned(
+                StatusCode::CONFLICT,
+                format!("A security with symbol \"{symbol}\" already exists (id {existing})"),
+            ));
         }
     }
     let mut update = QueryBuilder::<Db>::new("UPDATE securities SET ");

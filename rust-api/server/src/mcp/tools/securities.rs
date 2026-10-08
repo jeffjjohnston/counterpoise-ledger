@@ -11,8 +11,7 @@ use crate::{
     mcp::call::{
         Caller, Level, ToolResult, fail, integer, js_double, ok, outcome, thrown, without,
     },
-    routes::{investments::EFFECTIVE_DATE, securities::clashing_symbol},
-    validation::is_js_whitespace,
+    routes::investments::EFFECTIVE_DATE,
 };
 
 const MICROS: f64 = 1_000_000.0;
@@ -53,9 +52,8 @@ pub(super) async fn list(
         .await?))
 }
 
-/// The route answers a symbol that another security in the book has with
-/// its 500 message. The tool gives the text of `SecurityDuplicateError` as a
-/// thrown error.
+/// The route answers a symbol that another security in the book has with a
+/// 409. The tool gives the text of the 409 body as a thrown error.
 pub(super) async fn update(
     caller: &Caller,
     arguments: &Map<String, Value>,
@@ -73,20 +71,10 @@ pub(super) async fn update(
     if status == StatusCode::NOT_FOUND {
         return Err(not_found(security_id));
     }
-    if status == StatusCode::INTERNAL_SERVER_ERROR
-        && let Some(symbol) = arguments.get("symbol").and_then(Value::as_str)
-        && let (Ok(book), Ok(security)) = (i32::try_from(book_id), i32::try_from(security_id))
+    if status == StatusCode::CONFLICT
+        && let Some(message) = body.get("error").and_then(Value::as_str)
     {
-        let symbol = symbol.trim_matches(is_js_whitespace);
-        if let Some(existing) = clashing_symbol(&caller.state().pool, book, security, symbol)
-            .await
-            .map_err(db_error)?
-        {
-            return Err(thrown(&format!(
-                "A security with symbol \"{symbol}\" already exists (id {existing})"
-            ))
-            .into());
-        }
+        return Err(thrown(message).into());
     }
     Ok(ok(&outcome(status, body)?))
 }

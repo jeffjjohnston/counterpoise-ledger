@@ -83,6 +83,17 @@
 
   --shadow-color: rgba(0, 0, 0, 0.05);
   --shadow-md: 0 2px 8px -2px rgba(0, 0, 0, 0.08), 0 1px 2px -1px rgba(0, 0, 0, 0.04);
+
+  /* Chart series colors. Each has 3:1 contrast or more on --bg-primary.
+     --chart-8 is for "Other". tests/lib/chart-palette.test.ts checks them. */
+  --chart-1: #2563eb;
+  --chart-2: #d97706;
+  --chart-3: #059669;
+  --chart-4: #db2777;
+  --chart-5: #7c3aed;
+  --chart-6: #0891b2;
+  --chart-7: #dc2626;
+  --chart-8: #71717a;
 }
 
 /* ── Dark mode ── */
@@ -123,6 +134,15 @@
 
   --shadow-color: rgba(0, 0, 0, 0.4);
   --shadow-md: 0 2px 8px -2px rgba(0, 0, 0, 0.3), 0 1px 2px -1px rgba(0, 0, 0, 0.2);
+
+  --chart-1: #60a5fa;
+  --chart-2: #fbbf24;
+  --chart-3: #34d399;
+  --chart-4: #f472b6;
+  --chart-5: #a78bfa;
+  --chart-6: #22d3ee;
+  --chart-7: #f87171;
+  --chart-8: #a1a1aa;
 }
 
 body {

@@ -11,8 +11,10 @@ Streamable HTTP at `/api/mcp`. The browser gets a subset through WebMCP; see
 
 ## Authentication
 
-Every tool requires a valid API key. Over stdio the key is
-`COUNTERPOISE_API_KEY`; over HTTP it is the `Authorization: Bearer` header.
+Every tool requires a credential. Over stdio it is an API key in
+`COUNTERPOISE_API_KEY`. Over HTTP it is the `Authorization: Bearer` header:
+an API key, or an OAuth access token when OAuth is on (see
+[OAuth for custom connectors](#oauth-for-custom-connectors)).
 
 1. A user creates an API key in the UI at `/account` (ApiKeyManager component).
 2. The key is `cpk_` + 48 hex chars; only the scrypt hash is stored in the
@@ -22,6 +24,111 @@ Every tool requires a valid API key. Over stdio the key is
    through `principal()` in `auth.rs`), so a revoked key stops working at the
    next call, without a restart. A tool then sends its route requests with the
    same key, so each route checks it too.
+
+## OAuth for custom connectors
+
+claude.ai, Claude Desktop, Claude mobile and Claude Code can connect to
+`/api/mcp` as a custom connector. These clients use the MCP authorization
+flow (OAuth 2.1, specification revision 2026-07-28), not a pasted key. The
+code is in `rust-api/server/src/oauth/`; the server is both the
+authorization server and the resource server.
+
+**Turn it on** with `COUNTERPOISE_PUBLIC_URL`, the public origin of the
+server, such as `https://books.example.com`. The issuer, the endpoint URLs
+and the token audience come from it. The server does not guess its own URL,
+because behind a proxy that terminates TLS it cannot know the scheme. An
+`http` value is accepted only for a loopback host, for tests. A value that is
+not an origin stops the server at start. Without the variable, the OAuth
+routes answer 404 and the 401 of `/api/mcp` is a plain `Bearer` challenge.
+
+**Reachability:** the hosted Claude apps call the server from Anthropic's
+cloud (`160.79.104.0/21`), not from the user's computer. The server must be
+on public HTTPS. An install that only the LAN or a VPN reaches cannot use a
+claude.ai connector; Claude Code, which runs on the user's computer, can.
+
+**Connect:** in Claude, add a custom connector with the URL
+`https://<host>/api/mcp`. Claude finds the endpoints, registers itself,
+and opens the consent page. The user signs in if necessary, approves, and is
+back in Claude. Claude Code: `claude mcp add --transport http counterpoise
+https://<host>/api/mcp`, then `/mcp` to sign in.
+
+**The flow:**
+
+1. `/api/mcp` without a valid credential answers 401 with
+   `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/api/mcp", scope="mcp"`
+   (and `error="invalid_token"` when the request sent a value).
+2. Discovery: the protected resource metadata (RFC 9728) at
+   `/.well-known/oauth-protected-resource/api/mcp` and at
+   `/.well-known/oauth-protected-resource`, and the authorization server
+   metadata (RFC 8414) at `/.well-known/oauth-authorization-server`. Both
+   allow any origin to read them.
+3. Client identity. All clients are public (`token_endpoint_auth_method`
+   `none`); PKCE protects their codes.
+   - **Client ID Metadata Document** (`oauth/cimd.rs`): a `client_id` that
+     is an HTTPS URL. The server reads the JSON document at that URL; its
+     `client_id` must be the URL, and it gives the name and redirect URIs.
+     The fetch refuses a host with an address that is not public, connects
+     only to the addresses it checked, follows no redirect, and stops after
+     5 seconds or 64 KiB. A document is kept for one hour, and a copy of up
+     to one day is used when a new read fails.
+   - **Dynamic Client Registration** (RFC 7591, `POST /api/oauth/register`).
+     The specification marks it deprecated, but clients still use it. Each
+     registration counts against a per-address limit, and a client with no
+     grant after one day is deleted.
+4. `GET /api/oauth/authorize` sends the browser to the consent page
+   `/oauth/consent` with the same query, through `/login?next=...` when the
+   browser has no session. The login page goes on only to `/oauth/consent`.
+5. The consent page sends the query to `GET /api/oauth/consent`, which
+   checks the request and gives what the page shows: the client name, who
+   publishes it (a metadata document) or that it registered itself, the
+   host of the redirect URI, and a warning when every redirect URI is on a
+   loopback host. `POST /api/oauth/consent` with `{ query, approve }` checks
+   it again, and gives `redirectTo`. Until the client and the redirect URI
+   are known good, no error goes to the redirect URI.
+6. The page sends the browser to `redirectTo` in JavaScript. A form cannot:
+   the CSP has `form-action 'self'`, which also applies to the redirect after
+   a form post. A request that fails after the client and the redirect URI
+   are known (no PKCE, a wrong `response_type`) gets `returnTo` and
+   `returnHost` instead of `redirectTo`. The page shows the error and a
+   "Return to <host>" button, and goes there only when the user clicks.
+   Every client registers itself, so a validated redirect URI proves nothing
+   about its destination; an automatic error redirect would make the server
+   an open redirector from a trusted link (RFC 9700 section 4.11.2).
+7. `POST /api/oauth/token` (form-encoded) exchanges the code: S256 PKCE, the
+   same client and redirect URI, at most 5 minutes old, one use. It gives an
+   access token (`cpo_`, 1 hour) and a refresh token (`cpr_`, 30 days).
+
+**Rules:**
+
+- **Audience:** an access token is good only for `/api/mcp` and the route
+  requests of the tools that it runs. `principal_with()` in `auth.rs`
+  accepts one only when its caller says so: the `/api/mcp` gate, and a
+  route request inside a tool of `/api/mcp` (the `TOOL_CALL` task-local in
+  `mcp/call.rs` is `true`). The same token on `/api/books` gets 401. The
+  stdio server refuses a token in `COUNTERPOISE_API_KEY`. Each grant records
+  the canonical resource, so a change of `COUNTERPOISE_PUBLIC_URL` stops the
+  old tokens. A `resource` parameter that names another server gets
+  `invalid_target`.
+- **Rotation:** each refresh gives a new refresh token. A used refresh token
+  sent again within 60 seconds gets `invalid_grant` only, so a retry after a
+  timeout does not disconnect the client. Later, a second use revokes the
+  grant. A second use of a code revokes its grant too.
+- **Storage:** codes and tokens are stored as SHA-256 digests only
+  ([schema](schema.md)).
+- **Consent and grants accept the cookie only** (`cookie_session`): a key or
+  a token cannot approve a client or revoke one.
+- **Revocation:** the account page lists the grants that have a token
+  ("Connected Apps", `GET /api/oauth/grants`); Disconnect deletes the grant
+  (`DELETE /api/oauth/grants/{id}`), and the next call gets 401.
+  `POST /api/oauth/revoke` (RFC 7009) revokes a grant by its refresh token,
+  or one access token.
+- **One scope:** `mcp`. A grant gives the user's MCP access, as a key does,
+  and the book roles still apply to each tool. A request for other scopes
+  (Claude registers `claudeai`) is accepted, and the token response gives
+  `mcp`.
+
+`tests/http/mcp-oauth.test.ts` covers the flow, including a connection by
+the MCP TypeScript SDK's own OAuth client.
 
 ## Access Levels
 
@@ -111,11 +218,15 @@ claude mcp add --transport http counterpoise https://<host>/api/mcp \
   --header "Authorization: Bearer cpk_..."
 ```
 
+With `COUNTERPOISE_PUBLIC_URL` set, leave out the header and sign in with
+OAuth instead; see [OAuth for custom connectors](#oauth-for-custom-connectors).
+
 ## Environment Variables
 
 | Variable | Purpose |
 | -------- | ------- |
 | `COUNTERPOISE_API_KEY` | User API key, for the stdio transport |
+| `COUNTERPOISE_PUBLIC_URL` | The public `https` origin of the server. It turns on OAuth for `/api/mcp` |
 | `DATABASE_PATH` | The SQLite database file. Default `data/counterpoise.db`; the image sets `/data/counterpoise.db` |
 | `TZ` | The app time zone for calendar dates; the system zone when unset |
 
@@ -124,11 +235,11 @@ claude mcp add --transport http counterpoise https://<host>/api/mcp \
 `IMPLEMENTED` in `rust-api/server/src/mcp/tools/mod.rs` lists the tools, and a
 unit test fails when it differs from the manifest.
 
-- **HTTP auth:** only `Authorization: Bearer cpk_...`. The endpoint removes the
-  session cookie before it reads the request, so a browser session cannot
-  drive it. A missing, unknown or revoked key gets 401 with
-  `WWW-Authenticate: Bearer`. No OAuth, so claude.ai and Claude Desktop custom
-  connectors cannot use it.
+- **HTTP auth:** only `Authorization: Bearer`, with an API key or an OAuth
+  access token. The endpoint removes the session cookie before it reads the
+  request, so a browser session cannot drive it. A missing, unknown or
+  revoked credential gets 401 with `WWW-Authenticate: Bearer`, which names
+  the protected resource metadata when OAuth is on.
 - **Origin:** a request whose `Origin` names another host gets 403. That stops
   a web page on another site from calling it. A request without `Origin`
   passes, as in the cross-origin write check of `security.rs`. The host is
@@ -137,6 +248,15 @@ unit test fails when it differs from the manifest.
   bearer header, never a cookie, so this check is a second line of defense.
 - **HTTP is stateless:** no session IDs. Each request gets a new handler, and
   the tools send no notifications.
+- **Protocol versions:** `initialize` agrees to `2025-11-25` at most. `rmcp`
+  also serves the stateless lifecycle of `2026-07-28`: `server/discover`, then
+  requests that carry the version in `_meta`, with no `initialize`. Claude Code
+  uses that path. Version `2026-07-28` requires `ttlMs` and `cacheScope` on a
+  list result (SEP-2549), so `list_tools` sets both; without them Claude Code
+  rejects the tool list and shows no tools. The MCP SDK in `devDependencies`
+  stops at `2025-11-25`, so the SDK-based suites cannot see a defect on this
+  path. `tests/mcp/rust-transport.test.ts` sends the `2026-07-28` JSON-RPC
+  itself.
 - **Tool definitions:** `rust-api/server/mcp-tools.json` holds the name, title,
   description, annotations and input schema of every tool, and it is the
   source: edit it to change what a client sees. The TypeScript server wrote it
@@ -168,7 +288,9 @@ unit test fails when it differs from the manifest.
   `report_splits()`, `income_rows()` and `search_book()`: the routes check
   their dates more strictly and leave out fields that the tools report.
   `list_transactions` uses the register route with `includeMeta=true` and
-  keeps the fields it reports. `get_account_balance_history` has no route.
+  keeps the fields it reports. No route gives the entries of
+  `get_account_balance_history`. It shares `find_book_account()` and
+  `balance_before()` with the month-end `balance-history` route.
 - **Messages:** where the library names an ID or a date in an error and the
   route does not ("Security 5 not found", "Price entry for 2026-01-02 not
   found"), the tool reads the route's status with `Caller::send()` or

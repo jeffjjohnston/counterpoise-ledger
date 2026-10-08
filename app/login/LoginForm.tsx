@@ -1,15 +1,27 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Link, useRouter } from "@/lib/navigation";
+import { Link, useRouter, useSearchParams } from "@/lib/navigation";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { identifyUser } from "@/lib/posthog-client";
 import { apiPost, toMessage } from "@/lib/api-client";
 import { useRegistrationOpen } from "@/hooks/useRegistrationOpen";
 
+/**
+ * The page to open after login. Only the OAuth consent page may be named:
+ * `/api/oauth/authorize` sends a browser without a session here with
+ * `next=/oauth/consent?...`. Any other value goes to the books page, so
+ * `next` cannot send a user to another site.
+ */
+export function returnPath(next: string | null): string {
+  if (next !== null && /^\/oauth\/consent(?:\?|$)/.test(next)) return next;
+  return "/";
+}
+
 export function LoginForm() {
   const router = useRouter();
+  const next = useSearchParams().get("next");
   const registrationOpen = useRegistrationOpen();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -29,7 +41,7 @@ export function LoginForm() {
     try {
       const data = await apiPost<{ id: number }>("/api/auth/login", { username, password });
       identifyUser(data.id);
-      router.push("/");
+      router.push(returnPath(next));
     } catch (err) {
       setError(toMessage(err, "An error occurred. Please try again."));
     } finally {

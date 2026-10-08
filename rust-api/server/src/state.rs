@@ -1,6 +1,7 @@
 use crate::analytics::PostHogCapture;
 use crate::api_key_cache::ApiKeyCache;
 use crate::book_changes::BookChangeHub;
+use crate::oauth::Issuer;
 use crate::plaid::Plaid;
 use crate::rate_limit::RateLimiter;
 use crate::tiingo::Tiingo;
@@ -19,6 +20,10 @@ pub(crate) struct AppState {
     pub(crate) plaid: Plaid,
     pub(crate) book_changes: BookChangeHub,
     pub(crate) jobs: Arc<JobLocks>,
+    /// The public origin of OAuth for MCP, from `COUNTERPOISE_PUBLIC_URL`.
+    /// `None` turns OAuth off. `Config::from_env` refuses a value that is
+    /// not valid, so the server does not start with one.
+    pub(crate) oauth: Option<Arc<Issuer>>,
 }
 
 /// One lock for each scheduled job, so that two runs of one job never
@@ -58,6 +63,7 @@ impl AppState {
             tiingo: Tiingo::from_env(),
             plaid: Plaid::from_env(),
             jobs: Arc::new(JobLocks::default()),
+            oauth: Issuer::from_env().ok().flatten().map(Arc::new),
         }
     }
 }

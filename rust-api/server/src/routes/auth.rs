@@ -35,7 +35,10 @@ fn db_error(cause: sqlx::Error, message: &'static str) -> ApiError {
     internal_error(cause, message)
 }
 
-async fn cookie_session(
+/// The user and session of the session cookie, and never of a bearer
+/// header. A route that must not accept a key or a token uses this: the API
+/// key routes, and the OAuth consent and grant routes.
+pub(crate) async fn cookie_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<(i32, i32)>, sqlx::Error> {

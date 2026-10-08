@@ -19,6 +19,9 @@ pub(crate) struct Config {
     /// Whether the client address comes from `X-Forwarded-For`, from
     /// `TRUST_PROXY`, `APP_BIND` and `RUST_BIND` (`client_ip.rs`).
     pub(crate) trust_proxy: ProxyTrust,
+    /// The public origin for OAuth on `/api/mcp` (`COUNTERPOISE_PUBLIC_URL`).
+    /// `None` turns OAuth off; a value that is not an origin stops the start.
+    pub(crate) public_url: Option<crate::oauth::Issuer>,
 }
 
 impl Config {
@@ -39,6 +42,7 @@ impl Config {
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
             trust_proxy,
+            public_url: crate::oauth::Issuer::from_env()?,
         })
     }
 

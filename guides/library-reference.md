@@ -49,7 +49,10 @@ shared helpers from here, not from `lib/accounting.ts`. It exports:
 - Formatting: `formatCurrency()`, `formatDate()`, `formatDateShort()`,
   `toDateString()`, `isValidDateString()`, `parseStrictCurrency()`,
   `resolveAmountOnBlur()`, `getAccountShortName()`, `formatRelativeAge()`,
-  `formatPriceMicrosInput()`, `evaluateExpression()`
+  `formatPriceMicrosInput()`, `evaluateExpression()`,
+  `formatCurrencyCompact()` and `compactDecimals()` (in `lib/formatters.ts`
+  only: the short label for a chart axis, such as "$1.2k", and the decimals
+  that keep two ticks one step apart different)
 
 The TypeScript modules `accounting`, `recurring`, `formatters` and
 `expression` give its types.
@@ -122,6 +125,48 @@ enforces every level regardless of what the client shows
   the WASM recurrence functions
 - `/lib/reports.ts` - report grouping for the report page: `groupSplits()`,
   `computeGrandTotal()`, `buildTopParentMap()`
+- `/lib/report-chart.ts` - `toChartData()`: turns the grouped report rows
+  into the series for `ReportChart`, or `null` when the report has nothing
+  to draw. It keeps the `TOP_ACCOUNTS` or `TOP_ITEMS` largest items and
+  puts the rest in one `OTHER_KEY` series. The payee page chart
+  (`PayeeSpendingChart`) calls it with `["month"]`, after `groupSplits()`,
+  through `toPayeeSpendingChart()`
+- `/lib/payee-spending-chart.ts` - `toPayeeSpendingChart()`: the payee page
+  chart. It calls `toChartData()` with `["month"]` and fills each empty month
+  from the first to the last month of the range with zero bars
+- `/lib/income-statement-chart.ts` - `toMonthlyChart()`: income, expense
+  and net bars for each month (gap months get zeros), or for each year when
+  the range has more than `MAX_MONTHS` (24) months; `unit` says which. It
+  gives `null` for fewer than 2 months. `toCategoryChart()`: the expense rows rolled up to the
+  top-level account with `buildTopParentMap()`, the 10 largest and "Other"
+- `/lib/realized-gains-chart.ts` - `toRealizedGainsChart()`: turns the rows
+  of the realized gains page into stacked short-term and long-term bars. It
+  has one group for each month of the range, or for each year above 24
+  months. A row with an unknown term or basis is left out. Gives `null` when
+  no row has a known gain
+- `/lib/allocation-chart.ts` - `toAllocationChart()`: turns the securities
+  into one horizontal bar for each security, by market value, largest first.
+  The 10 largest get a bar and the rest go into "Other". A security with no
+  price or no positive value has no bar. Gives `null` for fewer than two bars
+- `/lib/chart-range.ts` - `ChartRange` (`"1Y"`, `"5Y"`, `"All"`),
+  `CHART_RANGES`, `RANGE_NAMES` (the words for a range in a chart label),
+  and `rangeStart()`: the first date of a range, or `null` for all history
+- `/lib/price-history-chart.ts` - `toPriceHistoryChart()`: turns the price
+  rows (newest first) into one `LineSeries`, oldest first, with values in
+  cents, or `null` for fewer than two prices
+- `/lib/account-balance-chart.ts` - `toAccountBalanceChart()`: turns the
+  points of the `balance-history` route into one `LineSeries` with the
+  display sign of the account type (`getDisplayBalance()`), or `null` for
+  fewer than two points
+- `/lib/net-worth-chart.ts` - `toNetWorthGroupChart()`: turns the
+  `net-worth-history?groupBy=account` response into the stacked areas of the
+  dashboard "By group" view: the 7 groups with the largest absolute value at
+  the last point, then "Other" (`OTHER_KEY`, `--chart-8`), and net worth as
+  the total line. Gives `null` for fewer than two points
+- `/lib/net-worth.ts` - `effectiveBalance()`: the balance that the dashboard
+  shows for an account (an investment account uses its market value plus
+  the balance of its cash child). `computeNetWorth()`: the dashboard total.
+  The net worth history route in Rust checks its result against this
 - `/lib/csv.ts` - CSV export: `csvEscape()`, `datedCsvFilename()`,
   `triggerDownload()`
 - `/lib/merge-transactions.ts` - `mergeTransactionsForDisplay()` interleaves
@@ -181,7 +226,15 @@ Pure domain code. The server links it, and the browser loads it as WASM
   `is_recurring_rule_due()`, `schedule_key()`, `preview_occurrences()`,
   business-day shifts, and `effective_date()`
 - `investments.rs` - `aggregate_positions()`, `fixed_price_row()`,
-  `aggregate_market_values_by_account()`
+  `aggregate_market_values_by_account()`, `replay_order()` (the order of a
+  position replay) and `PositionReplay` (the replay that the positions and the
+  net worth series share)
+- `net_worth.rs` - `net_worth_series()` (the net worth at each date),
+  `net_worth_by_group()` (the same values, split by top-level account; the
+  group values of a point add up to its net worth) and `point_dates()`
+  (month ends, then the end date). Both series use one per-account
+  calculation, so they cannot disagree. The account balance
+  history route uses `point_dates()` too
 - `lots.rs` - `replay_lots()`, the FIFO replay engine
 - `formatters.rs`, `expression.rs` - formatting, currency parsing, and the
   amount expression parser
@@ -215,8 +268,10 @@ Database code that the server and `ledger-cli` both run:
 ### `rust-api/server/src`
 Shared server modules:
 - `auth.rs` - `principal()` resolves the session cookie or a bearer key to a
-  user, with the API-key lockout. `session_user()` gives the route's 401.
-  `bearer_token()`, `cookie_token()`
+  user, with the API-key lockout. `principal_with()` also takes whether an
+  OAuth access token counts: only `/api/mcp` and its tools' route requests
+  accept one. `session_user()` gives the route's 401. `bearer_token()`,
+  `cookie_token()`
 - `routes/auth.rs` - `cookie_session()`, the cookie-only session. The
   password change and the API-key routes use only this, so a device that
   holds one key cannot mint another. A repository test holds that rule
@@ -254,6 +309,9 @@ Shared server modules:
   TypeSafe experiment
 - `openapi/` - the OpenAPI document. See [guides/api-contract.md](api-contract.md)
 - `mcp/` - the MCP server. See [guides/mcp-server.md](mcp-server.md)
+- `oauth/` - OAuth 2.1 for `/api/mcp`: discovery, client registration and
+  metadata documents, consent, tokens and grants. See
+  [guides/mcp-server.md](mcp-server.md#oauth-for-custom-connectors)
 
 ### `rust-api/server/src/routes/`
 One module per route area. `routes/mod.rs` registers each entry of
@@ -305,6 +363,7 @@ One module per route area. `routes/mod.rs` registers each entry of
 | `/rust-api/server/src/scheduler.rs` | The scheduled jobs (recurring, Plaid, prices, TypeSafe cleanup, backup, prune, `VACUUM`), on when `COUNTERPOISE_SCHEDULER=on` |
 | `/rust-api/cli/src/import_moneydance/mod.rs` | Moneydance import orchestration, run by `ledger-cli import-moneydance` and `npm run import:moneydance` |
 | `/rust-api/server/src/mcp/` | The MCP server: the tool registry, the stdio and HTTP transports, WebMCP, and one handler module per tool group. See [mcp-server.md](mcp-server.md) |
+| `/rust-api/server/src/oauth/` | OAuth 2.1 for `/api/mcp`, on when `COUNTERPOISE_PUBLIC_URL` is set. See [mcp-server.md](mcp-server.md#oauth-for-custom-connectors) |
 | `/rust-api/server/mcp-tools.json` | The source of each MCP tool's name, title, description, annotations and input schema |
 | `/rust-api/server/src/openapi/` | The source of `openapi/openapi.json` |
 | `/rust-api/server/src/security.rs` | The only copy of the session gate, the cross-origin write check and the security headers: `protect()` adds the headers (HSTS when `ENABLE_HSTS=true`), the cross-origin write check, the API gate (401 for an `/api/` request without credentials, before the router), and the gate for unmatched paths (404 for `/api/`, a redirect to `/login` for a page without a session) |

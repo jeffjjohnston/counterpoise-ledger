@@ -129,10 +129,31 @@ can pass while the conversion is wrong.
   - One row per (sell split, lot): `sharesMicros`, `basisCents`, `proceedsCents`
   - Realized gain is always `proceedsCents - basisCents`; never stored
 
+- **transactionChanges**: The change log of the delta sync
+  (`GET /api/b/{bookId}/transactions/changes`). Fields: `seq` (the cursor),
+  `bookId`, `transactionId`. It has no foreign key and no timestamp.
+  - Migration `0003_transaction_changes.sql` adds insert, update and delete
+    triggers on `transactions`, `transaction_splits` and `investment_splits`.
+    A split row logs the ID of its parent transaction. An update that moves a
+    row to a different transaction or book logs the old and the new IDs.
+  - A row with `bookId` 0 is a floor marker, not a change. The migration and
+    each snapshot add one. A delta cursor below the newest marker gets 410.
+  - Do not write to this table, and do not prune it. A pruned row is a change
+    that a client never sees.
+  - A deleted book keeps its log rows. `resetTestDatabase` deletes them
+    after the cascade, because they have no foreign key.
+  - A change to a payee, an account or a security does not log the
+    transactions that embed it. A client reads those tables again.
+
 - **recurringRules** / **recurringTemplateSplits**: Recurring transaction templates
 
 - **apiKeys**: User API keys for MCP server authentication
   - Fields: `userId`, `name`, `keyHash` (scrypt), `keyPrefix` (first 8 chars for lookup), `lastUsedAt`
+
+- **oauthClients** / **oauthGrants** / **oauthCodes** / **oauthTokens**: OAuth for `/api/mcp` (migration 0004, [mcp-server.md](mcp-server.md#oauth-for-custom-connectors))
+  - `oauthClients` has no `userId`: any user can grant a client access. `clientId` is the HTTPS URL of a Client ID Metadata Document (`metadataDocument` 1, `fetchedAt` set) or a `cpc_` ID from registration. `redirectUris` is a JSON array. `resetTestDatabase` deletes these rows itself, because the `users` cascade does not reach them
+  - `oauthGrants`: one approval on the consent page (`userId`, `clientId` → `oauthClients.id`). `resource` is the canonical MCP URI at grant time; a token whose grant has another `resource` is refused. To revoke deletes the grant, and its codes and tokens cascade
+  - `oauthCodes` / `oauthTokens`: `codeHash` / `tokenHash` are SHA-256 hex digests, never the secret. `usedAt` marks the one exchange of a code or a refresh token; a later use revokes the grant. `oauthTokens.kind` is `access` or `refresh`
 
 - **issueReports**: In-app issue reports (meta table — scoped to `userId`, not `bookId`)
   - Fields: `userId`, `description`, `type` (`bug`/`improvement`/`other`), `page`, `status` (`new`/`resolved`/`wontfix`)

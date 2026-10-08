@@ -1,7 +1,7 @@
 "use client";
 
 import { cn } from "@/lib/utils";
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 interface DateInputProps {
   label?: string;
@@ -20,6 +20,9 @@ interface DateInputProps {
   dropUp?: boolean;
   className?: string;
 }
+
+/** The width of the calendar, `w-[17rem]`, in pixels. */
+const CALENDAR_WIDTH = 272;
 
 const DAYS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 // The column headers are abbreviated to fit the cell. Assistive tech gets
@@ -164,6 +167,17 @@ export function DateInput({
       setViewMonth(p.month);
     }
   }, [value, editing]);
+
+  // The calendar opens at the left edge of the field. When it would go past
+  // the right edge of the screen, for example for a field in the right column
+  // on a phone, it opens at the right edge of the field. The layout effect
+  // runs before the paint, so the calendar never shows in the wrong place.
+  const [alignRight, setAlignRight] = useState(false);
+  useLayoutEffect(() => {
+    if (!open || !containerRef.current) return;
+    const box = containerRef.current.getBoundingClientRect();
+    setAlignRight(box.left + CALENDAR_WIDTH > window.innerWidth && box.right - CALENDAR_WIDTH >= 0);
+  }, [open]);
 
   // Close on outside click
   useEffect(() => {
@@ -381,9 +395,11 @@ export function DateInput({
       {open && (
         <div
           onMouseDown={(e) => e.preventDefault()}
+          data-align={alignRight ? "right" : "left"}
           className={cn(
             "absolute z-50 bg-surface-elevated rounded-lg border border-border shadow-lg p-2 w-[17rem]",
-            dropUp ? "bottom-full mb-1" : "mt-1"
+            dropUp ? "bottom-full mb-1" : "mt-1",
+            alignRight && "right-0"
           )}
         >
           {/* Header: prev / month year / next */}

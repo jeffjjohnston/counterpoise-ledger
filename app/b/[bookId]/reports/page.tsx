@@ -3,10 +3,12 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { useBookId } from "@/hooks/useBookId";
 import { ReportConfigPanel, type ReportConfig } from "@/components/reports/ReportConfigPanel";
+import { ReportChart } from "@/components/reports/ReportChart";
 import { ReportTable } from "@/components/reports/ReportTable";
 import {
   groupSplits,
   computeGrandTotal,
+  isMixedReport,
   type ReportSplit,
   type ReportAccount,
 } from "@/lib/reports";
@@ -95,9 +97,10 @@ export default function ReportsPage() {
   }, [rawSplits, config.groupings, accountMap, config.collapseToParent]);
 
   const grandTotal = useMemo(() => computeGrandTotal(rawSplits), [rawSplits]);
+  const mixed = useMemo(() => isMixedReport(rawSplits), [rawSplits]);
 
   return (
-    <div className="space-y-6">
+    <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
       <h1 className="text-2xl font-bold text-fg">Reports</h1>
 
       <ReportConfigPanel
@@ -109,11 +112,15 @@ export default function ReportsPage() {
       />
 
       {hasRun && !loading && (
-        <ReportTable
-          groups={grouped}
-          grandTotal={grandTotal}
-          dimensions={config.groupings}
-        />
+        <>
+          <ReportChart groups={grouped} dimensions={config.groupings} />
+          <ReportTable
+            groups={grouped}
+            grandTotal={grandTotal}
+            mixed={mixed}
+            dimensions={config.groupings}
+          />
+        </>
       )}
     </div>
   );

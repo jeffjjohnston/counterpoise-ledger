@@ -55,18 +55,33 @@ pub(crate) struct IncomeRow {
     pub(crate) balance: i32,
 }
 
+/// The filters of [`report_splits`]. An empty list or a `None` filters nothing.
+pub(crate) struct ReportFilter<'a> {
+    pub(crate) start_date: Option<&'a str>,
+    pub(crate) end_date: Option<&'a str>,
+    pub(crate) account_ids: &'a [i64],
+    pub(crate) account_types: &'a [&'a str],
+    pub(crate) payee_id: Option<i64>,
+}
+
 /// `getReportSplits()`: the splits of the book in effective-date order,
 /// with their account and payee. With `limit`, only the first rows, and the
 /// count of all the rows that match; without it, every row and their count.
+/// With `payee_id`, only the splits of that payee. The rows are of this book,
+/// so a payee of another book matches nothing.
 pub(crate) async fn report_splits(
     pool: &DbPool,
     book_id: i32,
-    start_date: Option<&str>,
-    end_date: Option<&str>,
-    account_ids: &[i64],
-    account_types: &[&str],
+    filter: &ReportFilter<'_>,
     limit: Option<i64>,
 ) -> Result<(Vec<ReportSplit>, i64), sqlx::Error> {
+    let ReportFilter {
+        start_date,
+        end_date,
+        account_ids,
+        account_types,
+        payee_id,
+    } = *filter;
     let today = local_today();
     let push_filters = |query: &mut QueryBuilder<'_, Db>| {
         if let Some(start) = start_date {
@@ -94,6 +109,9 @@ pub(crate) async fn report_splits(
                 query.push_bind(account_type.to_string());
             }
             query.push(")");
+        }
+        if let Some(payee_id) = payee_id {
+            query.push(" AND payee_id = ").push_bind(payee_id);
         }
     };
     let rows_sql = |select: &str| {
@@ -162,13 +180,23 @@ pub(crate) async fn report_data(
         .flat_map(|value| value.split(','))
         .filter(|value| ["asset", "liability", "equity", "income", "expense"].contains(value))
         .collect();
+    let payee_id = match params.get("payeeId") {
+        None => None,
+        Some(value) => match value.parse::<i64>() {
+            Ok(id) if id > 0 => Some(id),
+            _ => return Err(error(StatusCode::BAD_REQUEST, "Invalid payeeId")),
+        },
+    };
     let (splits, _) = report_splits(
         &state.pool,
         book.book_id,
-        start_date.as_deref(),
-        end_date.as_deref(),
-        &account_ids,
-        &account_types,
+        &ReportFilter {
+            start_date: start_date.as_deref(),
+            end_date: end_date.as_deref(),
+            account_ids: &account_ids,
+            account_types: &account_types,
+            payee_id,
+        },
         None,
     )
     .await

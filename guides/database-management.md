@@ -67,6 +67,16 @@ change is a new numbered file after it. Each binary embeds the files with
 4. Start the server, or run `npm run db:migrate`, to apply it to the dev
    database. The tests apply it to their own files.
 
+Each binary embeds the migration files when the `ledger-db` crate compiles.
+A rustc wrapper that caches compiles (for example sccache, or a
+`rustc-wrapper` in `~/.cargo/config.toml`) can return a cached `ledger-db`
+that does not have a new file, because it keys on the Rust sources only. The
+server, `ledger-cli` and the test databases then stop at the old version, and
+no error tells you. After you add or change a migration, run
+`cargo clean -p ledger-db` and build with `CARGO_BUILD_RUSTC_WRAPPER=""`.
+`SELECT max(version) FROM _sqlx_migrations` on a new database shows the
+version that the binary has.
+
 The server applies the pending migrations when it starts, before it serves a
 request. A failed migration stops the start, so a new server never runs on
 the old schema. In production, `docker compose up --wait` then exits 1.

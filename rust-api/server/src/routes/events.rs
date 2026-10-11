@@ -40,7 +40,7 @@ pub(crate) async fn book_events(
             }
             Err(denied) => return denied.into_response(),
         };
-    let subscription = state.book_changes.subscribe(book.book_id);
+    let subscription = state.book_changes.subscribe(book.book_id());
     if tokio::time::timeout(STARTUP, subscription.ready())
         .await
         .is_err()

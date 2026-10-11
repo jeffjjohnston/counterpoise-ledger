@@ -1,9 +1,14 @@
 # Upgrade from PostgreSQL to SQLite
 
-Counterpoise stores its data in one SQLite file from this release. Earlier
-releases used a PostgreSQL container. An install that has data in PostgreSQL
-must convert it **once**, with the procedure on this page, before the new
-release can start.
+Counterpoise stores its data in one SQLite file. Releases up to v1.48.0 used
+a PostgreSQL container. An install that has data in PostgreSQL must convert it
+**once**, with the procedure on this page, before a SQLite release can start.
+
+**The converter is only in v1.50.0 to v1.53.0.** Later releases do not have
+`ledger-cli import-postgres` or `scripts/upgrade-to-sqlite.sh`. Do the
+conversion in a checkout of v1.50.0, the first public SQLite release, then
+upgrade to the current release. The path is: your release, then v1.48.0, then
+v1.50.0, then the current release.
 
 A new install does not need this page. It creates the data volume and starts:
 
@@ -49,22 +54,23 @@ action again when the long write is done. Reads continue during both.
    server log.
 2. **Make sure that you have space** for a second copy of the data and a
    `pg_dump` safety copy in the backups directory.
-3. **Plan a short stop.** The script builds the new image first, while the
-   app runs. The app is down from the stop until you start the new release.
-   For a typical personal install, this is less than a minute.
+3. **Plan a short stop.** The script builds the v1.50.0 image first, while
+   the app runs. The app is down from the stop until you start v1.50.0. For a
+   typical personal install, this is less than a minute.
 
 ## Steps
 
 Do these steps in the install's checkout (the directory that holds
 `docker-compose.yml` and `.env.production.local`).
 
-1. Check out the first public SQLite release:
+1. Check out the first public SQLite release. It is the release that has the
+   converter:
 
    ```bash
-   git fetch && git checkout v1.50.0   # the first public SQLite release
+   git fetch --tags && git checkout v1.50.0
    ```
 
-2. Run the upgrade script:
+2. Run the upgrade script of v1.50.0:
 
    ```bash
    scripts/upgrade-to-sqlite.sh
@@ -93,7 +99,7 @@ Do these steps in the install's checkout (the directory that holds
    The converter writes the summary of its checks into
    `backups/sqlite-conversion-<time>.txt`. Keep it.
 
-3. Start the new release:
+3. Start v1.50.0:
 
    ```bash
    docker compose --env-file .env.production.local up -d --wait
@@ -105,7 +111,18 @@ Do these steps in the install's checkout (the directory that holds
 
 4. Sign in. Compare the balances of some accounts with what you know.
 
-5. **After a week of use**, clean up:
+5. Upgrade to the current release. Go back to your branch, get the current
+   release and build it:
+
+   ```bash
+   git checkout main && git pull
+   docker compose --env-file .env.production.local up -d --wait --build
+   ```
+
+   The current release applies its own migrations to the SQLite file when it
+   starts.
+
+6. **After a week of use**, clean up:
    - Remove `DATABASE_URL`, `POSTGRES_PASSWORD` and `APP_DB_PASSWORD` from
      `.env.production.local`.
    - Remove the old `postgres` and `scheduler` containers. The script stopped
@@ -125,7 +142,7 @@ Do these steps in the install's checkout (the directory that holds
 
 ## What the converter checks
 
-`ledger-cli import-postgres` copies each table in foreign-key order and keeps
+`ledger-cli import-postgres` in v1.50.0 copies each table in foreign-key order and keeps
 every ID and every sequence position. Then it checks the copy:
 
 - every row and every value of every table, against the source;
@@ -173,7 +190,8 @@ The copy then keeps the same sums as the source.
   run of the script uses it again.
 - **The new release does not start.** Read `docker compose logs rust-api`.
   If it says that `DATABASE_URL` is set and there is no database, the
-  conversion did not run: do step 2.
+  conversion did not run: do steps 1 and 2. A release after v1.53.0 cannot
+  convert the data itself.
 - **You want to go back after you used the new release.** Check out v1.48.0
   and start it with
   `docker compose --env-file .env.production.local up -d --build`.

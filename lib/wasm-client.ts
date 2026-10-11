@@ -46,6 +46,37 @@ export const buildDividendSplits = wrap("buildDividendSplits") as typeof account
 export const buildCapGainSplits = wrap("buildCapGainSplits") as typeof accounting.buildCapGainSplits;
 export const buildBuySplits = wrap("buildBuySplits") as typeof accounting.buildBuySplits;
 export const buildSellSplits = wrap("buildSellSplits") as typeof accounting.buildSellSplits;
+
+/** The input of `buildReinvestSplits`: a dividend `D` that buys shares and pays a fee. */
+export type ReinvestBuilderInput = {
+  securityAccountId: number;
+  cashAccountId: number;
+  incomeAccountId: number;
+  feeAccountId?: number;
+  dividendCents: number;
+  sharesMicros: number;
+  priceMicros: number;
+  feesCents?: number;
+};
+export type ReinvestSplits = {
+  splits: accounting.InvestmentSplitInput[];
+  investmentSplits: Array<{
+    action: "dividend" | "buy";
+    sharesMicros: number;
+    priceMicros: number;
+    feesCents: number;
+  }>;
+};
+/**
+ * A reinvested dividend as one transaction (`build_reinvest_splits` in
+ * rust-api/core/src/accounting.rs). Throws when the dividend does not cover
+ * the shares and the fee.
+ */
+export const buildReinvestSplits = wrap("buildReinvestSplits") as (input: ReinvestBuilderInput) => ReinvestSplits;
+/** `(D - F) / shares`, rounded down to micros; null when it is not positive. */
+export const reinvestPriceMicros = wrap("reinvestPriceMicros") as (
+  dividendCents: number, feesCents: number, sharesMicros: number
+) => number | null;
 export const getNextBusinessDay = wrap("getNextBusinessDay") as typeof accounting.getNextBusinessDay;
 export const getNextDate = wrap("getNextDate") as typeof accounting.getNextDate;
 export const getDisplayBalance = wrap("getDisplayBalance") as typeof accounting.getDisplayBalance;

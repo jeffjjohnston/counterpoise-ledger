@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
-  addBookMember, createBook, createUser, resetTestDatabase, setupTestDatabase,
+  addBookMember, createAccount, createBook, createInvestmentSplit, createTransactionWithSplits, createUser,
+  resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { rows } from "../helpers/sql";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
@@ -60,6 +61,37 @@ describe("security HTTP parity", () => {
     });
     securityListSchema.parse(list);
     expect(stable(list)).toMatchSnapshot();
+  });
+
+  // A client can write a reinvested dividend with gross cash legs (+D and -D
+  // on cash). The income is the income legs less the expense legs, so the
+  // read does not count the gross legs: D - F.
+  it("reads the income of a reinvested dividend with gross cash legs as D - F", async () => {
+    const dividends = await createAccount({ name: "DRIP Dividends", type: "income" });
+    const fees = await createAccount({ name: "DRIP Fees", type: "expense" });
+    const drip = await createTransactionWithSplits({
+      date: "2025-06-01", description: "VTI reinvested",
+      splits: [
+        // D = 1000, G = 900, F = 20, R = 80.
+        { accountId: scenario.brokerage.id, amount: 900 }, { accountId: fees.id, amount: 20 },
+        { accountId: dividends.id, amount: -1000 },
+        { accountId: scenario.cash.id, amount: 1000 }, { accountId: scenario.cash.id, amount: -1000 },
+        { accountId: scenario.cash.id, amount: 80 },
+      ],
+    });
+    for (const split of [
+      { action: "dividend" as const, sharesMicros: 0, priceMicros: 0 },
+      { action: "buy" as const, sharesMicros: 1_000_000, priceMicros: 9_000_000, feesCents: 20 },
+    ]) {
+      await createInvestmentSplit({ ...split, transactionId: drip.id, accountId: scenario.brokerage.id, securityId: scenario.vti.id });
+    }
+    const list = await ok("/api/b/1/securities");
+    // 950 from the dividend of the scenario, 980 from the reinvested one.
+    expect(list.find((row: { symbol: string }) => row.symbol === "VTI").incomeCents).toBe(1930);
+    const page = await ok(`/api/b/1/securities/${scenario.vti.id}/splits?limit=1000`);
+    const income = page.splits.filter((row: { transactionId: number; action: string }) =>
+      row.transactionId === drip.id && row.action === "dividend");
+    expect(income.map((row: { cashAmountCents: number }) => row.cashAmountCents)).toEqual([980]);
   });
 
   it("creates a trimmed security and refuses a case-insensitive duplicate symbol", async () => {

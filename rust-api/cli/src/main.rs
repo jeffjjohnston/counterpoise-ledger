@@ -19,10 +19,6 @@
 //!
 //! `list-books` prints each book with its owner and ID.
 //!
-//! `import-postgres --from <postgres-url> --to <path>` converts the database
-//! of the last PostgreSQL release into a new SQLite file and checks it. See
-//! `import_postgres`.
-//!
 //! `backup [--dir D]` writes a checked copy of the database into D (default
 //! `BACKUP_DIR`, else `backups`), as the scheduled backup does. It exits 1
 //! when the copy fails `PRAGMA integrity_check`. It also writes the "backup"
@@ -38,7 +34,6 @@
 //! leaves the book as it was.
 
 mod import_moneydance;
-mod import_postgres;
 
 use ledger_db::engine::DbPool;
 use std::{
@@ -497,29 +492,6 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("import-postgres") => {
-            let parsed = match import_postgres::parse_args(&args[1..]) {
-                Ok(parsed) => parsed,
-                Err(message) => {
-                    eprintln!("{message}");
-                    return ExitCode::from(2);
-                }
-            };
-            match import_postgres::run(&parsed).await {
-                Ok(summary) => {
-                    print!("{}", summary.text);
-                    if summary.ok {
-                        ExitCode::SUCCESS
-                    } else {
-                        ExitCode::FAILURE
-                    }
-                }
-                Err(message) => {
-                    eprintln!("Conversion refused or FAILED: {message}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Some("backup") => match backup(&args[1..]).await {
             Ok(snapshot) if snapshot.verified => {
                 println!(
@@ -631,9 +603,6 @@ async fn main() -> ExitCode {
             );
             eprintln!("       ledger-cli list-books");
             eprintln!("       ledger-cli backup [--dir D]");
-            eprintln!(
-                "       ledger-cli import-postgres --from <postgres-url> --to <path> [--allow-unbalanced]"
-            );
             eprintln!("       ledger-cli import-moneydance <path-to-json> --book-id N [options]");
             ExitCode::from(2)
         }

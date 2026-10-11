@@ -156,7 +156,7 @@ pub(crate) async fn update_book(
         .bind(name)
         .bind(upcoming)
         .bind(Utc::now().naive_utc())
-        .bind(authenticated.book_id)
+        .bind(authenticated.book_id())
         .fetch_optional(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, "Failed to update book"))?
@@ -180,7 +180,7 @@ pub(crate) async fn delete_book(
     )
     .await?;
     sqlx::query("DELETE FROM books WHERE id = $1")
-        .bind(authenticated.book_id)
+        .bind(authenticated.book_id())
         .execute(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, "Failed to delete book"))?;

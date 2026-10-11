@@ -478,7 +478,7 @@ pub(super) const OPERATIONS: &[Operation] = &[
             (
                 400,
                 concat!(
-                    "The request is not valid. The message names the problem. It can be any message of createTransaction. Also: \"At least 2 splits are required, even for stock splits\" (you send investmentSplits for a transaction with fewer than two splits and send no splits, or `splits` has fewer than 2 items). ",
+                    "The request is not valid. The message names the problem. It can be any message of createTransaction. Also: \"At least 2 splits are required, even for stock splits\" (you send investmentSplits for a transaction with fewer than two splits and send no splits, or `splits` has fewer than 2 items); \"The splits must keep each investment account of the investment splits; send investmentSplits to change it\" (you send splits and no investmentSplits, and the splits leave out the account of a stored investment split). ",
                     investment_split_errors!()
                 ),
             ),
@@ -919,6 +919,52 @@ pub(super) const OPERATIONS: &[Operation] = &[
             (
                 500,
                 "The server has no Tiingo key. The message is \"TIINGO_API_KEY environment variable not configured\".",
+            ),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Post,
+        path: "/api/b/{bookId}/sync/link-sessions",
+        operation_id: "createPlaidLinkSession",
+        summary: "Start a Plaid Hosted Link session to connect a bank, or to reconnect one in update mode. Owner only. Without restart, the server first checks the open sessions of the same connection, and answers the newest one, or the one that is complete, in place of a new session. Open hostedLinkUrl in a new tab, then poll checkPlaidLinkSession.",
+        tag: "sync",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: Some("CreatePlaidLinkSessionBody"),
+        response: &["PlaidLinkSession"],
+        errors: &[
+            (
+                400,
+                "tokenId is not a positive integer or null, it names a demo connection, or restart is not a boolean.",
+            ),
+            (403, "The caller is not an owner of the book."),
+            (404, "The book has no connection with this tokenId."),
+            (
+                502,
+                "Plaid refused the request. The message is Plaid's error message.",
+            ),
+        ],
+    },
+    Operation {
+        method: HttpMethod::Post,
+        path: "/api/b/{bookId}/sync/link-sessions/{id}/check",
+        operation_id: "checkPlaidLinkSession",
+        summary: "Read the state of a Hosted Link session. When the user finished at Plaid, the server saves the new connection, or clears the last sync error of the reconnected one, and loads its accounts. Owner only.",
+        tag: "sync",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &["PlaidLinkSession"],
+        errors: &[
+            (403, "The caller is not an owner of the book."),
+            (404, "The book has no link session with this id."),
+            (
+                409,
+                "The book already has a connection for this Item. The session is failed.",
+            ),
+            (
+                502,
+                "Plaid refused the request, or the public token exchange failed. The session stays pending, so a later check tries again.",
             ),
         ],
     },

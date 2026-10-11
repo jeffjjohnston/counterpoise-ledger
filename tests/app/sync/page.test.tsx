@@ -490,6 +490,31 @@ describe("SyncPage", () => {
     ).toBeInTheDocument();
   });
 
+  // POST sync/link-sessions refuses a demo connection: it has no Plaid Item.
+  it("does not offer Reconnect for a demo connection", async () => {
+    const link = (plaidLinkId: number, tokenId: number, financialInstitution: string, isDemo: boolean) => ({
+      plaidLinkId, financialInstitution, tokenId, itemId: `item-${tokenId}`, plaidAccountId: `plaid-${plaidLinkId}`,
+      plaidAccountName: `${financialInstitution} Checking`, plaidAccountMask: null, counterpoiseAccountId: plaidLinkId,
+      counterpoiseAccountName: "Checking", lastSyncedAt: null, lastError: null, pendingCount: 0, reviewCount: 0, isDemo,
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/sync/assigned-accounts") {
+        return { ok: true, json: async () => [link(11, 5, "Chase Bank", false), link(12, 6, "Demo Bank", true)] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }));
+
+    render(<SyncPage />);
+    await screen.findByText("Demo Bank");
+    fireEvent.click(screen.getByRole("button", { name: /Chase Bank actions/i }));
+    expect(screen.getByRole("menuitem", { name: "Reconnect" })).toBeInTheDocument();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: /Demo Bank actions/i }));
+    expect(screen.getByRole("menuitem", { name: /Reset sync data/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Reconnect" })).toBeNull();
+  });
+
   it("shows one error surface naming the connection, with a retry", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -904,19 +929,96 @@ describe("SyncPage", () => {
     await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(before));
   });
 
-  it("offers a route into setup when nothing is mapped", async () => {
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      json: async () => [],
-    }));
+  it("connects a bank from the empty state through Plaid Hosted Link", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/sync/link-sessions" && init?.method === "POST") {
+        return {
+          ok: true,
+          json: async () => ({
+            id: 3, mode: "create", status: "pending", tokenId: null, financialInstitution: null,
+            hostedLinkUrl: "https://hosted.plaid.test/link/3", expiresAt: "2026-10-09T14:00:00.000Z", error: null,
+          }),
+        };
+      }
+      return { ok: true, json: async () => [] };
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<SyncPage />);
     expect(await screen.findByText(/No bank accounts are connected yet/i)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /connect a bank/i })).toHaveAttribute(
-      "href",
-      "/b/1/sync/tokens"
+    fireEvent.click(screen.getByRole("button", { name: /connect a bank/i }));
+
+    const open = await screen.findByRole("link", { name: "Open Plaid" });
+    expect(open).toHaveAttribute("href", "https://hosted.plaid.test/link/3");
+    expect(open).toHaveAttribute("target", "_blank");
+    const call = fetchMock.mock.calls.find(([url]) => url === "/api/b/1/sync/link-sessions");
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ tokenId: null });
+  });
+
+  it("offers Reconnect for a connection to an owner, in update mode", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/sync/assigned-accounts") {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              plaidLinkId: 11, financialInstitution: "Chase", tokenId: 5, itemId: "item-1",
+              plaidAccountId: "plaid-1", plaidAccountName: "Chase Checking", counterpoiseAccountId: 1,
+              counterpoiseAccountName: "Checking", lastSyncedAt: null, lastError: "ITEM_LOGIN_REQUIRED",
+              pendingCount: 0, reviewCount: 0,
+            },
+          ],
+        };
+      }
+      if (url === "/api/b/1/sync/link-sessions" && init?.method === "POST") {
+        return {
+          ok: true,
+          json: async () => ({
+            id: 4, mode: "update", status: "pending", tokenId: 5, financialInstitution: "Chase",
+            hostedLinkUrl: "https://hosted.plaid.test/link/4", expiresAt: "2026-10-09T14:00:00.000Z", error: null,
+          }),
+        };
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<SyncPage />);
+    expect(await screen.findByText("Chase Checking")).toBeInTheDocument();
+    // The banner of the failed connection offers the reconnect too.
+    expect(within(screen.getByRole("alert")).getByRole("button", { name: "Reconnect" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Chase actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect" }));
+    expect(await screen.findByText(/Sign in to Chase again at Plaid/)).toBeInTheDocument();
+    const call = fetchMock.mock.calls.find(([url]) => url === "/api/b/1/sync/link-sessions");
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ tokenId: 5 });
+  });
+
+  it("does not offer Reconnect to an editor", async () => {
+    bookRoleValue = { canWrite: true, isOwner: false, role: "editor" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => [
+          {
+            plaidLinkId: 11, financialInstitution: "Chase", tokenId: 5, itemId: "item-1",
+            plaidAccountId: "plaid-1", plaidAccountName: "Chase Checking", counterpoiseAccountId: 1,
+            counterpoiseAccountName: "Checking", lastSyncedAt: null, lastError: "ITEM_LOGIN_REQUIRED",
+            pendingCount: 0, reviewCount: 0,
+          },
+        ],
+      }))
     );
+
+    render(<SyncPage />);
+    expect(await screen.findByText("Chase Checking")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Chase actions" }));
+    expect(screen.queryByRole("menuitem", { name: "Reconnect" })).not.toBeInTheDocument();
   });
 
   it("reports every failing connection when Sync all fails on more than one, not just the last", async () => {

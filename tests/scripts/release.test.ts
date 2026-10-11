@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -130,6 +130,58 @@ function detachAtDev() {
   git(["checkout", "--detach", "dev"]);
 }
 
+/** Real tsc consumes generated modules; only the toolchain and browser are fixtures. */
+function prepareChecks(failBuild = false) {
+  const checkLog = join(root, "checks.log");
+  const pkg = JSON.parse(readFileSync(join(repo, "package.json"), "utf8"));
+  Object.assign(pkg.scripts, {
+    "core:wasm:build": "node fixture-checks.mjs wasm",
+    lint: "node fixture-checks.mjs lint",
+    test: "node fixture-checks.mjs test",
+  });
+  writeFileSync(join(repo, "package.json"), JSON.stringify(pkg));
+  writeFileSync(join(repo, ".gitignore"), "lib/wasm/generated/\n");
+  writeFileSync(join(repo, "fixture-checks.mjs"), `
+    import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+    const stage = process.argv[2];
+    appendFileSync(${JSON.stringify(checkLog)}, stage + '\\n');
+    if (stage === 'wasm') {
+      if (${failBuild}) { console.error('WASM build failed'); process.exit(23); }
+      mkdirSync('lib/wasm/generated', { recursive: true });
+      writeFileSync('lib/wasm/generated/ledger_core.d.ts', 'export function validate_splits(): boolean;');
+      writeFileSync('lib/wasm/generated/core-bytes.ts', 'export const CORE_WASM_BASE64 = "";');
+    }
+  `);
+  writeFileSync(join(repo, "consumer.ts"), `
+    import { validate_splits } from '@/lib/wasm/generated/ledger_core';
+    import { CORE_WASM_BASE64 } from '@/lib/wasm/generated/core-bytes';
+    export const result: [boolean, string] = [validate_splits(), CORE_WASM_BASE64];
+  `);
+  writeFileSync(join(repo, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2020", module: "ESNext", moduleResolution: "Bundler",
+      paths: { "@/*": ["./*"] }, types: [],
+    },
+    include: ["consumer.ts", "lib/**/*.ts"],
+  }));
+  writeFileSync(join(binDir, "npx"), `#!/usr/bin/env node
+    const { appendFileSync } = require('node:fs');
+    const { execFileSync } = require('node:child_process');
+    const [command, ...args] = process.argv.slice(2);
+    appendFileSync(${JSON.stringify(checkLog)}, command + '\\n');
+    if (command === 'tsc') {
+      try {
+        execFileSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), "node_modules/typescript/bin/tsc"))}, ...args], { stdio: 'inherit' });
+      } catch (error) { process.exit(error.status ?? 1); }
+    } else if (command !== 'playwright') { process.exit(1); }
+  `);
+  chmodSync(join(binDir, "npx"), 0o755);
+  git(["add", "-A"]);
+  git(["commit", "-m", "prepare release checks"]);
+  releaseBase = head();
+  return () => existsSync(checkLog) ? readFileSync(checkLog, "utf8").trim().split("\n") : [];
+}
+
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "cp-release-"));
   binDir = join(root, "bin");
@@ -181,6 +233,45 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
+});
+
+describe("release.sh prepares WASM for a fresh checkout", () => {
+  it("generates both imported modules before the real type check and finishes the release", () => {
+    const checks = prepareChecks();
+    expect(existsSync(join(repo, "lib/wasm/generated"))).toBe(false);
+
+    const run = release(["patch", "--no-pr"]);
+
+    expect(run.code, run.output).toBe(0);
+    expect(checks()).toEqual(["wasm", "lint", "tsc", "test", "playwright"]);
+    expect(version()).toBe("1.0.1");
+    expect(remoteBranches()).toContain("release/v1.0.1");
+    expect(git(["status", "--porcelain"])).toBe("");
+  });
+
+  it("stops before type checking, bumping or pushing when the WASM build fails", () => {
+    const checks = prepareChecks(true);
+
+    const run = release(["patch", "--no-pr"]);
+
+    expect(run.output).toContain("WASM build failed");
+    expect(run.code).toBe(23);
+    expect(checks()).toEqual(["wasm"]);
+    expect(version()).toBe("1.0.0");
+    expect(head()).toBe(releaseBase);
+    expect(remoteBranches().sort()).toEqual(["dev", "main"]);
+  });
+
+  it("skips the WASM build along with the other checks under --skip-checks", () => {
+    const checks = prepareChecks(true);
+
+    const run = release(["--skip-checks", "patch", "--no-pr"]);
+
+    expect(run.code, run.output).toBe(0);
+    expect(checks()).toEqual([]);
+    expect(version()).toBe("1.0.1");
+    expect(remoteBranches()).toContain("release/v1.0.1");
+  });
 });
 
 describe("release.sh runs in a release checkout, never on a shared branch", () => {

@@ -9,7 +9,7 @@ import { SecurityAutocomplete } from "@/components/ui/SecurityAutocomplete";
 import { formatCurrency, resolveAmountOnBlur } from "@/lib/wasm-client";
 import { evaluateExpression } from "@/lib/wasm-client";
 import type { AccountWithBalance } from "@/types";
-import type { InvestmentEntry } from "./useInvestmentEntry";
+import type { InvestmentAction, InvestmentEntry } from "./useInvestmentEntry";
 import { tabTo } from "./tab-to";
 
 // Renders the investment-specific field set (Security, Action, Investment
@@ -54,9 +54,11 @@ export function InvestmentEntrySection(props: {
   const handlePriceBlur = () => {
     if (!investment.investmentPrice.trim()) return;
     const evaluated = evaluateExpression(investment.investmentPrice);
-    if (evaluated !== null) {
-      investment.setInvestmentPrice(formatMicrosInput(Math.round(evaluated * 1_000_000)));
-    }
+    if (evaluated === null) return;
+    const formatted = formatMicrosInput(Math.round(evaluated * 1_000_000));
+    // A blur that changes nothing keeps a computed Dividend Reinvest price
+    // computed.
+    if (formatted !== investment.investmentPrice) investment.setInvestmentPrice(formatted);
   };
 
   const investmentAccounts = accounts.filter(
@@ -72,12 +74,13 @@ export function InvestmentEntrySection(props: {
   const incomeAccounts = accounts.filter((a) => a.type === "income");
   const expenseAccounts = accounts.filter((a) => a.type === "expense");
 
+  const action = investment.investmentAction;
   const showIncomeAccount =
-    investment.investmentAction === "dividend" || investment.investmentAction === "capGain";
+    action === "dividend" || action === "capGain" || action === "reinvest";
   const showFeeAccount =
-    investment.investmentAction === "buy" ||
-    investment.investmentAction === "sell" ||
-    investment.investmentAction === "fee";
+    action === "buy" || action === "sell" || action === "fee" || action === "reinvest";
+  const onActionChange = (value: string) => investment.setInvestmentAction(value as InvestmentAction);
+  const remainder = investment.investmentTotal.remainderCents;
 
   if (compact) {
     return (
@@ -97,15 +100,12 @@ export function InvestmentEntrySection(props: {
           id="investmentAction"
           size="compact"
           value={investment.investmentAction}
-          onChange={(e) =>
-            investment.setInvestmentAction(
-              e.target.value as "buy" | "sell" | "dividend" | "capGain" | "fee" | "split"
-            )
-          }
+          onChange={(e) => onActionChange(e.target.value)}
           options={[
             { value: "buy", label: "Buy" },
             { value: "sell", label: "Sell" },
             { value: "dividend", label: "Dividend" },
+            { value: "reinvest", label: "Div. Reinvest" },
             { value: "capGain", label: "Cap Gain" },
             { value: "fee", label: "Fee" },
             { value: "split", label: "Split" },
@@ -155,6 +155,29 @@ export function InvestmentEntrySection(props: {
             <Input type="number" label="Split Denominator" id="investmentSplitDenominator" size="compact"
               value={investment.investmentSplitDenominator} onChange={(e) => investment.setInvestmentSplitDenominator(e.target.value)}
               onKeyDown={tabToAdd} placeholder="1" min="1" step="any" selectOnFocus />
+            <Button ref={addButtonRef} type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
+          </div>
+        ) : action === "reinvest" ? (
+          <div className="col-span-full grid grid-cols-[1fr_1fr_1fr_1fr_auto_auto] gap-2 items-end">
+            <Input type="text" label="Dividend Amount" id="investmentDividendAmount" size="compact"
+              value={investment.investmentDividendAmount} onChange={(e) => investment.setInvestmentDividendAmount(e.target.value)}
+              onBlur={() => investment.setInvestmentDividendAmount(resolveAmountOnBlur(investment.investmentDividendAmount))}
+              placeholder="0.00" selectOnFocus />
+            <Input type="text" label="Shares" id="investmentShares" size="compact"
+              value={investment.investmentShares} onChange={(e) => investment.setInvestmentShares(e.target.value)}
+              placeholder="0.000000" selectOnFocus />
+            <Input type="text" label={priceLabel} id="investmentPrice" size="compact"
+              value={investment.investmentPrice} onChange={(e) => investment.setInvestmentPrice(e.target.value)}
+              onBlur={handlePriceBlur}
+              placeholder="0.000000" selectOnFocus />
+            <Input type="text" label="Fee" id="investmentFee" size="compact"
+              value={investment.investmentFee} onChange={(e) => investment.setInvestmentFee(e.target.value)}
+              onBlur={() => investment.setInvestmentFee(resolveAmountOnBlur(investment.investmentFee))}
+              onKeyDown={tabToAdd} placeholder="0.00" selectOnFocus />
+            <div className={`mb-1 text-sm font-medium whitespace-nowrap ${remainder < 0 ? "text-fg-danger" : "text-fg-secondary"}`}
+              data-testid="investment-remainder" title="Cash remainder">
+              Cash {formatCurrency(remainder)}
+            </div>
             <Button ref={addButtonRef} type="submit" size="sm" aria-label="Add Transaction" className="mb-px">Add</Button>
           </div>
         ) : investment.investmentAction === "dividend" ? (
@@ -218,21 +241,12 @@ export function InvestmentEntrySection(props: {
           label="Action"
           id="investmentAction"
           value={investment.investmentAction}
-          onChange={(e) =>
-            investment.setInvestmentAction(
-              e.target.value as
-                | "buy"
-                | "sell"
-                | "dividend"
-                | "capGain"
-                | "fee"
-                | "split"
-            )
-          }
+          onChange={(e) => onActionChange(e.target.value)}
           options={[
             { value: "buy", label: "Buy" },
             { value: "sell", label: "Sell" },
             { value: "dividend", label: "Dividend" },
+            { value: "reinvest", label: "Dividend Reinvest" },
             { value: "capGain", label: "Capital Gain" },
             { value: "fee", label: "Fee" },
             { value: "split", label: "Stock Split" },
@@ -296,6 +310,48 @@ export function InvestmentEntrySection(props: {
             placeholder="1"
             min="1"
             step="any"
+            selectOnFocus
+          />
+        </div>
+      ) : action === "reinvest" ? (
+        <div className="grid grid-cols-4 gap-4">
+          <Input
+            type="text"
+            label="Dividend Amount"
+            id="investmentDividendAmount"
+            value={investment.investmentDividendAmount}
+            onChange={(e) => investment.setInvestmentDividendAmount(e.target.value)}
+            onBlur={() => investment.setInvestmentDividendAmount(resolveAmountOnBlur(investment.investmentDividendAmount))}
+            placeholder="0.00"
+            selectOnFocus
+          />
+          <Input
+            type="text"
+            label="Shares"
+            id="investmentShares"
+            value={investment.investmentShares}
+            onChange={(e) => investment.setInvestmentShares(e.target.value)}
+            placeholder="0.000000"
+            selectOnFocus
+          />
+          <Input
+            type="text"
+            label={priceLabel}
+            id="investmentPrice"
+            value={investment.investmentPrice}
+            onChange={(e) => investment.setInvestmentPrice(e.target.value)}
+            onBlur={handlePriceBlur}
+            placeholder="0.000000"
+            selectOnFocus
+          />
+          <Input
+            type="text"
+            label="Fee"
+            id="investmentFee"
+            value={investment.investmentFee}
+            onChange={(e) => investment.setInvestmentFee(e.target.value)}
+            onBlur={() => investment.setInvestmentFee(resolveAmountOnBlur(investment.investmentFee))}
+            placeholder="0.00"
             selectOnFocus
           />
         </div>
@@ -375,6 +431,23 @@ export function InvestmentEntrySection(props: {
           <p className="text-xs text-fg-tertiary">
             Stock splits adjust share counts without changing cash balances.
           </p>
+        ) : action === "reinvest" ? (
+          <>
+            <div className="flex items-center justify-between">
+              <span>Cash remainder</span>
+              <output
+                id="investmentRemainder"
+                aria-live="polite"
+                data-testid="investment-remainder"
+                className={`font-medium ${remainder < 0 ? "text-fg-danger" : ""}`}
+              >
+                {formatCurrency(remainder)}
+              </output>
+            </div>
+            <p className="text-xs text-fg-tertiary">
+              The dividend buys the shares and pays the fee; the rest stays in the cash account
+            </p>
+          </>
         ) : investment.investmentAction === "dividend" ? (
           <p className="text-xs text-fg-tertiary">
             Cash dividend paid to investment account

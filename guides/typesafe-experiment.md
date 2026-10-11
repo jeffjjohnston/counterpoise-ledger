@@ -149,8 +149,21 @@ remains beside them:
 
 The TypeScript modules remain only for `npm run typesafe:report`
 (`scripts/typesafe-report.ts`), which reads the records. A change to a rule
-that the report depends on must change both sides. The MCP tools do not call
-TypeSafe. The fingerprint is the SHA-256 of `JSON.stringify(snapshot)`, so the
+that the report depends on must change both sides. Both summaries count each
+evaluation in the same named steps: request, latency, cost, suggestion,
+proposal, then the resolution by the user. `tests/fixtures/typesafe-summary.json`
+holds hand-worked event histories with their expected counts; a Rust test and
+a Vitest test both read it. Add a case there with a change to a count.
+Two rules cover records that the server does not write (owner decision of
+2026-10-11):
+
+- A usage with a token count that is missing, null or not a number adds 0
+  tokens. The usage is still a sample (`usage_samples`).
+- A snapshot without a `baselineIds` list has no baseline. The summary does
+  not fail on it: a chosen candidate counts as `differs_from_baseline`, and a
+  manual match does not count as `baseline_agrees_with_user`.
+
+The MCP tools do not call TypeSafe. The fingerprint is the SHA-256 of `JSON.stringify(snapshot)`, so the
 Rust snapshot keeps the key order that the Node object literal had, and stored
 fingerprints stay valid. The state and the questions are built from the
 snapshot as the database returns it: the JSON columns are read as text, so

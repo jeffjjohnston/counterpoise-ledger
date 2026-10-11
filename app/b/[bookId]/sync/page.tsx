@@ -8,6 +8,7 @@ import { ConfirmModal } from "@/components/ui/ConfirmModal";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { ReconciliationModal } from "@/components/sync/ReconciliationModal";
+import { PlaidLinkModal } from "@/components/sync/PlaidLinkModal";
 import { formatDate, toDateString } from "@/lib/wasm-client";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
@@ -85,6 +86,12 @@ export default function SyncPage() {
   const [resetTarget, setResetTarget] = useState<{ tokenId: number; institution: string } | null>(
     null
   );
+  // The Plaid Hosted Link session that is open: a new bank (tokenId null),
+  // or a reconnect of one connection. Owners only.
+  const [linkTarget, setLinkTarget] = useState<{
+    tokenId: number | null;
+    institution: string | null;
+  } | null>(null);
 
   const fetchAssignedAccounts = useCallback(async () => {
     const data = await apiGet<AssignedSyncAccount[]>(
@@ -293,6 +300,16 @@ export default function SyncPage() {
     };
   }, [error, failedConnections, groupedRows]);
 
+  // A reconnect clears the last sync error of the connection, so the rows
+  // are read again. A new connection has no mapped account yet, so it does
+  // not show here until its accounts are mapped.
+  const handleLinkComplete = useCallback(() => {
+    setError(null);
+    void fetchAssignedAccounts().catch(() => {
+      // Best-effort; the 60s refresh catches up.
+    });
+  }, [fetchAssignedAccounts]);
+
   const handleReset = async (tokenId: number) => {
     setError(null);
     setResettingById((prev) => ({ ...prev, [tokenId]: true }));
@@ -360,6 +377,10 @@ export default function SyncPage() {
                   label="Sync options"
                   items={[
                     {
+                      label: "Connect a bank",
+                      onSelect: () => setLinkTarget({ tokenId: null, institution: null }),
+                    },
+                    {
                       label: "Manage connections",
                       onSelect: () => router.push(`/b/${bookId}/sync/tokens`),
                     },
@@ -396,13 +417,33 @@ export default function SyncPage() {
             )}
           </div>
           {canWrite && errorBanner.tokenId !== null && (
-            <Button
-              size="sm"
-              onClick={() => void handleSync(errorBanner.tokenId as number)}
-              disabled={syncingById[errorBanner.tokenId] === true}
-            >
-              {syncingById[errorBanner.tokenId] ? "Retrying…" : "Retry"}
-            </Button>
+            <div className="inline-flex items-center gap-2">
+              {/* A sign-in that expired (ITEM_LOGIN_REQUIRED) needs the
+                  owner to reconnect; a retry alone cannot fix it. */}
+              {isOwner && !groupedRows[errorBanner.tokenId as number]?.[0]?.isDemo && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() =>
+                    setLinkTarget({
+                      tokenId: errorBanner.tokenId as number,
+                      institution:
+                        groupedRows[errorBanner.tokenId as number]?.[0]?.financialInstitution ??
+                        null,
+                    })
+                  }
+                >
+                  Reconnect
+                </Button>
+              )}
+              <Button
+                size="sm"
+                onClick={() => void handleSync(errorBanner.tokenId as number)}
+                disabled={syncingById[errorBanner.tokenId] === true}
+              >
+                {syncingById[errorBanner.tokenId] ? "Retrying…" : "Retry"}
+              </Button>
+            </div>
           )}
         </div>
       )}
@@ -412,7 +453,14 @@ export default function SyncPage() {
           <EmptyState
             title="No bank accounts are connected yet"
             description="Connect a bank, then map its accounts to accounts in this book. Synced transactions appear here for you to review."
-            action={isOwner ? { label: "Connect a bank", href: `/b/${bookId}/sync/tokens` } : undefined}
+            action={
+              isOwner
+                ? {
+                    label: "Connect a bank",
+                    onClick: () => setLinkTarget({ tokenId: null, institution: null }),
+                  }
+                : undefined
+            }
           />
         </div>
       ) : (
@@ -420,6 +468,7 @@ export default function SyncPage() {
           {Object.entries(groupedRows).map(([tokenIdStr, groupRows]) => {
             const tokenId = Number(tokenIdStr);
             const institution = groupRows[0].financialInstitution;
+            const isDemo = groupRows[0].isDemo;
             const lastSyncedAt = groupRows[0].lastSyncedAt;
             const isSyncing = syncingById[tokenId] === true;
             const isResetting = resettingById[tokenId] === true;
@@ -459,6 +508,14 @@ export default function SyncPage() {
                       <MenuButton
                         label={`${institution} actions`}
                         items={[
+                          ...(isOwner && !isDemo
+                            ? [
+                                {
+                                  label: "Reconnect",
+                                  onSelect: () => setLinkTarget({ tokenId, institution }),
+                                },
+                              ]
+                            : []),
                           {
                             label: "Reset sync data",
                             variant: "danger",
@@ -569,6 +626,17 @@ export default function SyncPage() {
         onClose={closeReconcileModal}
         onQueueChanged={() => void fetchAssignedAccounts()}
       />
+
+      {linkTarget && (
+        <PlaidLinkModal
+          bookId={bookId}
+          tokenId={linkTarget.tokenId}
+          institution={linkTarget.institution}
+          onClose={() => setLinkTarget(null)}
+          onComplete={handleLinkComplete}
+          onMapAccounts={() => router.push(`/b/${bookId}/sync/tokens`)}
+        />
+      )}
 
       <ConfirmModal
         isOpen={resetTarget !== null}

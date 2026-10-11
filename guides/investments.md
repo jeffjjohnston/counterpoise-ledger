@@ -17,6 +17,73 @@ const splits = buildBuySplits({
 });
 ```
 
+## Reinvested dividends (DRIP)
+
+A dividend `D` that buys shares is **one transaction** with two investment
+splits of the same security: a `dividend` split with no shares and no price,
+and a `buy` split with the shares, the price and the fee `F`. There is no
+`reinvest` action: a new enum value would break a client that decodes
+`InvestmentSplitRow.action`, and an older binary could not read the rows.
+
+| Ledger leg | Amount |
+| --- | --- |
+| Investment account | `+G`, where `G = gross_amount_cents(shares, price)` |
+| Fee expense account (only when `F > 0`) | `+F` |
+| Income account | `-D` |
+| Investment cash account (only when `R != 0`) | `+R`, where `R = D - G - F` |
+
+`R` must not be negative. Do not write a cash leg in and a cash leg out for the
+same money. `build_reinvest_splits()` in `rust-api/core/src/accounting.rs`
+(`buildReinvestSplits()` in `lib/wasm-client.ts`) builds the legs and the two
+investment splits, and refuses a bad input. `reinvest_price_micros()` gives
+the price `(D - F) / shares`, rounded down to micros, so that `R` is not
+negative.
+
+What reads the shape:
+- The lot rebuild opens one lot from the `buy` split, with the basis `G + F`.
+  It ignores the `dividend` split.
+- The income statement counts the `-D` income leg.
+- The security income (`incomeCents`, `cashAmountCents`, and the MCP security
+  detail) is the income legs less the expense legs of the transaction,
+  negated: `D - F`. It does not read the asset legs, so a client that writes
+  gross cash legs gets the same value (`income_by_transaction()` in
+  `rust-api/server/src/routes/securities.rs`).
+- The Moneydance importer writes a reinvested dividend in the same shape (see
+  [moneydance-import.md](moneydance-import.md)).
+
+In the form, the Action "Dividend Reinvest" is a UI value only
+(`useInvestmentEntry`). It fills the price from the dividend, the fee and the
+shares until the user types a price, shows the cash remainder, and refuses a
+negative remainder.
+
+The API and MCP clients write a DRIP with `create_transaction` or
+`update_transaction`; the `investmentSplits` description of each states the
+shape.
+
+## Editing a transaction with more than one investment split
+
+The investment mode of `TransactionForm` shows one investment split, and its
+save replaces all the investment splits of the transaction. A transaction
+with more than one investment split therefore opens in journal mode
+(`editFieldsFromTransaction()` in
+`components/transactions/transaction-form-fields.ts`). The exception is a
+reinvested dividend that Dividend Reinvest saves again with the same ledger
+legs: it opens as Dividend Reinvest (`reinvestFieldsFromTransaction()`). An
+imported reinvestment keeps its fee in the investment leg, so the form would
+add a fee leg; it opens in journal mode. A journal save sends
+no `investmentSplits` key, and the update route keeps the investment splits
+that the transaction has. Before this rule, a save from investment mode
+deleted the splits that the form did not show.
+
+The update route refuses splits that leave out the investment account of a
+stored investment split, when the request sends no `investmentSplits`. The
+investment cash child counts as its parent, because a dividend stores the
+brokerage on its investment split and has only the cash leg. The check runs
+after the conflict check, so a stale edit gets 409, not 400. The
+ledger would move to another account while the shares and the lots stay in
+the old one. "Make recurring" is hidden for a transaction with investment
+splits, because a recurring rule copies only the ledger splits.
+
 ## Investment Split Validation
 Before creating investment transactions, validate:
 1. Investment account exists and is active
@@ -113,10 +180,7 @@ and does not follow it. Left open, the lot looks older than it actually is
 relative to fixed-date trades. The drift is latent until an installation
 actually holds a floating investment transaction, and a ledger with none is
 unaffected. The pair self-heals on any write that triggers the rebuild for
-it — there is nothing to migrate ahead of time. For the same reason,
-`ledger-cli import-postgres` does not compare the lots of a pair with a
-floating investment split against a fresh rebuild: it rebuilds those pairs in
-the copy and names them in its summary.
+it — there is nothing to migrate ahead of time.
 
 The Moneydance importer writes investment splits only; lots and allocations come
 from the rebuild alone.

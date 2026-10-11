@@ -53,7 +53,11 @@ problem that squash-merging a long-running branch produces:
   detached HEAD is the expected starting state: the branch name carries the
   version, which is not knowable until the bump has written `package.json`, so
   `release.sh` names the branch itself afterwards.
-- **The release checkout needs the Rust toolchain.** After the bump,
+- **The release checkout needs the Rust and WASM toolchains.** The pre-release
+  checks first run `npm run core:wasm:build` so a fresh checkout has the ignored
+  browser bindings before lint and TypeScript checking. See
+  [testing.md](testing.md) for the WASM tools. `--skip-checks` skips this build
+  along with the checks the caller already ran. After the bump,
   `release.sh` runs `npm run openapi:generate`, which builds and runs
   `counterpoise-rust-api openapi` with `cargo`. The document carries the
   package version, so the release commit includes the regenerated
@@ -96,10 +100,11 @@ problem that squash-merging a long-running branch produces:
 - **The deploy refuses an install that has not converted to SQLite.** It
   refuses when the `counterpoise_data` volume does not exist, and when
   `.env.production.local` still sets `DATABASE_URL` and the volume holds no
-  `counterpoise.db` (the test of `scripts/upgrade-to-sqlite.sh`). The check
+  `counterpoise.db` (the test of the upgrade script of v1.50.0). The check
   runs before the production checkout moves and before the tag is published,
-  so a refusal changes nothing. Run `scripts/upgrade-to-sqlite.sh` in the
-  production checkout first (see [upgrade-to-sqlite.md](upgrade-to-sqlite.md)).
+  so a refusal changes nothing. Convert the data with v1.50.0 in the
+  production checkout first: this release does not have the converter (see
+  [upgrade-to-sqlite.md](upgrade-to-sqlite.md)).
   A new install creates the volume once with
   `docker volume create counterpoise_data`.
 - **The requested SHA must fast-forward production's `main`.** The deploy

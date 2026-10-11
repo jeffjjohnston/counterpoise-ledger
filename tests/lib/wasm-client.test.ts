@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   buildBuySplits,
+  buildReinvestSplits,
+  reinvestPriceMicros,
   evaluateExpression,
   flattenAccounts,
   getInvestmentGrossAmountCents,
@@ -31,6 +33,28 @@ describe("browser WASM core in Node", () => {
     expect(getNextDate("2026-01-31", { frequency: "monthly", interval: 1 })).toBe("2026-02-28");
     expect(evaluateExpression("2 * (3 + 4)")).toBe(14);
     expect(formatCurrency(-125)).toBe("−$1.25");
+  });
+
+  it("builds a reinvested dividend as one balanced transaction", () => {
+    // $100.00 less a $1.00 fee buys 1.5 shares at $65.00; $1.50 stays as cash.
+    const built = buildReinvestSplits({
+      securityAccountId: 1, cashAccountId: 2, incomeAccountId: 3, feeAccountId: 4,
+      dividendCents: 10_000, sharesMicros: 1_500_000, priceMicros: 65_000_000, feesCents: 100,
+    });
+    expect(built.splits).toEqual([
+      { accountId: 1, amount: 9_750 }, { accountId: 4, amount: 100 },
+      { accountId: 3, amount: -10_000 }, { accountId: 2, amount: 150 },
+    ]);
+    expect(built.investmentSplits).toEqual([
+      { action: "dividend", sharesMicros: 0, priceMicros: 0, feesCents: 0 },
+      { action: "buy", sharesMicros: 1_500_000, priceMicros: 65_000_000, feesCents: 100 },
+    ]);
+    expect(() => buildReinvestSplits({
+      securityAccountId: 1, cashAccountId: 2, incomeAccountId: 3,
+      dividendCents: 10_000, sharesMicros: 3_000_000, priceMicros: 50_000_000,
+    })).toThrow("The shares and the fee cost more than the dividend.");
+    expect(reinvestPriceMicros(10_000, 100, 3_000_000)).toBe(33_000_000);
+    expect(reinvestPriceMicros(100, 100, 1_000_000)).toBeNull();
   });
 
   it("preserves account data and settled dates", () => {

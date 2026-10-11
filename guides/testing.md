@@ -202,7 +202,8 @@ Never set it outside tests. The HTTP suite
 covers account reads and writes, payee writes, the transaction register and
 transaction CRUD, investments and securities, security prices and the Tiingo
 fetch, recurring rules and their processing, Plaid connections, account
-mappings, the sync, reconciliation, the sync reads, live updates, TypeSafe
+mappings, the Plaid Hosted Link sessions, the sync, reconciliation, the sync
+reads, live updates, TypeSafe
 settings, suggestions and retention, the scheduled jobs (`/api/cron/*`),
 version, book and member management, demo book creation, issue reports,
 health, job status, and WebMCP.

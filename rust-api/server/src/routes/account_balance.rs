@@ -100,7 +100,7 @@ pub(crate) async fn account_balance_history(
         ));
     }
     let pool = &state.pool;
-    let book_id = book.book_id;
+    let book_id = book.book_id();
     let db_error = |cause| internal_error(cause, FAILURE);
     let account = find_book_account(pool, book_id, account_id)
         .await

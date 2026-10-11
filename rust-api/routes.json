@@ -41,6 +41,8 @@
   { "method": "PUT", "path": "/api/b/[bookId]/sync/tokens/[id]/accounts", "handler": "sync.assignaccounts" },
   { "method": "DELETE", "path": "/api/b/[bookId]/sync/tokens/[id]/sync", "handler": "sync.clear" },
   { "method": "POST", "path": "/api/b/[bookId]/sync/tokens/[id]/sync", "handler": "sync.run" },
+  { "method": "POST", "path": "/api/b/[bookId]/sync/link-sessions", "handler": "sync.createlinksession" },
+  { "method": "POST", "path": "/api/b/[bookId]/sync/link-sessions/[id]/check", "handler": "sync.checklinksession" },
   { "method": "GET", "path": "/api/b/[bookId]/sync/reconcile", "handler": "sync.bookqueue" },
   { "method": "GET", "path": "/api/b/[bookId]/sync/accounts/[id]/reconcile", "handler": "sync.linkqueue" },
   { "method": "POST", "path": "/api/b/[bookId]/sync/accounts/[id]/reconcile", "handler": "sync.resolve" },

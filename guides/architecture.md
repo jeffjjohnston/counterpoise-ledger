@@ -31,8 +31,9 @@ it carries the rules that apply everywhere and says when to come here.
   under `server/src/routes/`. The database pool, configuration, tracing,
   authentication and the JSON error response are separate modules.
 - `cli` holds `ledger-cli`: `migrate`, `seed`, `list-books`,
-  `rebuild-lots`, `import-moneydance`, `backup` and `import-postgres` (the
-  one-time converter; see [upgrade-to-sqlite.md](upgrade-to-sqlite.md)).
+  `rebuild-lots`, `import-moneydance` and `backup`. The one-time PostgreSQL
+  converter is only in v1.50.0 to v1.53.0; see
+  [upgrade-to-sqlite.md](upgrade-to-sqlite.md).
 
 `rust-api/routes.json` lists the method and path pattern of each route that
 the Axum router registers from its handler table. A few routes are registered

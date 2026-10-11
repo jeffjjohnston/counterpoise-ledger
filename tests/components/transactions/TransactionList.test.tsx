@@ -447,6 +447,29 @@ describe("TransactionList", () => {
     expect(screen.queryByText("Checking")).not.toBeInTheDocument();
   });
 
+  // A reinvested dividend with no cash rest does not change the cash
+  // account. Its amount is zero, with no sign and no direction color.
+  it("shows a zero amount with no sign", () => {
+    const account = (id: number, name: string) => ({
+      id, bookId: 1, name, type: "asset" as const, subtype: null, parentId: null, isActive: true,
+      isInvestmentCash: false, icon: null, isFavorite: false, createdAt: new Date(), updatedAt: new Date(),
+    });
+    const transactions = [{
+      id: 7, bookId: 1, date: "2024-01-20", description: "No change", checkNumber: null, notes: null,
+      payeeId: null, payee: null, isReconciled: false, isFloating: false, recurringRuleId: null,
+      createdBy: null, updatedBy: null, createdAt: new Date(), updatedAt: new Date(),
+      splits: [
+        { id: 71, bookId: 1, transactionId: 7, accountId: 1, amount: 0, account: account(1, "Checking") },
+        { id: 72, bookId: 1, transactionId: 7, accountId: 4, amount: 0, account: account(4, "Other") },
+      ],
+      investmentSplits: [],
+    }];
+    render(<TransactionList transactions={transactions} accounts={mockAccounts} selectedAccountId={1} onEdit={vi.fn()} />);
+    const cell = screen.getByTestId("transaction-amount-7");
+    expect(cell.textContent).toMatch(/^\$0\.00/);
+    expect(cell.className).not.toMatch(/text-fg-(success|danger)/);
+  });
+
   it("shows minus icons when the selected account balance decreases", () => {
     const transactions: TransactionWithSplits[] = [
       {
@@ -3478,6 +3501,32 @@ describe("date-state row emphasis", () => {
       expect(card.className).not.toContain("border-border-future");
       expect(card.className).not.toContain("border-l-2");
     }
+  });
+
+  // Report #42: a floating row whose stored date is in the future also showed
+  // the Scheduled pill. Its effective date is today, so it is not scheduled.
+  const FLOATING_FUTURE = dateStateRow(9104, "Floating rent", "2999-01-01", {
+    isFloating: true,
+  });
+
+  it("gives a floating row with a future stored date the Float pill only (desktop)", () => {
+    renderRows([FLOATING_FUTURE]);
+
+    const row = screen.getByText("Float").closest("tr");
+    expect(row).not.toBeNull();
+    expect(screen.queryByText("Scheduled")).not.toBeInTheDocument();
+    expect(row!.className).not.toContain("bg-future");
+  });
+
+  it("gives a floating row with a future stored date the Float pill only (mobile)", () => {
+    isMobileRef.value = true;
+    const { container } = renderRows([FLOATING_FUTURE]);
+
+    const cards = Array.from(container.querySelectorAll("div.divide-y > div"));
+    expect(cards).toHaveLength(1);
+    expect(screen.getByText("Float")).toBeInTheDocument();
+    expect(screen.queryByText("Scheduled")).not.toBeInTheDocument();
+    expect(cards[0].className).not.toContain("bg-future");
   });
 
   it("leaves the Plaid-pending row's own border alone", () => {

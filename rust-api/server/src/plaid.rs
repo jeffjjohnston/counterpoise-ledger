@@ -67,6 +67,14 @@ pub(crate) fn is_configuration_error(message: &str) -> bool {
         .any(|name| message.contains(name))
 }
 
+/// True when Plaid refused the request itself, for example an expired or a
+/// used token (`INVALID_PUBLIC_TOKEN`, `INVALID_LINK_TOKEN`): another try
+/// gives the same answer. A network failure, a rate limit or a Plaid server
+/// error is not definitive, and a later try can work.
+pub(crate) fn is_definitive_error(message: &str) -> bool {
+    message.contains("(INVALID_")
+}
+
 /// `formatPlaidError`: the prefix, then the error message and code of a
 /// Plaid error body when it has a message.
 fn format_error(prefix: &str, payload: Option<&Value>) -> String {
@@ -267,9 +275,260 @@ impl Plaid {
     }
 }
 
+/// A Hosted Link session that `/link/token/create` started.
+pub(crate) struct HostedLink {
+    pub(crate) link_token: String,
+    pub(crate) hosted_link_url: String,
+    /// The `expiration` of the link token, when Plaid sent one that parses.
+    pub(crate) expiration: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The result of a Hosted Link session, as `/link/token/get` reports it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LinkOutcome {
+    /// The user has not finished the session yet. A session that the user
+    /// closed is also here: the user can open the URL again until the link
+    /// token expires.
+    Pending,
+    /// The user finished the session. A new Item has a public token. An
+    /// update-mode session can finish without one.
+    Success {
+        public_token: Option<String>,
+        institution: Option<String>,
+    },
+}
+
+/// A text field of a JSON object, when it is a string that is not empty.
+fn text_field(value: Option<&Value>, key: &str) -> Option<String> {
+    value
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+/// Reads the result of a Hosted Link session from a `/link/token/get` body.
+///
+/// The function is total: it runs in a poll loop, and an error on a body of
+/// an unexpected shape would abandon a session that the user possibly
+/// finished. Plaid adds a session to `link_sessions` each time the user
+/// opens the URL, so the function reads each session, newest last.
+///
+/// A session finished with success when `results.item_add_results` has a
+/// public token (a new Item), when it has `on_success` (the older field),
+/// or when it has `finished_at` and no exit (update mode, which needs no
+/// public token).
+pub(crate) fn link_outcome(payload: &Value) -> LinkOutcome {
+    let Some(sessions) = payload.get("link_sessions").and_then(Value::as_array) else {
+        return LinkOutcome::Pending;
+    };
+    for session in sessions.iter().rev() {
+        let adds = session
+            .get("results")
+            .and_then(|results| results.get("item_add_results"))
+            .and_then(Value::as_array);
+        // A session can record results that are not item adds, so each
+        // entry is read.
+        for add in adds.into_iter().flatten() {
+            if let Some(public_token) = text_field(Some(add), "public_token") {
+                return LinkOutcome::Success {
+                    public_token: Some(public_token),
+                    institution: text_field(add.get("institution"), "name"),
+                };
+            }
+        }
+        if let Some(success) = session.get("on_success").filter(|value| value.is_object()) {
+            return LinkOutcome::Success {
+                public_token: text_field(Some(success), "public_token"),
+                institution: text_field(
+                    success
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("institution")),
+                    "name",
+                ),
+            };
+        }
+        let present = |key: &str| session.get(key).is_some_and(|value| !value.is_null());
+        if present("finished_at") && !present("on_exit") && !present("exit") {
+            return LinkOutcome::Success {
+                public_token: None,
+                institution: None,
+            };
+        }
+    }
+    LinkOutcome::Pending
+}
+
+impl Plaid {
+    /// `/link/token/create` for a Hosted Link session. Without an access
+    /// token, the session adds a new Item with the transactions product.
+    /// With one, it is update mode for that Item: the user signs in again,
+    /// and can select more accounts. Update mode keeps the access token.
+    pub(crate) async fn create_hosted_link(
+        &self,
+        client_user_id: &str,
+        access_token: Option<&str>,
+    ) -> Result<HostedLink, String> {
+        let mut fields = json!({
+            "client_name": "Counterpoise",
+            "language": "en",
+            "country_codes": ["US"],
+            "user": { "client_user_id": client_user_id },
+            // This object makes the session Hosted Link, and it makes
+            // `hosted_link_url` appear in the response.
+            "hosted_link": {},
+        });
+        let object = fields.as_object_mut().expect("an object");
+        match access_token {
+            None => {
+                object.insert("products".into(), json!(["transactions"]));
+            }
+            Some(access_token) => {
+                object.insert("access_token".into(), json!(access_token));
+                object.insert(
+                    "update".into(),
+                    json!({ "account_selection_enabled": true }),
+                );
+            }
+        }
+        let payload = self.post("/link/token/create", fields).await?;
+        let link_token = text_field(Some(&payload), "link_token");
+        let hosted_link_url = text_field(Some(&payload), "hosted_link_url");
+        let (Some(link_token), Some(hosted_link_url)) = (link_token, hosted_link_url) else {
+            return Err(
+                "Plaid /link/token/create returned no hosted_link_url. Hosted Link \
+                        may not be enabled for this client ID: check the Plaid dashboard."
+                    .to_owned(),
+            );
+        };
+        let expiration = text_field(Some(&payload), "expiration")
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(&text).ok())
+            .map(|time| time.with_timezone(&chrono::Utc));
+        Ok(HostedLink {
+            link_token,
+            hosted_link_url,
+            expiration,
+        })
+    }
+
+    /// `/link/token/get`: the result of the Hosted Link session so far.
+    pub(crate) async fn link_session_outcome(
+        &self,
+        link_token: &str,
+    ) -> Result<LinkOutcome, String> {
+        let payload = self
+            .post("/link/token/get", json!({ "link_token": link_token }))
+            .await?;
+        Ok(link_outcome(&payload))
+    }
+
+    /// `/item/public_token/exchange`: the access token and the Item ID. The
+    /// caller writes the access token into `plaid_tokens` and must not log
+    /// it or send it to a client.
+    pub(crate) async fn exchange_public_token(
+        &self,
+        public_token: &str,
+    ) -> Result<(String, String), String> {
+        let payload = self
+            .post(
+                "/item/public_token/exchange",
+                json!({ "public_token": public_token }),
+            )
+            .await?;
+        match (
+            text_field(Some(&payload), "access_token"),
+            text_field(Some(&payload), "item_id"),
+        ) {
+            (Some(access_token), Some(item_id)) => Ok((access_token, item_id)),
+            _ => Err("Plaid /item/public_token/exchange returned an incomplete payload".to_owned()),
+        }
+    }
+
+    /// `/item/remove`: ends an Item at Plaid. The caller uses it when it
+    /// cannot keep the access token of a new Item, so that no connection is
+    /// left at Plaid that the book cannot use or remove.
+    pub(crate) async fn remove_item(&self, access_token: &str) -> Result<(), String> {
+        self.post("/item/remove", json!({ "access_token": access_token }))
+            .await
+            .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refusal_by_plaid_is_definitive() {
+        assert!(is_definitive_error(
+            "Plaid /item/public_token/exchange request failed: public token expired (INVALID_PUBLIC_TOKEN)"
+        ));
+        assert!(!is_definitive_error("fetch failed"));
+        assert!(!is_definitive_error(
+            "Plaid /link/token/get request failed: internal error (INTERNAL_SERVER_ERROR)"
+        ));
+        assert!(!is_definitive_error(
+            "Plaid /link/token/get request failed: too many requests (RATE_LIMIT_EXCEEDED)"
+        ));
+    }
+
+    #[test]
+    fn a_link_session_is_pending_until_it_finishes_with_success() {
+        assert_eq!(link_outcome(&json!(null)), LinkOutcome::Pending);
+        assert_eq!(link_outcome(&json!({})), LinkOutcome::Pending);
+        assert_eq!(
+            link_outcome(&json!({ "link_sessions": [] })),
+            LinkOutcome::Pending
+        );
+        // Started, not finished.
+        assert_eq!(
+            link_outcome(&json!({ "link_sessions": [
+                { "link_session_id": "a", "started_at": "2026-10-09T10:00:00Z", "finished_at": null }
+            ] })),
+            LinkOutcome::Pending
+        );
+        // Closed by the user. The URL stays good until the link token expires.
+        assert_eq!(
+            link_outcome(&json!({ "link_sessions": [
+                { "finished_at": "2026-10-09T10:05:00Z", "on_exit": { "error": null } }
+            ] })),
+            LinkOutcome::Pending
+        );
+        // A new Item: a result that is not an item add comes first.
+        assert_eq!(
+            link_outcome(&json!({ "link_sessions": [
+                { "finished_at": "2026-10-09T10:05:00Z", "on_exit": {} },
+                { "finished_at": "2026-10-09T10:09:00Z", "results": { "item_add_results": [
+                    { "public_token": "" },
+                    { "public_token": "public-sandbox-1", "institution": { "name": "First Platypus Bank" } }
+                ] } }
+            ] })),
+            LinkOutcome::Success {
+                public_token: Some("public-sandbox-1".into()),
+                institution: Some("First Platypus Bank".into()),
+            }
+        );
+        // The older on_success field.
+        assert_eq!(
+            link_outcome(&json!({ "link_sessions": [
+                { "on_success": { "public_token": "public-2", "metadata": { "institution": { "name": "Tartan" } } } }
+            ] })),
+            LinkOutcome::Success {
+                public_token: Some("public-2".into()),
+                institution: Some("Tartan".into()),
+            }
+        );
+        // Update mode can finish without a public token.
+        assert_eq!(
+            link_outcome(&json!({ "link_sessions": [
+                { "finished_at": "2026-10-09T10:05:00Z", "results": { "item_add_results": [] } }
+            ] })),
+            LinkOutcome::Success {
+                public_token: None,
+                institution: None,
+            }
+        );
+    }
 
     #[test]
     fn plaid_errors_and_configuration_match_node() {

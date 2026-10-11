@@ -9,6 +9,7 @@ mod issue_reports;
 mod members;
 pub(crate) mod net_worth;
 pub(crate) mod payees;
+mod plaid_link;
 pub(crate) mod plaid_sync;
 pub(crate) mod realized_gains;
 pub(crate) mod reconcile;
@@ -43,6 +44,7 @@ use self::{
     members::{add_member, change_member, list_members, remove_member},
     net_worth::net_worth_history,
     payees::{create_payee, delete_payee, get_payee, last_account, list_payees},
+    plaid_link::{check_link_session, create_link_session},
     plaid_sync::sync_now,
     realized_gains::realized_gains,
     reconcile::{book_queue, link_queue, resolve_route},
@@ -266,6 +268,17 @@ pub(crate) fn routes() -> Router<AppState> {
                 "/api/b/{book_id}/sync/tokens/{id}/sync",
                 axum::routing::post(sync_now),
             ),
+            ("POST", "/api/b/[bookId]/sync/link-sessions", "sync.createlinksession") => router
+                .route(
+                    "/api/b/{book_id}/sync/link-sessions",
+                    axum::routing::post(create_link_session),
+                ),
+            ("POST", "/api/b/[bookId]/sync/link-sessions/[id]/check", "sync.checklinksession") => {
+                router.route(
+                    "/api/b/{book_id}/sync/link-sessions/{id}/check",
+                    axum::routing::post(check_link_session),
+                )
+            }
             ("GET", "/api/b/[bookId]/sync/reconcile", "sync.bookqueue") => {
                 router.route("/api/b/{book_id}/sync/reconcile", get(book_queue))
             }

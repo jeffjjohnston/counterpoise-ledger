@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { summarizeTypeSafe } from "@/lib/typesafe/report";
 import type { TypeSafeDecision as Decision, TypeSafeEvaluation as Evaluation } from "@/types/db";
@@ -101,4 +102,94 @@ describe("summarizeTypeSafe proposals", () => {
     expect(summarizeTypeSafe([v1], [])).toMatchObject({ evaluations: 1 });
     expect(summarizeTypeSafe([v1], []).proposals).toBeUndefined();
   });
+});
+
+// The hand-worked cases that the Rust summary also reads (`summarize` in
+// rust-api/server/src/typesafe.rs). The same events must give the same counts.
+interface FixtureEvaluation {
+  id: number;
+  status: Evaluation["status"];
+  snapshot: string;
+  choice?: string;
+  usage?: Evaluation["usage"];
+  answers?: Evaluation["answers"];
+  displayedAt?: string;
+  latencyMs?: number;
+}
+interface FixtureDecision {
+  evaluationId?: number;
+  action: string;
+  transactionId?: number;
+  suggestionVisible?: boolean;
+  acceptedSuggestion?: boolean;
+  proposalPayeeKept?: boolean;
+  proposalCategoryKept?: boolean;
+  activeReviewMs?: number;
+  decidedAt: string;
+}
+/** The counts in key order (a NaN count is null), or a TypeError. */
+interface Outcome {
+  expected?: Record<string, number | null>;
+  error?: boolean;
+}
+interface History {
+  name: string;
+  evaluations: FixtureEvaluation[];
+  decisions: FixtureDecision[];
+}
+interface Fixture {
+  snapshots: Record<string, Evaluation["snapshot"]>;
+  cases: (History & Outcome)[];
+}
+
+const fixture = JSON.parse(
+  readFileSync("tests/fixtures/typesafe-summary.json", "utf8"),
+) as Fixture;
+const utc = (text: string) => new Date(`${text.replace(" ", "T")}Z`);
+
+function fixtureEvaluation(row: FixtureEvaluation): Evaluation {
+  return evaluation(row.id, {
+    status: row.status,
+    snapshot: fixture.snapshots[row.snapshot],
+    choice: row.choice ?? null,
+    usage: row.usage ?? null,
+    answers: row.answers ?? null,
+    displayedAt: row.displayedAt ? utc(row.displayedAt) : null,
+    latencyMs: row.latencyMs ?? null,
+  });
+}
+
+function fixtureDecision(row: FixtureDecision, index: number): Decision {
+  return {
+    id: index + 1,
+    bookId: 1,
+    reconciliationId: 1,
+    evaluationId: row.evaluationId ?? null,
+    action: row.action,
+    transactionId: row.transactionId ?? null,
+    suggestionVisible: row.suggestionVisible ?? false,
+    acceptedSuggestion: row.acceptedSuggestion ?? false,
+    proposalPayeeKept: row.proposalPayeeKept ?? null,
+    proposalCategoryKept: row.proposalCategoryKept ?? null,
+    activeReviewMs: row.activeReviewMs ?? null,
+    decidedAt: utc(row.decidedAt),
+  };
+}
+
+function expectOutcome(history: History, outcome: Outcome) {
+  const summarize = () =>
+    summarizeTypeSafe(
+      history.evaluations.map(fixtureEvaluation),
+      history.decisions.map(fixtureDecision),
+    );
+  if (outcome.error) {
+    expect(summarize).toThrow(TypeError);
+    return;
+  }
+  // The JSON text compares the key order too, and writes a NaN count as null.
+  expect(JSON.stringify(summarize())).toBe(JSON.stringify(outcome.expected));
+}
+
+describe("summarizeTypeSafe on the shared hand-worked cases", () => {
+  it.each(fixture.cases)("$name", (testCase) => expectOutcome(testCase, testCase));
 });

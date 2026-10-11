@@ -101,5 +101,5 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=5 \
 # No entrypoint script: the server opens the file, takes the server lock,
 # applies the migrations and runs the lot guard before it serves. Any other
 # command runs in its place, for example
-# `docker run ... ledger-cli import-postgres --from ... --to /data/counterpoise.db`.
+# `docker run ... ledger-cli backup`.
 CMD ["counterpoise-rust-api"]

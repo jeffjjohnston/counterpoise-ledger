@@ -271,15 +271,15 @@ done
 # nothing. An earlier version checked after the fast-forward, and a refusal
 # left production on the new commit with the old containers still running.
 STAGE="check the database volume"
-# The upgrade script is in the release, not in the checkout that production
-# runs now. So the production checkout moves to the release commit first (a
-# fast-forward, as this script does), then the script runs there, then this
-# deploy runs again and finds the checkout already at the commit.
+# The upgrade script is only in v1.50.0 to v1.53.0: later releases do not
+# have the converter. So the production checkout goes to v1.50.0, the script
+# runs there, the checkout goes back, and this deploy runs again.
 upgrade_first() {
-  echo "The data is still in PostgreSQL. Convert it once, then run this deploy again:" >&2
-  echo "  git -C $BUILD_DIR fetch origin" >&2
-  echo "  git -C $BUILD_DIR merge --ff-only $DEPLOY_SHA" >&2
+  echo "The data is still in PostgreSQL. Convert it once with v1.50.0, then run this deploy again:" >&2
+  echo "  git -C $BUILD_DIR fetch origin --tags" >&2
+  echo "  git -C $BUILD_DIR checkout v1.50.0" >&2
   echo "  (cd $BUILD_DIR && scripts/upgrade-to-sqlite.sh)" >&2
+  echo "  git -C $BUILD_DIR checkout -" >&2
   echo "See guides/upgrade-to-sqlite.md." >&2
 }
 docker volume inspect counterpoise_data >/dev/null 2>&1 || {
@@ -289,7 +289,7 @@ docker volume inspect counterpoise_data >/dev/null 2>&1 || {
   echo "  docker volume create counterpoise_data" >&2
   exit 1
 }
-# The same test as scripts/upgrade-to-sqlite.sh: an environment file that
+# The same test as the upgrade script of v1.50.0: an environment file that
 # still names the PostgreSQL database, and a volume with no SQLite file, is
 # an install that has not converted. The new server would create an empty
 # database there.

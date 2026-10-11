@@ -30,6 +30,7 @@ const baseRow: AssignedSyncAccount = {
   lastError: null,
   pendingCount: 1,
   reviewCount: 0,
+  isDemo: false,
 };
 
 function makeCandidate(
@@ -193,6 +194,7 @@ describe("ReconciliationModal", () => {
       lastError: null,
       pendingCount: 1,
       reviewCount: 0,
+      isDemo: false,
     };
 
     const item: SyncReconciliationItem = {

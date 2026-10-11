@@ -110,7 +110,7 @@ pub(crate) async fn list_transaction_changes(
             let mut ids: Vec<i32> = sqlx::query_scalar(
                 "SELECT id FROM transactions WHERE book_id = $1 AND id > $2 ORDER BY id LIMIT $3",
             )
-            .bind(book.book_id)
+            .bind(book.book_id())
             .bind(after_id)
             .bind(limit + 1)
             .fetch_all(&mut *transaction)
@@ -118,7 +118,7 @@ pub(crate) async fn list_transaction_changes(
             .map_err(db_error)?;
             let has_more = ids.len() as i64 > limit;
             ids.truncate(limit as usize);
-            let transactions = load_transactions(&mut transaction, book.book_id, &ids)
+            let transactions = load_transactions(&mut transaction, book.book_id(), &ids)
                 .await
                 .map_err(db_error)?;
             json!({
@@ -147,7 +147,7 @@ pub(crate) async fn list_transaction_changes(
                 "SELECT DISTINCT transaction_id FROM transaction_changes
                  WHERE book_id = $1 AND seq > $2 ORDER BY transaction_id LIMIT $3",
             )
-            .bind(book.book_id)
+            .bind(book.book_id())
             .bind(since)
             .bind(MAX_DELTA as i64 + 1)
             .fetch_all(&mut *transaction)
@@ -156,7 +156,7 @@ pub(crate) async fn list_transaction_changes(
             if ids.len() > MAX_DELTA {
                 return Err(error(StatusCode::GONE, TOO_MANY_CHANGES));
             }
-            let transactions = load_transactions(&mut transaction, book.book_id, &ids)
+            let transactions = load_transactions(&mut transaction, book.book_id(), &ids)
                 .await
                 .map_err(db_error)?;
             // A logged ID that is not a transaction of this book is deleted.

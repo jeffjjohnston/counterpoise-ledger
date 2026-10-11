@@ -355,7 +355,7 @@ mod tests {
             ("counterpoise-20250101-000000.dump", Some(old)),
             ("counterpoise-20260101-000000.db", None),
             ("pre-sqlite-upgrade.dump", Some(old)),
-            // The safety dump of scripts/upgrade-to-sqlite.sh, by its real name.
+            // The safety dump of the v1.50.0 upgrade script, by its real name.
             ("counterpoise-pre-sqlite-20250101-000000.dump", Some(old)),
             ("counterpoise-20250101-000000.db.partial", Some(old)),
             ("counterpoise-20250101-000000.db.bad", Some(old)),

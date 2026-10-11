@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -89,17 +91,104 @@ describe("Moneydance import with the Rust CLI", () => {
     // Two security accounts hold AAA, so it is one security.
     const symbols = (await rows<{ symbol: string }>("SELECT symbol FROM securities ORDER BY id")).map((row) => row.symbol);
     expect(symbols).toEqual(["AAA", "BBB", "Gamma Growth", "DDD"]);
-    const reinvested = await rows(
-      "SELECT id FROM transactions WHERE description IN ($1, $2)",
-      ["AAA Dividend (Dividend)", "AAA Dividend (Reinvestment)"],
-    );
-    expect(reinvested).toHaveLength(2);
     const ratios = await rows<{ n: number; d: number }>(
       "SELECT split_numerator AS n, split_denominator AS d FROM investment_splits WHERE action = $1 ORDER BY id", ["split"]
     );
     expect(ratios).toEqual([{ n: 2, d: 1 }, { n: 2, d: 1 }, { n: 1, d: 2 }]);
     // Every reminder with a known frequency and imported accounts, and no bad date.
     expect(await count("recurring_rules", 1)).toBe(5);
+  }, TIMEOUT);
+
+  // Critical Accounting Rule 1 holds for every imported row, not only for the
+  // rows that a route writes.
+  for (const fixture of FIXTURES) {
+    it(`writes no unbalanced transaction for ${fixture}`, async () => {
+      await rustImport(fixturePath(fixture), "--book-id", "1");
+      const unbalanced = await rows<{ description: string; total: number }>(`
+        SELECT t.description, SUM(s.amount) AS total
+        FROM transactions t JOIN transaction_splits s ON s.transaction_id = t.id
+        WHERE t.book_id = $1 GROUP BY t.id HAVING SUM(s.amount) <> 0`, [1]);
+      expect(unbalanced).toEqual([]);
+    }, TIMEOUT);
+  }
+
+  // A Moneydance buy with reinvest="true" is a DRIP: one transaction with a
+  // buy split and a dividend split. Its cash sum is 0, so the investment leg
+  // comes from the security, not from the cash.
+  it("imports a reinvested buy as one balanced transaction", async () => {
+    await rustImport(fixturePath("moneydance-edge-cases.json"), "--book-id", "1");
+    const [transaction] = await rows<{ id: number }>(
+      "SELECT id FROM transactions WHERE description = $1", ["AAA Reinvested"]
+    );
+    const legs = await rows<{ name: string; amount: number }>(`
+      SELECT a.name, s.amount FROM transaction_splits s JOIN accounts a ON a.id = s.account_id
+      WHERE s.transaction_id = $1 ORDER BY s.amount DESC`, [transaction.id]);
+    // G = 2 shares at 50.00 = 10000. D = 10000. R = D - G = 0, so no cash leg.
+    expect(legs).toEqual([
+      { name: "Brokerage", amount: 10000 },
+      { name: "Dividends", amount: -10000 },
+    ]);
+    const splits = await rows<{ action: string; sharesMicros: number; priceMicros: number }>(`
+      SELECT action, shares_micros, price_micros FROM investment_splits
+      WHERE transaction_id = $1 ORDER BY action`, [transaction.id]);
+    expect(splits).toEqual([
+      { action: "buy", sharesMicros: 2_000_000, priceMicros: 50_000_000 },
+      { action: "dividend", sharesMicros: 0, priceMicros: 0 },
+    ]);
+  }, TIMEOUT);
+
+  // A Moneydance dividend with shares (a DRIP) is one transaction, as the form
+  // writes it: a dividend split and a buy split, the investment leg G + F,
+  // the income leg -D, and the cash leg D - G - F only when it is not 0.
+  it("imports a reinvested dividend as one transaction", async () => {
+    const { stdout } = await rustImport(fixturePath("moneydance-edge-cases.json"), "--book-id", "1", "--verbose");
+    expect(stdout).toContain("DIVIDEND REINVESTMENT AAA Dividend");
+    expect(stdout).not.toContain("split into 2 txns");
+    const drips = await rows<{ id: number }>(`
+      SELECT t.id FROM transactions t
+      WHERE t.description = $1
+        AND EXISTS (SELECT 1 FROM investment_splits i WHERE i.transaction_id = t.id AND i.action = 'buy')`,
+    ["AAA Dividend"]);
+    expect(drips).toHaveLength(1);
+    expect(await rows("SELECT id FROM transactions WHERE description LIKE $1", ["AAA Dividend (%"])).toEqual([]);
+    const legs = await rows<{ name: string; amount: number }>(`
+      SELECT a.name, s.amount FROM transaction_splits s JOIN accounts a ON a.id = s.account_id
+      WHERE s.transaction_id = $1 ORDER BY s.amount DESC`, [drips[0].id]);
+    // D = 5000 buys 1 share at 50.00 (G = 5000), so there is no cash leg.
+    expect(legs).toEqual([
+      { name: "Brokerage", amount: 5000 },
+      { name: "Dividends", amount: -5000 },
+    ]);
+    const splits = await rows<{ action: string; sharesMicros: number; priceMicros: number }>(`
+      SELECT action, shares_micros, price_micros FROM investment_splits
+      WHERE transaction_id = $1 ORDER BY action`, [drips[0].id]);
+    expect(splits).toEqual([
+      { action: "buy", sharesMicros: 1_000_000, priceMicros: 50_000_000 },
+      { action: "dividend", sharesMicros: 0, priceMicros: 0 },
+    ]);
+  }, TIMEOUT);
+
+  // When --no-hidden leaves out the income account, the income leg of a
+  // dividend or a reinvested buy has no account. The importer must refuse the
+  // row, not write it without that leg.
+  it("refuses an investment row whose income account was left out", async () => {
+    const fixture = JSON.parse(await readFile(fixturePath("moneydance-edge-cases.json"), "utf8"));
+    const dividends = fixture.all_items.find((item: { id?: string }) => item.id === "acct-dividends");
+    dividends.hide = "y";
+    const file = path.join(await mkdtemp(path.join(os.tmpdir(), "md-hidden-")), "export.json");
+    await writeFile(file, JSON.stringify(fixture));
+
+    const { stdout } = await rustImport(file, "--book-id", "1", "--no-hidden");
+    expect(stdout).toContain("Unbalanced transaction");
+    const unbalanced = await rows(`
+      SELECT t.id FROM transactions t JOIN transaction_splits s ON s.transaction_id = t.id
+      WHERE t.book_id = $1 GROUP BY t.id HAVING SUM(s.amount) <> 0`, [1]);
+    expect(unbalanced).toEqual([]);
+    const refused = await rows(
+      "SELECT description FROM transactions WHERE description IN ($1, $2)",
+      ["AAA Reinvested", "AAA Dividend"],
+    );
+    expect(refused).toEqual([]);
   }, TIMEOUT);
 
   it("writes the same rows each time the same file is imported twice", async () => {

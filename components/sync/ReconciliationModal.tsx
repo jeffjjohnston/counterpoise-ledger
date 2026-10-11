@@ -13,10 +13,11 @@ import { SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
 import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useTypeSafeSuggestion } from "@/hooks/useTypeSafeSuggestion";
 import { TypeSafeSuggestion } from "@/components/sync/TypeSafeSuggestion";
+import { DisclosureChevron, ReconciliationCandidates, type MatchAction } from "./ReconciliationCandidates";
 import { cn } from "@/lib/utils";
 import { useRegisterShortcuts } from "@/hooks/useRegisterShortcuts";
 import type { ShortcutDef } from "@/components/KeyboardShortcutProvider";
-import type { AccountWithBalance, AssignedSyncAccount, SyncMatchCandidate, SyncReconciliationItem } from "@/types";
+import type { AccountWithBalance, AssignedSyncAccount, SyncReconciliationItem } from "@/types";
 
 type ReconciliationResponse = {
   items: SyncReconciliationItem[];
@@ -47,25 +48,6 @@ function linkLabel(link: AssignedSyncAccount): string {
 
 function isUnresolved(item: SyncReconciliationItem): boolean {
   return item.resolutionStatus === "pending" || item.reviewReason !== null;
-}
-
-// The server already scores and ranks every candidate. These are the tags
-// `score()` emits (rust-api/server/src/routes/reconcile.rs); anything not listed
-// is deliberately not shown, because a tag with no plain-English reading is
-// worse than no chip.
-const SCORE_TAG_LABELS: Record<string, string> = {
-  exact_amount: "exact amount",
-  amount_close: "amount close",
-  same_day: "same day",
-  date_close: "date close",
-  name_exact: "same payee",
-  name_similar: "similar payee",
-};
-
-function candidateChips(candidate: SyncMatchCandidate): string[] {
-  return candidate.scoreTags
-    .map((tag) => SCORE_TAG_LABELS[tag])
-    .filter((label): label is string => !!label);
 }
 
 /**
@@ -101,25 +83,6 @@ function KeyCap({ children }: { children: React.ReactNode }) {
     <kbd className="inline-flex items-center justify-center min-w-[1.5rem] h-6 px-1.5 font-mono text-xs font-semibold bg-surface-tertiary border border-border rounded text-fg">
       {children}
     </kbd>
-  );
-}
-
-// The disclosure chevron used to fold the "other candidates" list and the
-// Create form. Matches the toggle already shipped in
-// components/transactions/PlaidBanner.tsx, so a folded section on this
-// screen looks like a folded section everywhere else.
-function DisclosureChevron({ expanded }: { expanded: boolean }) {
-  return (
-    <svg
-      className={cn("h-3.5 w-3.5 flex-none transition-transform", expanded && "rotate-180")}
-      viewBox="0 0 20 20"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      aria-hidden="true"
-    >
-      <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
   );
 }
 
@@ -163,10 +126,7 @@ export function ReconciliationModal({
   const [hasMore, setHasMore] = useState(false);
   const [totalCount, setTotalCount] = useState(0);
   const [submitting, setSubmitting] = useState(false);
-  const [matchingAction, setMatchingAction] = useState<{
-    transactionId: number;
-    action: "match" | "match_update_amount";
-  } | null>(null);
+  const [matchingAction, setMatchingAction] = useState<MatchAction | null>(null);
 
   const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
   const [selectedCounterAccountId, setSelectedCounterAccountId] = useState<number | null>(
@@ -189,7 +149,6 @@ export function ReconciliationModal({
   );
 
   const bestMatch = selectedItem?.candidates[0] ?? null;
-  const otherCandidates = selectedItem?.candidates.slice(1) ?? [];
   const canReview = selectedItem?.reviewReason != null;
   const position = items.findIndex((item) => item.id === selectedId) + 1;
   const selectedLinkId = selectedItem?.plaidAccountLinkId ?? null;
@@ -249,7 +208,7 @@ export function ReconciliationModal({
         }
       }
     },
-    [bookId, filterLinkId]
+    [bookId, filterLinkId, setSelectedId]
   );
 
   // The account list does not change with the filter, so it loads once for
@@ -397,7 +356,7 @@ export function ReconciliationModal({
         setMatchingAction(null);
       }
     },
-    [selectedItem, bookId, items, hasMore, fetchQueue, onQueueChanged, typesafeObservation]
+    [selectedItem, bookId, items, hasMore, fetchQueue, onQueueChanged, typesafeObservation, setSelectedId]
   );
 
   const moveSelection = useCallback(
@@ -410,7 +369,7 @@ export function ReconciliationModal({
       );
       setSelectedId(items[next].id);
     },
-    [items, selectedId]
+    [items, selectedId, setSelectedId]
   );
 
   const shortcuts = useMemo<ShortcutDef[]>(() => {
@@ -480,7 +439,7 @@ export function ReconciliationModal({
         action: () => setShowCreate(true),
       },
     ];
-  }, [bestMatch, canReview, isOpen, moveSelection, resolveSelected, submitting]);
+  }, [bestMatch, canReview, isOpen, moveSelection, resolveSelected, submitting, setShowCreate]);
 
   useRegisterShortcuts(shortcuts);
 
@@ -675,185 +634,14 @@ export function ReconciliationModal({
                       setShowCreate(true);
                     }} />
 
-                  {bestMatch && (
-                    <div data-testid="best-match" className="overflow-hidden rounded-lg border border-accent">
-                      <div className="flex flex-wrap items-center gap-2 border-b border-accent bg-accent-subtle px-3.5 py-2">
-                        <span className="text-xs font-semibold uppercase tracking-wider text-fg-accent">
-                          Best match
-                        </span>
-                        {candidateChips(bestMatch).map((chip) => (
-                          <span
-                            key={chip}
-                            className="inline-flex items-center rounded-full bg-success-subtle px-2 py-0.5 text-xs font-medium text-fg-success"
-                          >
-                            {chip}
-                          </span>
-                        ))}
-                      </div>
-                      <div className="flex items-center gap-4 p-3.5">
-                        <div className="min-w-0 flex-1">
-                          <p className="text-[15px] font-semibold text-fg">
-                            {bestMatch.payeeName || bestMatch.description || "(No description)"}
-                          </p>
-                          <p className="mt-0.5 text-13 text-fg-secondary">
-                            {formatDate(bestMatch.date)}
-                            {bestMatch.counterpartAccountNames.length > 0
-                              ? ` · ${bestMatch.counterpartAccountNames.join(", ")}`
-                              : ""}
-                            {" · "}
-                            <span className="tabular-nums">{formatCurrency(bestMatch.linkedSplitAmount)}</span>
-                          </p>
-                        </div>
-                        <div className="flex flex-col gap-1.5 shrink-0">
-                          <Button
-                            disabled={submitting || bestMatch.alreadyLinked}
-                            title={bestMatch.alreadyLinked ? "Already matched to another synced transaction" : undefined}
-                            onClick={() =>
-                              void resolveSelected({ action: "match", transactionId: bestMatch.transactionId })
-                            }
-                          >
-                            {matchingAction?.transactionId === bestMatch.transactionId &&
-                            matchingAction.action === "match"
-                              ? "Matching…"
-                              : "Match"}
-                          </Button>
-                          {bestMatch.amountDelta !== 0 && bestMatch.splitCount === 2 && (
-                            <Button
-                              size="sm"
-                              variant="secondary"
-                              disabled={submitting || bestMatch.alreadyLinked}
-                              title={
-                                bestMatch.alreadyLinked
-                                  ? "Already matched to another synced transaction"
-                                  : undefined
-                              }
-                              onClick={() =>
-                                void resolveSelected({
-                                  action: "match_update_amount",
-                                  transactionId: bestMatch.transactionId,
-                                })
-                              }
-                            >
-                              {matchingAction?.transactionId === bestMatch.transactionId &&
-                              matchingAction.action === "match_update_amount"
-                                ? "Matching…"
-                                : `Match & Update ${formatCurrency(Math.abs(bestMatch.expectedAmount))}`}
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {selectedItem.candidates.length === 0 && (
-                    <p className="text-sm text-fg-secondary">No likely matches found.</p>
-                  )}
-
-                  {otherCandidates.length > 0 && (
-                    <div>
-                      <button
-                        type="button"
-                        aria-expanded={showOthers}
-                        onClick={() => setShowOthers((prev) => !prev)}
-                        className="flex w-full items-center gap-2 rounded-lg border border-border px-3 py-2 text-left text-sm hover:bg-surface-tertiary"
-                      >
-                        <DisclosureChevron expanded={showOthers} />
-                        <span className="font-medium text-fg">
-                          {otherCandidates.length} other candidate{otherCandidates.length === 1 ? "" : "s"}
-                        </span>
-                        <span className="ml-auto text-xs text-fg-tertiary">
-                          closest is {Math.abs(otherCandidates[0].dayDelta)} day
-                          {Math.abs(otherCandidates[0].dayDelta) === 1 ? "" : "s"} out,{" "}
-                          {formatCurrency(otherCandidates[0].amountDelta)} apart
-                        </span>
-                      </button>
-                      {showOthers && (
-                        <div className="mt-2 space-y-2">
-                          {otherCandidates.map((candidate) => {
-                            const chips = candidateChips(candidate);
-                            return (
-                              <div
-                                key={candidate.transactionId}
-                                className="rounded-lg border border-border p-3"
-                              >
-                                <div className="flex items-start justify-between gap-2">
-                                  <div className="min-w-0 flex-1">
-                                    <p className="text-sm font-semibold text-fg truncate">
-                                      {candidate.payeeName || candidate.description || "(No description)"}
-                                    </p>
-                                    <div className="flex flex-wrap items-center gap-1.5 mt-1.5 text-sm text-fg-secondary">
-                                      <span>{formatDate(candidate.date)}</span>
-                                      {chips.length > 0 && (
-                                        <>
-                                          <span className="text-fg-tertiary">·</span>
-                                          <span>{chips.join(" · ")}</span>
-                                        </>
-                                      )}
-                                    </div>
-                                    {candidate.counterpartAccountNames.length > 0 && (
-                                      <p className="text-sm text-fg-secondary mt-1">
-                                        Counterpart: {candidate.counterpartAccountNames.join(", ")}
-                                      </p>
-                                    )}
-                                  </div>
-                                  <div className="flex flex-col gap-1.5 shrink-0">
-                                    <Button
-                                      size="sm"
-                                      onClick={() =>
-                                        void resolveSelected({
-                                          action: "match",
-                                          transactionId: candidate.transactionId,
-                                        })
-                                      }
-                                      disabled={submitting || candidate.alreadyLinked}
-                                      title={
-                                        candidate.alreadyLinked
-                                          ? "Already matched to another synced transaction"
-                                          : undefined
-                                      }
-                                    >
-                                      {matchingAction?.transactionId === candidate.transactionId &&
-                                      matchingAction.action === "match"
-                                        ? "Matching…"
-                                        : "Match"}
-                                    </Button>
-                                    {candidate.amountDelta !== 0 && candidate.splitCount === 2 && (
-                                      <Button
-                                        size="sm"
-                                        variant="secondary"
-                                        onClick={() =>
-                                          void resolveSelected({
-                                            action: "match_update_amount",
-                                            transactionId: candidate.transactionId,
-                                          })
-                                        }
-                                        disabled={submitting || candidate.alreadyLinked}
-                                        title={
-                                          candidate.alreadyLinked
-                                            ? "Already matched to another synced transaction"
-                                            : undefined
-                                        }
-                                      >
-                                        {matchingAction?.transactionId === candidate.transactionId &&
-                                        matchingAction.action === "match_update_amount"
-                                          ? "Matching…"
-                                          : `Match & Update ${formatCurrency(Math.abs(candidate.expectedAmount))}`}
-                                      </Button>
-                                    )}
-                                  </div>
-                                </div>
-                                {candidate.alreadyLinked && (
-                                  <p className="text-xs text-fg-tertiary mt-2">
-                                    Already matched to another synced transaction
-                                  </p>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  <ReconciliationCandidates
+                    candidates={selectedItem.candidates}
+                    showOthers={showOthers}
+                    onToggleOthers={() => setShowOthers((prev) => !prev)}
+                    submitting={submitting}
+                    matchingAction={matchingAction}
+                    onMatch={(action) => void resolveSelected(action)}
+                  />
 
                   <div>
                     <button

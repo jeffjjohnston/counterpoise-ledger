@@ -3,6 +3,7 @@ mod api_key_cache;
 mod auth;
 mod book_auth;
 mod book_changes;
+mod book_scope;
 mod client_ip;
 mod compression;
 mod config;

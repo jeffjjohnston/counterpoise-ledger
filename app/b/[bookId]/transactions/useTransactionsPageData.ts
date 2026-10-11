@@ -76,6 +76,14 @@ export interface UseTransactionsPageDataResult {
 type PageContext = Parameters<UseTransactionsPageDataResult["fetchTransactionsPage"]>[2];
 type PageResponse = { transactions?: TransactionWithSplits[]; startingBalance?: number; totalCount?: number };
 type RefreshRequest = { showLoading: boolean; ensureId?: number | null; background: boolean; immediate?: boolean };
+type RefreshContext = Pick<UseTransactionsPageDataArgs,
+  "bookId" | "accountId" | "startDate" | "endDate" | "selectedPayeeId" | "showUpcoming">;
+type RefreshScope = {
+  key: string; active: boolean; paused: boolean; running: boolean; loadingPage: boolean;
+  loadedCount: number; pending: RefreshRequest | null; controller: AbortController;
+  promise: Promise<void>; frame?: number;
+  wait?: { timer: ReturnType<typeof setTimeout>; resume: () => void };
+};
 
 function pageParams(offset: number, limit: number, context: PageContext) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset), includeMeta: "true" });
@@ -90,6 +98,51 @@ function pageParams(offset: number, limit: number, context: PageContext) {
   if (context.endDate) params.set("endDate", context.endDate);
   if (context.selectedPayeeId !== null) params.set("payeeId", String(context.selectedPayeeId));
   return params;
+}
+
+// Fetch a whole register snapshot before publishing any of it. Optional panels
+// may fail independently; accounts and the transaction page remain required.
+async function fetchRefreshSnapshot(context: RefreshContext, request: RefreshRequest, loadedCount: number, signal: AbortSignal) {
+  const { bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming } = context;
+  const today = toDateString(new Date());
+  const prefix = `/api/b/${bookId}`;
+  const init = { signal };
+  const accountQuery = accountId ? `?accountId=${accountId}` : "";
+  const [accountRows, values, payeeRows, projected, pending] = await Promise.all([
+    apiGet<AccountWithBalance[]>(`${prefix}/accounts?includeInactive=true&asOfDate=${today}`, init),
+    apiGet<AccountMarketValue[]>(`${prefix}/investments/account-values?asOfDate=${today}`, init).catch(() => []),
+    apiGet<Array<{ id: number; name: string }>>(`${prefix}/payees`, init).catch(() => []),
+    showUpcoming ? apiGet<DisplayTransaction[]>(`${prefix}/recurring/projected${accountQuery}`, init).catch(() => []) : Promise.resolve([]),
+    apiGet<DisplayTransaction[]>(`${prefix}/sync/pending-transactions${accountQuery}`, init).catch(() => []),
+  ]);
+  const accounts = flattenAccounts(accountRows);
+  const selected = accounts.find((a) => a.id === accountId);
+  const investment = selected?.type === "asset" && selected.subtype === "investment";
+  const cashId = investment ? accounts.find((a) => a.parentId === accountId && a.isInvestmentCash)?.id ?? null : null;
+  const params = pageParams(0, request.background ? Math.max(PAGE_SIZE, loadedCount) : PAGE_SIZE, {
+    selectedAccountId: accountId, isInvestmentAccount: investment,
+    investmentCashAccountId: cashId, startDate, endDate, selectedPayeeId, ensureId: request.ensureId,
+  });
+  const page = await apiGet<PageResponse>(`${prefix}/transactions?${params}`, init);
+  const transactions = page.transactions ?? [];
+  return {
+    accounts, transactions,
+    marketValues: Array.isArray(values) ? values : [],
+    payees: Array.isArray(payeeRows) ? payeeRows : [],
+    projectedTransactions: Array.isArray(projected) ? projected : [],
+    plaidPendingTransactions: Array.isArray(pending) ? pending : [],
+    startingBalance: page.startingBalance ?? 0,
+    totalCount: page.totalCount ?? transactions.length,
+  };
+}
+
+function preferredAccountId(accounts: AccountWithBalance[], bookId: string): number | null {
+  try {
+    const stored = Number(localStorage.getItem(`lastSelectedAccountId:${bookId}`));
+    if (accounts.some((a) => a.id === stored && a.isActive)) return stored;
+  } catch { /* Storage may be unavailable. */ }
+  return accounts.filter((a) => a.isFavorite && a.isActive && !a.isInvestmentCash)
+    .sort((a, b) => a.name.localeCompare(b.name))[0]?.id ?? null;
 }
 
 export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseTransactionsPageDataResult {
@@ -127,12 +180,25 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
   // A fresh scope fences every response to the book/filter that requested it.
   // No old response can publish after cleanup, even if fetch ignores abort.
   const contextKey = JSON.stringify([bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming]);
-  const scopeRef = useRef<{
-    key: string; active: boolean; paused: boolean; running: boolean; loadingPage: boolean;
-    loadedCount: number; pending: RefreshRequest | null; controller: AbortController;
-    promise: Promise<void>; frame?: number;
-    wait?: { timer: ReturnType<typeof setTimeout>; resume: () => void };
-  } | null>(null);
+  const scopeRef = useRef<RefreshScope | null>(null);
+
+  const applySnapshot = useCallback((snapshot: Awaited<ReturnType<typeof fetchRefreshSnapshot>>) => {
+    setAccounts(snapshot.accounts); setMarketValues(snapshot.marketValues);
+    setPayees(snapshot.payees); setProjectedTransactions(snapshot.projectedTransactions);
+    setPlaidPendingTransactions(snapshot.plaidPendingTransactions);
+    setTransactions(snapshot.transactions);
+    setStartingBalance(snapshot.startingBalance); setTotalCount(snapshot.totalCount);
+    setPositionsVersion((v) => v + 1);
+    setLoadMoreFailed(false); setError(null);
+  }, []);
+
+  const autoSelectAccount = useCallback((accounts: AccountWithBalance[]) => {
+    if (autoSelectDone.current) return;
+    autoSelectDone.current = true;
+    if (accountId) return;
+    const target = preferredAccountId(accounts, bookId);
+    if (target !== null) routerRef.current.replace(`/b/${bookId}/transactions?accountId=${target}`, { scroll: false });
+  }, [accountId, bookId]);
 
   const drain = useCallback((): Promise<void> => {
     const scope = scopeRef.current;
@@ -157,26 +223,8 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
           scope.pending = null;
           if (request.showLoading) setLoading(true);
           try {
-            const today = toDateString(new Date());
-            const prefix = `/api/b/${bookId}`;
-            const init = { signal: scope.controller.signal };
-            const accountQuery = accountId ? `?accountId=${accountId}` : "";
-            const [accountRows, values, payeeRows, projected, pending] = await Promise.all([
-              apiGet<AccountWithBalance[]>(`${prefix}/accounts?includeInactive=true&asOfDate=${today}`, init),
-              apiGet<AccountMarketValue[]>(`${prefix}/investments/account-values?asOfDate=${today}`, init).catch(() => []),
-              apiGet<Array<{ id: number; name: string }>>(`${prefix}/payees`, init).catch(() => []),
-              showUpcoming ? apiGet<DisplayTransaction[]>(`${prefix}/recurring/projected${accountQuery}`, init).catch(() => []) : Promise.resolve([]),
-              apiGet<DisplayTransaction[]>(`${prefix}/sync/pending-transactions${accountQuery}`, init).catch(() => []),
-            ]);
-            const flatAccounts = flattenAccounts(accountRows);
-            const selected = flatAccounts.find((a) => a.id === accountId);
-            const investment = selected?.type === "asset" && selected.subtype === "investment";
-            const cashId = investment ? flatAccounts.find((a) => a.parentId === accountId && a.isInvestmentCash)?.id ?? null : null;
-            const params = pageParams(0, request.background ? Math.max(PAGE_SIZE, scope.loadedCount) : PAGE_SIZE, {
-              selectedAccountId: accountId, isInvestmentAccount: investment,
-              investmentCashAccountId: cashId, startDate, endDate, selectedPayeeId, ensureId: request.ensureId,
-            });
-            const page = await apiGet<PageResponse>(`${prefix}/transactions?${params}`, init);
+            const snapshot = await fetchRefreshSnapshot({ bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming },
+              request, scope.loadedCount, scope.controller.signal);
             if (!scope.active) return;
             // An editor opened while the requests were in flight. Discard the
             // snapshot and fetch again on close, retaining an explicit request.
@@ -184,32 +232,12 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
               scope.pending ??= request;
               continue;
             }
-            const rows = page.transactions ?? [];
-            setAccounts(flatAccounts); setMarketValues(Array.isArray(values) ? values : []);
-            setPayees(Array.isArray(payeeRows) ? payeeRows : []);
-            setProjectedTransactions(Array.isArray(projected) ? projected : []);
-            setPlaidPendingTransactions(Array.isArray(pending) ? pending : []);
-            setTransactions(rows); scope.loadedCount = rows.length;
-            setStartingBalance(page.startingBalance ?? 0);
-            setTotalCount(page.totalCount ?? rows.length);
-            setPositionsVersion((v) => v + 1);
-            setLoadMoreFailed(false); setError(null);
+            applySnapshot(snapshot);
+            scope.loadedCount = snapshot.transactions.length;
             if (!request.background) {
               scope.frame = requestAnimationFrame(() => { if (scope.active) scrollRef.current(); });
             }
-            if (!autoSelectDone.current) {
-              autoSelectDone.current = true;
-              if (!accountId) {
-                let target: number | null = null;
-                try {
-                  const stored = Number(localStorage.getItem(`lastSelectedAccountId:${bookId}`));
-                  if (flatAccounts.some((a) => a.id === stored && a.isActive)) target = stored;
-                } catch { /* Storage may be unavailable. */ }
-                target ??= flatAccounts.filter((a) => a.isFavorite && a.isActive && !a.isInvestmentCash)
-                  .sort((a, b) => a.name.localeCompare(b.name))[0]?.id ?? null;
-                if (target !== null) routerRef.current.replace(`/b/${bookId}/transactions?accountId=${target}`, { scroll: false });
-              }
-            }
+            autoSelectAccount(snapshot.accounts);
           } catch {
             if (scope.active) {
               if (request.showLoading) setError("Could not load transactions.");
@@ -226,7 +254,7 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
       } finally { scope.running = false; }
     })();
     return scope.promise;
-  }, [contextKey, bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming]);
+  }, [contextKey, bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming, applySnapshot, autoSelectAccount]);
 
   const enqueue = useCallback((request: RefreshRequest) => {
     const scope = scopeRef.current;

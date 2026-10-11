@@ -79,7 +79,7 @@ pub(crate) async fn get_settings(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let book = authenticate(&state, &headers, &raw_book_id, AccessLevel::Read).await?;
-    let mut response = Json(settings(&state.pool, book.book_id).await?).into_response();
+    let mut response = Json(settings(&state.pool, book.book_id()).await?).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -101,7 +101,7 @@ pub(crate) async fn update_settings(
         _ => None,
     }
     .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Expected enabled: true or false"))?;
-    set_settings(&state, book.book_id, enabled, false)
+    set_settings(&state, book.book_id(), enabled, false)
         .await
         .map(Json)
 }
@@ -114,7 +114,7 @@ pub(crate) async fn clear_settings(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let book = authenticate(&state, &headers, &raw_book_id, AccessLevel::Write).await?;
-    set_settings(&state, book.book_id, false, true)
+    set_settings(&state, book.book_id(), false, true)
         .await
         .map(Json)
 }

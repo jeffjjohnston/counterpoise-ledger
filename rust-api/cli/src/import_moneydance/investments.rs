@@ -298,7 +298,7 @@ pub async fn import_investment_transactions(
                     if reinvestment {
                         stats.imported += counted.imported;
                         context.verbose(format!(
-                            "  ✓ {} - DIVIDEND REINVESTMENT {} (split into 2 txns)",
+                            "  ✓ {} - DIVIDEND REINVESTMENT {}",
                             resolved.date,
                             describe(transaction)
                         ));
@@ -447,22 +447,46 @@ fn resolve<'a>(
     })
 }
 
-fn js_trim(text: &str) -> String {
-    text.trim_matches(ledger_core::js::is_js_whitespace)
-        .to_owned()
+/// Refuses a transaction whose ledger splits do not sum to zero (Critical
+/// Accounting Rule 1). This occurs when the account of a split was not
+/// imported, for example an income account that `--no-hidden` or
+/// `--no-inactive` left out. The caller then rolls back the savepoint, and the
+/// run records the row as an error.
+async fn ensure_balanced(
+    connection: &mut DbConnection,
+    book_id: i32,
+    transaction_id: i32,
+) -> Result<(), RowError> {
+    let sum: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount), 0) FROM transaction_splits
+         WHERE transaction_id = $1 AND book_id = $2",
+    )
+    .bind(transaction_id)
+    .bind(book_id)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(super::row_error)?;
+    if sum != 0 {
+        return Err(format!(
+            "Unbalanced transaction: its splits sum to {sum} cents. An account of a split was not imported"
+        ));
+    }
+    Ok(())
 }
 
-/// A dividend that bought shares becomes two transactions: the cash
-/// dividend, then a buy of the shares with that cash.
+/// A dividend that bought shares (DRIP) becomes one transaction, as the
+/// form writes it: a `dividend` and a `buy` investment split, and the legs
+/// investment `+(G + F)`, income `-D`, and cash `+R` where `R = D - G - F`
+/// when it is not 0. `G` is the Moneydance amount of the shares (`pamt`),
+/// not shares x price, so the ledger keeps the amounts of the export. The
+/// export has no fee account, so the fee stays in the investment leg, as for
+/// an imported buy. The lot basis comes from the buy split, as before.
 async fn write_reinvestment(
     connection: &mut DbConnection,
     book_id: i32,
     now: chrono::NaiveDateTime,
     resolved: &Resolved<'_>,
 ) -> Result<Counted, RowError> {
-    let description = field(resolved.transaction, "desc")
-        .map(|text| text.into_owned())
-        .unwrap_or_default();
     let pamt = resolved.security().pamt.unwrap_or(0.0).abs();
     let price_micros = resolved.price_micros();
     let income = resolved.find("inc");
@@ -470,86 +494,75 @@ async fn write_reinvestment(
         Some(samt) if samt != 0.0 && !samt.is_nan() => samt.abs(),
         _ => pamt,
     };
+    let fees_cents = resolved.fees_cents();
+    let basis_cents = pamt + fees_cents;
+    let remainder_cents = dividend_cents - basis_cents;
 
-    let dividend_id = insert_transaction(
+    let transaction_id = insert_transaction(
         connection,
         book_id,
         now,
-        &resolved.new_transaction(Some(js_trim(&format!("{description} (Dividend)")))),
+        &resolved
+            .new_transaction(field(resolved.transaction, "desc").map(|text| text.into_owned())),
     )
     .await?;
-    insert_investment_split(
-        connection,
-        book_id,
-        &NewInvestmentSplit {
-            transaction_id: dividend_id,
-            account_id: Some(resolved.account_id),
-            security_id: resolved.security_id,
-            action: "dividend",
-            shares_micros: 0.0,
-            price_micros: 0.0,
-            fees_cents: 0.0,
-            split_ratio: None,
-        },
-    )
-    .await?;
-    if let Some(cash_id) = resolved.cash_id {
-        insert_splits(
+    for (action, shares_micros, price_micros, fees_cents) in [
+        ("dividend", 0.0, 0.0, 0.0),
+        (
+            "buy",
+            resolved.shares_micros.abs(),
+            price_micros,
+            fees_cents,
+        ),
+    ] {
+        insert_investment_split(
             connection,
             book_id,
-            dividend_id,
-            &[(cash_id, dividend_cents)],
+            &NewInvestmentSplit {
+                transaction_id,
+                account_id: Some(resolved.account_id),
+                security_id: resolved.security_id,
+                action,
+                shares_micros,
+                price_micros,
+                fees_cents,
+                split_ratio: None,
+            },
         )
         .await?;
     }
+    insert_splits(
+        connection,
+        book_id,
+        transaction_id,
+        &[(resolved.account_id, basis_cents)],
+    )
+    .await?;
     if let Some(account_id) = resolved.income_account {
         insert_splits(
             connection,
             book_id,
-            dividend_id,
+            transaction_id,
             &[(account_id, -dividend_cents)],
         )
         .await?;
     }
-
-    let buy_id = insert_transaction(
-        connection,
-        book_id,
-        now,
-        &resolved.new_transaction(Some(js_trim(&format!("{description} (Reinvestment)")))),
-    )
-    .await?;
-    let fees_cents = resolved.fees_cents();
-    insert_investment_split(
-        connection,
-        book_id,
-        &NewInvestmentSplit {
-            transaction_id: buy_id,
-            account_id: Some(resolved.account_id),
-            security_id: resolved.security_id,
-            action: "buy",
-            shares_micros: resolved.shares_micros.abs(),
-            price_micros,
-            fees_cents,
-            split_ratio: None,
-        },
-    )
-    .await?;
-    let basis_cents = pamt + fees_cents;
-    insert_splits(
-        connection,
-        book_id,
-        buy_id,
-        &[(resolved.account_id, basis_cents)],
-    )
-    .await?;
-    if let Some(cash_id) = resolved.cash_id {
-        insert_splits(connection, book_id, buy_id, &[(cash_id, -basis_cents)]).await?;
+    if let Some(cash_id) = resolved.cash_id
+        && remainder_cents != 0.0
+    {
+        insert_splits(
+            connection,
+            book_id,
+            transaction_id,
+            &[(cash_id, remainder_cents)],
+        )
+        .await?;
     }
+    ensure_balanced(connection, book_id, transaction_id).await?;
     Ok(Counted {
         dividends: 1,
         buys: 1,
-        imported: 2,
+        imported: 1,
         ..Counted::default()
     })
 }
@@ -593,10 +606,18 @@ async fn write_investment(
     let has_shares = truthy(security.samt);
     // The offsetting split of the investment account. The lot rebuild does
     // not read it: basis comes from the investment split. A transfer
-    // (BuyXfr, SellXfr) uses the security's pamt without the fee.
+    // (BuyXfr, SellXfr) uses the security's pamt without the fee. An income
+    // split is not part of the trade: in a reinvested buy it pays for the
+    // shares, and its own leg below offsets it.
+    let traded_amount: f64 = resolved
+        .splits
+        .iter()
+        .filter(|split| split.kind != "inc")
+        .filter_map(|split| split.pamt)
+        .sum();
     let investment_amount = match action {
         "buy" | "sell" if resolved.find("xfr").is_some() => -security.pamt.unwrap_or(0.0),
-        "buy" | "sell" => -cash_amount,
+        "buy" | "sell" => -traded_amount,
         "dividend" if has_shares => -security.pamt.unwrap_or(0.0),
         _ => 0.0,
     };
@@ -680,6 +701,7 @@ async fn write_investment(
         .await?;
         counted.dividends += 1;
     }
+    ensure_balanced(connection, book_id, transaction_id).await?;
     Ok(counted)
 }
 

@@ -588,7 +588,7 @@
           "description": "Transaction splits (must sum to zero)"
         },
         "investmentSplits": {
-          "description": "Investment splits (required if transaction involves investment accounts)",
+          "description": "Investment splits (required if transaction involves investment accounts). A reinvested dividend (DRIP) is one transaction with two investment splits of the same security: a dividend split with sharesMicros 0 and priceMicros 0, and a buy split with the shares, the price and the fee. Its ledger splits are the investment account +G (G = shares x price, in cents), the fee expense account +F when there is a fee, the income account -D (the dividend), and the investment cash account +R (R = D - G - F) only when R is not 0. R must not be negative. Do not add a cash leg in and a cash leg out for the same money.",
           "type": "array",
           "items": {
             "type": "object",
@@ -2991,7 +2991,7 @@
           }
         },
         "investmentSplits": {
-          "description": "New investment splits (replaces all existing)",
+          "description": "New investment splits (replaces all existing). A reinvested dividend (DRIP) is one transaction with two investment splits of the same security: a dividend split with sharesMicros 0 and priceMicros 0, and a buy split with the shares, the price and the fee. Its ledger splits are the investment account +G (G = shares x price, in cents), the fee expense account +F when there is a fee, the income account -D (the dividend), and the investment cash account +R (R = D - G - F) only when R is not 0. R must not be negative. Do not add a cash leg in and a cash leg out for the same money.",
           "type": "array",
           "items": {
             "type": "object",

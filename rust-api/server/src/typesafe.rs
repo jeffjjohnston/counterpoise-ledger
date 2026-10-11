@@ -393,6 +393,11 @@ async fn record_in(
 pub(crate) struct Counts(Vec<(String, Option<f64>)>);
 
 impl Counts {
+    /// One more `key`.
+    fn count(&mut self, key: &str) {
+        self.add(key, 1.0);
+    }
+
     fn add(&mut self, key: &str, n: f64) {
         match self.0.iter_mut().find(|(seen, _)| seen == key) {
             // `(a[key] ?? 0) + n`: a stored null counts as 0.
@@ -555,15 +560,6 @@ fn find_by<'a>(
     }
 }
 
-/// `array[0]`: an error where JavaScript reads a property of undefined.
-fn first_item(array: Option<&Value>) -> Result<Option<&Value>, TypeError> {
-    match array {
-        None | Some(Value::Null) => Err(TypeError),
-        Some(Value::Array(items)) => Ok(items.first()),
-        Some(_) => Ok(None),
-    }
-}
-
 /// A JSON number for a SQL integer, so that `strict_equal` compares it with
 /// a value read from a snapshot.
 fn number(value: i32) -> Value {
@@ -573,183 +569,273 @@ fn number(value: i32) -> Value {
 /// `summarizeTypeSafe`: the counts of a set of evaluations and of the
 /// decisions that refer to them. A snapshot that JavaScript cannot read (a
 /// TypeError in Node) fails the summary.
+///
+/// Each evaluation is counted in the same steps as in lib/typesafe/report.ts:
+/// request, latency, cost, suggestion, proposal, then the resolution by the
+/// user. A count key is in the order that the steps first add it.
 pub(crate) fn summarize(
     evaluations: &[SummaryEvaluation],
     decisions: &[SummaryDecision],
 ) -> Result<Counts, String> {
-    let type_error = |TypeError| "TypeError in summarizeTypeSafe".to_owned();
     let mut counts = Counts::default();
     for row in evaluations {
-        let mut add = |key: &str, n: f64| counts.add(key, n);
-        let snapshot = &row.snapshot;
-        add("evaluations", 1.0);
-        add(&format!("status_{}", row.status), 1.0);
-        add(
-            if property(Some(snapshot), "merchantSeenBefore").is_some_and(js_truthy_value) {
-                "familiar_merchant_evaluations"
-            } else {
-                "unseen_merchant_evaluations"
-            },
-            1.0,
-        );
-        if let Some(latency) = row.latency_ms {
-            add("latency_samples", 1.0);
-            add("latency_total_ms", f64::from(latency));
-        }
-        if let Some(usage) = row.usage.as_ref().filter(|usage| js_truthy_value(usage)) {
-            add("usage_samples", 1.0);
-            add(
-                "input_tokens",
-                json_number(property(Some(usage), "input_tokens")),
-            );
-            add(
-                "output_tokens",
-                json_number(property(Some(usage), "output_tokens")),
-            );
-        }
-        if row.choice.as_deref() == Some("none") {
-            add("none_predictions", 1.0);
-        }
-        let choice = row.choice.clone().map(Value::String).unwrap_or(Value::Null);
-        let chosen = find_by(
-            property(Some(snapshot), "candidates"),
-            "label",
-            Some(&choice),
-        )
-        .map_err(type_error)?
-        .and_then(|candidate| property(Some(candidate), "transactionId"));
-        let baseline_first =
-            first_item(property(Some(snapshot), "baselineIds")).map_err(type_error)?;
-        if let Some(chosen) = chosen.filter(|chosen| js_truthy_value(chosen)) {
-            add(
-                if strict_equal(Some(chosen), baseline_first) {
-                    "agrees_with_baseline"
-                } else {
-                    "differs_from_baseline"
-                },
-                1.0,
-            );
-        }
-        let proposal = proposal(
-            snapshot,
-            row.answers.as_ref().filter(|answers| !answers.is_null()),
-        )
-        .map_err(type_error)?;
-        if let Some((_, category)) = proposal {
-            add("proposals", 1.0);
-            if row.displayed_at.is_some() {
-                add("proposals_displayed", 1.0);
-            }
-            if let Some(baseline) =
-                property(Some(snapshot), "baselineCategoryId").filter(|value| !value.is_null())
-            {
-                add(
-                    if strict_equal(property(Some(category), "accountId"), Some(baseline)) {
-                        "proposal_category_agrees_with_baseline"
-                    } else {
-                        "proposal_category_differs_from_baseline"
-                    },
-                    1.0,
-                );
-            }
-        }
-        let mut outcomes: Vec<&SummaryDecision> = decisions
-            .iter()
-            .filter(|decision| decision.evaluation_id == Some(row.id))
-            .collect();
-        outcomes.sort_by_key(|decision| millis(decision.decided_at));
-        let Some(first) = outcomes.iter().find(|decision| decision.action != "unlink") else {
-            add("outcome_unknown", 1.0);
-            continue;
-        };
-        add("ui_decisions", 1.0);
-        add(&format!("ui_action_{}", first.action), 1.0);
-        if first.suggestion_visible {
-            add("suggestion_visible_decisions", 1.0);
-        }
-        if first.accepted_suggestion {
-            add("suggestion_button_acceptances", 1.0);
-        }
-        if let Some(review) = first.active_review_ms {
-            add("review_time_samples", 1.0);
-            add("review_time_total_ms", f64::from(review));
-        }
-        if proposal.is_some() && first.suggestion_visible {
-            if first.action != "create" {
-                add(&format!("proposal_shown_then_{}", first.action), 1.0);
-            } else if first.accepted_suggestion {
-                add("proposal_one_click_creates", 1.0);
-            } else if first.proposal_payee_kept == Some(true)
-                && first.proposal_category_kept == Some(true)
-            {
-                add("proposal_edits_unchanged", 1.0);
-            } else {
-                add("proposal_edits_changed", 1.0);
-                if first.proposal_payee_kept == Some(false) {
-                    add("proposal_edits_changed_payee", 1.0);
-                }
-                if first.proposal_category_kept == Some(false) {
-                    add("proposal_edits_changed_category", 1.0);
-                }
-            }
-        }
-        if first.action == "match"
-            && let Some(transaction_id) = first.transaction_id
-        {
-            let transaction_id = number(transaction_id);
-            add("manual_matches", 1.0);
-            let in_candidates = find_by(
-                property(Some(snapshot), "candidates"),
-                "transactionId",
-                Some(&transaction_id),
-            )
-            .map_err(type_error)?
-            .is_some();
-            add(
-                if in_candidates {
-                    "manual_match_in_candidates"
-                } else {
-                    "manual_match_outside_candidates"
-                },
-                1.0,
-            );
-            if strict_equal(baseline_first, Some(&transaction_id)) {
-                add("baseline_agrees_with_user", 1.0);
-            }
-            if strict_equal(chosen, Some(&transaction_id)) {
-                add("jev_agrees_with_user", 1.0);
-                add(
-                    if property(Some(snapshot), "merchantSeenBefore").is_some_and(js_truthy_value) {
-                        "familiar_merchant_agrees_with_user"
-                    } else {
-                        "unseen_merchant_agrees_with_user"
-                    },
-                    1.0,
-                );
-            }
-            if row.choice.as_deref() == Some("none") {
-                add("none_followed_by_manual_match", 1.0);
-            }
-        }
-        let first_decided = millis(first.decided_at);
-        if outcomes.iter().any(|decision| {
-            decision.action == "unlink" && millis(decision.decided_at) >= first_decided
-        }) {
-            add("subsequently_unlinked", 1.0);
-        }
+        count_evaluation(&mut counts, row, decisions)
+            .map_err(|TypeError| "TypeError in summarizeTypeSafe".to_owned())?;
     }
     Ok(counts)
+}
+
+/// `countEvaluation`: the counts of one evaluation and its decisions.
+fn count_evaluation(
+    counts: &mut Counts,
+    row: &SummaryEvaluation,
+    decisions: &[SummaryDecision],
+) -> Result<(), TypeError> {
+    count_request(counts, row);
+    count_latency(counts, row.latency_ms);
+    count_cost(counts, row.usage.as_ref());
+    let suggestion = count_suggestion(counts, row)?;
+    let proposed = count_proposal(counts, row)?;
+    let outcomes = outcomes_of(decisions, row.id);
+    let Some(first) = outcomes.iter().find(|decision| decision.action != "unlink") else {
+        counts.count("outcome_unknown");
+        return Ok(());
+    };
+    count_resolution(counts, first);
+    if proposed && first.suggestion_visible {
+        count_proposal_resolution(counts, first);
+    }
+    count_manual_match(counts, row, first, &suggestion)?;
+    if unlinked_after(&outcomes, first) {
+        counts.count("subsequently_unlinked");
+    }
+    Ok(())
+}
+
+/// `snapshot.merchantSeenBefore`: a prior matched row had the same merchant.
+fn familiar_merchant(snapshot: &Value) -> bool {
+    property(Some(snapshot), "merchantSeenBefore").is_some_and(js_truthy_value)
+}
+
+/// `countRequest`: the request, its status (`status_error` counts the
+/// errors), and the merchant familiarity.
+fn count_request(counts: &mut Counts, row: &SummaryEvaluation) {
+    counts.count("evaluations");
+    counts.count(&format!("status_{}", row.status));
+    counts.count(if familiar_merchant(&row.snapshot) {
+        "familiar_merchant_evaluations"
+    } else {
+        "unseen_merchant_evaluations"
+    });
+}
+
+/// `countLatency`: a sample for each request with a measured time.
+fn count_latency(counts: &mut Counts, latency_ms: Option<i32>) {
+    if let Some(latency) = latency_ms {
+        counts.count("latency_samples");
+        counts.add("latency_total_ms", f64::from(latency));
+    }
+}
+
+/// `countCost`: the tokens of each request that TypeSafe gave a usage for.
+/// A token count that is missing, null or not a number adds 0, as in
+/// TypeScript; the usage is still a sample. See guides/typesafe-experiment.md.
+fn count_cost(counts: &mut Counts, usage: Option<&Value>) {
+    let Some(usage) = usage.filter(|usage| js_truthy_value(usage)) else {
+        return;
+    };
+    counts.count("usage_samples");
+    counts.add(
+        "input_tokens",
+        token_count(property(Some(usage), "input_tokens")),
+    );
+    counts.add(
+        "output_tokens",
+        token_count(property(Some(usage), "output_tokens")),
+    );
+}
+
+/// What `count_suggestion` read from the snapshot.
+struct Suggestion<'a> {
+    /// The transaction of the candidate that Jev chose.
+    chosen: Option<&'a Value>,
+    /// The first transaction of the baseline order.
+    baseline_first: Option<&'a Value>,
+}
+
+/// `countSuggestion`: a `none` choice, and the chosen candidate compared
+/// with the first transaction of the baseline order.
+fn count_suggestion<'a>(
+    counts: &mut Counts,
+    row: &'a SummaryEvaluation,
+) -> Result<Suggestion<'a>, TypeError> {
+    let snapshot = &row.snapshot;
+    if row.choice.as_deref() == Some("none") {
+        counts.count("none_predictions");
+    }
+    let choice = row.choice.clone().map(Value::String).unwrap_or(Value::Null);
+    let chosen = find_by(
+        property(Some(snapshot), "candidates"),
+        "label",
+        Some(&choice),
+    )?
+    .and_then(|candidate| property(Some(candidate), "transactionId"));
+    // A snapshot without a `baselineIds` list has no baseline: a chosen
+    // candidate or a manual match then counts as a disagreement.
+    let baseline_first = match property(Some(snapshot), "baselineIds") {
+        Some(Value::Array(ids)) => ids.first(),
+        _ => None,
+    };
+    if let Some(chosen) = chosen.filter(|chosen| js_truthy_value(chosen)) {
+        counts.count(if strict_equal(Some(chosen), baseline_first) {
+            "agrees_with_baseline"
+        } else {
+            "differs_from_baseline"
+        });
+    }
+    Ok(Suggestion {
+        chosen,
+        baseline_first,
+    })
+}
+
+/// `countProposal`: a proposed new transaction, its display, and its
+/// category compared with the history-based category. Returns true when
+/// there is a proposal.
+fn count_proposal(counts: &mut Counts, row: &SummaryEvaluation) -> Result<bool, TypeError> {
+    let snapshot = &row.snapshot;
+    let answers = row.answers.as_ref().filter(|answers| !answers.is_null());
+    let Some((_, category)) = proposal(snapshot, answers)? else {
+        return Ok(false);
+    };
+    counts.count("proposals");
+    if row.displayed_at.is_some() {
+        counts.count("proposals_displayed");
+    }
+    if let Some(baseline) =
+        property(Some(snapshot), "baselineCategoryId").filter(|value| !value.is_null())
+    {
+        counts.count(
+            if strict_equal(property(Some(category), "accountId"), Some(baseline)) {
+                "proposal_category_agrees_with_baseline"
+            } else {
+                "proposal_category_differs_from_baseline"
+            },
+        );
+    }
+    Ok(true)
+}
+
+/// `outcomesOf`: the decisions of one evaluation in time order. Decisions
+/// at the same time keep their given order.
+fn outcomes_of(decisions: &[SummaryDecision], evaluation_id: i32) -> Vec<&SummaryDecision> {
+    let mut outcomes: Vec<&SummaryDecision> = decisions
+        .iter()
+        .filter(|decision| decision.evaluation_id == Some(evaluation_id))
+        .collect();
+    outcomes.sort_by_key(|decision| millis(decision.decided_at));
+    outcomes
+}
+
+/// `countResolution`: the first decision of the user in the UI.
+fn count_resolution(counts: &mut Counts, first: &SummaryDecision) {
+    counts.count("ui_decisions");
+    counts.count(&format!("ui_action_{}", first.action));
+    if first.suggestion_visible {
+        counts.count("suggestion_visible_decisions");
+    }
+    if first.accepted_suggestion {
+        counts.count("suggestion_button_acceptances");
+    }
+    if let Some(review) = first.active_review_ms {
+        counts.count("review_time_samples");
+        counts.add("review_time_total_ms", f64::from(review));
+    }
+}
+
+/// `countProposalResolution`: what the user did after a proposal was on
+/// the screen. A "kept" value that is unknown (null) is not counted as a
+/// change of the payee or the category.
+fn count_proposal_resolution(counts: &mut Counts, first: &SummaryDecision) {
+    if first.action != "create" {
+        counts.count(&format!("proposal_shown_then_{}", first.action));
+    } else if first.accepted_suggestion {
+        counts.count("proposal_one_click_creates");
+    } else if first.proposal_payee_kept == Some(true) && first.proposal_category_kept == Some(true)
+    {
+        counts.count("proposal_edits_unchanged");
+    } else {
+        counts.count("proposal_edits_changed");
+        if first.proposal_payee_kept == Some(false) {
+            counts.count("proposal_edits_changed_payee");
+        }
+        if first.proposal_category_kept == Some(false) {
+            counts.count("proposal_edits_changed_category");
+        }
+    }
+}
+
+/// `countManualMatch`: a transaction that the user matched, compared with
+/// the candidates, the baseline order, and the choice of Jev.
+fn count_manual_match(
+    counts: &mut Counts,
+    row: &SummaryEvaluation,
+    first: &SummaryDecision,
+    suggestion: &Suggestion,
+) -> Result<(), TypeError> {
+    let Some(matched) = first
+        .transaction_id
+        .filter(|_| first.action == "match")
+        .map(number)
+    else {
+        return Ok(());
+    };
+    counts.count("manual_matches");
+    let in_candidates = find_by(
+        property(Some(&row.snapshot), "candidates"),
+        "transactionId",
+        Some(&matched),
+    )?
+    .is_some();
+    counts.count(if in_candidates {
+        "manual_match_in_candidates"
+    } else {
+        "manual_match_outside_candidates"
+    });
+    if strict_equal(suggestion.baseline_first, Some(&matched)) {
+        counts.count("baseline_agrees_with_user");
+    }
+    if strict_equal(suggestion.chosen, Some(&matched)) {
+        counts.count("jev_agrees_with_user");
+        counts.count(if familiar_merchant(&row.snapshot) {
+            "familiar_merchant_agrees_with_user"
+        } else {
+            "unseen_merchant_agrees_with_user"
+        });
+    }
+    if row.choice.as_deref() == Some("none") {
+        counts.count("none_followed_by_manual_match");
+    }
+    Ok(())
+}
+
+/// `unlinkedAfter`: an unlink at the time of the first decision or later.
+fn unlinked_after(outcomes: &[&SummaryDecision], first: &SummaryDecision) -> bool {
+    let first_decided = millis(first.decided_at);
+    outcomes
+        .iter()
+        .any(|decision| decision.action == "unlink" && millis(decision.decided_at) >= first_decided)
 }
 
 fn js_truthy_value(value: &Value) -> bool {
     crate::validation::js_truthy(value)
 }
 
-/// A number read from stored JSON; anything else is NaN, as `0 + undefined`.
-fn json_number(value: Option<&Value>) -> f64 {
+/// A token count read from stored JSON; anything that is not a number is 0.
+fn token_count(value: Option<&Value>) -> f64 {
     match value {
         Some(Value::Number(number)) => crate::validation::js_number(number),
-        _ => f64::NAN,
+        _ => 0.0,
     }
 }
 
@@ -1010,6 +1096,142 @@ mod tests {
             assert_eq!(counts.get(key), Some(1.0), "{key}");
         }
         assert_eq!(counts.get("baseline_agrees_with_user"), None);
+    }
+
+    /// The hand-worked cases that `summarizeTypeSafe` in
+    /// lib/typesafe/report.ts also reads. The same events must give the same
+    /// counts.
+    mod shared_cases {
+        use super::*;
+        use serde::Deserialize;
+        use serde_json::Map;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Evaluation {
+            id: i32,
+            status: String,
+            snapshot: String,
+            choice: Option<String>,
+            usage: Option<Value>,
+            answers: Option<Value>,
+            displayed_at: Option<String>,
+            latency_ms: Option<i32>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Decision {
+            evaluation_id: Option<i32>,
+            action: String,
+            transaction_id: Option<i32>,
+            #[serde(default)]
+            suggestion_visible: bool,
+            #[serde(default)]
+            accepted_suggestion: bool,
+            proposal_payee_kept: Option<bool>,
+            proposal_category_kept: Option<bool>,
+            active_review_ms: Option<i32>,
+            decided_at: String,
+        }
+
+        /// The counts in key order (a NaN count is null), or an error.
+        #[derive(Deserialize)]
+        struct Outcome {
+            expected: Option<Value>,
+            #[serde(default)]
+            error: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            evaluations: Vec<Evaluation>,
+            decisions: Vec<Decision>,
+            #[serde(flatten)]
+            outcome: Outcome,
+        }
+
+        #[derive(Deserialize)]
+        struct Fixture {
+            snapshots: Map<String, Value>,
+            cases: Vec<Case>,
+        }
+
+        fn fixture() -> Fixture {
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/typesafe-summary.json"
+            )))
+            .expect("the fixture must be valid")
+        }
+
+        fn check(
+            fixture: &Fixture,
+            name: &str,
+            evaluations: &[Evaluation],
+            decisions: &[Decision],
+            outcome: &Outcome,
+        ) -> Option<String> {
+            let evaluations: Vec<SummaryEvaluation> = evaluations
+                .iter()
+                .map(|row| SummaryEvaluation {
+                    id: row.id,
+                    status: row.status.clone(),
+                    snapshot: fixture.snapshots[&row.snapshot].clone(),
+                    choice: row.choice.clone(),
+                    usage: row.usage.clone(),
+                    answers: row.answers.clone(),
+                    displayed_at: row.displayed_at.as_deref().map(at),
+                    latency_ms: row.latency_ms,
+                })
+                .collect();
+            let decisions: Vec<SummaryDecision> = decisions
+                .iter()
+                .map(|row| SummaryDecision {
+                    evaluation_id: row.evaluation_id,
+                    action: row.action.clone(),
+                    transaction_id: row.transaction_id,
+                    suggestion_visible: row.suggestion_visible,
+                    accepted_suggestion: row.accepted_suggestion,
+                    proposal_payee_kept: row.proposal_payee_kept,
+                    proposal_category_kept: row.proposal_category_kept,
+                    active_review_ms: row.active_review_ms,
+                    decided_at: at(&row.decided_at),
+                })
+                .collect();
+            // The JSON text compares the key order too.
+            let actual = summarize(&evaluations, &decisions).map(|counts| counts.to_json());
+            let expected = outcome.expected.as_ref().map(Value::to_string);
+            match (actual, outcome.error) {
+                (Err(_), true) => None,
+                (Ok(actual), false) if Some(&actual) == expected.as_ref() => None,
+                (actual, _) => Some(format!(
+                    "{name}: expected {}, got {actual:?}",
+                    expected.unwrap_or_else(|| "an error".to_owned())
+                )),
+            }
+        }
+
+        #[test]
+        fn summarize_gives_the_hand_worked_counts() {
+            let fixture = fixture();
+            assert!(fixture.cases.len() >= 11, "fixture coverage fell");
+            let failures: Vec<String> = fixture
+                .cases
+                .iter()
+                .filter_map(|case| {
+                    check(
+                        &fixture,
+                        &case.name,
+                        &case.evaluations,
+                        &case.decisions,
+                        &case.outcome,
+                    )
+                })
+                .collect();
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
     }
 
     #[test]

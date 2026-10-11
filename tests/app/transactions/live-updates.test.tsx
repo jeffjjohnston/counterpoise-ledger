@@ -135,6 +135,39 @@ describe("transaction live refresh", () => {
     expect(screen.getByLabelText("register")).toHaveTextContent("v3-account2");
   });
 
+  it("discards a background snapshot if editing starts in flight and reloads on close", async () => {
+    vi.useFakeTimers();
+    render(<BookChangesProvider><Fixture /></BookChangesProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    let release!: () => void;
+    hold = new Promise<void>((resolve) => { release = resolve; });
+    version = 2;
+    await change();
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(getCount).toBe(2);
+
+    fireEvent.click(screen.getByText("Edit"));
+    fireEvent.change(screen.getByLabelText("Draft"), { target: { value: "unsaved draft" } });
+    hold = undefined;
+    await act(async () => { release(); await vi.advanceTimersByTimeAsync(0); });
+
+    // No part of the discarded snapshot may publish while the draft is open.
+    expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
+    expect(screen.getByLabelText("projected")).toHaveTextContent("v1");
+    expect(screen.getByLabelText("pending")).toHaveTextContent("v1");
+    expect(screen.getByLabelText("positions")).toHaveTextContent("1");
+    expect(screen.getByLabelText("Draft")).toHaveValue("unsaved draft");
+
+    version = 3;
+    fireEvent.click(screen.getByText("Close editor"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(screen.getByLabelText("register")).toHaveTextContent("v3-account1");
+    expect(screen.getByLabelText("projected")).toHaveTextContent("v3");
+    expect(screen.getByLabelText("pending")).toHaveTextContent("v3");
+    expect(screen.getByLabelText("positions")).toHaveTextContent("2");
+    expect(getCount).toBe(3);
+  });
+
   it("finishes initial loading under StrictMode", async () => {
     render(<StrictMode><BookChangesProvider><Fixture /></BookChangesProvider></StrictMode>);
     await screen.findByText("v1-account1");

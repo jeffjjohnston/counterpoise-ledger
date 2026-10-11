@@ -301,7 +301,8 @@ docker compose --env-file .env.production.local up -d --build --wait rust-api
 ### Upgrading from PostgreSQL
 
 An install that runs v1.48.0, the last release that uses PostgreSQL, must
-convert its data one time before this release can start. Follow
+convert its data one time, with release v1.50.0, before this release can
+start. This release does not have the converter. Follow
 [guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md).
 
 ### Updating Environment Variables
@@ -663,10 +664,31 @@ optional: a production secret in `.env.local` means `npm run dev` reaches real
 banks and bills real API requests, and the separate development database does
 nothing to prevent it — it bounds writes, not outbound calls.
 
-### 2. Mint an access token
+### 2. Connect a bank
 
-Counterpoise syncs against a stored access token per institution, but it does
-not run Plaid Link itself. `scripts/plaid-link.ts` produces the token:
+On the **Sync** page, an owner of the book selects **Connect a bank** (in the
+options menu, or in the empty page). Counterpoise starts a Plaid
+[Hosted Link](https://plaid.com/docs/link/hosted-link/) session on the server
+and shows **Open Plaid**. Plaid opens in a new tab: sign in to the bank there.
+The Sync page checks the session every few seconds. When you finish, the
+server exchanges the result for an access token, stores it, and loads the
+accounts of the bank. The access token never goes to the browser. In Sandbox,
+sign in to any institution with `user_good` / `pass_good`.
+
+Hosted Link serves the sign-in on the Plaid domain, so there is no redirect
+URI to register. That is important for OAuth institutions (Chase, Wells
+Fargo, US Bank): they need a redirect URI that is HTTPS and registered in the
+Plaid dashboard, and a `http://localhost` page cannot complete them.
+
+When a bank asks you to sign in again (the last sync failed with
+`ITEM_LOGIN_REQUIRED`), or to add an account of that bank, select
+**Reconnect** on the connection. This is Plaid update mode: the connection
+keeps its ID, its account mappings and its history.
+
+**Fallback:** `scripts/plaid-link.ts` runs the same Hosted Link flow in a
+terminal and prints the Item ID and the access token. Paste them into
+**Sync → Manage connections → Add with access token**. Use it only when the
+in-app flow is not available:
 
 ```bash
 npm run plaid:link      # sandbox, via .env.local
@@ -675,29 +697,15 @@ npm run plaid:link      # sandbox, via .env.local
 npx tsx --env-file=.env.production.local scripts/plaid-link.ts
 ```
 
-It prints a Plaid-hosted URL. Open it in any browser, log in to the bank, and
-the script prints an **Item ID** and an **Access Token** when the session
-completes. In Sandbox, log in to any institution with `user_good` /
-`pass_good`.
+The script stops waiting after ten minutes and prints the command to resume.
+Use that command, not a plain run: a new link token stops watching the session
+that you opened, and an Item that you already made at the bank stays on your
+Plaid plan with no token to exchange for it.
 
-It stops waiting after ten minutes and prints the command to resume. Use that
-rather than re-running plain: a fresh link token stops watching the session you
-opened, so an Item you had already created at the bank would sit on your Plaid
-plan with no token to exchange for it.
+### 3. Map the accounts
 
-The script uses [Hosted Link](https://plaid.com/docs/link/hosted-link/), where
-Plaid serves the Link UI on its own domain, so there is nothing to run locally
-and no redirect URI to register. That matters for OAuth institutions — Chase,
-Wells Fargo, US Bank — which require a redirect URI that is HTTPS and
-registered in the Plaid dashboard, and so cannot be completed against a
-`http://localhost` page at all.
-
-### 3. Add the token to a book
-
-Go to **Sync → Manage Sync Tokens**, then **Add Token**. Enter the institution
-name, and paste the Item ID and Access Token. Counterpoise fetches the
-institution's accounts, and **Assign Accounts** maps each one to a Counterpoise
-account.
+After a new connection, select **Map accounts** and map each bank account to a
+Counterpoise account. Only a mapped account syncs.
 
 From then on the server syncs every six hours, staging
 transactions for reconciliation rather than writing them to the ledger
@@ -803,7 +811,7 @@ npm run db:seed -- --book-id 2  # Seed sample data into an existing book
 npm run db:seed -- --dataset single --today 2025-12-31  # Pick the dataset and pin the end date
 npm run db:rebuild-lots  # Regenerate investment lots from splits
 npm run mcp:dev      # Start the MCP server over stdio (Rust; needs COUNTERPOISE_API_KEY)
-npm run plaid:link   # Mint a Plaid access token for one bank (sandbox)
+npm run plaid:link   # Fallback: mint a Plaid access token for one bank in a terminal (sandbox)
 sqlite3 data/counterpoise.db  # Open the dev database in the SQLite shell
 ```
 

@@ -287,7 +287,7 @@ pub(crate) async fn search(
     let query = params.get("q").map_or("", String::as_str);
     let mut results = search_book(
         &state.pool,
-        book.book_id,
+        book.book_id(),
         query,
         start.as_deref(),
         end.as_deref(),

@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/Input";
 import { MenuButton } from "@/components/ui/MenuButton";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { Modal } from "@/components/ui/Modal";
+import { PlaidLinkModal } from "@/components/sync/PlaidLinkModal";
 import { flattenAccounts } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
@@ -66,6 +67,13 @@ export default function SyncTokensPage() {
   const [editError, setEditError] = useState<string | null>(null);
 
   const [deleteTarget, setDeleteTarget] = useState<PlaidTokenListItem | null>(null);
+
+  // The Plaid Hosted Link session that is open: a new bank (tokenId null),
+  // or a reconnect of one connection.
+  const [linkTarget, setLinkTarget] = useState<{
+    tokenId: number | null;
+    institution: string | null;
+  } | null>(null);
   const [deleting, setDeleting] = useState(false);
 
   const [showAssignModal, setShowAssignModal] = useState(false);
@@ -240,6 +248,21 @@ export default function SyncTokensPage() {
     await refreshTokenCounts();
   };
 
+  // A new connection goes straight to its account mapping. The list is read
+  // again first, so the row has its new account counts.
+  const handleMapNewConnection = async (tokenId: number) => {
+    setLinkTarget(null);
+    try {
+      const data = await apiGet<PlaidTokenListItem[]>(`/api/b/${bookId}/sync/tokens`);
+      const list = Array.isArray(data) ? data : [];
+      setTokens(list);
+      const token = list.find((entry) => entry.id === tokenId);
+      if (token) await handleOpenAssignModal(token);
+    } catch (fetchError) {
+      setError(toMessage(fetchError, "Failed to load bank connections"));
+    }
+  };
+
   const closeAssignModal = () => {
     setShowAssignModal(false);
     setSelectedToken(null);
@@ -316,7 +339,12 @@ export default function SyncTokensPage() {
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-fg">Bank connections</h1>
         <div className="inline-flex items-center gap-2">
-          <Button onClick={() => setShowAddModal(true)}>Add connection</Button>
+          <Button onClick={() => setLinkTarget({ tokenId: null, institution: null })}>
+            Connect a bank
+          </Button>
+          <Button variant="secondary" onClick={() => setShowAddModal(true)}>
+            Add with access token
+          </Button>
           <Button variant="secondary" onClick={() => router.push(`/b/${bookId}/sync`)}>
             Back to Sync
           </Button>
@@ -333,8 +361,11 @@ export default function SyncTokensPage() {
         <div className="bg-surface rounded-lg border border-border">
           <EmptyState
             title="No banks connected yet"
-            description="Add a connection to start syncing transactions from your bank."
-            action={{ label: "Add connection", onClick: () => setShowAddModal(true) }}
+            description="Connect a bank to start syncing transactions from it."
+            action={{
+              label: "Connect a bank",
+              onClick: () => setLinkTarget({ tokenId: null, institution: null }),
+            }}
           />
         </div>
       ) : (
@@ -412,6 +443,19 @@ export default function SyncTokensPage() {
                         <MenuButton
                           label={`${token.financialInstitution} actions`}
                           items={[
+                            // A demo connection has no Plaid Item to reconnect.
+                            ...(token.isDemo
+                              ? []
+                              : [
+                                  {
+                                    label: "Reconnect",
+                                    onSelect: () =>
+                                      setLinkTarget({
+                                        tokenId: token.id,
+                                        institution: token.financialInstitution,
+                                      }),
+                                  },
+                                ]),
                             { label: "Edit", onSelect: () => handleOpenEditModal(token) },
                             {
                               label: "Remove connection",
@@ -430,14 +474,16 @@ export default function SyncTokensPage() {
         </div>
       )}
 
-      <Modal isOpen={showAddModal} onClose={closeAddModal} title="Add connection">
+      <Modal isOpen={showAddModal} onClose={closeAddModal} title="Add with access token">
         <div className="mb-5 rounded-lg border border-border bg-accent-subtle p-3">
           <p className="text-13 leading-relaxed text-fg-secondary">
-            Counterpoise does not run Plaid&rsquo;s sign-in flow itself. Run{" "}
+            Use Connect a bank when you can: it signs in at Plaid and keeps the access token on
+            the server. This form is the fallback. Run{" "}
             <code className="rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-xs">
               npm run plaid:link
             </code>{" "}
-            to sign in at your bank; it prints the item ID and access token to paste below.
+            on the server to sign in at your bank; it prints the item ID and access token to paste
+            below.
           </p>
         </div>
         <form className="space-y-4" onSubmit={handleAddToken}>
@@ -629,6 +675,17 @@ export default function SyncTokensPage() {
           </div>
         )}
       </Modal>
+
+      {linkTarget && (
+        <PlaidLinkModal
+          bookId={bookId}
+          tokenId={linkTarget.tokenId}
+          institution={linkTarget.institution}
+          onClose={() => setLinkTarget(null)}
+          onComplete={() => void refreshTokenCounts()}
+          onMapAccounts={(tokenId) => void handleMapNewConnection(tokenId)}
+        />
+      )}
 
       <ConfirmModal
         isOpen={deleteTarget !== null}

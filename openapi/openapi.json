@@ -3,7 +3,7 @@
   "info": {
     "title": "Counterpoise API",
     "description": "The routes a native client uses. Money is integer cents. Shares and prices are integer micros, except that fetchTiingoPrices returns prices as decimal dollars. Dates are YYYY-MM-DD strings.",
-    "version": "1.53.0",
+    "version": "1.54.0",
     "x-api-contract": 1
   },
   "servers": [
@@ -1444,7 +1444,7 @@
             }
           },
           "400": {
-            "description": "The request is not valid. The message names the problem. It can be any message of createTransaction. Also: \"At least 2 splits are required, even for stock splits\" (you send investmentSplits for a transaction with fewer than two splits and send no splits, or `splits` has fewer than 2 items). A malformed investment split item first fails with the message of its field, for example \"Invalid input: expected number, received undefined\" or \"Too small: expected number to be >=0\". An unknown action fails with an \"Invalid option\" message, and an investmentSplits value that is not an array fails with \"investmentSplits must be an array when provided\". An item that passes then fails with one of these messages: \"Invalid investment split values\" (a stock split lacks a splitNumerator or splitDenominator above 0); \"Invalid investment actions\" (a buy or sell with no gross amount, a fee with no amount, a gross amount that is too large, or a stock split with no ratio); \"One or more investment split securities do not belong to this book\"; \"Investment splits require a transaction split on an investment account\" (a buy or sell without a split on an investment account).",
+            "description": "The request is not valid. The message names the problem. It can be any message of createTransaction. Also: \"At least 2 splits are required, even for stock splits\" (you send investmentSplits for a transaction with fewer than two splits and send no splits, or `splits` has fewer than 2 items); \"The splits must keep each investment account of the investment splits; send investmentSplits to change it\" (you send splits and no investmentSplits, and the splits leave out the account of a stored investment split). A malformed investment split item first fails with the message of its field, for example \"Invalid input: expected number, received undefined\" or \"Too small: expected number to be >=0\". An unknown action fails with an \"Invalid option\" message, and an investmentSplits value that is not an array fails with \"investmentSplits must be an array when provided\". An item that passes then fails with one of these messages: \"Invalid investment split values\" (a stock split lacks a splitNumerator or splitDenominator above 0); \"Invalid investment actions\" (a buy or sell with no gross amount, a fee with no amount, a gross amount that is too large, or a stock split with no ratio); \"One or more investment split securities do not belong to this book\"; \"Investment splits require a transaction split on an investment account\" (a buy or sell without a split on an investment account).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3104,6 +3104,202 @@
           }
         ]
       }
+    },
+    "/api/b/{bookId}/sync/link-sessions": {
+      "post": {
+        "tags": [
+          "sync"
+        ],
+        "summary": "Start a Plaid Hosted Link session to connect a bank, or to reconnect one in update mode. Owner only. Without restart, the server first checks the open sessions of the same connection, and answers the newest one, or the one that is complete, in place of a new session. Open hostedLinkUrl in a new tab, then poll checkPlaidLinkSession.",
+        "operationId": "createPlaidLinkSession",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePlaidLinkSessionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlaidLinkSession"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "tokenId is not a positive integer or null, it names a demo connection, or restart is not a boolean.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an owner of the book.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no connection with this tokenId.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Plaid refused the request. The message is Plaid's error message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/sync/link-sessions/{id}/check": {
+      "post": {
+        "tags": [
+          "sync"
+        ],
+        "summary": "Read the state of a Hosted Link session. When the user finished at Plaid, the server saves the new connection, or clears the last sync error of the reconnected one, and loads its accounts. Owner only.",
+        "operationId": "checkPlaidLinkSession",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlaidLinkSession"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an owner of the book.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The book has no link session with this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The book already has a connection for this Item. The session is failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Plaid refused the request, or the public token exchange failed. The session stays pending, so a later check tries again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -3837,6 +4033,27 @@
           }
         }
       },
+      "CreatePlaidLinkSessionBody": {
+        "type": "object",
+        "properties": {
+          "tokenId": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Omit it, or send null, to connect a new bank. Send the ID of a connection of this book to reconnect it in update mode."
+          },
+          "restart": {
+            "type": "boolean",
+            "description": "Omit it, or send false, to continue the newest open session of the same connection: the response has the same id and hostedLinkUrl, or the saved connection when the user finished at Plaid. Send true to stop the open sessions and start a new one. A session that the server completes at that moment does not stop: the response is that session, and its next check shows the saved connection."
+          }
+        }
+      },
       "CreateSecurityBody": {
         "type": "object",
         "required": [
@@ -3995,7 +4212,7 @@
                 }
               }
             },
-            "description": "Investment splits (required if transaction involves investment accounts)"
+            "description": "Investment splits (required if transaction involves investment accounts). A reinvested dividend (DRIP) is one transaction with two investment splits of the same security: a dividend split with sharesMicros 0 and priceMicros 0, and a buy split with the shares, the price and the fee. Its ledger splits are the investment account +G (G = shares x price, in cents), the fee expense account +F when there is a fee, the income account -D (the dividend), and the investment cash account +R (R = D - G - F) only when R is not 0. R must not be negative. Do not add a cash leg in and a cash leg out for the same money."
           }
         }
       },
@@ -4293,6 +4510,80 @@
           },
           "createdAt": {
             "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "PlaidLinkSession": {
+        "type": "object",
+        "description": "A Plaid Hosted Link session. It never holds an access token, a public token or a link token.",
+        "required": [
+          "id",
+          "mode",
+          "status",
+          "tokenId",
+          "financialInstitution",
+          "hostedLinkUrl",
+          "expiresAt",
+          "error"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "mode": {
+            "type": "string",
+            "description": "create: a new bank connection. update: update mode for the connection tokenId, to sign in again or to add accounts."
+          },
+          "status": {
+            "type": "string",
+            "description": "pending: the user has not finished at Plaid. complete: the connection is saved. expired: the session is older than four hours, or its link token expired; start a new one. failed: the public token was used and the connection could not be saved; error has the reason. The list can grow, so treat an unknown value as failed."
+          },
+          "tokenId": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The connection. Null for a new connection until the session is complete."
+          },
+          "financialInstitution": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The name of the connection, when there is one."
+          },
+          "hostedLinkUrl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The Plaid Hosted Link URL to open in a new tab. Null when the session is not pending."
+          },
+          "expiresAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why a failed session stopped. A message safe to show to the user."
           }
         }
       },
@@ -5021,7 +5312,7 @@
           },
           "incomeCents": {
             "$ref": "#/components/schemas/Cents",
-            "description": "Cash received from dividends and capital gains of this security, all time. It counts the positive asset legs of those transactions."
+            "description": "Income from dividends and capital gains of this security, all time. For each of those transactions it is the income legs less the expense legs, negated: a dividend less the tax withheld, or a reinvested dividend less its fee."
           }
         }
       },
@@ -5265,7 +5556,7 @@
           },
           "cashAmountCents": {
             "$ref": "#/components/schemas/Cents",
-            "description": "Cash received by a dividend or capital gain: the positive asset legs of its transaction. Present only in the response of listSecuritySplits, and only on a dividend or capGain row."
+            "description": "Income of a dividend or capital gain: the income legs less the expense legs of its transaction, negated. Present only in the response of listSecuritySplits, and only on a dividend or capGain row."
           }
         }
       },
@@ -5817,7 +6108,7 @@
                 }
               }
             },
-            "description": "New investment splits (replaces all existing)"
+            "description": "New investment splits (replaces all existing). A reinvested dividend (DRIP) is one transaction with two investment splits of the same security: a dividend split with sharesMicros 0 and priceMicros 0, and a buy split with the shares, the price and the fee. Its ledger splits are the investment account +G (G = shares x price, in cents), the fee expense account +F when there is a fee, the income account -D (the dividend), and the investment cash account +R (R = D - G - F) only when R is not 0. R must not be negative. Do not add a cash leg in and a cash leg out for the same money."
           },
           "expectedUpdatedAt": {
             "type": "string",

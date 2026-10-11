@@ -98,7 +98,6 @@ docker exec -i -e COUNTERPOISE_API_KEY=cpk_... counterpoise-rust-api-1 counterpo
 # Release & Deploy — read guides/release-and-deploy.md first
 ./scripts/release.sh [patch|minor|major] [--skip-checks] [--no-pr]  # In a RELEASE CHECKOUT: bump, name and push release/vX.Y.Z, open PR to main
 ./scripts/deploy.sh --ref <commit> [--yes]                          # Publish tag vX.Y.Z once at that commit, rebuild Docker
-scripts/upgrade-to-sqlite.sh                                        # Once per install: convert PostgreSQL data to SQLite (guides/upgrade-to-sqlite.md)
 ```
 
 ### Running Individual Tests

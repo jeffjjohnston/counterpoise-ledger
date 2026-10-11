@@ -112,6 +112,19 @@ Each path is under `/api/b/{bookId}`. Rules to know:
 - `createTransaction` and `updateTransaction` document the 400 messages of
   their investment splits. Test them in `tests/http/`.
 
+## Bank connection routes
+
+`createPlaidLinkSession` (`POST /sync/link-sessions`) and
+`checkPlaidLinkSession` (`POST /sync/link-sessions/{id}/check`) have the tag
+`sync`. They are new routes, so `API_CONTRACT` did not change. The field
+`restart` of `CreatePlaidLinkSessionBody` is optional. Without it, the create
+continues the open session of the same connection, if there is one. Only an
+owner of the book can call them (403 for an editor or a viewer). `status` in
+`PlaidLinkSession` is a string and not an enum, so a later value does not
+break a generated client: treat an unknown value as `failed`. See
+[plaid-sync.md](plaid-sync.md#connect-and-reconnect-hosted-link) for the
+flow.
+
 ## Auth in the contract
 
 Data routes accept a cookie session or `Authorization: Bearer cpk_...`.
@@ -131,7 +144,8 @@ does for a bad key. The limiter is `rust-api/server/src/rate_limit.rs`.
 A key grants everything the cookie grants, except the password change and
 key management. That includes routes outside this contract: securities,
 recurring rules, reports, settings, issue reports, system status, WebMCP, and
-every bank-sync route under `/api/b/{bookId}/sync/`. The contract lists what
+the bank-sync routes under `/api/b/{bookId}/sync/` (only the two Hosted Link
+routes are in the contract). The contract lists what
 the client uses. It does not limit what a key can reach.
 
 A native client must not send `Origin` or `Sec-Fetch-Site`. The server's

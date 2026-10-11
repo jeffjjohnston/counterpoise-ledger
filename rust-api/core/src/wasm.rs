@@ -33,6 +33,14 @@ fn result(op: &str, args: &[Value]) -> Result<Value, String> {
         "buildSellSplits" => {
             json!(accounting::build_sell_splits(&arg(args, 0)?).map_err(str::to_owned)?)
         }
+        "buildReinvestSplits" => {
+            json!(accounting::build_reinvest_splits(&arg(args, 0)?).map_err(str::to_owned)?)
+        }
+        "reinvestPriceMicros" => json!(accounting::reinvest_price_micros(
+            arg(args, 0)?,
+            arg(args, 1)?,
+            arg(args, 2)?
+        )),
         "getEffectiveDate" => {
             let transaction: Value = arg(args, 0)?;
             let today: String = arg(args, 1)?;

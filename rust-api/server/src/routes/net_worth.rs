@@ -54,7 +54,7 @@ pub(crate) async fn net_worth_history(
         ));
     }
     let pool = &state.pool;
-    let book_id = book.book_id;
+    let book_id = book.book_id();
     // The first point is the later of the start date and the first transaction.
     // A book with no transaction, or one that starts after the end, has no points.
     let first = first_transaction_date(pool, book_id)

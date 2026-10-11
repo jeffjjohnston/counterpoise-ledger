@@ -113,6 +113,11 @@ though editors can write everywhere else, and the static test enforces this:
 - `POST /api/b/[bookId]/sync/tokens` (Plaid link)
 - `PUT` and `DELETE /api/b/[bookId]/sync/tokens/[id]` (Plaid unlink and rename)
 - `PUT /api/b/[bookId]/sync/tokens/[id]/accounts` (map bank accounts)
+- `POST /api/b/[bookId]/sync/link-sessions` and
+  `POST /api/b/[bookId]/sync/link-sessions/[id]/check` (Plaid Hosted Link:
+  connect and reconnect a bank). They make or change bank credentials, so
+  they are owner-only like the other connection writes. See
+  [plaid-sync.md](plaid-sync.md#connect-and-reconnect-hosted-link)
 
 Owner-only under `/api/books/`: rename the book, change `upcomingDays`,
 delete the book; add a member, change a member's role, and remove another
@@ -338,7 +343,9 @@ The Plaid connection routes and the sync reads are in
 `sync/tokens/[id]` PUT and DELETE, `sync/tokens/[id]/accounts` GET and PUT,
 `sync/tokens/[id]/sync` DELETE, `sync/assigned-accounts`,
 `sync/pending-transactions`, `sync/stale-unmatched`, `transactions/[id]/plaid`
-GET, and `transactions/[id]/plaid/unlink` POST. The sync
+GET, and `transactions/[id]/plaid/unlink` POST. The Hosted Link sessions
+(`sync/link-sessions` POST and `sync/link-sessions/[id]/check` POST) are in
+`rust-api/server/src/routes/plaid_link.rs`. The sync
 (`sync/tokens/[id]/sync` POST) and the auto-matcher are in
 `rust-api/server/src/routes/plaid_sync.rs`. The reconciliation queues
 (`sync/reconcile` GET and `sync/accounts/[id]/reconcile` GET) and the six

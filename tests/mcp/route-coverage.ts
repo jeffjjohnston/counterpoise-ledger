@@ -118,6 +118,12 @@ export const ROUTE_WAIVERS: Record<string, string> = {
     "produce, so there is no legitimate way for an MCP caller to supply one — a tool that " +
     "accepted a caller-supplied credential here would be a way to write an arbitrary token into " +
     "the database.",
+  "POST /b/[bookId]/sync/link-sessions":
+    "Plaid Hosted Link. The owner signs in at the bank in a browser tab, so a machine caller " +
+    "cannot finish the session. Decided 2026-10-09 when the route was added.",
+  "POST /b/[bookId]/sync/link-sessions/[id]/check":
+    "Polls the Hosted Link session that the Sync page started. It makes sense only for the " +
+    "browser that opened the session. Decided 2026-10-09.",
   "GET /b/[bookId]/accounts/[id]": "Covered by list_accounts.",
   "GET /b/[bookId]/transactions/[id]": "Covered by list_transactions.",
   "GET /b/[bookId]/transactions/changes": "Delta sync of a native client's local copy of the book. An MCP client reads with list_transactions and keeps no copy. Decided 2026-10-03 when the route was added.",

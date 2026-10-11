@@ -39,6 +39,32 @@ rows that a TypeScript script or test helper writes. For calendar-date behavior,
 the instant and the timezone near a midnight boundary; an ambient-clock test
 can pass while the conversion is wrong.
 
+### References between rows of one book
+
+A row of a book must refer only to rows of the same book. The database
+enforces this in two ways:
+
+- A **composite foreign key** on `(book_id, id)`: the splits, the investment
+  splits, the template splits, `security_prices` and `accounts.parent_id`.
+  `tests/db/book-scoped-composite-fks.test.ts` tests them.
+- A **trigger** where the key has one column, because a composite key with
+  `ON DELETE SET NULL` would also set `book_id` to null. Migration
+  `0006_book_reference_checks.sql` adds a `BEFORE INSERT` and a
+  `BEFORE UPDATE OF <column>, book_id` trigger, named `*_in_book_*`, for
+  `transactions.payee_id`, `transactions.recurring_rule_id`,
+  `recurring_rules.payee_id`, `plaid_accounts.token_id`,
+  `plaid_accounts.counterpoise_account_id`,
+  `plaid_transaction_reconciliation.plaid_account_link_id` and
+  `.matched_transaction_id`, and `plaid_link_sessions.token_id` and
+  `.result_token_id`. Its error text starts with `cross-book reference:`.
+  `tests/db/book-reference-triggers.test.ts` tests them.
+
+The routes still check an ID before they write, and give 400 or 404. A
+trigger error is a 500 and means that a writer skipped its check. A new
+single-column reference between two book tables needs a trigger of the same
+kind. The lot tables and the TypeSafe records have none: only the server
+writes their references.
+
 - **books**: `userId` is the user who created the book. It is not the access
   list. `book_members` decides who can open the book and at what role.
   `typesafeReconciliationEnabled` defaults to false; `typesafeRevision`
@@ -166,3 +192,11 @@ can pass while the conversion is wrong.
     - `resolutionStatus`: `pending`, `matched`, `created`, `ignored`
     - `reviewReason`: `plaid_modified` or `plaid_removed` (flags items needing human review)
     - `matchedTransactionId`: FK to local transaction when matched (manually or auto-matched)
+  - `plaidLinkSessions` (migration 0005): one Plaid Hosted Link session of the
+    Sync page. `tokenId` is null for a new connection and names the connection
+    in update mode; `resultTokenId` is the connection that the session made or
+    reconnected. `linkToken` goes only to Plaid: no response contains it.
+    `status` is `pending`, `completing` (the claim of the one request that
+    exchanges the result), `complete`, `expired` or `failed`. `expiresAt` is
+    at most four hours after `createdAt`. The table never holds an access
+    token. See [plaid-sync.md](plaid-sync.md#connect-and-reconnect-hosted-link)

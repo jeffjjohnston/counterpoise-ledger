@@ -32,6 +32,7 @@ const databaseTests = [
   "tests/db/book-members.test.ts",
   "tests/db/reset-test-database.test.ts",
   "tests/db/book-scoped-composite-fks.test.ts",
+  "tests/db/book-reference-triggers.test.ts",
   "tests/db/lot-schema.test.ts",
   "tests/db/typesafe-report.test.ts",
   ...(process.env.COUNTERPOISE_HTTP_SERVER ? ["tests/http/**/*.test.ts"] : []),

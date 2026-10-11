@@ -449,7 +449,7 @@ pub(crate) async fn list_rules(
         "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE book_id = $1
          ORDER BY is_active DESC, next_date, name, id"
     ))
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_all(&state.pool)
     .await
     .map_err(database_error(FAILURE))?;
@@ -468,7 +468,7 @@ pub(crate) async fn get_rule(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let id = rule_path_id(&raw_id).ok_or_else(|| failed(FAILURE))?;
-    load_rule(&state.pool, book.book_id, id)
+    load_rule(&state.pool, book.book_id(), id)
         .await
         .map_err(database_error(FAILURE))?
         .map(|rule| Json(rule_json(&rule)))
@@ -496,7 +496,7 @@ async fn create(
     }
     let amounts =
         balanced_amounts(&input.template_splits).ok_or_else(|| bad_request(UNBALANCED))?;
-    require_template_accounts(pool, book.book_id, &input.template_splits, failure).await?;
+    require_template_accounts(pool, book.book_id(), &input.template_splits, failure).await?;
 
     let loose = &input.loose;
     // `interval || 1`.
@@ -526,7 +526,7 @@ async fn create(
     // back with a failed write.
     let payee_id = resolve_rule_payee(
         &mut tx,
-        book.book_id,
+        book.book_id(),
         loose.payee_id.as_ref(),
         loose.payee_name.as_ref(),
     )
@@ -559,14 +559,14 @@ async fn create(
     .bind(input.auto_create_days_before.unwrap_or(0) as i32)
     .bind(truthy(&loose.template_description).map(|value| js_string(&value)))
     .bind(payee_id)
-    .bind(book.book_id)
+    .bind(book.book_id())
     .bind(now_millis())
     .fetch_one(&mut *tx)
     .await
     .map_err(database_error(failure))?;
     insert_template_splits(
         &mut tx,
-        book.book_id,
+        book.book_id(),
         rule_id,
         &input.template_splits,
         &amounts,
@@ -588,14 +588,14 @@ pub(crate) async fn create_rule(
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let input = validate_create(&parse_json_body(&body, FAILURE)?)?;
     let id = create(&state.pool, &book, &input, FAILURE).await?;
-    let created = load_rule(&state.pool, book.book_id, id)
+    let created = load_rule(&state.pool, book.book_id(), id)
         .await
         .map_err(database_error(FAILURE))?
         .ok_or_else(|| failed(FAILURE))?;
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         "recurring_rule_created",
-        Some(json!({ "bookId": book.book_id })),
+        Some(json!({ "bookId": book.book_id() })),
     );
     Ok(Json(rule_json(&created)))
 }
@@ -748,7 +748,7 @@ async fn update(
             "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE id = $1 AND book_id = $2"
         ))
         .bind(id()?)
-        .bind(book.book_id)
+        .bind(book.book_id())
         .fetch_optional(pool)
         .await
         .map_err(database_error(failure))?
@@ -766,7 +766,7 @@ async fn update(
         }
     }
     if let Some(splits) = &input.template_splits {
-        require_template_accounts(pool, book.book_id, splits, failure).await?;
+        require_template_accounts(pool, book.book_id(), splits, failure).await?;
     }
 
     let mut computed = None;
@@ -793,7 +793,7 @@ async fn update(
                 "SELECT max(date) FROM transactions WHERE recurring_rule_id = $1 AND book_id = $2",
             )
             .bind(id()?)
-            .bind(book.book_id)
+            .bind(book.book_id())
             .fetch_one(pool)
             .await
             .map_err(database_error(failure))?;
@@ -826,7 +826,7 @@ async fn update(
     let exists: Option<i32> =
         sqlx::query_scalar("SELECT id FROM recurring_rules WHERE id = $1 AND book_id = $2 LIMIT 1")
             .bind(id()?)
-            .bind(book.book_id)
+            .bind(book.book_id())
             .fetch_optional(&mut *tx)
             .await
             .map_err(database_error(failure))?;
@@ -836,7 +836,7 @@ async fn update(
         Some(
             resolve_rule_payee(
                 &mut tx,
-                book.book_id,
+                book.book_id(),
                 loose.payee_id.as_ref(),
                 loose.payee_name.as_ref(),
             )
@@ -859,7 +859,7 @@ async fn update(
         set.push(" WHERE id = ")
             .push_bind(rule_id)
             .push(" AND book_id = ")
-            .push_bind(book.book_id);
+            .push_bind(book.book_id());
         set.build()
             .execute(&mut *tx)
             .await
@@ -870,11 +870,11 @@ async fn update(
             "DELETE FROM recurring_template_splits WHERE recurring_rule_id = $1 AND book_id = $2",
         )
         .bind(rule_id)
-        .bind(book.book_id)
+        .bind(book.book_id())
         .execute(&mut *tx)
         .await
         .map_err(database_error(failure))?;
-        insert_template_splits(&mut tx, book.book_id, rule_id, splits, amounts, failure).await?;
+        insert_template_splits(&mut tx, book.book_id(), rule_id, splits, amounts, failure).await?;
     }
     tx.commit().await.map_err(database_error(failure))?;
     Ok(())
@@ -893,7 +893,7 @@ pub(crate) async fn update_rule(
     let input = validate_update(&parse_json_body(&body, FAILURE)?)?;
     update(&state.pool, &book, rule_id, &input, FAILURE).await?;
     let id = rule_id.ok_or_else(|| failed(FAILURE))?;
-    load_rule(&state.pool, book.book_id, id)
+    load_rule(&state.pool, book.book_id(), id)
         .await
         .map_err(database_error(FAILURE))?
         .map(|rule| Json(rule_json(&rule)))
@@ -919,7 +919,7 @@ pub(crate) async fn delete_rule(
         "DELETE FROM recurring_rules WHERE id = $1 AND book_id = $2 RETURNING id",
     )
     .bind(id)
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_optional(&state.pool)
     .await
     .map_err(database_error(FAILURE))?;
@@ -1188,12 +1188,12 @@ pub(crate) async fn process_rules(
     let processed = match input.rule_id.filter(|id| *id != 0) {
         Some(rule_id) => {
             let rule_id = i32::try_from(rule_id).map_err(|_| failed(FAILURE))?;
-            process_rule(&state.pool, book.book_id, rule_id, FAILURE)
+            process_rule(&state.pool, book.book_id(), rule_id, FAILURE)
                 .await?
                 .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))?
         }
         None if input.process_all == Some(true) => {
-            process_all(&state.pool, book.book_id, FAILURE).await?
+            process_all(&state.pool, book.book_id(), FAILURE).await?
         }
         None => Processed::default(),
     };
@@ -1275,7 +1275,7 @@ pub(crate) async fn projected(
     let schedule = schedule_error(FAILURE);
     let today = local_today();
     let upcoming_days: i32 = sqlx::query_scalar("SELECT upcoming_days FROM books WHERE id = $1")
-        .bind(book.book_id)
+        .bind(book.book_id())
         .fetch_one(&state.pool)
         .await
         .map_err(database_error(FAILURE))?;
@@ -1287,7 +1287,7 @@ pub(crate) async fn projected(
         Some(date) => date,
         None => add_days_to_date_string(&today, upcoming_days.into()).map_err(&schedule)?,
     };
-    let rules = load_active_rules(&state.pool, book.book_id)
+    let rules = load_active_rules(&state.pool, book.book_id())
         .await
         .map_err(database_error(FAILURE))?;
 
@@ -1316,7 +1316,7 @@ pub(crate) async fn projected(
             if occurrence >= start_date && occurrence <= end_date {
                 projected.push((
                     occurrence.clone(),
-                    projected_transaction(book.book_id, rule, &occurrence, index),
+                    projected_transaction(book.book_id(), rule, &occurrence, index),
                 ));
                 index += 1;
             }
@@ -1381,7 +1381,7 @@ pub(crate) async fn rule_transactions(
            AND {EFFECTIVE_DATE} >= $2 AND {EFFECTIVE_DATE} <= $3
          ORDER BY t.id"
     ))
-    .bind(book.book_id)
+    .bind(book.book_id())
     .bind(start_date)
     .bind(end_date)
     .fetch_all(&state.pool)

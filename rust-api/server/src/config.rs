@@ -1,7 +1,8 @@
 use crate::client_ip::{ProxyTrust, trust_proxy};
 use std::{env, path::PathBuf};
 
-/// The upgrade guide that a PostgreSQL install must follow first.
+/// The upgrade guide that a PostgreSQL install must follow first. The
+/// converter is not in this release; the guide names the release that has it.
 pub(crate) const UPGRADE_GUIDE: &str =
     "https://github.com/jeffjjohnston/counterpoise-ledger/blob/main/guides/upgrade-to-sqlite.md";
 
@@ -55,7 +56,8 @@ impl Config {
         if postgres && !self.database_path.exists() {
             return Err(format!(
                 "DATABASE_URL is set, and there is no database at {}. This release \
-                 stores its data in SQLite. Convert the PostgreSQL data first: see {UPGRADE_GUIDE}. \
+                 stores its data in SQLite. Convert the PostgreSQL data with release v1.50.0 first: \
+                 see {UPGRADE_GUIDE}. \
                  Remove DATABASE_URL only for a new, empty install.",
                 self.database_path.display()
             ));

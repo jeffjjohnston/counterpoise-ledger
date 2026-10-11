@@ -88,18 +88,20 @@ describe("Plaid read HTTP parity", () => {
     const foreignToken = await createPlaidToken({ financialInstitution: "F", itemId: "item-f", accessToken: "t", bookId: other.id });
     await createPlaidAccount({ tokenId: foreignToken.id, plaidAccountId: "pa-f", name: "F", type: "depository", counterpoiseAccountId: foreignAccount.id, bookId: other.id });
 
+    await exec("UPDATE plaid_tokens SET is_demo = 1 WHERE id = $1", [zeta.id]);
     expect(await ok(client, "/api/b/1/sync/assigned-accounts")).toEqual([
       {
         plaidLinkId: checking.plaidAccount.id, financialInstitution: "Chase", tokenId: checking.token.id,
         itemId: "item-pa-checking", plaidAccountId: "pa-checking", plaidAccountName: "Chase Checking",
         plaidAccountMask: null, counterpoiseAccountId: checking.account.id, counterpoiseAccountName: "Checking",
-        lastSyncedAt: null, lastError: null, pendingCount: 2, reviewCount: 2,
+        lastSyncedAt: null, lastError: null, pendingCount: 2, reviewCount: 2, isDemo: false,
       },
       {
         plaidLinkId: cardLink.id, financialInstitution: "Zeta", tokenId: zeta.id, itemId: "item-zeta",
         plaidAccountId: "pa-card", plaidAccountName: "Card", plaidAccountMask: "4242",
         counterpoiseAccountId: card.id, counterpoiseAccountName: "Card",
         lastSyncedAt: lastSyncedAt.toISOString(), lastError: "Plaid said no", pendingCount: 0, reviewCount: 0,
+        isDemo: true,
       },
     ]);
   });

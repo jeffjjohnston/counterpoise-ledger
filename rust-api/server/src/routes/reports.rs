@@ -189,7 +189,7 @@ pub(crate) async fn report_data(
     };
     let (splits, _) = report_splits(
         &state.pool,
-        book.book_id,
+        book.book_id(),
         &ReportFilter {
             start_date: start_date.as_deref(),
             end_date: end_date.as_deref(),
@@ -204,15 +204,15 @@ pub(crate) async fn report_data(
     let accounts: Vec<ReportAccount> = sqlx::query_as(
         "SELECT id, name, type AS account_type, parent_id FROM accounts WHERE book_id = $1 ORDER BY id",
     )
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_all(&state.pool)
     .await
     .map_err(|cause| internal_error(cause, "Failed to fetch report data"))?;
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         "report_generated",
         Some(json!({
-            "bookId": book.book_id, "reportType": "balance-sheet",
+            "bookId": book.book_id(), "reportType": "balance-sheet",
         })),
     );
     Ok(Json(
@@ -312,7 +312,7 @@ pub(crate) async fn income_statement(
         .is_some_and(|value| value == "true");
     let rows = income_rows(
         &state.pool,
-        book.book_id,
+        book.book_id(),
         start_date.as_deref().zip(end_date.as_deref()),
         include_inactive,
     )
@@ -328,10 +328,10 @@ pub(crate) async fn income_statement(
         }
     }
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         "report_generated",
         Some(json!({
-            "bookId": book.book_id, "reportType": "income-statement",
+            "bookId": book.book_id(), "reportType": "income-statement",
         })),
     );
     Ok(Json(

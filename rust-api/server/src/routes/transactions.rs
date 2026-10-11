@@ -1,13 +1,17 @@
 //! The transaction register and transaction CRUD.
 
 use crate::{
-    book_auth::{AccessLevel, AuthenticatedBook, authenticate_book},
+    book_auth::{AccessLevel, authenticate_book},
+    book_scope::{
+        Account, BalancedSplits, BookAccess, InBook, Payee, ProvedInvestmentSplits, ProvedSplits,
+        RecurringRule, Security, SplitAccount, Write, resolve_payee, row_in_book, rows_in_book,
+        split_accounts,
+    },
     error::{ApiError, ApiResult, error, internal_error},
-    routes::payees::normalize_name,
     state::AppState,
     transaction_input::{
-        CreateTransaction, InvestmentSplitInput, ListQuery, SplitInput, UpdateTransaction,
-        expected_updated_at, validate_create, validate_list_query, validate_update,
+        CreateTransaction, InvestmentSplitInput, ListQuery, UpdateTransaction, expected_updated_at,
+        validate_create, validate_list_query, validate_update,
     },
     validation::{
         database_integer, first_query_values, is_js_whitespace, parse_int_auto_radix,
@@ -23,7 +27,7 @@ use axum::{
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use ledger_core::accounting::{
     InvestmentAction, InvestmentActionInput, is_valid_date_string, validate_investment_actions,
-    validate_investment_split_payload, validate_splits,
+    validate_investment_split_payload,
 };
 use ledger_db::engine::{Db, DbConnection, DbPool};
 use ledger_db::locks::FOR_UPDATE;
@@ -40,6 +44,7 @@ const FOREIGN_SPLIT_ACCOUNT: &str = "One or more split accounts do not belong to
 const CHECK_NUMBER_ACCOUNT: &str =
     "Check number can only be set for transactions involving bank accounts";
 const INVESTMENT_SPLITS_REQUIRED: &str = "Investment transactions require investmentSplits";
+const INVESTMENT_ACCOUNT_KEPT: &str = "The splits must keep each investment account of the investment splits; send investmentSplits to change it";
 const CONFLICT: &str = "Another user changed this transaction. Showing the latest version.";
 const NOT_FOUND: &str = "Transaction not found";
 
@@ -460,21 +465,6 @@ fn push_position(builder: &mut QueryBuilder<Db>, operator: &str, anchor: &PageRo
         .push("))");
 }
 
-async fn exists_in_book(
-    pool: &DbPool,
-    table: &str,
-    id: i32,
-    book_id: i32,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(&format!(
-        "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = $1 AND book_id = $2)"
-    ))
-    .bind(id)
-    .bind(book_id)
-    .fetch_one(pool)
-    .await
-}
-
 pub(crate) async fn list_transactions(
     State(state): State<AppState>,
     Path(raw_book_id): Path<String>,
@@ -484,23 +474,23 @@ pub(crate) async fn list_transactions(
     const FAILURE: &str = "Failed to fetch transactions";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
+    let access = book.read();
     let query = validate_list_query(&first_query_values(raw_query.as_deref()))?;
     let pool = &state.pool;
     let db_error = |cause| internal_error(cause, FAILURE);
 
     // The route refuses an out-of-book balance account outright, rather than
     // answering about nothing.
-    let balance_account_id = match query.balance_account_id {
+    let balance_account: Option<InBook<Account>> = match query.balance_account_id {
         None => None,
         Some(id) => {
             let id = database_integer(id, FAILURE)?;
-            if !exists_in_book(pool, "accounts", id, book.book_id)
-                .await
-                .map_err(db_error)?
-            {
-                return Err(bad_request("Invalid balanceAccountId"));
-            }
-            Some(id)
+            Some(
+                row_in_book(pool, &access, id)
+                    .await
+                    .map_err(db_error)?
+                    .ok_or_else(|| bad_request("Invalid balanceAccountId"))?,
+            )
         }
     };
     let filtered_account_ids = query
@@ -526,14 +516,14 @@ pub(crate) async fn list_transactions(
              WHERE t.id = $1 AND t.book_id = $2"
         ))
         .bind(ensure_id)
-        .bind(book.book_id)
+        .bind(book.book_id())
         .fetch_optional(pool)
         .await
         .map_err(db_error)?;
         if let Some(target) = target {
             let filters = Filters::from_query(filtered_account_ids.as_ref(), &query, FAILURE)?;
             let mut count = QueryBuilder::new(filters.count_expression());
-            filters.push_from_where(&mut count, book.book_id);
+            filters.push_from_where(&mut count, book.book_id());
             push_position(&mut count, ">", &target);
             let position: i32 = count
                 .build_query_scalar()
@@ -544,52 +534,35 @@ pub(crate) async fn list_transactions(
         }
     }
 
-    // selectTransactionPage: the ownership checks, in its order.
+    // selectTransactionPage: the ownership checks, in its order. The SQL
+    // below also binds the book, so a proof here gives the 400 answer; it
+    // does not guard the read.
     if let Some(payee_id) = query.payee_id {
         let payee_id = database_integer(payee_id, FAILURE)?;
-        if !exists_in_book(pool, "payees", payee_id, book.book_id)
+        row_in_book::<Payee, _>(pool, &access, payee_id)
             .await
             .map_err(db_error)?
-        {
-            return Err(bad_request("Invalid payeeId"));
-        }
+            .ok_or_else(|| bad_request("Invalid payeeId"))?;
     }
     if let Some(rule_id) = query.recurring_rule_id {
         let rule_id = database_integer(rule_id, FAILURE)?;
-        if !exists_in_book(pool, "recurring_rules", rule_id, book.book_id)
+        row_in_book::<RecurringRule, _>(pool, &access, rule_id)
             .await
             .map_err(db_error)?
-        {
-            return Err(bad_request("Invalid recurringRuleId"));
-        }
+            .ok_or_else(|| bad_request("Invalid recurringRuleId"))?;
     }
     if let Some(ids) = &filtered_account_ids {
-        let unique: Vec<i32> = database_ids(ids, FAILURE)?
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let owned: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*) FROM accounts WHERE id {in1} AND book_id = $2",
-            in1 = sql::in_integers("$1")
-        ))
-        .bind(sql::json_array(&unique))
-        .bind(book.book_id)
-        .fetch_one(pool)
-        .await
-        .map_err(db_error)?;
-        if owned != unique.len() as i64 {
-            return Err(bad_request(
-                "One or more accounts do not belong to this book",
-            ));
-        }
+        rows_in_book::<Account, _>(pool, &access, &database_ids(ids, FAILURE)?)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| bad_request("One or more accounts do not belong to this book"))?;
     }
     let filters = Filters::from_query(filtered_account_ids.as_ref(), &query, FAILURE)?;
 
     let mut page = QueryBuilder::new(format!(
         "SELECT t.id, {EFFECTIVE_DATE} AS date, t.is_floating"
     ));
-    filters.push_from_where(&mut page, book.book_id);
+    filters.push_from_where(&mut page, book.book_id());
     if filters.account_ids.is_some() {
         // A transaction with splits on two filtered accounts appears once.
         page.push(" GROUP BY t.id, t.date, t.is_floating");
@@ -614,7 +587,7 @@ pub(crate) async fn list_transactions(
 
     let total_count = if query.include_meta {
         let mut count = QueryBuilder::new(filters.count_expression());
-        filters.push_from_where(&mut count, book.book_id);
+        filters.push_from_where(&mut count, book.book_id());
         let total: i32 = count
             .build_query_scalar()
             .fetch_one(pool)
@@ -629,7 +602,7 @@ pub(crate) async fn list_transactions(
     // The connection goes back to the pool before the balance query.
     let transactions = {
         let mut connection = pool.acquire().await.map_err(db_error)?;
-        load_transactions(&mut connection, book.book_id, &ids)
+        load_transactions(&mut connection, book.book_id(), &ids)
             .await
             .map_err(db_error)?
     };
@@ -642,13 +615,13 @@ pub(crate) async fn list_transactions(
     if let (Some(account_ids), Some(oldest)) = (&filters.account_ids, rows.last()) {
         // Everything the register prints below the page: the inverse of
         // REGISTER_ORDER. The date filters do not apply.
-        let account_id = balance_account_id.unwrap_or(account_ids[0]);
+        let account_id = balance_account.map_or(account_ids[0], |account| account.id());
         let mut balance = QueryBuilder::new(
             "SELECT cast(coalesce(sum(s.amount), 0) as integer) FROM transaction_splits s
              JOIN transactions t ON t.id = s.transaction_id WHERE t.book_id = ",
         );
         balance
-            .push_bind(book.book_id)
+            .push_bind(book.book_id())
             .push(" AND s.account_id = ")
             .push_bind(account_id);
         push_position(&mut balance, "<", oldest);
@@ -682,7 +655,7 @@ pub(crate) async fn get_transaction(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let id = transaction_path_id(&raw_id, FAILURE)?;
-    load_transaction(&state.pool, book.book_id, id)
+    load_transaction(&state.pool, book.book_id(), id)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?
         .map(Json)
@@ -693,40 +666,6 @@ pub(crate) async fn get_transaction(
 // Shared write rules
 // ---------------------------------------------------------------------------
 
-/// One account of the transaction's splits. `investment_parent_id` is the
-/// parent only when the parent is an investment account in the same book,
-/// because `accounts.parent_id` is not book-scoped by its foreign key.
-#[derive(FromRow)]
-struct SplitAccount {
-    id: i32,
-    subtype: Option<String>,
-    is_investment_cash: bool,
-    investment_parent_id: Option<i32>,
-}
-
-async fn load_split_accounts(
-    pool: &DbPool,
-    book_id: i32,
-    account_ids: &[i32],
-) -> Result<Vec<SplitAccount>, sqlx::Error> {
-    if account_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    sqlx::query_as(&format!(
-        "SELECT a.id, a.subtype, a.is_investment_cash,
-                CASE WHEN p.subtype = 'investment' THEN p.id ELSE NULL END AS investment_parent_id
-         FROM accounts a
-         LEFT JOIN accounts p ON p.id = a.parent_id AND p.book_id = $1
-         WHERE a.book_id = $1 AND a.id {in2}
-         ORDER BY a.id",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(book_id)
-    .bind(sql::json_array(account_ids))
-    .fetch_all(pool)
-    .await
-}
-
 fn has_subtype(accounts: &[SplitAccount], subtype: &str) -> bool {
     accounts
         .iter()
@@ -736,17 +675,17 @@ fn has_subtype(accounts: &[SplitAccount], subtype: &str) -> bool {
 /// `deriveInvestmentAccountId`: the brokerage account for a buy or a sell,
 /// or the parent of the investment-cash leg for a dividend, capital gain, or
 /// fee. `None` for a dividend paid into a plain bank account.
-fn derive_investment_account_id(accounts: &[SplitAccount]) -> Option<i32> {
+fn derive_investment_account(accounts: &[SplitAccount]) -> Option<InBook<Account>> {
     if let Some(direct) = accounts
         .iter()
         .find(|account| account.subtype.as_deref() == Some("investment"))
     {
-        return Some(direct.id);
+        return Some(direct.account);
     }
     accounts
         .iter()
         .find(|account| account.is_investment_cash)
-        .and_then(|account| account.investment_parent_id)
+        .and_then(|account| account.investment_parent)
 }
 
 /// First-seen order without repeats, as `[...new Set(ids)]`.
@@ -755,17 +694,21 @@ fn unique_in_order(ids: impl IntoIterator<Item = i32>) -> Vec<i32> {
     ids.into_iter().filter(|id| seen.insert(*id)).collect()
 }
 
+const FOREIGN_SECURITY: &str = "One or more investment split securities do not belong to this book";
+
 /// The investment-split checks that follow the account checks in both
-/// createTransaction and updateTransaction.
-async fn validate_investment_splits(
+/// createTransaction and updateTransaction. An empty list passes.
+async fn prove_investment_splits<'a>(
     pool: &DbPool,
-    book_id: i32,
-    splits: &[InvestmentSplitInput],
+    access: &BookAccess<'_, Write>,
+    splits: &'a [InvestmentSplitInput],
     accounts: &[SplitAccount],
     failure: &'static str,
-) -> Result<(), ApiError> {
+) -> Result<ProvedInvestmentSplits<'a>, ApiError> {
+    let account = derive_investment_account(accounts);
     if splits.is_empty() {
-        return Ok(());
+        return ProvedInvestmentSplits::new(access, splits, &[], account)
+            .ok_or_else(|| bad_request(FOREIGN_SECURITY));
     }
     if !splits
         .iter()
@@ -787,27 +730,17 @@ async fn validate_investment_splits(
     if !validate_investment_actions(&actions) {
         return Err(bad_request("Invalid investment actions"));
     }
-    let security_ids = unique_in_order(database_ids(
+    let security_ids = database_ids(
         &splits
             .iter()
             .map(|split| split.security_id)
             .collect::<Vec<_>>(),
         failure,
-    )?);
-    let owned: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM securities WHERE book_id = $1 AND id {in2}",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(book_id)
-    .bind(sql::json_array(&security_ids))
-    .fetch_one(pool)
-    .await
-    .map_err(|cause| internal_error(cause, failure))?;
-    if owned != security_ids.len() as i64 {
-        return Err(bad_request(
-            "One or more investment split securities do not belong to this book",
-        ));
-    }
+    )?;
+    let securities = rows_in_book::<Security, _>(pool, access, &security_ids)
+        .await
+        .map_err(|cause| internal_error(cause, failure))?
+        .ok_or_else(|| bad_request(FOREIGN_SECURITY))?;
     let trades = splits
         .iter()
         .any(|split| matches!(split.action, InvestmentAction::Buy | InvestmentAction::Sell));
@@ -816,70 +749,53 @@ async fn validate_investment_splits(
             "Investment splits require a transaction split on an investment account",
         ));
     }
-    Ok(())
+    ProvedInvestmentSplits::new(access, splits, &securities, account)
+        .ok_or_else(|| bad_request(FOREIGN_SECURITY))
 }
 
-/// `resolvePayeeId`: a case-insensitive match, or a new payee. The upsert
-/// covers a concurrent insert of the same name between the two statements.
-pub(crate) async fn resolve_payee_id(
-    connection: &mut DbConnection,
-    book_id: i32,
-    payee_name: &str,
-) -> Result<Option<i32>, sqlx::Error> {
-    let name = normalize_name(payee_name);
-    if name.is_empty() {
-        return Ok(None);
-    }
-    let existing: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM payees WHERE book_id = $1 AND lower(name) = $2 LIMIT 1")
-            .bind(book_id)
-            .bind(name.to_lowercase())
-            .fetch_optional(&mut *connection)
-            .await?;
-    if existing.is_some() {
-        return Ok(existing);
-    }
-    sqlx::query_scalar(
-        "INSERT INTO payees (name, book_id, created_at) VALUES ($1, $2, $3)
-         ON CONFLICT (name, book_id) DO UPDATE SET name = EXCLUDED.name
-         RETURNING id",
-    )
-    .bind(&name)
-    .bind(book_id)
-    .bind(now_millis())
-    .fetch_optional(&mut *connection)
-    .await
-}
+/// `recurring.rs` resolves payees without the proofs until it moves to them.
+pub(crate) use crate::book_scope::resolve_payee_id;
 
 pub(crate) fn database_error(failure: &'static str) -> impl Fn(sqlx::Error) -> ApiError {
     move |cause| internal_error(cause, failure)
 }
 
-/// Inserts the double-entry splits. The amounts passed `validate_splits`, so
-/// each is in the int4 range.
+/// The proofs and the access must be of one book. One request has one book,
+/// so a mismatch is a defect: answer 500 and write nothing.
+fn same_book(
+    access: &BookAccess<'_, Write>,
+    proof_book_id: i32,
+    failure: &'static str,
+) -> Result<i32, ApiError> {
+    if proof_book_id == access.book_id() {
+        Ok(proof_book_id)
+    } else {
+        tracing::error!(
+            access_book_id = access.book_id(),
+            proof_book_id,
+            "Split proof of another book"
+        );
+        Err(error(StatusCode::INTERNAL_SERVER_ERROR, failure))
+    }
+}
+
+/// Inserts the double-entry splits. `ProvedSplits` holds only balanced
+/// splits on accounts of this book.
 async fn insert_splits(
     connection: &mut DbConnection,
-    book_id: i32,
+    access: &BookAccess<'_, Write>,
     transaction_id: i32,
-    splits: &[SplitInput],
+    splits: &ProvedSplits,
     failure: &'static str,
 ) -> Result<(), ApiError> {
+    let book_id = same_book(access, splits.book_id(), failure)?;
     let mut insert = QueryBuilder::<Db>::new(
         "INSERT INTO transaction_splits (transaction_id, account_id, amount, book_id) ",
     );
-    let rows = splits
-        .iter()
-        .map(|split| {
-            Ok((
-                database_integer(split.account_id, failure)?,
-                database_integer(split.amount, failure)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    insert.push_values(rows, |mut row, (account_id, amount)| {
+    insert.push_values(splits.rows(), |mut row, (account, amount)| {
         row.push_bind(transaction_id)
-            .push_bind(account_id)
-            .push_bind(amount)
+            .push_bind(account.id())
+            .push_bind(*amount)
             .push_bind(book_id);
     });
     insert
@@ -894,25 +810,27 @@ async fn insert_splits(
 /// rejects a fee or a ratio outside the int4 range, and so does this.
 async fn insert_investment_splits(
     connection: &mut DbConnection,
-    book_id: i32,
+    access: &BookAccess<'_, Write>,
     transaction_id: i32,
-    splits: &[InvestmentSplitInput],
-    investment_account_id: Option<i32>,
+    splits: &ProvedInvestmentSplits<'_>,
     failure: &'static str,
 ) -> Result<(), ApiError> {
+    let book_id = same_book(access, splits.book_id(), failure)?;
     let optional = |value: Option<i64>| {
         value
             .map(|value| database_integer(value, failure))
             .transpose()
     };
+    let investment_account_id = splits.account().map(|account| account.id());
     let rows = splits
+        .splits()
         .iter()
-        .map(|split| {
+        .map(|(split, security)| {
             Ok((
                 (split.action != InvestmentAction::Split)
                     .then_some(investment_account_id)
                     .flatten(),
-                database_integer(split.security_id, failure)?,
+                security.id(),
                 to_value(split.action).expect("action serializes"),
                 split.shares_micros,
                 split.price_micros,
@@ -979,7 +897,7 @@ async fn assert_unchanged(
 
 async fn create(
     pool: &DbPool,
-    book: &AuthenticatedBook,
+    access: &BookAccess<'_, Write>,
     input: &CreateTransaction,
     failure: &'static str,
 ) -> Result<i32, ApiError> {
@@ -992,24 +910,19 @@ async fn create(
         .map(|value| value.trim_matches(is_js_whitespace))
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let amounts: Vec<i64> = input.splits.iter().map(|split| split.amount).collect();
-    if !validate_splits(&amounts) {
-        return Err(bad_request(UNBALANCED));
-    }
-    let account_ids = unique_in_order(database_ids(
+    let balanced = BalancedSplits::new(&input.splits).ok_or_else(|| bad_request(UNBALANCED))?;
+    let account_ids = database_ids(
         &input
             .splits
             .iter()
             .map(|split| split.account_id)
             .collect::<Vec<_>>(),
         failure,
-    )?);
-    let accounts = load_split_accounts(pool, book.book_id, &account_ids)
+    )?;
+    let accounts = split_accounts(pool, access, &account_ids)
         .await
-        .map_err(database_error(failure))?;
-    if accounts.len() != account_ids.len() {
-        return Err(bad_request(FOREIGN_SPLIT_ACCOUNT));
-    }
+        .map_err(database_error(failure))?
+        .ok_or_else(|| bad_request(FOREIGN_SPLIT_ACCOUNT))?;
     if check_number.is_some() && !has_subtype(&accounts, "bank") {
         return Err(bad_request(CHECK_NUMBER_ACCOUNT));
     }
@@ -1017,13 +930,16 @@ async fn create(
     if has_subtype(&accounts, "investment") && investment_splits.is_empty() {
         return Err(bad_request(INVESTMENT_SPLITS_REQUIRED));
     }
-    validate_investment_splits(pool, book.book_id, investment_splits, &accounts, failure).await?;
+    let investment_splits =
+        prove_investment_splits(pool, access, investment_splits, &accounts, failure).await?;
+    let splits = ProvedSplits::new(access, balanced, &accounts)
+        .ok_or_else(|| bad_request(FOREIGN_SPLIT_ACCOUNT))?;
 
     let mut tx = ledger_db::locks::begin_pool(pool)
         .await
         .map_err(database_error(failure))?;
-    let payee_id = match &input.payee_name {
-        Some(name) => resolve_payee_id(&mut tx, book.book_id, name)
+    let payee = match &input.payee_name {
+        Some(name) => resolve_payee(&mut tx, access, name)
             .await
             .map_err(database_error(failure))?,
         None => None,
@@ -1047,36 +963,22 @@ async fn create(
     .bind(check_number)
     .bind(input.is_floating.unwrap_or(false))
     .bind(input.is_reconciled.unwrap_or(false))
-    .bind(payee_id)
-    .bind(book.book_id)
-    .bind(book.user_id)
+    .bind(payee.map(|payee| payee.id()))
+    .bind(access.book_id())
+    .bind(access.user_id())
     .bind(now)
     .fetch_one(&mut *tx)
     .await
     .map_err(database_error(failure))?;
-    insert_splits(
-        &mut tx,
-        book.book_id,
-        transaction_id,
-        &input.splits,
-        failure,
-    )
-    .await?;
+    insert_splits(&mut tx, access, transaction_id, &splits, failure).await?;
     if !investment_splits.is_empty() {
-        insert_investment_splits(
-            &mut tx,
-            book.book_id,
-            transaction_id,
-            investment_splits,
-            derive_investment_account_id(&accounts),
-            failure,
-        )
-        .await?;
+        insert_investment_splits(&mut tx, access, transaction_id, &investment_splits, failure)
+            .await?;
         // Lots are derived state: rebuild every pair this write can change.
-        let pairs = collect_affected_pairs(&mut tx, book.book_id, transaction_id)
+        let pairs = collect_affected_pairs(&mut tx, access.book_id(), transaction_id)
             .await
             .map_err(database_error(failure))?;
-        rebuild_lots_for_pairs(&mut tx, book.book_id, &pairs)
+        rebuild_lots_for_pairs(&mut tx, access.book_id(), &pairs)
             .await
             .map_err(database_error(failure))?;
     }
@@ -1093,17 +995,18 @@ pub(crate) async fn create_transaction(
     const FAILURE: &str = "Failed to create transaction";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let input = validate_create(&parse_json_body(&body, FAILURE)?)?;
-    let id = create(&state.pool, &book, &input, FAILURE).await?;
-    let created = load_transaction(&state.pool, book.book_id, id)
+    let id = create(&state.pool, &access, &input, FAILURE).await?;
+    let created = load_transaction(&state.pool, book.book_id(), id)
         .await
         .map_err(database_error(FAILURE))?
         .ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         "transaction_created",
         Some(json!({
-            "bookId": book.book_id,
+            "bookId": book.book_id(),
             "hasInvestmentSplits": input.investment_splits.as_ref().is_some_and(|splits| !splits.is_empty()),
             "splitCount": input.splits.len(),
         })),
@@ -1134,11 +1037,12 @@ async fn existing_split_account_ids(
 
 async fn update(
     pool: &DbPool,
-    book: &AuthenticatedBook,
+    access: &BookAccess<'_, Write>,
     transaction_id: i32,
     input: &UpdateTransaction,
     failure: &'static str,
 ) -> Result<(), ApiError> {
+    let book_id = access.book_id();
     if input
         .date
         .as_deref()
@@ -1153,12 +1057,11 @@ async fn update(
             .map(str::to_owned)
     });
     let has_check_number = matches!(check_number, Some(Some(_)));
-    if let Some(splits) = &input.splits {
-        let amounts: Vec<i64> = splits.iter().map(|split| split.amount).collect();
-        if !validate_splits(&amounts) {
-            return Err(bad_request(UNBALANCED));
-        }
-    }
+    let balanced = input
+        .splits
+        .as_deref()
+        .map(|splits| BalancedSplits::new(splits).ok_or_else(|| bad_request(UNBALANCED)))
+        .transpose()?;
 
     let mut account_ids: Option<Vec<i32>> = None;
     let mut existing_split_count: Option<usize> = None;
@@ -1174,7 +1077,7 @@ async fn update(
         }
         _ if input.investment_splits.is_some() => {
             let existing =
-                existing_split_account_ids(pool, book.book_id, transaction_id, failure).await?;
+                existing_split_account_ids(pool, book_id, transaction_id, failure).await?;
             existing_split_count = Some(existing.len());
             account_ids = Some(unique_in_order(existing));
         }
@@ -1182,7 +1085,7 @@ async fn update(
     }
     if has_check_number && account_ids.is_none() {
         account_ids = Some(unique_in_order(
-            existing_split_account_ids(pool, book.book_id, transaction_id, failure).await?,
+            existing_split_account_ids(pool, book_id, transaction_id, failure).await?,
         ));
     }
     let investment_splits = input.investment_splits.as_deref();
@@ -1196,12 +1099,10 @@ async fn update(
     let mut accounts = Vec::new();
     match account_ids.as_deref() {
         Some(ids) if !ids.is_empty() => {
-            accounts = load_split_accounts(pool, book.book_id, ids)
+            accounts = split_accounts(pool, access, ids)
                 .await
-                .map_err(database_error(failure))?;
-            if accounts.len() != ids.len() {
-                return Err(bad_request(FOREIGN_SPLIT_ACCOUNT));
-            }
+                .map_err(database_error(failure))?
+                .ok_or_else(|| bad_request(FOREIGN_SPLIT_ACCOUNT))?;
             if has_check_number && !has_subtype(&accounts, "bank") {
                 return Err(bad_request(CHECK_NUMBER_ACCOUNT));
             }
@@ -1212,7 +1113,7 @@ async fn update(
                        WHERE transaction_id = $1 AND book_id = $2)",
                 )
                 .bind(transaction_id)
-                .bind(book.book_id)
+                .bind(book_id)
                 .fetch_one(pool)
                 .await
                 .map_err(database_error(failure))?;
@@ -1224,36 +1125,89 @@ async fn update(
         _ if has_check_number => return Err(bad_request(CHECK_NUMBER_ACCOUNT)),
         _ => {}
     }
-    validate_investment_splits(
+    // New splits without investmentSplits keep the stored investment splits.
+    // Each of them names an investment account, and the new splits must still
+    // hold that account, directly or through its investment cash child (a
+    // dividend has only the cash leg). Otherwise the ledger moves to another
+    // account while the shares and the lots stay in the old one. The stored
+    // splits are read after the conflict check, inside the write transaction.
+    let retained_accounts: Option<HashSet<i32>> = (investment_splits.is_none()
+        && input
+            .splits
+            .as_ref()
+            .is_some_and(|splits| splits.len() >= 2))
+    .then(|| {
+        accounts
+            .iter()
+            .flat_map(|account| {
+                let parent = account
+                    .is_investment_cash
+                    .then_some(account.investment_parent)
+                    .flatten();
+                std::iter::once(account.account.id()).chain(parent.map(|parent| parent.id()))
+            })
+            .collect()
+    });
+    let proved_investment_splits = prove_investment_splits(
         pool,
-        book.book_id,
+        access,
         investment_splits.unwrap_or_default(),
         &accounts,
         failure,
     )
     .await?;
+    // Fewer than two splits leaves the stored splits as they are. Two or
+    // more replace them, and `accounts` holds the accounts of these splits.
+    let splits = match balanced {
+        Some(balanced)
+            if input
+                .splits
+                .as_ref()
+                .is_some_and(|splits| splits.len() >= 2) =>
+        {
+            Some(
+                ProvedSplits::new(access, balanced, &accounts)
+                    .ok_or_else(|| bad_request(FOREIGN_SPLIT_ACCOUNT))?,
+            )
+        }
+        _ => None,
+    };
 
     let mut tx = ledger_db::locks::begin_pool(pool)
         .await
         .map_err(database_error(failure))?;
     assert_unchanged(
         &mut tx,
-        book.book_id,
+        book_id,
         transaction_id,
         input.expected_updated_at,
         failure,
     )
     .await?;
-    // Collected before the splits change: a replaced account or security
-    // still needs a rebuild once its investment splits are gone.
-    let prior_pairs = collect_affected_pairs(&mut tx, book.book_id, transaction_id)
+    if let Some(retained) = &retained_accounts {
+        let kept: Vec<i32> = sqlx::query_scalar(
+            "SELECT DISTINCT account_id FROM investment_splits
+               WHERE transaction_id = $1 AND book_id = $2 AND account_id IS NOT NULL",
+        )
+        .bind(transaction_id)
+        .bind(book_id)
+        .fetch_all(&mut *tx)
         .await
         .map_err(database_error(failure))?;
-    let payee_id: Option<Option<i32>> = match &input.payee_name {
+        if kept.iter().any(|account_id| !retained.contains(account_id)) {
+            return Err(bad_request(INVESTMENT_ACCOUNT_KEPT));
+        }
+    }
+    // Collected before the splits change: a replaced account or security
+    // still needs a rebuild once its investment splits are gone.
+    let prior_pairs = collect_affected_pairs(&mut tx, book_id, transaction_id)
+        .await
+        .map_err(database_error(failure))?;
+    let payee: Option<Option<InBook<Payee>>> = match &input.payee_name {
         None => None,
         Some(None) => Some(None),
         Some(Some(name)) => Some(
-            resolve_payee_id(&mut tx, book.book_id, name)
+            resolve_payee(&mut tx, access, name)
                 .await
                 .map_err(database_error(failure))?,
         ),
@@ -1262,7 +1216,7 @@ async fn update(
     let mut set = QueryBuilder::<Db>::new("UPDATE transactions SET updated_at = ");
     set.push_bind(now_millis())
         .push(", updated_by = ")
-        .push_bind(book.user_id);
+        .push_bind(access.user_id());
     if let Some(date) = &input.date {
         set.push(", date = ").push_bind(date.clone());
     }
@@ -1276,8 +1230,9 @@ async fn update(
         set.push(", check_number = ")
             .push_bind(check_number.clone());
     }
-    if let Some(payee_id) = payee_id {
-        set.push(", payee_id = ").push_bind(payee_id);
+    if let Some(payee) = payee {
+        set.push(", payee_id = ")
+            .push_bind(payee.map(|payee| payee.id()));
     }
     if let Some(is_reconciled) = input.is_reconciled {
         set.push(", is_reconciled = ").push_bind(is_reconciled);
@@ -1288,35 +1243,34 @@ async fn update(
     set.push(" WHERE id = ")
         .push_bind(transaction_id)
         .push(" AND book_id = ")
-        .push_bind(book.book_id);
+        .push_bind(book_id);
     set.build()
         .execute(&mut *tx)
         .await
         .map_err(database_error(failure))?;
 
-    if let Some(splits) = input.splits.as_deref().filter(|splits| splits.len() >= 2) {
+    if let Some(splits) = &splits {
         sqlx::query("DELETE FROM transaction_splits WHERE transaction_id = $1 AND book_id = $2")
             .bind(transaction_id)
-            .bind(book.book_id)
+            .bind(book_id)
             .execute(&mut *tx)
             .await
             .map_err(database_error(failure))?;
-        insert_splits(&mut tx, book.book_id, transaction_id, splits, failure).await?;
+        insert_splits(&mut tx, access, transaction_id, splits, failure).await?;
     }
-    if let Some(investment_splits) = investment_splits {
+    if investment_splits.is_some() {
         sqlx::query("DELETE FROM investment_splits WHERE transaction_id = $1 AND book_id = $2")
             .bind(transaction_id)
-            .bind(book.book_id)
+            .bind(book_id)
             .execute(&mut *tx)
             .await
             .map_err(database_error(failure))?;
-        if !investment_splits.is_empty() {
+        if !proved_investment_splits.is_empty() {
             insert_investment_splits(
                 &mut tx,
-                book.book_id,
+                access,
                 transaction_id,
-                investment_splits,
-                derive_investment_account_id(&accounts),
+                &proved_investment_splits,
                 failure,
             )
             .await?;
@@ -1325,11 +1279,11 @@ async fn update(
     // A date change alone reorders FIFO, so the rebuild always runs.
     let mut pairs: Vec<LotPair> = prior_pairs;
     pairs.extend(
-        collect_affected_pairs(&mut tx, book.book_id, transaction_id)
+        collect_affected_pairs(&mut tx, book_id, transaction_id)
             .await
             .map_err(database_error(failure))?,
     );
-    rebuild_lots_for_pairs(&mut tx, book.book_id, &pairs)
+    rebuild_lots_for_pairs(&mut tx, book_id, &pairs)
         .await
         .map_err(database_error(failure))?;
     tx.commit().await.map_err(database_error(failure))?;
@@ -1478,15 +1432,16 @@ pub(crate) async fn update_transaction(
     const FAILURE: &str = "Failed to update transaction";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let input = validate_update(&parse_json_body(&body, FAILURE)?)?;
     // The route reads the transaction for the analytics diff before it
     // updates, so an unusable ID fails at that read.
     let id = transaction_path_id(&raw_id, FAILURE)?;
-    let existing = load_existing(&state.pool, book.book_id, id)
+    let existing = load_existing(&state.pool, book.book_id(), id)
         .await
         .map_err(database_error(FAILURE))?;
-    update(&state.pool, &book, id, &input, FAILURE).await?;
-    let updated = load_transaction(&state.pool, book.book_id, id)
+    update(&state.pool, &access, id, &input, FAILURE).await?;
+    let updated = load_transaction(&state.pool, book.book_id(), id)
         .await
         .map_err(database_error(FAILURE))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))?;
@@ -1495,10 +1450,10 @@ pub(crate) async fn update_transaction(
         .map(|existing| diff_transaction_fields(existing, &input))
         .unwrap_or_default();
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         "transaction_updated",
         Some(json!({
-            "bookId": book.book_id,
+            "bookId": book.book_id(),
             "fieldsChanged": fields_changed,
             "splitsAccountsChanged": splits_accounts_changed,
         })),
@@ -1536,11 +1491,12 @@ pub(crate) async fn update_transaction(
 ///    releases at commit, so it must run on `tx`, not on the pool.
 async fn delete(
     pool: &DbPool,
-    book_id: i32,
+    access: &BookAccess<'_, Write>,
     transaction_id: i32,
     expected: Option<i64>,
     failure: &'static str,
 ) -> Result<bool, ApiError> {
+    let book_id = access.book_id();
     let mut tx = ledger_db::locks::begin_pool(pool)
         .await
         .map_err(database_error(failure))?;
@@ -1598,18 +1554,19 @@ pub(crate) async fn delete_transaction(
     const FAILURE: &str = "Failed to delete transaction";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let expected = first_query_values(raw_query.as_deref())
         .get("expectedUpdatedAt")
         .map(|value| expected_updated_at(Some(value)))
         .transpose()?;
     let id = transaction_path_id(&raw_id, FAILURE)?;
-    if !delete(&state.pool, book.book_id, id, expected, FAILURE).await? {
+    if !delete(&state.pool, &access, id, expected, FAILURE).await? {
         return Err(error(StatusCode::NOT_FOUND, NOT_FOUND));
     }
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         "transaction_deleted",
-        Some(json!({ "bookId": book.book_id })),
+        Some(json!({ "bookId": book.book_id() })),
     );
     Ok(Json(json!({ "success": true })))
 }
@@ -1680,27 +1637,24 @@ mod tests {
 
     #[test]
     fn investment_account_prefers_the_brokerage_then_the_cash_parent() {
-        let account = |id, subtype: Option<&str>, cash, parent| SplitAccount {
-            id,
+        let account = |id, subtype: Option<&str>, cash, parent: Option<i32>| SplitAccount {
+            account: InBook::unchecked(id, 1),
             subtype: subtype.map(str::to_owned),
             is_investment_cash: cash,
-            investment_parent_id: parent,
+            investment_parent: parent.map(|parent| InBook::unchecked(parent, 1)),
+        };
+        let derived = |accounts: &[SplitAccount]| {
+            derive_investment_account(accounts).map(|account| account.id())
         };
         assert_eq!(
-            derive_investment_account_id(&[
+            derived(&[
                 account(1, Some("cash"), true, Some(7)),
                 account(2, Some("investment"), false, None),
             ]),
             Some(2)
         );
-        assert_eq!(
-            derive_investment_account_id(&[account(1, Some("cash"), true, Some(7))]),
-            Some(7)
-        );
-        assert_eq!(
-            derive_investment_account_id(&[account(1, Some("bank"), false, None)]),
-            None
-        );
+        assert_eq!(derived(&[account(1, Some("cash"), true, Some(7))]), Some(7));
+        assert_eq!(derived(&[account(1, Some("bank"), false, None)]), None);
     }
 
     #[test]

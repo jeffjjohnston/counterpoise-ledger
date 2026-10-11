@@ -1,8 +1,5 @@
 //! The security tools.
 
-use ledger_db::sql;
-use std::collections::HashMap;
-
 use axum::http::{Method, StatusCode};
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
@@ -11,7 +8,7 @@ use crate::{
     mcp::call::{
         Caller, Level, ToolResult, fail, integer, js_double, ok, outcome, thrown, without,
     },
-    routes::investments::EFFECTIVE_DATE,
+    routes::{investments::EFFECTIVE_DATE, securities::income_by_transaction},
 };
 
 const MICROS: f64 = 1_000_000.0;
@@ -196,24 +193,9 @@ pub(super) async fn detail(
         .filter(|split| is_income(&split.2))
         .map(|split| split.9)
         .collect();
-    let mut cash: HashMap<i32, i64> = HashMap::new();
-    if !income_ids.is_empty() {
-        let rows: Vec<(i32, i32)> = sqlx::query_as(&format!(
-            "SELECT ts.transaction_id, ts.amount FROM transaction_splits ts
-             JOIN accounts a ON a.id = ts.account_id
-             WHERE ts.transaction_id {in1} AND a.type = 'asset'",
-            in1 = sql::in_integers("$1")
-        ))
-        .bind(sql::json_array(&income_ids))
-        .fetch_all(pool)
+    let cash = income_by_transaction(pool, &income_ids)
         .await
         .map_err(db_error)?;
-        for (transaction_id, amount) in rows {
-            if amount > 0 {
-                *cash.entry(transaction_id).or_default() += i64::from(amount);
-            }
-        }
-    }
     let transactions: Vec<Value> = splits
         .into_iter()
         .map(

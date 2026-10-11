@@ -1061,7 +1061,7 @@ pub(crate) async fn request_route(
         .flatten()
         .filter(|_| only_keys(&object, &["reconciliationId"]))
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid reconciliation ID"))?;
-    request_suggestion(&state.pool, book.book_id, link_id, reconciliation_id)
+    request_suggestion(&state.pool, book.book_id(), link_id, reconciliation_id)
         .await
         .map(Json)
         .map_err(Failure::into_api)
@@ -1081,7 +1081,7 @@ pub(crate) async fn display_route(
         .flatten()
         .filter(|_| only_keys(&object, &["evaluationId"]))
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid evaluation ID"))?;
-    mark_displayed(&state.pool, book.book_id, link_id, evaluation_id)
+    mark_displayed(&state.pool, book.book_id(), link_id, evaluation_id)
         .await
         .map(Json)
         .map_err(Failure::into_api)
@@ -1126,12 +1126,12 @@ pub(crate) async fn confirm_route(
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid evaluation ID"))?;
     let (item, mut input) = confirm(
         &state.pool,
-        book.book_id,
+        book.book_id(),
         link_id,
         evaluation_id,
         kind,
         started_at,
-        book.user_id,
+        book.user_id(),
     )
     .await
     .map_err(Failure::into_api)?;
@@ -1149,7 +1149,7 @@ pub(crate) async fn confirm_route(
     // the response.
     record_decision(
         &state.pool,
-        book.book_id,
+        book.book_id(),
         &input,
         &Observation::accepted(evaluation_id as f64, active_review_ms),
         started_at,

@@ -213,7 +213,7 @@ pub(crate) async fn call(
         .get(name.as_str())
         .is_some_and(|keys| keys.iter().any(|key| key == "bookId"))
     {
-        arguments.insert("bookId".to_owned(), json!(book.book_id));
+        arguments.insert("bookId".to_owned(), json!(book.book_id()));
     }
     let caller = Caller::new(state, &headers);
     let result = call_tool(&caller, name, arguments).await;

@@ -228,6 +228,131 @@ pub fn build_sell_splits(input: &SellBuilderInput) -> Result<Vec<InvestmentSplit
     Ok(splits)
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReinvestBuilderInput {
+    pub security_account_id: i64,
+    pub cash_account_id: i64,
+    pub income_account_id: i64,
+    pub fee_account_id: Option<i64>,
+    pub dividend_cents: i64,
+    pub shares_micros: i64,
+    pub price_micros: i64,
+    #[serde(default)]
+    pub fees_cents: i64,
+}
+
+/// One investment split of a reinvested dividend, without its account and
+/// security, which the caller adds.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReinvestActionSplit {
+    pub action: InvestmentAction,
+    pub shares_micros: i64,
+    pub price_micros: i64,
+    pub fees_cents: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReinvestSplits {
+    pub splits: Vec<InvestmentSplit>,
+    pub investment_splits: Vec<ReinvestActionSplit>,
+}
+
+/// A reinvested dividend (DRIP) as one transaction: a dividend `D` buys
+/// shares for `G = shares x price` and pays the fee `F`. The rest
+/// `R = D - G - F` goes to the cash account.
+///
+/// Ledger legs: investment account `+G`, fee account `+F` (only when `F > 0`),
+/// income account `-D`, cash account `+R` (only when `R != 0`). The
+/// investment splits are a `dividend` split with no shares and a `buy` split
+/// with the shares, the price and the fee. The lot of the buy has the basis
+/// `G + F`.
+///
+/// A negative `R` is refused: the shares would cost more than the dividend.
+/// Record the extra cash as a second buy.
+pub fn build_reinvest_splits(input: &ReinvestBuilderInput) -> Result<ReinvestSplits, &'static str> {
+    if input.dividend_cents <= 0 {
+        return Err("dividendCents must be greater than zero.");
+    }
+    if input.shares_micros <= 0 || input.price_micros <= 0 {
+        return Err("sharesMicros and priceMicros must be greater than zero.");
+    }
+    if input.fees_cents < 0 {
+        return Err("feesCents must not be negative.");
+    }
+    if input.fees_cents > 0 && input.fee_account_id.is_none() {
+        return Err("feeAccountId is required when feesCents is provided.");
+    }
+    let gross = try_gross_amount_cents(input.shares_micros, input.price_micros)
+        .ok_or("Amount exceeds i64 cents.")?;
+    let remainder = input
+        .dividend_cents
+        .checked_sub(gross)
+        .and_then(|rest| rest.checked_sub(input.fees_cents))
+        .ok_or("Amount exceeds i64 cents.")?;
+    if remainder < 0 {
+        return Err("The shares and the fee cost more than the dividend.");
+    }
+    let mut splits = vec![InvestmentSplit {
+        account_id: input.security_account_id,
+        amount: gross,
+    }];
+    if let (true, Some(fee_account_id)) = (input.fees_cents > 0, input.fee_account_id) {
+        splits.push(InvestmentSplit {
+            account_id: fee_account_id,
+            amount: input.fees_cents,
+        });
+    }
+    splits.push(InvestmentSplit {
+        account_id: input.income_account_id,
+        amount: -input.dividend_cents,
+    });
+    if remainder != 0 {
+        splits.push(InvestmentSplit {
+            account_id: input.cash_account_id,
+            amount: remainder,
+        });
+    }
+    Ok(ReinvestSplits {
+        splits,
+        investment_splits: vec![
+            ReinvestActionSplit {
+                action: InvestmentAction::Dividend,
+                shares_micros: 0,
+                price_micros: 0,
+                fees_cents: 0,
+            },
+            ReinvestActionSplit {
+                action: InvestmentAction::Buy,
+                shares_micros: input.shares_micros,
+                price_micros: input.price_micros,
+                fees_cents: input.fees_cents,
+            },
+        ],
+    })
+}
+
+/// The price that spends the dividend less the fee on the shares:
+/// `(D - F) / shares`, rounded down to micros. Rounded down, the gross amount
+/// of the buy is never more than `D - F`, so the cash rest is not negative.
+/// `None` when there are no shares, nothing to spend, or the price rounds
+/// down to zero.
+pub fn reinvest_price_micros(
+    dividend_cents: i64,
+    fees_cents: i64,
+    shares_micros: i64,
+) -> Option<i64> {
+    let spend = i128::from(dividend_cents) - i128::from(fees_cents);
+    if shares_micros <= 0 || spend <= 0 {
+        return None;
+    }
+    i64::try_from(spend * MICROS_PRODUCT_PER_CENT / i128::from(shares_micros))
+        .ok()
+        .filter(|price| *price > 0)
+}
+
 pub fn map_investment_action_to_splits(
     input: &InvestmentActionInput,
 ) -> Vec<InvestmentActionSplit> {
@@ -446,5 +571,138 @@ mod tests {
             fees_cents: i64::MAX,
         };
         assert!(build_buy_splits(&input).is_err());
+    }
+
+    fn reinvest(dividend: i64, shares: i64, price: i64, fees: i64) -> ReinvestBuilderInput {
+        ReinvestBuilderInput {
+            security_account_id: 1,
+            cash_account_id: 2,
+            income_account_id: 3,
+            fee_account_id: (fees != 0).then_some(4),
+            dividend_cents: dividend,
+            shares_micros: shares,
+            price_micros: price,
+            fees_cents: fees,
+        }
+    }
+
+    fn sum(splits: &ReinvestSplits) -> i64 {
+        splits.splits.iter().map(|split| split.amount).sum()
+    }
+
+    #[test]
+    fn reinvest_with_no_remainder_has_no_cash_leg() {
+        // $100.00 buys 2 shares at $50.00.
+        let built = build_reinvest_splits(&reinvest(10_000, 2_000_000, 50_000_000, 0)).unwrap();
+        assert_eq!(
+            built.splits,
+            vec![
+                InvestmentSplit {
+                    account_id: 1,
+                    amount: 10_000
+                },
+                InvestmentSplit {
+                    account_id: 3,
+                    amount: -10_000
+                },
+            ]
+        );
+        assert_eq!(sum(&built), 0);
+        assert_eq!(
+            built.investment_splits,
+            vec![
+                ReinvestActionSplit {
+                    action: InvestmentAction::Dividend,
+                    shares_micros: 0,
+                    price_micros: 0,
+                    fees_cents: 0,
+                },
+                ReinvestActionSplit {
+                    action: InvestmentAction::Buy,
+                    shares_micros: 2_000_000,
+                    price_micros: 50_000_000,
+                    fees_cents: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reinvest_puts_the_remainder_and_the_fee_on_their_accounts() {
+        // $100.00 less a $1.00 fee buys 1.5 shares at $65.00 ($97.50); $1.50 stays as cash.
+        let built = build_reinvest_splits(&reinvest(10_000, 1_500_000, 65_000_000, 100)).unwrap();
+        assert_eq!(
+            built.splits,
+            vec![
+                InvestmentSplit {
+                    account_id: 1,
+                    amount: 9_750
+                },
+                InvestmentSplit {
+                    account_id: 4,
+                    amount: 100
+                },
+                InvestmentSplit {
+                    account_id: 3,
+                    amount: -10_000
+                },
+                InvestmentSplit {
+                    account_id: 2,
+                    amount: 150
+                },
+            ]
+        );
+        assert_eq!(sum(&built), 0);
+        assert_eq!(built.investment_splits[1].fees_cents, 100);
+    }
+
+    #[test]
+    fn reinvest_refuses_bad_input() {
+        let refused = |input: ReinvestBuilderInput| build_reinvest_splits(&input).is_err();
+        assert!(refused(reinvest(0, 1_000_000, 1_000_000, 0)));
+        assert!(refused(reinvest(-5, 1_000_000, 1_000_000, 0)));
+        assert!(refused(reinvest(10_000, 0, 1_000_000, 0)));
+        assert!(refused(reinvest(10_000, 1_000_000, 0, 0)));
+        assert!(refused(reinvest(10_000, 1_000_000, 1_000_000, -1)));
+        assert!(refused(ReinvestBuilderInput {
+            fee_account_id: None,
+            ..reinvest(10_000, 1_000_000, 1_000_000, 100)
+        }));
+        // A negative remainder: 2 shares at $50.00 plus a $0.01 fee is more than $100.00.
+        assert!(refused(reinvest(10_000, 2_000_000, 50_000_000, 1)));
+        // Overflow of the gross amount and of the remainder.
+        assert!(refused(reinvest(
+            10_000,
+            1_000_000_000_000_000,
+            100_000_000_000_000,
+            0
+        )));
+        assert!(refused(reinvest(i64::MAX, 1_000_000, 1_000_000, i64::MAX)));
+    }
+
+    #[test]
+    fn reinvest_price_spends_no_more_than_the_dividend() {
+        // ($100.00 - $1.00) / 3 shares = $33.00 exactly.
+        assert_eq!(
+            reinvest_price_micros(10_000, 100, 3_000_000),
+            Some(33_000_000)
+        );
+        // $100.00 / 3 shares = $33.333333 (rounded down). The gross amount
+        // rounds back to $100.00, so there is no cash rest.
+        let price = reinvest_price_micros(10_000, 0, 3_000_000).unwrap();
+        assert_eq!(price, 33_333_333);
+        let built = build_reinvest_splits(&reinvest(10_000, 3_000_000, price, 0)).unwrap();
+        assert_eq!(built.splits.len(), 2);
+        assert_eq!(sum(&built), 0);
+        // $0.07 / 3 shares = $0.023333; 3 x $0.023333 = $0.069999 rounds to $0.07.
+        // $0.05 / 7 shares = $0.007142; 7 x $0.007142 = $0.049994 rounds to $0.05.
+        for (dividend, shares) in [(7, 3_000_000), (5, 7_000_000), (99_999, 7_000_000)] {
+            let price = reinvest_price_micros(dividend, 0, shares).unwrap();
+            let built = build_reinvest_splits(&reinvest(dividend, shares, price, 0)).unwrap();
+            assert_eq!(sum(&built), 0);
+        }
+        assert_eq!(reinvest_price_micros(100, 100, 1_000_000), None);
+        assert_eq!(reinvest_price_micros(100, 0, 0), None);
+        assert_eq!(reinvest_price_micros(1, 0, i64::MAX), None);
     }
 }

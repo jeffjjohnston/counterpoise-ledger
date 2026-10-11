@@ -14,14 +14,12 @@ import { SplitEditor } from "./SplitEditor";
 import { tabTo } from "@/components/transactions/tab-to";
 import {
   toDateString,
-  parseStrictCurrency,
   resolveAmountOnBlur,
   getAccountShortName,
 } from "@/lib/wasm-client";
 import { validateSplits } from "@/lib/wasm-client";
 import type {
   AccountWithBalance,
-  InvestmentSplitInput,
   PlaidLinkData,
   SplitInput,
   TransactionWithSplits,
@@ -31,6 +29,16 @@ import { useInvestmentEntry } from "./useInvestmentEntry";
 import { InvestmentEntrySection } from "./InvestmentEntrySection";
 import { NewExpenseSubflow } from "./NewExpenseSubflow";
 import { TransactionAuthorship } from "./TransactionAuthorship";
+import {
+  buildSimpleEntry,
+  buildSubmitPayload,
+  editFieldsFromTransaction,
+  reconciledEditChanges,
+  reconciledEditPrompt,
+  type EntryResult,
+  type TransactionFormSubmitData,
+  type TransactionMode,
+} from "./transaction-form-fields";
 
 interface TransactionFormProps {
   accounts: AccountWithBalance[];
@@ -38,17 +46,7 @@ interface TransactionFormProps {
   editingTransaction?: TransactionWithSplits | null;
   plaidData?: PlaidLinkData | null;
   onPlaidUnlinked?: () => void;
-  onSubmit: (data: {
-    date: string;
-    description: string;
-    notes?: string;
-    checkNumber?: string;
-    payeeName?: string;
-    isReconciled?: boolean;
-    isFloating?: boolean;
-    splits: SplitInput[];
-    investmentSplits?: InvestmentSplitInput[];
-  }) => void;
+  onSubmit: (data: TransactionFormSubmitData) => void;
   onCancel?: () => void;
   onDelete?: () => void;
   onMakeRecurring?: (transactionId: number) => void;
@@ -58,8 +56,6 @@ interface TransactionFormProps {
   /** Show the transaction without edit controls. For a viewer. */
   readOnly?: boolean;
 }
-
-type TransactionMode = "simple" | "journal" | "investment";
 
 export interface TransactionFormHandle {
   focus: () => void;
@@ -171,11 +167,6 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   // before its submit button.
   const handleAmountKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) =>
     tabTo(e, addButtonRef);
-
-  const formatMicrosInput = (value: number) => {
-    const formatted = (value / 1_000_000).toFixed(6);
-    return formatted.replace(/\.?0+$/, "");
-  };
 
   const simpleAccountIds = useMemo(() => {
     return new Set(
@@ -320,82 +311,33 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     }
   };
 
+  // Fill the form from a saved transaction. resetForm() is the other way
+  // to initialize the form, for a new entry.
+  const loadTransaction = (transaction: TransactionWithSplits) => {
+    const fields = editFieldsFromTransaction(transaction);
+    setDate(fields.date);
+    setDescription(fields.description);
+    setCheckNumber(fields.checkNumber);
+    setNotes(fields.notes);
+    setPayeeName(fields.payeeName);
+    setIsReconciled(fields.isReconciled);
+    setIsFloating(fields.isFloating);
+    setSecondaryExpanded(true);
+    setSplits(fields.splits);
+    setMode(fields.mode);
+    if (fields.simple) {
+      setSimpleAmount(fields.simple.amount);
+      setToAccountId(fields.simple.toAccountId);
+      setFromAccountId(fields.simple.fromAccountId);
+    }
+    if (fields.investment) {
+      investment.restore(fields.investment);
+    }
+  };
+
   useEffect(() => {
     if (editingTransaction) {
-      setDate(editingTransaction.date);
-      setDescription(editingTransaction.description || "");
-      setCheckNumber(editingTransaction.checkNumber || "");
-      setNotes(editingTransaction.notes || "");
-      setPayeeName(editingTransaction.payee?.name || "");
-      setIsReconciled(editingTransaction.isReconciled);
-      setIsFloating(editingTransaction.isFloating);
-      setSecondaryExpanded(true);
-      setSplits(
-        editingTransaction.splits.map((s) => ({
-          accountId: s.accountId,
-          amount: s.amount,
-        }))
-      );
-      setMode(editingTransaction.splits.length === 2 ? "simple" : "journal");
-      if (editingTransaction.splits.length === 2) {
-        const debitSplit = editingTransaction.splits.find((s) => s.amount > 0);
-        const creditSplit = editingTransaction.splits.find((s) => s.amount < 0);
-        if (debitSplit && creditSplit) {
-          setSimpleAmount((debitSplit.amount / 100).toFixed(2));
-          setToAccountId(debitSplit.accountId);
-          setFromAccountId(creditSplit.accountId);
-        }
-      }
-
-      if (editingTransaction.investmentSplits?.length) {
-        const investmentSplit = editingTransaction.investmentSplits[0];
-        setMode("investment");
-        investment.setSelectedSecurityId(investmentSplit.securityId);
-        investment.setInvestmentAction(investmentSplit.action);
-        investment.setInvestmentShares(formatMicrosInput(investmentSplit.sharesMicros));
-        investment.setInvestmentPrice(formatMicrosInput(investmentSplit.priceMicros));
-        investment.setInvestmentFee(((investmentSplit.feesCents ?? 0) / 100).toFixed(2));
-        investment.setInvestmentSplitNumerator(
-          investmentSplit.splitNumerator ? String(investmentSplit.splitNumerator) : ""
-        );
-        investment.setInvestmentSplitDenominator(
-          investmentSplit.splitDenominator ? String(investmentSplit.splitDenominator) : ""
-        );
-
-        const investmentAccount = editingTransaction.splits.find(
-          (split) => split.account.subtype === "investment"
-        );
-        const investmentCashAccount = editingTransaction.splits.find(
-          (split) => split.account.isInvestmentCash
-        );
-
-        // For dividend transactions, set the dividend amount from the cash account split
-        if (investmentSplit.action === "dividend" && investmentCashAccount) {
-          investment.setInvestmentDividendAmount((investmentCashAccount.amount / 100).toFixed(2));
-        }
-        // For capital gain transactions, set the capital gain amount from the cash account split
-        if (investmentSplit.action === "capGain" && investmentCashAccount) {
-          investment.setInvestmentCapGainAmount((investmentCashAccount.amount / 100).toFixed(2));
-        }
-        const incomeAccount = editingTransaction.splits.find(
-          (split) => split.account.type === "income"
-        );
-        const expenseAccount = editingTransaction.splits.find(
-          (split) => split.account.type === "expense"
-        );
-
-        if (investmentAccount) {
-          investment.setInvestmentAccountId(investmentAccount.accountId);
-        } else if (investmentCashAccount?.account.parentId) {
-          investment.setInvestmentAccountId(investmentCashAccount.account.parentId);
-        }
-        if (incomeAccount) {
-          investment.setInvestmentIncomeAccountId(incomeAccount.accountId);
-        }
-        if (expenseAccount) {
-          investment.setInvestmentFeeAccountId(expenseAccount.accountId);
-        }
-      }
+      loadTransaction(editingTransaction);
     } else {
       resetForm();
     }
@@ -563,100 +505,59 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     [setPendingNewAccountId, onAccountsUpdate]
   );
 
+  // The splits of the entry in the current mode, or the message that says
+  // why the entry is not valid.
+  const buildModeEntry = (): EntryResult => {
+    if (mode === "simple") {
+      const resolvedAmount = resolveAmountOnBlur(simpleAmount);
+      setSimpleAmount(resolvedAmount);
+      return buildSimpleEntry(resolvedAmount, fromAccountId, toAccountId);
+    }
+    if (mode === "investment") {
+      const message = investment.validate();
+      return message ? { error: message } : investment.buildSplits();
+    }
+    if (hasPendingExpression) {
+      return { error: "Please resolve all invalid amounts before saving" };
+    }
+    return { splits };
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     // A viewer's Enter key must not submit the form.
     if (readOnly) return;
 
-    let finalSplits: SplitInput[];
-    let investmentSplits: InvestmentSplitInput[] | undefined;
-
-    if (mode === "simple") {
-      const resolvedAmount = resolveAmountOnBlur(simpleAmount);
-      setSimpleAmount(resolvedAmount);
-      const amount = parseStrictCurrency(resolvedAmount);
-      if (!fromAccountId || !toAccountId) {
-        toast.error("Please select both accounts");
-        return;
-      }
-      if (amount === null) {
-        toast.error("Please enter a valid amount");
-        return;
-      }
-      if (amount <= 0) {
-        toast.error("Please enter an amount");
-        return;
-      }
-
-      // Debit the "to" account, credit the "from" account
-      finalSplits = [
-        { accountId: toAccountId, amount: amount },
-        { accountId: fromAccountId, amount: -amount },
-      ];
-    } else if (mode === "investment") {
-      const message = investment.validate();
-      if (message) {
-        toast.error(message);
-        return;
-      }
-
-      const built = investment.buildSplits();
-      finalSplits = built.splits;
-      investmentSplits = built.investmentSplits;
-    } else {
-      if (hasPendingExpression) {
-        toast.error("Please resolve all invalid amounts before saving");
-        return;
-      }
-      finalSplits = splits;
+    const entry = buildModeEntry();
+    if ("error" in entry) {
+      toast.error(entry.error);
+      return;
     }
 
-    if (!validateSplits(finalSplits)) {
+    if (!validateSplits(entry.splits)) {
       toast.error("Transaction must be balanced (debits must equal credits)");
       return;
     }
 
     // Warn if editing a reconciled transaction with material changes
-    if (editingTransaction?.isReconciled) {
-      const origSplits = editingTransaction.splits;
-      const dateChanged = date !== editingTransaction.date;
+    const changes = reconciledEditChanges(editingTransaction, date, entry.splits);
+    if (changes.length > 0 && !confirm(reconciledEditPrompt(changes))) return;
 
-      // Compare splits by sorting both arrays by accountId then amount
-      const normalize = (s: { accountId: number; amount: number }[]) =>
-        [...s].sort((a, b) => a.accountId - b.accountId || a.amount - b.amount);
-      const origNorm = normalize(origSplits);
-      const newNorm = normalize(finalSplits);
-      const splitsChanged =
-        origNorm.length !== newNorm.length ||
-        origNorm.some(
-          (s, i) =>
-            s.accountId !== newNorm[i].accountId ||
-            s.amount !== newNorm[i].amount
-        );
-
-      if (dateChanged || splitsChanged) {
-        const changes: string[] = [];
-        if (dateChanged) changes.push("date");
-        if (splitsChanged) changes.push("amount/accounts");
-        const ok = confirm(
-          `This transaction is reconciled. You are changing its ${changes.join(" and ")}.\n\nSave anyway?`
-        );
-        if (!ok) return;
-      }
-    }
-
-    const normalizedCheckNumber = checkNumber.trim();
-    onSubmit({
-      date,
-      description,
-      ...(notes.trim() && { notes: notes.trim() }),
-      ...(hasBankAccountInvolved && { checkNumber: normalizedCheckNumber }),
-      payeeName: payeeName.trim(),
-      isReconciled,
-      isFloating,
-      splits: finalSplits,
-      investmentSplits,
-    });
+    onSubmit(
+      buildSubmitPayload(
+        {
+          date,
+          description,
+          notes,
+          checkNumber,
+          payeeName,
+          isReconciled,
+          isFloating,
+          hasBankAccountInvolved,
+        },
+        entry
+      )
+    );
     if (!editingTransaction) {
       resetForm();
       // Focus the payee field for immediate next entry
@@ -1269,6 +1170,15 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           <label className="block text-sm font-medium text-fg-secondary mb-2">
             Journal Entry
           </label>
+          {(editingTransaction?.investmentSplits?.length ?? 0) > 0 && (
+            <p className="text-xs text-fg-tertiary mb-2">
+              This transaction also has{" "}
+              {editingTransaction?.investmentSplits.length === 1
+                ? "1 investment split"
+                : `${editingTransaction?.investmentSplits.length} investment splits`}
+              . A save keeps them as they are.
+            </p>
+          )}
           <SplitEditor
             splits={splits}
             onChange={setSplits}
@@ -1302,7 +1212,12 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
                   Delete
                 </Button>
               )}
-              {editingTransaction && mode !== "investment" && onMakeRecurring && (
+              {/* A recurring rule copies only the ledger splits, so a
+                  transaction with investment splits cannot become one. A
+                  transaction with more than one opens in journal mode. */}
+              {editingTransaction &&
+                (editingTransaction.investmentSplits?.length ?? 0) === 0 &&
+                onMakeRecurring && (
                 <Button type="button" variant="secondary" onClick={() => onMakeRecurring(editingTransaction.id)}>
                   Make recurring...
                 </Button>

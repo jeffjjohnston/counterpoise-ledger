@@ -302,13 +302,13 @@ pub(crate) async fn realized_gains(
         })
         .transpose()?;
 
-    let report = report(&state.pool, book.book_id, &filters, account_id)
+    let report = report(&state.pool, book.book_id(), &filters, account_id)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         "report_generated",
-        Some(json!({ "bookId": book.book_id, "reportType": "realized_gains" })),
+        Some(json!({ "bookId": book.book_id(), "reportType": "realized_gains" })),
     );
     Ok(Json(report))
 }

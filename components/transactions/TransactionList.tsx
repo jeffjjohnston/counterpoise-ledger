@@ -155,6 +155,28 @@ interface TransactionListProps {
   isLoading?: boolean;
 }
 
+// The sign in front of a register amount. A row with no change to the
+// account (for example a reinvested dividend with no cash rest) has none.
+function signOf(selectedAccountId: number | null | undefined, amount: number, isPositive: boolean): string {
+  if (!selectedAccountId || amount === 0) return "";
+  return isPositive ? "+" : "\u2212";
+}
+
+// Both layouts use the same direction and date-state cues. Keep these choices
+// separate from the cell/card markup so a change cannot drift between them.
+function amountTextClass(isProjected: boolean, hasSelectedAccount: boolean, isPositive: boolean): string {
+  if (!hasSelectedAccount) return isProjected ? "text-fg-tertiary italic" : "text-fg";
+  if (isProjected) return isPositive ? "text-fg-success-muted italic" : "text-fg-danger-muted italic";
+  return isPositive ? "text-fg-success" : "text-fg-danger";
+}
+
+function balanceTextClass(isProjected: boolean, isPlaidPending: boolean, isFuture: boolean, balance: number, mobile: boolean): string {
+  if (isProjected || isPlaidPending) return "text-fg-tertiary italic";
+  if (isFuture) return "text-fg-tertiary";
+  if (balance >= 0) return mobile ? "text-fg-tertiary" : "text-fg";
+  return "text-fg-danger";
+}
+
 export function TransactionList({
   transactions,
   accounts,
@@ -377,6 +399,31 @@ export function TransactionList({
       Plaid
     </span>
   );
+
+  const renderDateStatePills = (transaction: DisplayTransaction, isFuture: boolean) => (
+    <>
+      {transaction.isProjected && renderUpcomingPill()}
+      {transaction.isPlaidPending && renderPlaidPill()}
+      {!transaction.isProjected && !transaction.isPlaidPending && isFuture && renderScheduledPill()}
+      {!transaction.isProjected && !transaction.isPlaidPending && transaction.isFloating && renderFloatPill()}
+    </>
+  );
+
+  const handleRowClick = (transaction: DisplayTransaction) => {
+    if (transaction.isProjected) {
+      if (transaction.recurringRuleId) onProjectedClick?.(transaction.recurringRuleId);
+    } else if (transaction.isPlaidPending) {
+      onPlaidPendingClick?.();
+    } else {
+      onEdit(transaction);
+    }
+  };
+
+  const handleRowAnimationEnd = (animationName: string, transactionId: number) => {
+    if (animationName !== "row-highlight") return;
+    if (transactionId === newTransactionId) onNewTransactionAnimated?.();
+    if (transactionId === highlightTransactionId) onHighlightAnimated?.();
+  };
 
   const getDisplayAmount = (transaction: TransactionWithSplits) => {
     const targetAccountId = balanceAccountId ?? selectedAccountId;
@@ -1333,7 +1380,9 @@ export function TransactionList({
       : getDisplayAmount(transaction);
     const isPositive = selectedAccountId ? selectedSplitAmount > 0 : true;
     const balance = runningBalances.get(transaction.id) || 0;
-    const isFuture = transaction.date > today;
+    // Use the effective date. A floating row is dated today, even when its
+    // stored date is in the future, so it is not a Scheduled row.
+    const isFuture = getEffectiveDate(transaction) > today;
     const isHighlightTarget = transaction.id === highlightTransactionId;
 
     return {
@@ -1359,11 +1408,7 @@ export function TransactionList({
               <div
                 key={transaction.id}
                 ref={isHighlightTarget ? highlightRef : undefined}
-                onClick={isProjected
-                  ? () => transaction.recurringRuleId && onProjectedClick?.(transaction.recurringRuleId)
-                  : isPlaidPending
-                    ? () => onPlaidPendingClick?.()
-                    : () => onEdit(transaction)}
+                onClick={() => handleRowClick(transaction)}
                 className={cn(
                   "px-3 py-3 cursor-pointer transition-colors",
                   isProjected
@@ -1376,20 +1421,12 @@ export function TransactionList({
                   transaction.id === newTransactionId && "animate-new-row",
                   isHighlightTarget && "animate-highlight-row"
                 )}
-                onAnimationEnd={(e) => {
-                  if (e.animationName === "row-highlight") {
-                    if (transaction.id === newTransactionId) onNewTransactionAnimated?.();
-                    if (isHighlightTarget) onHighlightAnimated?.();
-                  }
-                }}
+                onAnimationEnd={(e) => handleRowAnimationEnd(e.animationName, transaction.id)}
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
-                      {isProjected && renderUpcomingPill()}
-                      {isPlaidPending && renderPlaidPill()}
-                      {!isProjected && !isPlaidPending && isFuture && renderScheduledPill()}
-                      {!isProjected && !isPlaidPending && transaction.isFloating && renderFloatPill()}
+                      {renderDateStatePills(transaction, isFuture)}
                       <span className={cn(
                         "text-sm font-medium truncate",
                         isProjected ? "text-fg-tertiary italic" : "text-fg"
@@ -1410,21 +1447,10 @@ export function TransactionList({
                     <div className="text-right">
                       <div className={cn(
                         "flex items-center justify-end gap-1.5 text-sm font-medium tabular-nums whitespace-nowrap",
-                        isProjected
-                          ? selectedAccountId && isPositive
-                            ? "text-fg-success-muted italic"
-                            : selectedAccountId && !isPositive
-                              ? "text-fg-danger-muted italic"
-                              : "text-fg-tertiary italic"
-                          : selectedAccountId && isPositive
-                            ? "text-fg-success"
-                            : selectedAccountId && !isPositive
-                              ? "text-fg-danger"
-                              : "text-fg"
+                        amountTextClass(isProjected, !!selectedAccountId && amount !== 0, isPositive)
                       )}>
                         <span>
-                          {selectedAccountId && isPositive && "+"}
-                          {selectedAccountId && !isPositive && "−"}
+                          {signOf(selectedAccountId, amount, isPositive)}
                           {formatCurrency(Math.abs(amount))}
                         </span>
                         {renderReconciledIndicator(transaction, isProjected || isPlaidPending)}
@@ -1432,11 +1458,7 @@ export function TransactionList({
                       {selectedAccountId && (
                         <div className={cn(
                           "text-xs tabular-nums",
-                          isProjected || isPlaidPending
-                            ? "text-fg-tertiary italic"
-                            : isFuture
-                              ? "text-fg-tertiary"
-                              : balance >= 0 ? "text-fg-tertiary" : "text-fg-danger"
+                          balanceTextClass(isProjected, isPlaidPending, isFuture, balance, true)
                         )}>
                           {isPlaidPending ? "—" : formatCurrency(balance)}
                         </div>
@@ -1520,11 +1542,7 @@ export function TransactionList({
               <tr
                 key={transaction.id}
                 ref={isHighlightTarget ? highlightRef : undefined}
-                onClick={isProjected
-                  ? () => transaction.recurringRuleId && onProjectedClick?.(transaction.recurringRuleId)
-                  : isPlaidPending
-                    ? () => onPlaidPendingClick?.()
-                    : () => onEdit(transaction)}
+                onClick={() => handleRowClick(transaction)}
                 onMouseDown={isProjected || isPlaidPending ? undefined : handleRowMouseDown}
                 onContextMenu={isProjected || isPlaidPending ? undefined : (e) => handleContextMenu(e, transaction)}
                 className={cn(
@@ -1542,16 +1560,7 @@ export function TransactionList({
                   transaction.id === newTransactionId && "animate-new-row",
                   isHighlightTarget && "animate-highlight-row"
                 )}
-                onAnimationEnd={(e) => {
-                  if (e.animationName === "row-highlight") {
-                    if (transaction.id === newTransactionId) {
-                      onNewTransactionAnimated?.();
-                    }
-                    if (isHighlightTarget) {
-                      onHighlightAnimated?.();
-                    }
-                  }
-                }}
+                onAnimationEnd={(e) => handleRowAnimationEnd(e.animationName, transaction.id)}
               >
                 <td className={cn(
                   "px-4 py-3 text-sm whitespace-nowrap",
@@ -1575,10 +1584,7 @@ export function TransactionList({
                       isProjected ? "text-fg-tertiary italic" : "text-fg-secondary"
                     )}>
                       <div className="flex items-center gap-2 min-w-0">
-                        {isProjected && renderUpcomingPill()}
-                        {isPlaidPending && renderPlaidPill()}
-                        {!isProjected && !isPlaidPending && isFuture && renderScheduledPill()}
-                        {!isProjected && !isPlaidPending && transaction.isFloating && renderFloatPill()}
+                        {renderDateStatePills(transaction, isFuture)}
                         <span className="truncate">
                           {transaction.payee?.name ? (
                             transaction.payee.name
@@ -1608,32 +1614,17 @@ export function TransactionList({
                   data-testid={`transaction-amount-${transaction.id}`}
                   className={cn(
                     "px-4 py-3 text-sm font-medium text-right tabular-nums whitespace-nowrap",
-                    isProjected
-                      ? selectedAccountId && isPositive
-                        ? "text-fg-success-muted italic"
-                        : selectedAccountId && !isPositive
-                          ? "text-fg-danger-muted italic"
-                          : "text-fg-tertiary italic"
-                      : selectedAccountId && isPositive
-                        ? "text-fg-success"
-                        : selectedAccountId && !isPositive
-                          ? "text-fg-danger"
-                          : "text-fg"
+                    amountTextClass(isProjected, !!selectedAccountId && amount !== 0, isPositive)
                   )}
                 >
-                  {selectedAccountId && isPositive && "+"}
-                  {selectedAccountId && !isPositive && "−"}
+                  {signOf(selectedAccountId, amount, isPositive)}
                   {formatCurrency(Math.abs(amount))}
                 </td>
                 {selectedAccountId && (
                   <td
                     className={cn(
                       "px-4 py-3 text-sm text-right font-medium whitespace-nowrap tabular-nums",
-                      isProjected || isPlaidPending
-                        ? "text-fg-tertiary italic"
-                        : isFuture
-                          ? "text-fg-tertiary"
-                          : balance >= 0 ? "text-fg" : "text-fg-danger"
+                      balanceTextClass(isProjected, isPlaidPending, isFuture, balance, false)
                     )}
                   >
                     {isPlaidPending ? "—" : formatCurrency(balance)}

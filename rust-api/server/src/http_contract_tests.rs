@@ -37,7 +37,7 @@ async fn read_book(
     )
     .await?;
     Ok(Json(
-        json!({"bookId": auth.book_id, "userId": auth.user_id}),
+        json!({"bookId": auth.book_id(), "userId": auth.user_id()}),
     ))
 }
 
@@ -59,7 +59,7 @@ async fn write_account(
     let input = validate_account_create(&body)?;
     require_account_parent(
         &state.pool,
-        auth.book_id,
+        auth.book_id(),
         input.parent_id,
         "Failed to create account",
     )
@@ -67,14 +67,14 @@ async fn write_account(
     let id: i32 = sqlx::query_scalar(
         "INSERT INTO accounts (book_id, name, type) VALUES ($1, $2, $3) RETURNING id",
     )
-    .bind(auth.book_id)
+    .bind(auth.book_id())
     .bind(&input.name)
     .bind(&input.account_type)
     .fetch_one(&state.pool)
     .await
     .map_err(|cause| internal_error(cause, "Failed to create account"))?;
     Ok(Json(
-        json!({"id": id, "bookId": auth.book_id, "name": input.name}),
+        json!({"id": id, "bookId": auth.book_id(), "name": input.name}),
     ))
 }
 

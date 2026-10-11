@@ -796,4 +796,47 @@ describe("MCP Security and Investment Tools", () => {
       expect(await count("securities", "id = $1", [sec.id])).toBe(1);
     });
   });
+
+  // ---------- a reinvested dividend (DRIP) ----------
+  // The shape that the create_transaction description states: one
+  // transaction with a dividend and a buy split, legs investment +G, fee +F,
+  // income -D, cash +R.
+  describe("a reinvested dividend through create_transaction", () => {
+    it("writes one lot with basis G + F and income D - F", async () => {
+      const brokerage = await createAccount({ name: "Brokerage", type: "asset", subtype: "investment" });
+      const cash = await createAccount({ name: "Brokerage Cash", type: "asset", isInvestmentCash: true, parentId: brokerage.id });
+      const dividends = await createAccount({ name: "Dividends", type: "income" });
+      const fees = await createAccount({ name: "Fees", type: "expense" });
+      const security = await createSecurity({ name: "Reinvested Fund", symbol: "DRIP", securityType: "etf" });
+
+      // D = $100.00 buys 1.5 shares at $65.00 (G = $97.50), F = $1.00, R = $1.50.
+      const created = await createTransaction({
+        date: "2026-02-02",
+        description: "DRIP dividend",
+        splits: [
+          { accountId: brokerage.id, amount: 9750 },
+          { accountId: fees.id, amount: 100 },
+          { accountId: dividends.id, amount: -10000 },
+          { accountId: cash.id, amount: 150 },
+        ],
+        investmentSplits: [
+          { securityId: security.id, action: "dividend", sharesMicros: 0, priceMicros: 0 },
+          { securityId: security.id, action: "buy", sharesMicros: 1_500_000, priceMicros: 65_000_000, feesCents: 100 },
+        ],
+      });
+
+      expect(await count("transactions", "id = $1", [created.id])).toBe(1);
+      expect(await count("investment_lots", "security_id = $1", [security.id])).toBe(1);
+      const lot = await row<{ originalSharesMicros: number; originalBasisCents: number; openedTransactionId: number }>(
+        "SELECT original_shares_micros, original_basis_cents, opened_transaction_id FROM investment_lots WHERE security_id = $1",
+        [security.id],
+      );
+      expect(lot).toEqual({ originalSharesMicros: 1_500_000, originalBasisCents: 9850, openedTransactionId: created.id });
+
+      const { data, isError } = await callTool("get_security_detail", { bookId: 1, securityId: security.id });
+      expect(isError).toBe(false);
+      const detail = data as { transactions: Array<{ action: string; cashAmount: number | null }> };
+      expect(detail.transactions.find((row) => row.action === "dividend")?.cashAmount).toBe(99);
+    });
+  });
 });

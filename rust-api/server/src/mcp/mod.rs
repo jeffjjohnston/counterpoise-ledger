@@ -275,7 +275,8 @@ impl ServerHandler for Handler {
         // (SEP-2549). A client on that version, such as Claude Code, rejects
         // the result without them. Older clients ignore the two fields. The
         // list changes only with a deploy. It is private because the result
-        // goes to an authenticated caller.
+        // goes to an authenticated caller. If resources or prompts are
+        // enabled, their list results need the same two fields.
         Ok(ListToolsResult::with_all_items(registry().tools.clone())
             .with_ttl_ms(TOOLS_TTL_MS)
             .with_cache_scope(CacheScope::Private))

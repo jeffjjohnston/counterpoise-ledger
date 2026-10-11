@@ -127,14 +127,16 @@ describe("Plaid connection HTTP parity", () => {
     await createPlaidAccount({ tokenId: zeta.id, plaidAccountId: "z1", name: "Z1", type: "depository", counterpoiseAccountId: checking.id });
     await createPlaidAccount({ tokenId: zeta.id, plaidAccountId: "z2", name: "Z2", type: "depository" });
 
-    const item = (token: typeof zeta, masked: string, total: number, mapped: number) => ({
+    // A demo connection says so: the client does not offer Reconnect for it.
+    await exec("UPDATE plaid_tokens SET is_demo = 1 WHERE id = $1", [alphaB.id]);
+    const item = (token: typeof zeta, masked: string, total: number, mapped: number, isDemo = false) => ({
       id: token.id, financialInstitution: token.financialInstitution, itemId: token.itemId,
       accessTokenMasked: masked, createdAt: token.createdAt.toISOString(),
-      updatedAt: token.updatedAt.toISOString(), totalAccountCount: total, mappedAccountCount: mapped,
+      updatedAt: token.updatedAt.toISOString(), isDemo, totalAccountCount: total, mappedAccountCount: mapped,
     });
     expect(await ok(client, "/api/b/1/sync/tokens")).toEqual([
       item(alphaA, "1234********6789", 0, 0),
-      item(alphaB, "*****", 0, 0),
+      item(alphaB, "*****", 0, 0, true),
       item(zeta, "acce****************6789", 2, 1),
     ]);
     await expectError(client, `/api/b/${other.id}/sync/tokens`, {}, 404, "Book not found");
@@ -149,7 +151,7 @@ describe("Plaid connection HTTP parity", () => {
     expect(created).toEqual({
       id: stored.id, financialInstitution: "Chase", itemId: "item-1",
       accessTokenMasked: "acce****************6789",
-      createdAt: stored.createdAt.toISOString(), updatedAt: stored.updatedAt.toISOString(),
+      createdAt: stored.createdAt.toISOString(), updatedAt: stored.updatedAt.toISOString(), isDemo: false,
     });
     expect(Math.abs(Date.parse(created.createdAt) - Date.now())).toBeLessThan(60_000);
 
@@ -185,7 +187,7 @@ describe("Plaid connection HTTP parity", () => {
     expect(stored).toMatchObject({ financialInstitution: "New Bank", itemId: "item-new", accessToken: "old-access-token" });
     expect(kept).toEqual({
       id: token.id, financialInstitution: "New Bank", itemId: "item-new", accessTokenMasked: "old-********oken",
-      createdAt: token.createdAt.toISOString(), updatedAt: stored.updatedAt.toISOString(),
+      createdAt: token.createdAt.toISOString(), updatedAt: stored.updatedAt.toISOString(), isDemo: false,
     });
     expect(stored.updatedAt.getTime()).toBeGreaterThanOrEqual(token.updatedAt.getTime());
 

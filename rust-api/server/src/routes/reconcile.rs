@@ -523,7 +523,7 @@ pub(crate) async fn link_queue(
     let (limit, offset) = page_query(&first_query_values(raw_query.as_deref()));
     let link_id = database_id(link_id, FAILURE)?;
     let result: Result<Value, ReconcileError> = async {
-        let link = reconcilable_link(&state.pool, book.book_id, link_id).await?;
+        let link = reconcilable_link(&state.pool, book.book_id(), link_id).await?;
         let mut connection = state.pool.acquire().await?;
         let queue = "r.plaid_account_link_id = $1
                      AND (r.resolution_status = 'pending' OR r.review_reason IS NOT NULL)";
@@ -546,7 +546,7 @@ pub(crate) async fn link_queue(
         .await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in &rows {
-            items.push(load_item(&mut connection, row, link.account_id, book.book_id).await?);
+            items.push(load_item(&mut connection, row, link.account_id, book.book_id()).await?);
         }
         Ok(page(items, total, offset, limit))
     }
@@ -582,7 +582,7 @@ pub(crate) async fn book_queue(
         .transpose()?;
     let result: Result<Value, ReconcileError> = async {
         if let Some(link_id) = link_id {
-            reconcilable_link(&state.pool, book.book_id, link_id).await?;
+            reconcilable_link(&state.pool, book.book_id(), link_id).await?;
         }
         let mut connection = state.pool.acquire().await?;
         let queue = "r.book_id = $1 AND pa.book_id = $1 AND a.book_id = $1
@@ -598,14 +598,14 @@ pub(crate) async fn book_queue(
                       COALESCE(r.authorized_date, r.date) DESC, r.id DESC
              LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)"
         ))
-        .bind(book.book_id)
+        .bind(book.book_id())
         .bind(link_id)
         .bind(limit as i64)
         .bind(offset as i64)
         .fetch_all(&mut *connection)
         .await?;
         let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {joins} WHERE {queue}"))
-            .bind(book.book_id)
+            .bind(book.book_id())
             .bind(link_id)
             .fetch_one(&mut *connection)
             .await?;
@@ -617,7 +617,7 @@ pub(crate) async fn book_queue(
             .bind(id)
             .fetch_one(&mut *connection)
             .await?;
-            items.push(load_item(&mut connection, &row, mapped_account_id, book.book_id).await?);
+            items.push(load_item(&mut connection, &row, mapped_account_id, book.book_id()).await?);
         }
         Ok(page(items, total, offset, limit))
     }
@@ -1146,27 +1146,27 @@ pub(crate) async fn resolve_route(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let link_id = database_id(finite_path_id(&raw_id, INVALID_LINK_ID)?, FAILURE)?;
-    let link = reconcilable_link(&state.pool, book.book_id, link_id)
+    let link = reconcilable_link(&state.pool, book.book_id(), link_id)
         .await
         .map_err(|cause| cause.into_api(FAILURE))?;
     let body = parse_json_body(&body, FAILURE)?;
     let input = validate_reconcile(&body)?;
-    let item = resolve(&state.pool, book.book_id, link, &input, book.user_id)
+    let item = resolve(&state.pool, book.book_id(), link, &input, book.user_id())
         .await
         .map_err(|cause| cause.into_api(FAILURE))?;
     let observation = Observation::parse(body.get("typesafe"));
     record_decision(
         &state.pool,
-        book.book_id,
+        book.book_id(),
         &input,
         &observation,
         action_started_at,
     )
     .await;
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         input.action.event_name(),
-        Some(json!({ "bookId": book.book_id })),
+        Some(json!({ "bookId": book.book_id() })),
     );
     Ok(Json(item))
 }

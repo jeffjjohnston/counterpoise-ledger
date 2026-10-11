@@ -820,7 +820,7 @@ describe("the database volume is checked before anything changes", () => {
     const result = deploy({ env: { DOCKER_NO_VOLUME: "1" } });
     expect(result.code).not.toBe(0);
     expect(result.output).toContain("the volume counterpoise_data does not exist");
-    expect(result.output).toContain(`git -C ${buildDir} merge --ff-only ${mergeCommit}`);
+    expect(result.output).toContain(`git -C ${buildDir} checkout v1.50.0`);
     expect(result.output).toContain(`(cd ${buildDir} && scripts/upgrade-to-sqlite.sh)`);
     expectNothingChanged(before);
   });
@@ -832,7 +832,7 @@ describe("the database volume is checked before anything changes", () => {
     expect(result.code).not.toBe(0);
     expect(result.output).toContain("sets DATABASE_URL, and the volume counterpoise_data holds no counterpoise.db");
     expect(result.output).toContain("guides/upgrade-to-sqlite.md");
-    expect(result.output).toContain(`git -C ${buildDir} merge --ff-only ${mergeCommit}`);
+    expect(result.output).toContain(`git -C ${buildDir} checkout v1.50.0`);
     expect(dockerCalls()).toContain("args=run --rm -v counterpoise_data:/data alpine:3.22 test -e /data/counterpoise.db");
     expectNothingChanged(before);
   });

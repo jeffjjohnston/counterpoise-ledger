@@ -55,11 +55,13 @@ async fn database_with_books(count: i32) -> TempDatabase {
 /// row by row in `id` order. A table without `id` is in the order of all its
 /// columns. Columns that end in `_at` are timestamps
 /// and are left out. `transaction_changes` is a log that the triggers write,
-/// not seed data, so it is left out too.
+/// not seed data, so it is left out too. `plaid_link_sessions` holds the
+/// Plaid Hosted Link sessions of the Sync page, which the seed never writes,
+/// so it is left out and the hashes stay as before migration 0005.
 async fn dump_hash(pool: &DbPool, book_id: i32) -> String {
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT m.name FROM sqlite_master m
-         WHERE m.type = 'table' AND m.name <> 'transaction_changes'
+         WHERE m.type = 'table' AND m.name NOT IN ('transaction_changes', 'plaid_link_sessions')
            AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = 'book_id')
          ORDER BY m.name",
     )

@@ -116,7 +116,7 @@ pub(crate) async fn price_history(
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let failed = |cause| internal_error(cause, FAILURE);
     let security_id = security_path_id(&raw_id, FAILURE)?;
-    find_security(&state.pool, book.book_id, security_id, FAILURE).await?;
+    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
     let params = first_query_values(raw_query.as_deref());
     // The price chart asks for up to 5000 rows. The price list pages by 50.
     let limit = page_param(params.get("limit"), 1.0).map_or(50, |limit| limit.min(5000));
@@ -136,7 +136,7 @@ pub(crate) async fn price_history(
          ORDER BY price_date DESC LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)",
     )
     .bind(security_id)
-    .bind(book.book_id)
+    .bind(book.book_id())
     .bind(limit)
     .bind(offset)
     .bind(&start_date)
@@ -150,7 +150,7 @@ pub(crate) async fn price_history(
            AND ($3 IS NULL OR price_date >= $3) AND ($4 IS NULL OR price_date <= $4)",
     )
     .bind(security_id)
-    .bind(book.book_id)
+    .bind(book.book_id())
     .bind(&start_date)
     .bind(&end_date)
     .fetch_one(&state.pool)
@@ -189,7 +189,7 @@ pub(crate) async fn update_price(
     let input = validate_price_update(&parse_json_body(&body, FAILURE)?)?;
     let security_id = i32::try_from(security_id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
-    find_security(&state.pool, book.book_id, security_id, FAILURE).await?;
+    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
 
     let entry_exists = |date: String| {
         sqlx::query_scalar::<_, bool>(
@@ -246,7 +246,7 @@ pub(crate) async fn update_price(
         .bind(&input.price_date)
         .bind(input.price_micros)
         .bind(&input.source)
-        .bind(book.book_id)
+        .bind(book.book_id())
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await
@@ -270,7 +270,7 @@ pub(crate) async fn delete_price(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let security_id = security_path_id(&raw_id, FAILURE)?;
-    find_security(&state.pool, book.book_id, security_id, FAILURE).await?;
+    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
     let deleted =
         sqlx::query("DELETE FROM security_prices WHERE security_id = $1 AND price_date = $2")
             .bind(security_id)
@@ -310,7 +310,7 @@ pub(crate) async fn prices_due(
         "SELECT id FROM securities
          WHERE book_id = $1 AND fetch_prices = false AND fixed_price_micros IS NULL",
     )
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_all(&state.pool)
     .await
     .map_err(failed)?
@@ -328,13 +328,13 @@ pub(crate) async fn prices_due(
          JOIN securities s ON p.security_id = s.id
          WHERE s.book_id = $1 AND s.fetch_prices = true",
     )
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_one(&state.pool)
     .await
     .map_err(failed)?;
     let due_date = newest.unwrap_or_else(last_weekday);
 
-    let mut due: Vec<_> = positions(&state.pool, book.book_id, None)
+    let mut due: Vec<_> = positions(&state.pool, book.book_id(), None)
         .await
         .map_err(failed)?
         .into_iter()
@@ -531,7 +531,7 @@ pub(crate) async fn bulk_prices(
         .and_then(|object| object.get("priceUpdates"))
         .and_then(Value::as_array)
         .ok_or_else(|| bad_request("priceUpdates must be an array"))?;
-    let written = set_prices(&state.pool, book.book_id, items)
+    let written = set_prices(&state.pool, book.book_id(), items)
         .await
         .map_err(|cause| match cause {
             SetPricesError::Invalid(message) => bad_request(message),
@@ -592,7 +592,7 @@ pub(crate) async fn tiingo_prices(
     let fetching: Vec<(i32, String)> = sqlx::query_as(
         "SELECT id, symbol FROM securities WHERE book_id = $1 AND fetch_prices = true",
     )
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_all(&state.pool)
     .await
     .map_err(failed)?;

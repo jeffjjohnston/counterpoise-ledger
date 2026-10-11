@@ -104,6 +104,26 @@ export type PlaidTokenListItem = Pick<
   accessTokenMasked: string;
   mappedAccountCount: number;
   totalAccountCount: number;
+  /** A demo connection has no Plaid Item and cannot be reconnected. */
+  isDemo: boolean;
+};
+
+/**
+ * A Plaid Hosted Link session (`POST sync/link-sessions` and its `check`).
+ * It never holds an access token, a public token or a link token.
+ */
+export type PlaidLinkSession = {
+  id: number;
+  /** `create` connects a new bank; `update` reconnects `tokenId`. */
+  mode: "create" | "update";
+  /** The server can add a value. Treat an unknown one as `failed`. */
+  status: "pending" | "complete" | "expired" | "failed";
+  tokenId: number | null;
+  financialInstitution: string | null;
+  /** The URL to open in a new tab. Null when the session is not pending. */
+  hostedLinkUrl: string | null;
+  expiresAt: string;
+  error: string | null;
 };
 
 export type PlaidAccountAssignment = Pick<
@@ -128,6 +148,8 @@ export type AssignedSyncAccount = {
   lastError: string | null;
   pendingCount: number;
   reviewCount: number;
+  /** A demo connection has no Plaid Item and cannot be reconnected. */
+  isDemo: boolean;
 };
 
 export type SyncReviewReason = "plaid_modified" | "plaid_removed";

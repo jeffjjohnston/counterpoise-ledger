@@ -268,7 +268,7 @@ pub(crate) async fn get_positions(
             Some(i32::try_from(id).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?)
         }
     };
-    let rows = positions(&state.pool, book.book_id, account_id)
+    let rows = positions(&state.pool, book.book_id(), account_id)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
     Ok(Json(to_value(rows).expect("positions serialize")))
@@ -285,12 +285,12 @@ pub(crate) async fn account_values(
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let params = first_query_values(raw_query.as_deref());
     let as_of_date = query_date_param(&params, "asOfDate")?;
-    let splits = investment_splits(&state.pool, book.book_id, None, as_of_date.as_deref())
+    let splits = investment_splits(&state.pool, book.book_id(), None, as_of_date.as_deref())
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
     // Prices are not limited by asOfDate: an as-of value combines that date's
     // shares with today's prices, as the Node route does.
-    let prices = latest_prices(&state.pool, book.book_id)
+    let prices = latest_prices(&state.pool, book.book_id())
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
     let values = aggregate_market_values_by_account(&MarketValueInput { splits, prices });

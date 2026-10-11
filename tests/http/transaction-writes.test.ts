@@ -15,7 +15,7 @@ type TransactionBody = {
   updatedAt: string;
   payeeId: number | null;
   splits: { accountId: number; amount: number }[];
-  investmentSplits: { accountId: number | null; sharesMicros: number }[];
+  investmentSplits: { id: number; action: string; accountId: number | null; sharesMicros: number }[];
   [field: string]: unknown;
 };
 const transactionSchema = contract<TransactionBody>("Transaction");
@@ -261,6 +261,79 @@ describe("transaction write HTTP parity", () => {
     const cleared = await ok(`/api/b/1/transactions/${buy.id}`, json("PUT", { investmentSplits: [] }));
     expect(cleared.investmentSplits).toEqual([]);
     expect(await lotRows()).toMatchSnapshot();
+  });
+
+  // The transaction form saves a transaction with more than one investment
+  // split in journal mode, with no investmentSplits key. All of its
+  // investment splits must stay.
+  it("keeps every investment split when an update omits investmentSplits", async () => {
+    const reinvested = await create({
+      date: "2025-01-10",
+      splits: [{ accountId: a.brokerage, amount: 10_000 }, { accountId: a.dividends, amount: -10_000 }],
+      investmentSplits: [
+        { securityId: a.vti, action: "dividend", sharesMicros: 0, priceMicros: 0 },
+        { securityId: a.vti, action: "buy", sharesMicros: 2_000_000, priceMicros: 50_000_000 },
+      ],
+    });
+    // The rebuild gives the lot a new row id; the rest of the lot stays.
+    const lots = async () =>
+      (await rows<Record<string, unknown>>(
+        "SELECT security_id, opened_split_id, original_shares_micros, original_basis_cents FROM investment_lots"
+      ));
+    const lotsBefore = await lots();
+    expect(lotsBefore).toHaveLength(1);
+    const updated = transactionSchema.parse(await ok(`/api/b/1/transactions/${reinvested.id}`, json("PUT", {
+      description: "Reinvested",
+      splits: [{ accountId: a.brokerage, amount: 10_000 }, { accountId: a.dividends, amount: -10_000 }],
+      expectedUpdatedAt: reinvested.updatedAt,
+    })));
+    expect(updated.description).toBe("Reinvested");
+    expect(updated.investmentSplits.map((split) => split.id)).toEqual(
+      reinvested.investmentSplits.map((split) => split.id)
+    );
+    expect(updated.investmentSplits.map((split) => split.action)).toEqual(["dividend", "buy"]);
+    expect(await lots()).toEqual(lotsBefore);
+
+    // Splits that move the ledger to another investment account would leave
+    // the shares and the lot in the old one, so the route refuses them.
+    const other = await createAccount({ name: "Other Brokerage", type: "asset", subtype: "investment" });
+    await expectError(`/api/b/1/transactions/${reinvested.id}`, json("PUT", {
+      splits: [{ accountId: other.id, amount: 10_000 }, { accountId: a.dividends, amount: -10_000 }],
+    }), 400, "The splits must keep each investment account of the investment splits; send investmentSplits to change it");
+    const after = transactionSchema.parse(await ok(`/api/b/1/transactions/${reinvested.id}`));
+    expect(after.splits.map((split) => split.accountId)).toEqual([a.brokerage, a.dividends]);
+    expect(after.investmentSplits.map((split) => split.accountId)).toEqual([a.brokerage, a.brokerage]);
+    expect(await lots()).toEqual(lotsBefore);
+
+    // A stale edit is a conflict first: the stored splits it would be
+    // checked against are not the ones the editor loaded.
+    await expectError(`/api/b/1/transactions/${reinvested.id}`, json("PUT", {
+      splits: [{ accountId: other.id, amount: 10_000 }, { accountId: a.dividends, amount: -10_000 }],
+      expectedUpdatedAt: reinvested.updatedAt,
+    }), 409, "Another user changed this transaction. Showing the latest version.");
+  });
+
+  // A dividend or a capital gain stores the brokerage on its investment
+  // split, but its ledger has only the brokerage's cash child.
+  it("accepts unchanged cash-only splits for investment splits that name the cash parent", async () => {
+    const income = await create({
+      date: "2025-01-10",
+      splits: [{ accountId: a.brokerageCash, amount: 1_500 }, { accountId: a.dividends, amount: -1_500 }],
+      investmentSplits: [
+        { securityId: a.vti, action: "dividend", sharesMicros: 0, priceMicros: 0 },
+        { securityId: a.vti, action: "capGain", sharesMicros: 0, priceMicros: 0 },
+      ],
+    });
+    expect(income.investmentSplits.map((split) => split.accountId)).toEqual([a.brokerage, a.brokerage]);
+    const updated = transactionSchema.parse(await ok(`/api/b/1/transactions/${income.id}`, json("PUT", {
+      splits: [{ accountId: a.brokerageCash, amount: 1_500 }, { accountId: a.dividends, amount: -1_500 }],
+      expectedUpdatedAt: income.updatedAt,
+    })));
+    expect(updated.investmentSplits.map((split) => split.id)).toEqual(income.investmentSplits.map((split) => split.id));
+    // Moving the cash leg to an account outside the brokerage is refused.
+    await expectError(`/api/b/1/transactions/${income.id}`, json("PUT", {
+      splits: [{ accountId: a.checking, amount: 1_500 }, { accountId: a.dividends, amount: -1_500 }],
+    }), 400, "The splits must keep each investment account of the investment splits; send investmentSplits to change it");
   });
 
   it("refuses invalid updates with the Node bodies", async () => {

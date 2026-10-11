@@ -73,7 +73,7 @@ impl BookRole {
         }
     }
 
-    fn satisfies(self, level: AccessLevel) -> bool {
+    pub(crate) fn satisfies(self, level: AccessLevel) -> bool {
         match level {
             AccessLevel::Read => true,
             AccessLevel::Write => self != Self::Viewer,
@@ -93,7 +93,7 @@ pub(crate) enum AccessLevel {
     Owner,
 }
 
-fn denial(role: Option<BookRole>, level: AccessLevel) -> ApiError {
+pub(crate) fn denial(role: Option<BookRole>, level: AccessLevel) -> ApiError {
     match role {
         None => error(StatusCode::NOT_FOUND, "Book not found"),
         Some(_) if level == AccessLevel::Owner => {
@@ -161,9 +161,36 @@ pub(crate) async fn authenticate_book_membership(
 
 /// Carries the identity and role a write handler needs for auditing and
 /// analytics without a second authentication query.
-#[derive(Clone, Copy, Debug)]
+///
+/// The fields are private. Only this module makes the value, so a value
+/// is proof that `authenticate_book` accepted the caller in this book.
+#[derive(Debug)]
 pub(crate) struct AuthenticatedBook {
-    pub(crate) book_id: i32,
-    pub(crate) user_id: i32,
-    pub(crate) role: BookRole,
+    book_id: i32,
+    user_id: i32,
+    role: BookRole,
+}
+
+impl AuthenticatedBook {
+    pub(crate) fn book_id(&self) -> i32 {
+        self.book_id
+    }
+
+    pub(crate) fn user_id(&self) -> i32 {
+        self.user_id
+    }
+
+    pub(crate) fn role(&self) -> BookRole {
+        self.role
+    }
+
+    /// A test value that `authenticate_book` did not make.
+    #[cfg(test)]
+    pub(crate) fn unchecked(book_id: i32, user_id: i32, role: BookRole) -> Self {
+        Self {
+            book_id,
+            user_id,
+            role,
+        }
+    }
 }

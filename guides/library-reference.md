@@ -205,8 +205,9 @@ These run outside the web server. Do not import them from a component.
   database file with `node:sqlite`. The server's copies are
   `rust-api/server/src/typesafe_client.rs`, `typesafe_questions.rs` and
   `typesafe.rs`
-- `/lib/plaid.ts` - the Plaid client of `npm run plaid:link`. The server's
-  copy is `rust-api/server/src/plaid.rs`. `PLAID_API_URL` replaces the Plaid
+- `/lib/plaid.ts` - the Plaid client of `npm run plaid:link`, the terminal
+  fallback to the in-app Hosted Link flow. The server's copy is
+  `rust-api/server/src/plaid.rs`. `PLAID_API_URL` replaces the Plaid
   origin for a test mock
 - `/lib/posthog-query.ts` - HogQL queries for `scripts/posthog-export.ts`.
   The server's copy is `rust-api/server/src/posthog_query.rs`
@@ -358,8 +359,7 @@ One module per route area. `routes/mod.rs` registers each entry of
 | `/rust-api/server/src/routes/mod.rs` | The Axum router, and the routes that it registers by name (`/health`, `/api/health`, `/api/mcp`, WebMCP) |
 | `/rust-api/server/src/book_auth.rs` | Book access at a level |
 | `/rust-api/db/src/lots.rs` | The lot rebuild. Lots and allocations are derived state |
-| `/rust-api/cli/src/main.rs` | `ledger-cli`: `migrate`, `seed [--book-id N \| --reset]`, `list-books`, `rebuild-lots [--force]`, `import-moneydance`, `backup [--dir D]`, `import-postgres --from <url> --to <path> [--allow-unbalanced]`. Each uses `DATABASE_PATH` (default `data/counterpoise.db`) |
-| `/rust-api/cli/src/import_postgres.rs` | The one-time PostgreSQL-to-SQLite converter and its checks. See [upgrade-to-sqlite.md](upgrade-to-sqlite.md) |
+| `/rust-api/cli/src/main.rs` | `ledger-cli`: `migrate`, `seed [--book-id N \| --reset]`, `list-books`, `rebuild-lots [--force]`, `import-moneydance`, `backup [--dir D]`. Each uses `DATABASE_PATH` (default `data/counterpoise.db`) |
 | `/rust-api/server/src/scheduler.rs` | The scheduled jobs (recurring, Plaid, prices, TypeSafe cleanup, backup, prune, `VACUUM`), on when `COUNTERPOISE_SCHEDULER=on` |
 | `/rust-api/cli/src/import_moneydance/mod.rs` | Moneydance import orchestration, run by `ledger-cli import-moneydance` and `npm run import:moneydance` |
 | `/rust-api/server/src/mcp/` | The MCP server: the tool registry, the stdio and HTTP transports, WebMCP, and one handler module per tool group. See [mcp-server.md](mcp-server.md) |
@@ -373,8 +373,6 @@ One module per route area. `routes/mod.rs` registers each entry of
 | `/client/routes.tsx` | The route table of the client. Each page and the book layout load on demand |
 | `/lib/wasm-client.ts` | The browser adapter for `ledger-core` |
 | `/lib/api-client.ts` | Every browser API request |
-| `/scripts/upgrade-to-sqlite.sh` | Converts an install's PostgreSQL data to SQLite, once. Uses `docker-compose.upgrade.yml`. See [upgrade-to-sqlite.md](upgrade-to-sqlite.md) |
-| `/scripts/verify-postgres-conversion.sh` | `--ref <commit>`: seeds PostgreSQL with the binaries of that commit, converts, and compares every GET response of every book |
 | `/scripts/release.sh` | Version bump, release branch, push, and PR creation. Creates no tag |
 | `/scripts/deploy.sh` | Publishes the version tag at one named commit, then builds and restarts. Rebases nothing |
 | `/scripts/posthog-export.ts` | CLI tool for exporting PostHog events |

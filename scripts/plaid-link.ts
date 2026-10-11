@@ -1,10 +1,12 @@
 /**
  * Mints a Plaid access token for one financial institution.
  *
- * Counterpoise stores an access token per institution and syncs against it,
- * but it does not run Plaid Link itself — the Sync -> Tokens page asks for an
- * access token and an item id that already exist. This script is what
- * produces that pair.
+ * This is the fallback. The Sync page connects a bank itself ("Connect a
+ * bank"): the server runs the same Hosted Link flow and stores the access
+ * token, which never goes to the browser (see guides/plaid-sync.md). Use this
+ * script only when that flow cannot run. It prints the access token and the
+ * item id, and the owner pastes them into Manage connections -> Add with
+ * access token.
  *
  * It uses Hosted Link, where Plaid serves the Link UI on its own domain, in
  * preference to hosting Link locally. Hosting it locally cannot work for the
@@ -206,7 +208,7 @@ async function main(): Promise<void> {
     throw new Error("Plaid /item/public_token/exchange returned an incomplete payload");
   }
 
-  console.log("\nDone. Paste these into Sync -> Tokens in Counterpoise:\n");
+  console.log("\nDone. Paste these into Sync -> Manage connections -> Add with access token:\n");
   console.log(`  Item ID:      ${exchanged.item_id}`);
   console.log(`  Access Token: ${exchanged.access_token}\n`);
   console.log("The access token does not expire. Treat it like a password:");

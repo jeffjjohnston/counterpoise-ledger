@@ -1,0 +1,495 @@
+{
+  "about": [
+    "Hand-worked TypeSafe report cases. tests/lib/typesafe-report.test.ts gives them to summarizeTypeSafe in lib/typesafe/report.ts, and the tests of rust-api/server/src/typesafe.rs give them to summarize. Both must give the expected counts.",
+    "Each evaluation names one of the snapshots below. A field that an evaluation or a decision does not give is null (false for the two decision flags). A time is UTC.",
+    "The expected counts are in the order in which the summary first adds each key; the tests compare the JSON text, so the order and a NaN count (written as null) must also agree.",
+    "A case with \"error\": true has a snapshot that the summary cannot read: TypeScript throws a TypeError and Rust returns an error."
+  ],
+  "snapshots": {
+    "familiar": {
+      "merchantSeenBefore": true,
+      "baselineIds": [42, 43],
+      "candidates": [
+        { "label": "candidate_1", "transactionId": 43 },
+        { "label": "candidate_2", "transactionId": 42 }
+      ],
+      "payeeOptions": [{ "label": "payee_1", "payeeId": 3, "name": "Corner Shop", "source": "existing" }],
+      "categoryOptions": [
+        { "label": "category_1", "accountId": 7, "name": "Groceries", "kind": "expense" },
+        { "label": "category_2", "accountId": 8, "name": "Dining", "kind": "expense" }
+      ],
+      "baselineCategoryId": 7
+    },
+    "unseen": {
+      "merchantSeenBefore": false,
+      "baselineIds": [42, 43],
+      "candidates": [
+        { "label": "candidate_1", "transactionId": 43 },
+        { "label": "candidate_2", "transactionId": 42 }
+      ],
+      "payeeOptions": [{ "label": "payee_1", "payeeId": 3, "name": "Corner Shop", "source": "existing" }],
+      "categoryOptions": [{ "label": "category_1", "accountId": 7, "name": "Groceries", "kind": "expense" }],
+      "baselineCategoryId": 7
+    },
+    "noFamiliarity": {
+      "baselineIds": [],
+      "candidates": []
+    },
+    "v1": {
+      "merchantSeenBefore": true,
+      "baselineIds": [42, 43],
+      "candidates": [
+        { "label": "candidate_1", "transactionId": 43 },
+        { "label": "candidate_2", "transactionId": 42 }
+      ]
+    },
+    "noCategoryBaseline": {
+      "merchantSeenBefore": true,
+      "baselineIds": [42],
+      "candidates": [{ "label": "candidate_1", "transactionId": 42 }],
+      "payeeOptions": [{ "label": "payee_1", "payeeId": 3, "name": "Corner Shop", "source": "existing" }],
+      "categoryOptions": [{ "label": "category_1", "accountId": 7, "name": "Groceries", "kind": "expense" }],
+      "baselineCategoryId": null
+    },
+    "nullCandidateLast": {
+      "merchantSeenBefore": true,
+      "baselineIds": [42],
+      "candidates": [{ "label": "candidate_1", "transactionId": 43 }, null]
+    },
+    "nullCandidateFirst": {
+      "merchantSeenBefore": true,
+      "baselineIds": [42],
+      "candidates": [null, { "label": "candidate_1", "transactionId": 43 }]
+    },
+    "noCandidates": {
+      "merchantSeenBefore": true,
+      "baselineIds": [42]
+    },
+    "noBaselineIds": {
+      "merchantSeenBefore": true,
+      "candidates": [{ "label": "candidate_1", "transactionId": 43 }]
+    },
+    "payeeOptionsText": {
+      "merchantSeenBefore": true,
+      "baselineIds": [],
+      "candidates": [],
+      "payeeOptions": "Corner Shop",
+      "categoryOptions": [{ "label": "category_1", "accountId": 7, "name": "Groceries", "kind": "expense" }]
+    }
+  },
+  "cases": [
+    {
+      "name": "request outcomes, latency, and token usage without decisions",
+      "evaluations": [
+        {
+          "id": 1,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "candidate_2",
+          "answers": { "match": { "choice": "candidate_2", "probabilities": { "candidate_2": 1 }, "confidence": 1 } },
+          "usage": { "input_tokens": 120, "output_tokens": 8 },
+          "latencyMs": 900
+        },
+        { "id": 2, "status": "error", "snapshot": "unseen", "latencyMs": 5000 },
+        { "id": 3, "status": "skipped", "snapshot": "noFamiliarity" }
+      ],
+      "decisions": [],
+      "expected": {
+        "evaluations": 3,
+        "status_ready": 1,
+        "familiar_merchant_evaluations": 1,
+        "latency_samples": 2,
+        "latency_total_ms": 5900,
+        "usage_samples": 1,
+        "input_tokens": 120,
+        "output_tokens": 8,
+        "agrees_with_baseline": 1,
+        "outcome_unknown": 3,
+        "status_error": 1,
+        "unseen_merchant_evaluations": 2,
+        "status_skipped": 1
+      }
+    },
+    {
+      "name": "a zero latency and a zero token count are samples, and a choice outside the candidates",
+      "evaluations": [
+        {
+          "id": 1,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "candidate_9",
+          "usage": { "input_tokens": 5, "output_tokens": 0 },
+          "latencyMs": 0
+        }
+      ],
+      "decisions": [],
+      "expected": {
+        "evaluations": 1,
+        "status_ready": 1,
+        "familiar_merchant_evaluations": 1,
+        "latency_samples": 1,
+        "latency_total_ms": 0,
+        "usage_samples": 1,
+        "input_tokens": 5,
+        "output_tokens": 0,
+        "outcome_unknown": 1
+      }
+    },
+    {
+      "name": "manual matches against the candidates, the baseline, and the choice of Jev",
+      "evaluations": [
+        {
+          "id": 1,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "candidate_1",
+          "answers": { "match": { "choice": "candidate_1", "probabilities": { "candidate_1": 1 }, "confidence": 1 } }
+        },
+        {
+          "id": 2,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "none",
+          "answers": { "match": { "choice": "none", "probabilities": { "none": 1 }, "confidence": 1 } }
+        },
+        {
+          "id": 3,
+          "status": "ready",
+          "snapshot": "unseen",
+          "choice": "candidate_2",
+          "answers": { "match": { "choice": "candidate_2", "probabilities": { "candidate_2": 1 }, "confidence": 1 } }
+        }
+      ],
+      "decisions": [
+        {
+          "evaluationId": 1,
+          "action": "match",
+          "transactionId": 43,
+          "suggestionVisible": true,
+          "acceptedSuggestion": true,
+          "activeReviewMs": 4000,
+          "decidedAt": "2026-09-22 10:01:00"
+        },
+        { "evaluationId": 1, "action": "unlink", "transactionId": 43, "decidedAt": "2026-09-22 11:00:00" },
+        { "evaluationId": 2, "action": "unlink", "transactionId": 42, "decidedAt": "2026-09-22 09:00:00" },
+        { "evaluationId": 2, "action": "match", "transactionId": 42, "decidedAt": "2026-09-22 10:01:00" },
+        {
+          "evaluationId": 3,
+          "action": "match",
+          "transactionId": 99,
+          "suggestionVisible": true,
+          "decidedAt": "2026-09-22 10:01:00"
+        }
+      ],
+      "expected": {
+        "evaluations": 3,
+        "status_ready": 3,
+        "familiar_merchant_evaluations": 2,
+        "differs_from_baseline": 1,
+        "ui_decisions": 3,
+        "ui_action_match": 3,
+        "suggestion_visible_decisions": 2,
+        "suggestion_button_acceptances": 1,
+        "review_time_samples": 1,
+        "review_time_total_ms": 4000,
+        "manual_matches": 3,
+        "manual_match_in_candidates": 2,
+        "jev_agrees_with_user": 1,
+        "familiar_merchant_agrees_with_user": 1,
+        "subsequently_unlinked": 1,
+        "none_predictions": 1,
+        "baseline_agrees_with_user": 1,
+        "none_followed_by_manual_match": 1,
+        "unseen_merchant_evaluations": 1,
+        "agrees_with_baseline": 1,
+        "manual_match_outside_candidates": 1
+      }
+    },
+    {
+      "name": "proposals and how the user resolved them",
+      "evaluations": [
+        {
+          "id": 1,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "none",
+          "answers": {
+            "match": { "choice": "none", "probabilities": { "none": 1 }, "confidence": 1 },
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          },
+          "displayedAt": "2026-09-22 10:00:02"
+        },
+        {
+          "id": 2,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "none",
+          "answers": {
+            "match": { "choice": "none", "probabilities": { "none": 1 }, "confidence": 1 },
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          },
+          "displayedAt": "2026-09-22 10:00:02"
+        },
+        {
+          "id": 3,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "none",
+          "answers": {
+            "match": { "choice": "none", "probabilities": { "none": 1 }, "confidence": 1 },
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          },
+          "displayedAt": "2026-09-22 10:00:02"
+        },
+        {
+          "id": 4,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "none",
+          "answers": {
+            "match": { "choice": "none", "probabilities": { "none": 1 }, "confidence": 1 },
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_2", "probabilities": { "category_2": 1 }, "confidence": 1 }
+          }
+        },
+        {
+          "id": 5,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "none",
+          "answers": {
+            "match": { "choice": "none", "probabilities": { "none": 1 }, "confidence": 1 },
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          },
+          "displayedAt": "2026-09-22 10:00:02"
+        },
+        {
+          "id": 6,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "none",
+          "answers": {
+            "match": { "choice": "none", "probabilities": { "none": 1 }, "confidence": 1 },
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          },
+          "displayedAt": "2026-09-22 10:00:02"
+        },
+        {
+          "id": 7,
+          "status": "ready",
+          "snapshot": "noCategoryBaseline",
+          "answers": {
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          },
+          "displayedAt": "2026-09-22 10:00:02"
+        },
+        {
+          "id": 9,
+          "status": "ready",
+          "snapshot": "familiar",
+          "choice": "candidate_1",
+          "answers": {
+            "match": { "choice": "candidate_1", "probabilities": { "candidate_1": 1 }, "confidence": 1 },
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          },
+          "displayedAt": "2026-09-22 10:00:02"
+        }
+      ],
+      "decisions": [
+        {
+          "evaluationId": 1,
+          "action": "create",
+          "suggestionVisible": true,
+          "acceptedSuggestion": true,
+          "proposalPayeeKept": true,
+          "proposalCategoryKept": true,
+          "decidedAt": "2026-09-22 10:01:00"
+        },
+        {
+          "evaluationId": 2,
+          "action": "create",
+          "suggestionVisible": true,
+          "proposalPayeeKept": true,
+          "proposalCategoryKept": true,
+          "decidedAt": "2026-09-22 10:01:00"
+        },
+        {
+          "evaluationId": 3,
+          "action": "create",
+          "suggestionVisible": true,
+          "proposalPayeeKept": false,
+          "proposalCategoryKept": false,
+          "decidedAt": "2026-09-22 10:01:00"
+        },
+        { "evaluationId": 4, "action": "create", "decidedAt": "2026-09-22 10:01:00" },
+        { "evaluationId": 5, "action": "ignore", "suggestionVisible": true, "decidedAt": "2026-09-22 10:01:00" },
+        { "evaluationId": 6, "action": "create", "suggestionVisible": true, "decidedAt": "2026-09-22 10:01:00" }
+      ],
+      "expected": {
+        "evaluations": 8,
+        "status_ready": 8,
+        "familiar_merchant_evaluations": 8,
+        "none_predictions": 6,
+        "proposals": 7,
+        "proposals_displayed": 6,
+        "proposal_category_agrees_with_baseline": 5,
+        "ui_decisions": 6,
+        "ui_action_create": 5,
+        "suggestion_visible_decisions": 5,
+        "suggestion_button_acceptances": 1,
+        "proposal_one_click_creates": 1,
+        "proposal_edits_unchanged": 1,
+        "proposal_edits_changed": 2,
+        "proposal_edits_changed_payee": 1,
+        "proposal_edits_changed_category": 1,
+        "proposal_category_differs_from_baseline": 1,
+        "ui_action_ignore": 1,
+        "proposal_shown_then_ignore": 1,
+        "outcome_unknown": 2,
+        "differs_from_baseline": 1
+      }
+    },
+    {
+      "name": "the first decision in time order, ties in the given order, and later unlinks",
+      "evaluations": [
+        { "id": 1, "status": "ready", "snapshot": "familiar" },
+        { "id": 2, "status": "ready", "snapshot": "familiar" },
+        { "id": 3, "status": "ready", "snapshot": "familiar" }
+      ],
+      "decisions": [
+        { "evaluationId": 1, "action": "ignore", "decidedAt": "2026-09-22 10:05:00" },
+        { "evaluationId": 1, "action": "create", "decidedAt": "2026-09-22 10:01:00" },
+        { "evaluationId": 1, "action": "unlink", "decidedAt": "2026-09-22 10:01:00" },
+        { "action": "match", "transactionId": 42, "decidedAt": "2026-09-22 10:00:00" },
+        { "evaluationId": 99, "action": "match", "transactionId": 42, "decidedAt": "2026-09-22 10:00:00" },
+        { "evaluationId": 2, "action": "unlink", "decidedAt": "2026-09-22 10:00:00" },
+        { "evaluationId": 3, "action": "ignore", "decidedAt": "2026-09-22 10:03:00" },
+        { "evaluationId": 3, "action": "create", "decidedAt": "2026-09-22 10:03:00" }
+      ],
+      "expected": {
+        "evaluations": 3,
+        "status_ready": 3,
+        "familiar_merchant_evaluations": 3,
+        "ui_decisions": 2,
+        "ui_action_create": 1,
+        "subsequently_unlinked": 1,
+        "outcome_unknown": 1,
+        "ui_action_ignore": 1
+      }
+    },
+    {
+      "name": "a v1 snapshot without proposal options, and a null candidate after the chosen one",
+      "evaluations": [
+        { "id": 1, "status": "ready", "snapshot": "v1", "choice": "candidate_1" },
+        {
+          "id": 2,
+          "status": "ready",
+          "snapshot": "v1",
+          "answers": {
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          }
+        },
+        { "id": 3, "status": "stale", "snapshot": "nullCandidateLast", "choice": "candidate_1" }
+      ],
+      "decisions": [],
+      "expected": {
+        "evaluations": 3,
+        "status_ready": 2,
+        "familiar_merchant_evaluations": 3,
+        "differs_from_baseline": 2,
+        "outcome_unknown": 3,
+        "status_stale": 1
+      }
+    },
+    {
+      "name": "a snapshot without candidates",
+      "evaluations": [{ "id": 1, "status": "ready", "snapshot": "noCandidates" }],
+      "decisions": [],
+      "error": true
+    },
+    {
+      "name": "a null candidate before the chosen one",
+      "evaluations": [{ "id": 1, "status": "ready", "snapshot": "nullCandidateFirst", "choice": "candidate_1" }],
+      "decisions": [],
+      "error": true
+    },
+    {
+      "name": "a null candidate that a manual match reads",
+      "evaluations": [{ "id": 1, "status": "ready", "snapshot": "nullCandidateLast", "choice": "candidate_1" }],
+      "decisions": [{ "evaluationId": 1, "action": "match", "transactionId": 99, "decidedAt": "2026-09-22 10:01:00" }],
+      "error": true
+    },
+    {
+      "name": "a chosen candidate and a manual match without baseline IDs: no baseline, so a disagreement",
+      "evaluations": [{ "id": 1, "status": "ready", "snapshot": "noBaselineIds", "choice": "candidate_1" }],
+      "decisions": [
+        { "evaluationId": 1, "action": "match", "transactionId": 43, "suggestionVisible": true, "decidedAt": "2026-09-22 10:01:00" }
+      ],
+      "expected": {
+        "evaluations": 1,
+        "status_ready": 1,
+        "familiar_merchant_evaluations": 1,
+        "differs_from_baseline": 1,
+        "ui_decisions": 1,
+        "ui_action_match": 1,
+        "suggestion_visible_decisions": 1,
+        "manual_matches": 1,
+        "manual_match_in_candidates": 1,
+        "jev_agrees_with_user": 1,
+        "familiar_merchant_agrees_with_user": 1
+      }
+    },
+    {
+      "name": "a snapshot without baseline IDs and without a chosen candidate",
+      "evaluations": [{ "id": 1, "status": "ready", "snapshot": "noBaselineIds" }],
+      "decisions": [],
+      "expected": {
+        "evaluations": 1,
+        "status_ready": 1,
+        "familiar_merchant_evaluations": 1,
+        "outcome_unknown": 1
+      }
+    },
+    {
+      "name": "a usage without a token count, or with a null token count, adds 0 tokens",
+      "evaluations": [
+        { "id": 1, "status": "ready", "snapshot": "familiar", "usage": { "input_tokens": 5 } },
+        { "id": 2, "status": "ready", "snapshot": "familiar", "usage": { "input_tokens": 5, "output_tokens": null } }
+      ],
+      "decisions": [],
+      "expected": {
+        "evaluations": 2,
+        "status_ready": 2,
+        "familiar_merchant_evaluations": 2,
+        "usage_samples": 2,
+        "input_tokens": 10,
+        "output_tokens": 0,
+        "outcome_unknown": 2
+      }
+    },
+    {
+      "name": "payee options that are not a list",
+      "evaluations": [
+        {
+          "id": 1,
+          "status": "ready",
+          "snapshot": "payeeOptionsText",
+          "answers": {
+            "payee": { "choice": "payee_1", "probabilities": { "payee_1": 1 }, "confidence": 1 },
+            "category": { "choice": "category_1", "probabilities": { "category_1": 1 }, "confidence": 1 }
+          }
+        }
+      ],
+      "decisions": [],
+      "error": true
+    }
+  ]
+}

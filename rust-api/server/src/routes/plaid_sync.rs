@@ -1040,7 +1040,7 @@ pub(crate) async fn sync_now(
             return Err(error_owned(StatusCode::BAD_GATEWAY, refused));
         }
     };
-    match sync_token(&state, book.book_id, token_id).await {
+    match sync_token(&state, book.book_id(), token_id).await {
         Ok(result) => Ok(Json(result.to_json())),
         Err(SyncError::Refused(status, message)) => Err(error(status, message)),
         Err(SyncError::Failed(message)) => {

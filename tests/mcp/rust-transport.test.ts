@@ -83,13 +83,19 @@ describe.skipIf(mcpTestTransport() !== "http")("Rust MCP transport", () => {
     };
 
     const discover = await rpc(1, "server/discover");
-    expect(discover.supportedVersions ?? discover.protocolVersions).toContain("2026-07-28");
+    expect(discover.supportedVersions).toContain("2026-07-28");
+    // Only tools have a list method. If resources or prompts are enabled, their
+    // list results also need ttlMs and cacheScope, and this test must check them.
+    expect(discover.capabilities.tools).toBeDefined();
+    expect(discover.capabilities.resources).toBeUndefined();
+    expect(discover.capabilities.prompts).toBeUndefined();
 
     const list = await rpc(2, "tools/list");
     expect(list.tools.length).toBeGreaterThan(0);
-    expect(typeof list.ttlMs).toBe("number");
-    expect(list.ttlMs).toBeGreaterThanOrEqual(0);
-    expect(["public", "private"]).toContain(list.cacheScope);
+    // TOOLS_TTL_MS in rust-api/server/src/mcp/mod.rs. The result goes to an
+    // authenticated caller, so it must not be public.
+    expect(list.ttlMs).toBe(300_000);
+    expect(list.cacheScope).toBe("private");
 
     const call = await rpc(3, "tools/call", { name: "list_books", arguments: {} });
     expect(call.isError).not.toBe(true);

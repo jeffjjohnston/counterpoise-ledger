@@ -10,8 +10,10 @@ import {
   buildBuySplits,
   buildCapGainSplits,
   buildDividendSplits,
+  buildReinvestSplits,
   buildSellSplits,
   getInvestmentGrossAmountCents,
+  reinvestPriceMicros,
 } from "@/lib/wasm-client";
 import type {
   AccountWithBalance,
@@ -19,6 +21,11 @@ import type {
   SplitInput,
   TransactionWithSplits,
 } from "@/types";
+import {
+  formatMicrosInput,
+  type InvestmentFields,
+  type InvestmentFormAction,
+} from "./transaction-form-fields";
 
 interface Security {
   id: number;
@@ -28,13 +35,8 @@ interface Security {
   fixedPriceMicros?: number | null;
 }
 
-export type InvestmentAction =
-  | "buy"
-  | "sell"
-  | "dividend"
-  | "capGain"
-  | "fee"
-  | "split";
+/** The Action of the form. "reinvest" saves a dividend and a buy split. */
+export type InvestmentAction = InvestmentFormAction;
 
 export interface InvestmentEntry {
   // state + setters the section renders from
@@ -78,12 +80,18 @@ export interface InvestmentEntry {
 
   // derived
   investmentCashAccountId: number | null;
-  investmentTotal: { grossAmount: number; totalCents: number };
+  /**
+   * `remainderCents` is the cash rest of a Dividend Reinvest:
+   * dividend - shares x price - fee. It is 0 for the other actions.
+   */
+  investmentTotal: { grossAmount: number; totalCents: number; remainderCents: number };
 
   // behaviour
   validate: () => string | null; // null = valid; otherwise the message to toast
   buildSplits: () => { splits: SplitInput[]; investmentSplits: InvestmentSplitInput[] };
   reset: () => void;
+  /** Fill the fields from a saved transaction. An undefined field is kept. */
+  restore: (fields: InvestmentFields) => void;
 }
 
 export function useInvestmentEntry(args: {
@@ -110,11 +118,17 @@ export function useInvestmentEntry(args: {
     null
   );
   const [selectedSecurityId, setSelectedSecurityId] = useState<number | null>(null);
-  const [investmentAction, setInvestmentAction] = useState<
-    "buy" | "sell" | "dividend" | "capGain" | "fee" | "split"
-  >("buy");
+  const [investmentAction, setInvestmentAction] = useState<InvestmentAction>("buy");
   const [investmentShares, setInvestmentShares] = useState("");
-  const [investmentPrice, setInvestmentPrice] = useState("");
+  const [investmentPrice, setRawInvestmentPrice] = useState("");
+  // Dividend Reinvest fills the price from the dividend, the fee and the
+  // shares until the user types a price. A saved or a fixed price counts as
+  // typed. An emptied field goes back to the computed price.
+  const [priceTyped, setPriceTyped] = useState(false);
+  const setInvestmentPrice = (value: string) => {
+    setPriceTyped(value.trim() !== "");
+    setRawInvestmentPrice(value);
+  };
   const [investmentFee, setInvestmentFee] = useState("");
   const [investmentDividendAmount, setInvestmentDividendAmount] = useState("");
   const [investmentCapGainAmount, setInvestmentCapGainAmount] = useState("");
@@ -146,7 +160,8 @@ export function useInvestmentEntry(args: {
     setSelectedSecurityId(id);
 
     if (next?.fixedPriceMicros != null) {
-      setInvestmentPrice(formatPriceMicrosInput(next.fixedPriceMicros));
+      setRawInvestmentPrice(formatPriceMicrosInput(next.fixedPriceMicros));
+      setPriceTyped(true);
       return;
     }
 
@@ -158,7 +173,8 @@ export function useInvestmentEntry(args: {
       previous?.fixedPriceMicros != null &&
       investmentPrice === formatPriceMicrosInput(previous.fixedPriceMicros)
     ) {
-      setInvestmentPrice("");
+      setRawInvestmentPrice("");
+      setPriceTyped(false);
     }
   };
 
@@ -276,6 +292,29 @@ export function useInvestmentEntry(args: {
     );
   }, [accounts, investmentAccountId]);
 
+  // The default price of a Dividend Reinvest: (dividend - fee) / shares,
+  // rounded down to micros, so the cash rest is never negative.
+  const computeReinvestPrice = (): number | null => {
+    try {
+      return reinvestPriceMicros(
+        parseCentsInput(investmentDividendAmount),
+        parseCentsInput(investmentFee),
+        parseMicrosInput(investmentShares)
+      );
+    } catch {
+      // An amount too large for i64 while the user types: no price yet.
+      return null;
+    }
+  };
+  const defaultReinvestPrice =
+    investmentAction === "reinvest" && !priceTyped ? computeReinvestPrice() : null;
+  useEffect(() => {
+    if (investmentAction !== "reinvest" || priceTyped) return;
+    setRawInvestmentPrice(
+      defaultReinvestPrice === null ? "" : formatMicrosInput(defaultReinvestPrice)
+    );
+  }, [defaultReinvestPrice, investmentAction, priceTyped]);
+
   const investmentTotal = useMemo(() => {
     const sharesMicros = parseMicrosInput(investmentShares);
     const priceMicros = parseMicrosInput(investmentPrice);
@@ -285,6 +324,7 @@ export function useInvestmentEntry(args: {
     const capGainAmountCents = parseCentsInput(investmentCapGainAmount);
 
     let totalCents = grossAmount;
+    let remainderCents = 0;
     switch (investmentAction) {
       case "buy":
         totalCents = grossAmount + feesCents;
@@ -294,6 +334,10 @@ export function useInvestmentEntry(args: {
         break;
       case "dividend":
         totalCents = dividendAmountCents;
+        break;
+      case "reinvest":
+        totalCents = dividendAmountCents;
+        remainderCents = dividendAmountCents - grossAmount - feesCents;
         break;
       case "capGain":
         totalCents = capGainAmountCents;
@@ -306,7 +350,7 @@ export function useInvestmentEntry(args: {
         break;
     }
 
-    return { grossAmount, totalCents };
+    return { grossAmount, totalCents, remainderCents };
   }, [investmentAction, investmentFee, investmentPrice, investmentShares, investmentDividendAmount, investmentCapGainAmount]);
 
   const validate = (): string | null => {
@@ -325,17 +369,28 @@ export function useInvestmentEntry(args: {
     const splitDenominator = isSplitAction ? Number(splitDenominatorInput) : undefined;
 
     if (
-      ["buy", "sell"].includes(investmentAction) &&
+      ["buy", "sell", "reinvest"].includes(investmentAction) &&
       (sharesMicros <= 0 || priceMicros <= 0)
     ) {
       return "Shares and price are required for this investment action";
     }
 
-    if (investmentAction === "dividend") {
+    if (investmentAction === "dividend" || investmentAction === "reinvest") {
       const dividendAmount = parseCentsInput(investmentDividendAmount);
       if (dividendAmount <= 0) {
         return "Dividend amount is required";
       }
+    }
+
+    if (investmentAction === "reinvest" && feesCents < 0) {
+      return "The fee must not be negative";
+    }
+
+    if (
+      investmentAction === "reinvest" &&
+      parseCentsInput(investmentDividendAmount) - grossAmount - feesCents < 0
+    ) {
+      return "The shares and the fee cost more than the dividend";
     }
 
     if (investmentAction === "capGain") {
@@ -370,14 +425,20 @@ export function useInvestmentEntry(args: {
       return "No cash account found for the selected investment account";
     }
 
-    if (investmentAction === "buy" || investmentAction === "sell") {
+    if (
+      investmentAction === "buy" ||
+      investmentAction === "sell" ||
+      investmentAction === "reinvest"
+    ) {
       if (feesCents > 0 && !investmentFeeAccountId) {
         return "Please select a fee expense account";
       }
     }
 
     if (
-      (investmentAction === "dividend" || investmentAction === "capGain") &&
+      (investmentAction === "dividend" ||
+        investmentAction === "capGain" ||
+        investmentAction === "reinvest") &&
       !investmentIncomeAccountId
     ) {
       return "Please select an income account";
@@ -387,7 +448,32 @@ export function useInvestmentEntry(args: {
       return "Please select an expense account for fees";
     }
 
+    // The builder makes the last checks (for example an amount too large for
+    // i64). Its message goes to the toast, so that the save does not throw.
+    if (investmentAction === "reinvest") {
+      try {
+        buildReinvestEntry();
+      } catch (error) {
+        return error instanceof Error ? error.message : "The reinvestment is not valid";
+      }
+    }
+
     return null;
+  };
+
+  /** The splits of a Dividend Reinvest. Throws on a bad input. */
+  const buildReinvestEntry = () => {
+    const feesCents = parseCentsInput(investmentFee);
+    return buildReinvestSplits({
+      securityAccountId: investmentAccountId ?? 0,
+      cashAccountId: investmentCashAccountId!,
+      incomeAccountId: investmentIncomeAccountId ?? 0,
+      feeAccountId: feesCents > 0 ? investmentFeeAccountId ?? undefined : undefined,
+      dividendCents: parseCentsInput(investmentDividendAmount),
+      sharesMicros: parseMicrosInput(investmentShares),
+      priceMicros: parseMicrosInput(investmentPrice),
+      feesCents,
+    });
   };
 
   const buildSplits = (): {
@@ -403,6 +489,17 @@ export function useInvestmentEntry(args: {
     const splitDenominatorInput = investmentSplitDenominator.trim();
     const splitNumerator = isSplitAction ? Number(splitNumeratorInput) : undefined;
     const splitDenominator = isSplitAction ? Number(splitDenominatorInput) : undefined;
+
+    if (investmentAction === "reinvest") {
+      const built = buildReinvestEntry();
+      return {
+        splits: built.splits,
+        investmentSplits: built.investmentSplits.map((split) => ({
+          securityId: selectedSecurityId!,
+          ...split,
+        })),
+      };
+    }
 
     let finalSplits: SplitInput[];
     switch (investmentAction) {
@@ -477,7 +574,7 @@ export function useInvestmentEntry(args: {
     const investmentSplits: InvestmentSplitInput[] = [
       {
         securityId: selectedSecurityId!,
-        action: investmentAction,
+        action: investmentAction as InvestmentSplitInput["action"],
         sharesMicros: investmentAction === "dividend" || investmentAction === "capGain" ? 0 : sharesMicros,
         priceMicros: investmentAction === "dividend" || investmentAction === "capGain" ? 0 : priceMicros,
         feesCents,
@@ -492,12 +589,31 @@ export function useInvestmentEntry(args: {
   const reset = () => {
     setSelectedSecurityId(null);
     setInvestmentShares("");
-    setInvestmentPrice("");
+    setRawInvestmentPrice("");
+    setPriceTyped(false);
     setInvestmentFee("");
     setInvestmentDividendAmount("");
     setInvestmentCapGainAmount("");
     setInvestmentSplitNumerator("");
     setInvestmentSplitDenominator("");
+  };
+
+  // Uses the bare setSelectedSecurityId, not selectSecurity: a saved
+  // transaction keeps the price it was recorded at.
+  const restore = (fields: InvestmentFields) => {
+    setSelectedSecurityId(fields.securityId);
+    setInvestmentAction(fields.action);
+    setInvestmentShares(fields.shares);
+    setRawInvestmentPrice(fields.price);
+    setPriceTyped(true);
+    setInvestmentFee(fields.fee);
+    setInvestmentSplitNumerator(fields.splitNumerator);
+    setInvestmentSplitDenominator(fields.splitDenominator);
+    if (fields.dividendAmount !== undefined) setInvestmentDividendAmount(fields.dividendAmount);
+    if (fields.capGainAmount !== undefined) setInvestmentCapGainAmount(fields.capGainAmount);
+    if (fields.accountId !== undefined) setInvestmentAccountId(fields.accountId);
+    if (fields.incomeAccountId !== undefined) setInvestmentIncomeAccountId(fields.incomeAccountId);
+    if (fields.feeAccountId !== undefined) setInvestmentFeeAccountId(fields.feeAccountId);
   };
 
   return {
@@ -538,5 +654,6 @@ export function useInvestmentEntry(args: {
     validate,
     buildSplits,
     reset,
+    restore,
   };
 }

@@ -220,7 +220,7 @@ pub(crate) async fn create_account(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let input = validate_account_create(&parse_json_body(&body, FAILURE)?)?;
-    require_account_parent(&state.pool, book.book_id, input.parent_id, FAILURE).await?;
+    require_account_parent(&state.pool, book.book_id(), input.parent_id, FAILURE).await?;
     let parent_id = input.parent_id.map(|id| id as i32);
 
     let mut transaction = ledger_db::locks::begin_pool(&state.pool)
@@ -239,13 +239,13 @@ pub(crate) async fn create_account(
         .bind(&input.subtype)
         .bind(parent_id)
         .bind(&input.icon)
-        .bind(book.book_id)
+        .bind(book.book_id())
         .bind(now)
         .fetch_one(&mut *transaction)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
     if is_investment_account(&account.account_type, account.subtype.as_deref()) {
-        ensure_investment_cash_account(&mut transaction, book.book_id, account.id, &account.name)
+        ensure_investment_cash_account(&mut transaction, book.book_id(), account.id, &account.name)
             .await
             .map_err(|cause| internal_error(cause, FAILURE))?;
     }
@@ -255,10 +255,10 @@ pub(crate) async fn create_account(
         .map_err(|cause| internal_error(cause, FAILURE))?;
 
     state.analytics.capture_event(
-        book.user_id,
+        book.user_id(),
         "account_created",
         Some(json!({
-            "bookId": book.book_id,
+            "bookId": book.book_id(),
             "type": account.account_type,
             "subtype": account.subtype,
         })),
@@ -286,7 +286,7 @@ pub(crate) async fn update_account(
     let input = validate_account_update(&parse_json_body(&body, FAILURE)?)?;
     require_account_parent(
         &state.pool,
-        book.book_id,
+        book.book_id(),
         input.parent_id.flatten(),
         FAILURE,
     )
@@ -300,7 +300,7 @@ pub(crate) async fn update_account(
     let query = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = $1 AND book_id = $2");
     let existing: AccountRow = sqlx::query_as(&query)
         .bind(account_id)
-        .bind(book.book_id)
+        .bind(book.book_id())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?
@@ -333,7 +333,7 @@ pub(crate) async fn update_account(
         .push(" WHERE id = ")
         .push_bind(account_id)
         .push(" AND book_id = ")
-        .push_bind(book.book_id);
+        .push_bind(book.book_id());
     update
         .build()
         .execute(&mut *transaction)
@@ -349,7 +349,7 @@ pub(crate) async fn update_account(
         .and_then(Option::as_deref)
         .or(existing.subtype.as_deref());
     if is_investment_account(&existing.account_type, subtype) {
-        ensure_investment_cash_account(&mut transaction, book.book_id, account_id, name)
+        ensure_investment_cash_account(&mut transaction, book.book_id(), account_id, name)
             .await
             .map_err(|cause| internal_error(cause, FAILURE))?;
         if let Some(is_active) = input.is_active {
@@ -360,7 +360,7 @@ pub(crate) async fn update_account(
             .bind(is_active)
             .bind(Utc::now().naive_utc())
             .bind(account_id)
-            .bind(book.book_id)
+            .bind(book.book_id())
             .execute(&mut *transaction)
             .await
             .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -371,7 +371,7 @@ pub(crate) async fn update_account(
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
 
-    let updated = account_with_children(&state.pool, book.book_id, account_id, FAILURE)
+    let updated = account_with_children(&state.pool, book.book_id(), account_id, FAILURE)
         .await?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Account not found"))?;
     Ok(Json(
@@ -395,7 +395,7 @@ pub(crate) async fn delete_account(
          WHERE account_id = $1 AND book_id = $2",
     )
     .bind(account_id)
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_one(&state.pool)
     .await
     .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -409,7 +409,7 @@ pub(crate) async fn delete_account(
         "SELECT CAST(COUNT(*) AS integer) FROM accounts WHERE parent_id = $1 AND book_id = $2",
     )
     .bind(account_id)
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_one(&state.pool)
     .await
     .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -421,7 +421,7 @@ pub(crate) async fn delete_account(
     }
     let deleted = sqlx::query("DELETE FROM accounts WHERE id = $1 AND book_id = $2")
         .bind(account_id)
-        .bind(book.book_id)
+        .bind(book.book_id())
         .execute(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -452,7 +452,7 @@ pub(crate) async fn get_account(
     };
     let AccountWithChildren { account, children } = account_with_children(
         &state.pool,
-        book.book_id,
+        book.book_id(),
         account_id,
         "Failed to fetch account",
     )
@@ -463,7 +463,7 @@ pub(crate) async fn get_account(
          FROM transaction_splits WHERE account_id = $1 AND book_id = $2",
     )
     .bind(account_id)
-    .bind(book.book_id)
+    .bind(book.book_id())
     .fetch_one(&state.pool)
     .await
     .map_err(|cause| internal_error(cause, "Failed to fetch account"))?;
@@ -625,7 +625,7 @@ pub(crate) async fn list_accounts(
         "Failed to fetch accounts",
     )
     .await?;
-    let book_id = authenticated.book_id;
+    let book_id = authenticated.book_id();
 
     let query = parse_account_query(raw_query.as_deref())?;
     let (rows, balances) = account_rows(&state.pool, book_id, &query)

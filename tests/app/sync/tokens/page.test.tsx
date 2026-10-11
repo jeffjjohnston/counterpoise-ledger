@@ -148,6 +148,32 @@ describe("SyncTokensPage", () => {
     expect(screen.getByRole("menuitem", { name: /Remove connection/i })).toBeInTheDocument();
   });
 
+  // POST sync/link-sessions refuses a demo connection: it has no Plaid Item.
+  it("offers Reconnect for a real connection and not for a demo one", async () => {
+    const token = (id: number, name: string, isDemo: boolean) => ({
+      id, financialInstitution: name, itemId: `item-${id}`, accessTokenMasked: "acce********1234",
+      createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+      mappedAccountCount: 1, totalAccountCount: 1, isDemo,
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/sync/tokens") {
+        return { ok: true, json: async () => [token(1, "Chase Bank", false), token(2, "Demo Bank", true)] } as Response;
+      }
+      if (url.startsWith("/api/b/1/accounts")) return { ok: true, json: async () => accountsPayload } as Response;
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }));
+
+    render(<SyncTokensPage />);
+    await screen.findByText("Demo Bank");
+    fireEvent.click(screen.getByRole("button", { name: /Chase Bank actions/i }));
+    expect(screen.getByRole("menuitem", { name: "Reconnect" })).toBeInTheDocument();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: /Demo Bank actions/i }));
+    expect(screen.getByRole("menuitem", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Reconnect" })).toBeNull();
+  });
+
   it("names the reconciliation history in the delete confirmation", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -263,9 +289,8 @@ describe("SyncTokensPage", () => {
       expect(screen.getByText("Chase")).toBeInTheDocument();
     });
 
-    // The page's trigger and the modal's submit share this label, so the
-    // modal has to be opened by the first one and submitted by the last.
-    fireEvent.click(screen.getAllByRole("button", { name: "Add connection" })[0]);
+    // The paste form is the fallback to Connect a bank.
+    fireEvent.click(screen.getByRole("button", { name: "Add with access token" }));
 
     fireEvent.change(screen.getByLabelText("Bank name"), {
       target: { value: "Bank of America" },
@@ -276,8 +301,7 @@ describe("SyncTokensPage", () => {
     fireEvent.change(screen.getByLabelText("Access Token"), {
       target: { value: "access-token-2" },
     });
-    const submitButtons = screen.getAllByRole("button", { name: "Add connection" });
-    fireEvent.click(submitButtons[submitButtons.length - 1]);
+    fireEvent.click(screen.getByRole("button", { name: "Add connection" }));
 
     await waitFor(() => {
       expect(screen.getByText("Bank of America")).toBeInTheDocument();
@@ -330,7 +354,7 @@ describe("SyncTokensPage", () => {
     // the form is not sitting on the page
     expect(screen.queryByLabelText("Access Token")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: /Add connection/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Add with access token" }));
     expect(await screen.findByText(/npm run plaid:link/)).toBeInTheDocument();
     expect(screen.getByLabelText("Access Token")).toBeInTheDocument();
   });

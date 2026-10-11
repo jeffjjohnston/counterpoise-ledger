@@ -88,7 +88,7 @@ pub(crate) async fn list_payees(
                   p.name
          LIMIT COALESCE($4, -1)",
     )
-    .bind(book.book_id)
+    .bind(book.book_id())
     .bind(pattern)
     .bind(today)
     .bind(limit)
@@ -118,7 +118,7 @@ pub(crate) async fn get_payee(
          WHERE p.book_id = $1 AND p.id = $2
          GROUP BY p.id",
     )
-    .bind(book.book_id)
+    .bind(book.book_id())
     .bind(id)
     .fetch_optional(&state.pool)
     .await
@@ -178,7 +178,7 @@ pub(crate) async fn create_payee(
         "SELECT id, book_id, name, created_at FROM payees
          WHERE book_id = $1 AND lower(name) = $2 LIMIT 1",
     )
-    .bind(book.book_id)
+    .bind(book.book_id())
     .bind(name.to_lowercase())
     .fetch_optional(&state.pool)
     .await
@@ -190,7 +190,7 @@ pub(crate) async fn create_payee(
     // createPayee() refuses an exact repeat. The lookup above can miss one
     // only when PostgreSQL lower() and JavaScript toLowerCase() disagree, and
     // Node then returns its 500 message.
-    match create_exact(&state.pool, book.book_id, &name)
+    match create_exact(&state.pool, book.book_id(), &name)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?
     {
@@ -244,7 +244,7 @@ pub(crate) async fn delete_payee(
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM payees WHERE id = $1 AND book_id = $2)")
             .bind(payee_id)
-            .bind(book.book_id)
+            .bind(book.book_id())
             .fetch_one(&state.pool)
             .await
             .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -265,7 +265,7 @@ pub(crate) async fn delete_payee(
     }
     sqlx::query("DELETE FROM payees WHERE id = $1 AND book_id = $2")
         .bind(payee_id)
-        .bind(book.book_id)
+        .bind(book.book_id())
         .execute(&state.pool)
         .await
         .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -320,7 +320,7 @@ pub(crate) async fn last_account(
          SELECT c.account_id FROM candidates c LEFT JOIN usage u ON u.account_id = c.account_id
          ORDER BY COALESCE(u.frequency, 0) DESC, c.account_id ASC LIMIT 1",
     )
-    .bind(book.book_id)
+    .bind(book.book_id())
     .bind(id)
     .bind(today)
     .fetch_optional(&state.pool)

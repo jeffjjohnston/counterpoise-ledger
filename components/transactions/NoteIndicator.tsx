@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -8,11 +9,118 @@ interface NoteIndicatorProps {
   notes: string;
 }
 
+// The popup's width (w-64), its distance from the icon, and the space it keeps
+// from the edges of the window.
+const TOOLTIP_WIDTH = 256;
+const GAP = 8;
+const EDGE = 8;
+// The popup's own cap on its height (max-h-48).
+const TOOLTIP_MAX_HEIGHT = 192;
+
+type Placement = "above" | "below";
+
+interface Position {
+  top: number;
+  left: number;
+  placement: Placement;
+  maxHeight: number;
+}
+
+/**
+ * Where the popup goes for an icon at `anchor` and a popup `height` tall, in
+ * window coordinates. It opens above the icon when it fits there, below when
+ * it fits there, and otherwise on the side with more room, shortened to fit.
+ * It is centered on the icon but kept inside the window.
+ */
+export function placeNoteTooltip(
+  anchor: { top: number; bottom: number; left: number; right: number },
+  height: number,
+  viewport: { width: number; height: number }
+): Position {
+  const roomAbove = anchor.top - GAP - EDGE;
+  const roomBelow = viewport.height - anchor.bottom - GAP - EDGE;
+  let placement: Placement;
+  if (height <= roomAbove) placement = "above";
+  else if (height <= roomBelow) placement = "below";
+  else placement = roomAbove >= roomBelow ? "above" : "below";
+  const maxHeight = Math.max(0, placement === "above" ? roomAbove : roomBelow);
+  const shown = Math.min(height, maxHeight);
+  const top = placement === "above" ? anchor.top - GAP - shown : anchor.bottom + GAP;
+
+  const center = (anchor.left + anchor.right) / 2;
+  const maxLeft = Math.max(EDGE, viewport.width - TOOLTIP_WIDTH - EDGE);
+  const left = Math.min(Math.max(center - TOOLTIP_WIDTH / 2, EDGE), maxLeft);
+
+  return { top, left, placement, maxHeight };
+}
+
+/**
+ * The note icon of a register row, with the note in a popup on hover.
+ *
+ * The popup is rendered into document.body with fixed coordinates. The register
+ * scrolls inside its own container, and some of its cells clip their content,
+ * so a popup positioned inside the row was cut off: above the first rows it
+ * went under the edge of the scroll container.
+ */
 export function NoteIndicator({ notes }: NoteIndicatorProps) {
   const [showTooltip, setShowTooltip] = useState(false);
+  const [position, setPosition] = useState<Position | null>(null);
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  // Measure before the paint, so the popup never shows in the wrong place.
+  // Measure again when the note changes size after that: an image in the
+  // Markdown loads later and makes the popup taller.
+  useLayoutEffect(() => {
+    if (!showTooltip) {
+      setPosition(null);
+      return;
+    }
+    const anchor = anchorRef.current;
+    const tooltip = tooltipRef.current;
+    const content = contentRef.current;
+    if (!anchor || !tooltip || !content) return;
+    const place = () => {
+      // The height the popup wants, not the height it has: once placed, its
+      // max-height can cut it shorter than the note.
+      const chrome = tooltip.offsetHeight - tooltip.clientHeight;
+      const height = Math.min(TOOLTIP_MAX_HEIGHT, tooltip.scrollHeight + chrome);
+      setPosition(
+        placeNoteTooltip(anchor.getBoundingClientRect(), height, {
+          width: window.innerWidth,
+          height: window.innerHeight,
+        })
+      );
+    };
+    place();
+    // jsdom and very old browsers have no ResizeObserver. The first place stays.
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(place);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [showTooltip, notes]);
+
+  // The coordinates are fixed, so the popup would stay behind when the list
+  // scrolls or the window changes size. Close it instead, except for a scroll
+  // inside the popup itself (a long note).
+  useEffect(() => {
+    if (!showTooltip) return;
+    const close = (event: Event) => {
+      if (event.target instanceof Node && tooltipRef.current?.contains(event.target)) return;
+      setShowTooltip(false);
+    };
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [showTooltip]);
 
   return (
     <span
+      ref={anchorRef}
       className="relative inline-flex items-center"
       onMouseEnter={() => setShowTooltip(true)}
       onMouseLeave={() => setShowTooltip(false)}
@@ -31,15 +139,26 @@ export function NoteIndicator({ notes }: NoteIndicatorProps) {
           clipRule="evenodd"
         />
       </svg>
-      {showTooltip && (
-        <div
-          className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 z-50 w-64 max-h-48 overflow-y-auto rounded-lg border border-border bg-surface shadow-lg p-3 text-sm text-fg prose prose-sm dark:prose-invert max-w-none"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{notes}</ReactMarkdown>
-          <div className="absolute left-1/2 -translate-x-1/2 top-full w-2 h-2 rotate-45 border-r border-b border-border bg-surface" />
-        </div>
-      )}
+      {showTooltip &&
+        createPortal(
+          <div
+            ref={tooltipRef}
+            role="tooltip"
+            data-placement={position?.placement}
+            className="fixed z-50 w-64 max-h-48 overflow-y-auto rounded-lg border border-border bg-surface shadow-lg p-3 text-sm text-fg prose prose-sm dark:prose-invert max-w-none"
+            style={
+              position
+                ? { top: position.top, left: position.left, maxHeight: Math.min(TOOLTIP_MAX_HEIGHT, position.maxHeight) }
+                : { top: 0, left: 0, visibility: "hidden" }
+            }
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div ref={contentRef}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{notes}</ReactMarkdown>
+            </div>
+          </div>,
+          document.body
+        )}
     </span>
   );
 }

@@ -31,13 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
       - name: Install WASM bindings generator
-        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
 
       - name: Install WASM optimizer
         run: sudo apt-get update && sudo apt-get install -y binaryen
@@ -54,27 +54,23 @@ jobs:
 
       - name: Check Rust lint
         run: cargo clippy --workspace --all-targets --manifest-path rust-api/Cargo.toml -- -D warnings
-        env:
-          SQLX_OFFLINE: "true"
 
       - name: Test Rust workspace
         run: cargo test --workspace --manifest-path rust-api/Cargo.toml
-        env:
-          SQLX_OFFLINE: "true"
 
       - name: Build pure core for WebAssembly
         run: cargo build -p ledger-core --target wasm32-unknown-unknown --manifest-path rust-api/Cargo.toml
 
+      # The server without its `native` feature is the code a Worker runs.
+      - name: Check the server for WebAssembly without native
+        run: cargo clippy -p counterpoise-rust-api --no-default-features --target wasm32-unknown-unknown --manifest-path rust-api/Cargo.toml -- -D warnings
+
       - name: Build Rust HTTP server and CLI for parity tests
         run: cargo build --locked -p counterpoise-rust-api -p ledger-cli --manifest-path rust-api/Cargo.toml
-        env:
-          SQLX_OFFLINE: "true"
 
       # The committed openapi.json must match the code.
       - name: Check openapi.json is current
         run: npm run openapi:check
-        env:
-          SQLX_OFFLINE: "true"
 
       - name: Build the browser WASM
         run: npm run core:wasm:build
@@ -88,12 +84,15 @@ jobs:
       - name: Run MCP tool suites over the Rust HTTP transport
         run: npm run test:mcp:http
 
-      - name: Run MCP tool suites over the Rust stdio transport
+      - name: Run the MCP stdio transport suites against the Rust server
         run: npm run test:mcp:stdio
 
-  lint-typecheck:
+  # Lint, types and the production build, in one job. The build runs with no
+  # database service on purpose: a page that queries the database at build
+  # time passes a build that has one, and fails `docker build`.
+  static-checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v7
@@ -103,13 +102,13 @@ jobs:
           node-version: 26
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
 
       - name: Install WASM build tools
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.128 --locked
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
           sudo apt-get update && sudo apt-get install -y binaryen
 
       - run: npm ci
@@ -121,32 +120,6 @@ jobs:
 
       - name: Type check
         run: npx tsc --noEmit
-
-  # The build runs with no database service on purpose. A page that queries the
-  # database at build time passes a build that has one, and fails `docker build`.
-  production-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 26
-          cache: npm
-
-      - uses: dtolnay/rust-toolchain@1.98.1
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Install WASM bindings generator
-        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
-
-      - name: Install WASM optimizer
-        run: sudo apt-get update && sudo apt-get install -y binaryen
-
-      - run: npm ci
 
       - name: Build the client (no database)
         run: npm run build
@@ -163,13 +136,13 @@ jobs:
           node-version: 26
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
 
       - name: Install WASM build tools
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.128 --locked
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
           sudo apt-get update && sudo apt-get install -y binaryen
 
       - run: npm ci
@@ -180,3 +153,16 @@ jobs:
 
       - name: Run unit and integration tests with coverage
         run: npm run test:coverage
+
+      # Coverage shows where no test runs, to help find a gap; it is not a
+      # gate and has no percentage to reach. The summary lists the files with
+      # the most lines that no test ran. The HTML report is the artifact.
+      - name: Write the coverage summary
+        run: node scripts/coverage-summary.mjs >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14

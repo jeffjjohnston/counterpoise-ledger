@@ -69,8 +69,8 @@ services:
       # guides/upgrade-to-sqlite.md. A new install creates it once with
       # `docker volume create counterpoise_data`.
       - data:/data
-      # Read-write: the hourly snapshots (counterpoise-*.db) and the job
-      # status records (status/). It must be writable by uid 1000.
+      # Read-write: the hourly snapshots (counterpoise-*.db). It must be
+      # writable by uid 1000.
       #
       # The override exists because the deploy runs Compose from a separate
       # build checkout, so `./backups` would resolve against THAT checkout —

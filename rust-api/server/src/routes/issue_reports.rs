@@ -1,5 +1,6 @@
 use crate::{
     error::{ApiError, ApiResult, error, internal_error},
+    platform,
     state::AppState,
     validation::parse_json_body,
 };
@@ -9,13 +10,13 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{NaiveDateTime, SecondsFormat, Utc};
+use chrono::{NaiveDateTime, SecondsFormat};
+use ledger_db::{Sql, store::params};
 use serde_json::{Value, json};
-use sqlx::FromRow;
 
 use crate::auth::session_user;
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct ReportRow {
     id: i32,
     user_id: i32,
@@ -91,10 +92,9 @@ pub(crate) async fn list_reports(State(state): State<AppState>, headers: HeaderM
     let sql = format!(
         "SELECT {COLUMNS} FROM issue_reports WHERE user_id = $1 ORDER BY created_at DESC, id DESC"
     );
-    let rows = sqlx::query_as::<_, ReportRow>(&sql)
-        .bind(user_id)
-        .fetch_all(&state.pool)
-        .await
+    let rows = state
+        .database
+        .query::<ReportRow>(&sql, &params![user_id])
         .map_err(|cause| internal_error(cause, "Failed to fetch issue reports"))?;
     Ok(Json(Value::Array(
         rows.into_iter().map(report_json).collect(),
@@ -114,14 +114,18 @@ pub(crate) async fn create_report(
     let sql = format!(
         "INSERT INTO issue_reports (user_id, description, type, page, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING {COLUMNS}"
     );
-    let row = sqlx::query_as::<_, ReportRow>(&sql)
-        .bind(user_id)
-        .bind(description)
-        .bind(&report_type)
-        .bind(&page)
-        .bind(Utc::now().naive_utc())
-        .fetch_one(&state.pool)
-        .await
+    let row = state
+        .database
+        .query_row::<ReportRow>(
+            &sql,
+            &params![
+                user_id,
+                description,
+                &report_type,
+                &page,
+                platform::timestamp()
+            ],
+        )
         .map_err(|cause| internal_error(cause, "Failed to create issue report"))?;
     state.analytics.capture_event(
         user_id,
@@ -172,14 +176,12 @@ pub(crate) async fn update_report(
     let sql = format!(
         "UPDATE issue_reports SET description = COALESCE($1, description), status = COALESCE($2, status), type = COALESCE($3, type) WHERE id = $4 AND user_id = $5 RETURNING {COLUMNS}"
     );
-    let row = sqlx::query_as::<_, ReportRow>(&sql)
-        .bind(description)
-        .bind(status)
-        .bind(report_type)
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await
+    let row = state
+        .database
+        .query_optional::<ReportRow>(
+            &sql,
+            &params![description, status, report_type, id, user_id],
+        )
         .map_err(|cause| internal_error(cause, "Failed to update issue report"))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Issue report not found"))?;
     Ok(Json(report_json(row)))
@@ -192,13 +194,14 @@ pub(crate) async fn delete_report(
 ) -> ApiResult {
     let user_id = session_user(&state, &headers, "Failed to delete issue report").await?;
     let id = report_id(&raw_id)?;
-    let result = sqlx::query("DELETE FROM issue_reports WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(user_id)
-        .execute(&state.pool)
-        .await
+    let result = state
+        .database
+        .execute(
+            "DELETE FROM issue_reports WHERE id = ?1 AND user_id = ?2",
+            &params![id, user_id],
+        )
         .map_err(|cause| internal_error(cause, "Failed to delete issue report"))?;
-    if result.rows_affected() == 0 {
+    if result == 0 {
         return Err(error(StatusCode::NOT_FOUND, "Issue report not found"));
     }
     Ok(Json(json!({ "success": true })))

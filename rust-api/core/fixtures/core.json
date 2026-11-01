@@ -40,6 +40,17 @@
       "expected": false
     },
     {
+      "name": "unbalancedCredit",
+      "op": "validateSplits",
+      "input": {
+        "amounts": [
+          -100,
+          99
+        ]
+      },
+      "expected": false
+    },
+    {
       "name": "fractional",
       "op": "validateSplits",
       "input": {

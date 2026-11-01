@@ -46,7 +46,7 @@ pub(crate) fn error_owned(status: StatusCode, message: String) -> ApiError {
     }
 }
 
-pub(crate) fn internal_error(cause: sqlx::Error, message: &'static str) -> ApiError {
+pub(crate) fn internal_error(cause: impl std::fmt::Display, message: &'static str) -> ApiError {
     tracing::error!(error = %cause, "Rust API database request failed");
     error(StatusCode::INTERNAL_SERVER_ERROR, message)
 }

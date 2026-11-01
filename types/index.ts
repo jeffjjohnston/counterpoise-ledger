@@ -230,3 +230,49 @@ export type PlaidLinkData = {
   categoryDetailed: string | null;
   rawJson: string;
 };
+
+export type WeeklyReviewKind = "check" | "insight";
+export type WeeklyReviewCategory =
+  | "duplicate" | "missed_payment" | "unusual_amount" | "price_change"
+  | "new_recurring" | "spending_change" | "other";
+
+export interface WeeklyReviewItem {
+  id: number;
+  kind: WeeklyReviewKind;
+  category: WeeklyReviewCategory;
+  title: string;
+  detail: string;
+  transactionIds: number[];
+  /** The register account of each transaction; null when it was deleted. */
+  transactions: Array<{ id: number; accountId: number | null }>;
+  recurringRuleId: number | null;
+  dismissedAt: string | null;
+}
+
+export interface WeeklyReview {
+  id: number;
+  source: "schedule" | "manual";
+  periodStart: string;
+  periodEnd: string;
+  status: "running" | "complete" | "failed";
+  summary: string | null;
+  error: string | null;
+  model: string | null;
+  startedAt: string;
+  completedAt: string | null;
+  items: WeeklyReviewItem[];
+}
+
+export interface WeeklyReviewState {
+  configured: boolean;
+  enabled: boolean;
+  latest: WeeklyReview | null;
+  running: Pick<WeeklyReview, "id" | "periodStart" | "periodEnd" | "startedAt"> | null;
+  lastFailure: Pick<WeeklyReview, "id" | "error" | "completedAt"> | null;
+}
+
+export interface WeeklyReviewSettings {
+  enabled: boolean;
+  revision: number;
+  configured: boolean;
+}

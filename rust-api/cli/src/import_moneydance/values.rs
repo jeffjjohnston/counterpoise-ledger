@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{NaiveDate, TimeZone};
 use ledger_core::js::{is_js_whitespace, parse_float, parse_int};
 use serde_json::{Map, Value};
 
@@ -121,7 +121,7 @@ pub fn timestamp_date(value: Option<&str>, today: NaiveDate) -> NaiveDate {
     if milliseconds.is_nan() || milliseconds.abs() > 8.64e15 {
         return today;
     }
-    Local
+    ledger_db::clock::zone()
         .timestamp_millis_opt(milliseconds as i64)
         .single()
         .map_or(today, |moment| moment.date_naive())

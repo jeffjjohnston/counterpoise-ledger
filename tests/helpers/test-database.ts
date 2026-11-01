@@ -43,15 +43,49 @@ export function runDirectory(runId: string): string {
   return join(TEST_DATABASE_ROOT, runId);
 }
 
-/** The database file of this Vitest worker in this run. */
-export function workerDatabasePath(env: Record<string, string | undefined> = process.env): string {
+/**
+ * The file of the Durable Object named `ledger` under `wrangler dev`, below
+ * its `--persist-to` directory. The name hashes the object's name with the
+ * Worker's name and class (`counterpoise`, `LedgerObject`), so it is fixed;
+ * the worker test server checks it after the first request.
+ */
+export const LEDGER_OBJECT_FILE = join(
+  "v3", "do", "counterpoise-LedgerObject",
+  "0cd1863effe9c9159484c2ff145c569f3a6d423d5ea910a440b3c4d21eb51958.sqlite"
+);
+
+/**
+ * The `--persist-to` directory of this Vitest worker's `wrangler dev`, when
+ * the HTTP suites run against the Worker (`COUNTERPOISE_HTTP_SERVER=worker`).
+ */
+export function workerPersistDirectory(env: Record<string, string | undefined> = process.env): string {
+  return join(runDirectory(runIdOf(env)), `worker-${workerIdOf(env)}`);
+}
+
+function runIdOf(env: Record<string, string | undefined>): string {
   const runId = env.COUNTERPOISE_TEST_RUN_ID;
   if (!runId) {
     throw new Error("COUNTERPOISE_TEST_RUN_ID is unset; vitest.config.ts generates one for each run");
   }
+  return runId;
+}
+
+function workerIdOf(env: Record<string, string | undefined>): string {
   const worker = env.VITEST_POOL_ID ?? env.VITEST_WORKER_ID ?? "0";
   if (!/^\d+$/.test(worker)) throw new Error("Test worker id must be a non-negative integer");
-  return join(runDirectory(runId), `worker-${worker}.db`);
+  return worker;
+}
+
+/**
+ * The database file of this Vitest worker in this run. Against the Worker it
+ * is the object's own file, so the tests and the object share it as the
+ * tests and the native server do.
+ */
+export function workerDatabasePath(env: Record<string, string | undefined> = process.env): string {
+  if (env.COUNTERPOISE_HTTP_SERVER === "worker") {
+    return join(workerPersistDirectory(env), LEDGER_OBJECT_FILE);
+  }
+  return join(runDirectory(runIdOf(env)), `worker-${workerIdOf(env)}.db`);
 }
 
 /** Refuses a destructive step on a file outside the test directory. */
@@ -65,19 +99,36 @@ export function assertTestDatabasePath(path: string): void {
 /** Deletes a test database file and its WAL and lock files. */
 export function removeDatabase(path: string): void {
   assertTestDatabasePath(path);
-  for (const suffix of ["", "-wal", "-shm", ".lock", ".locks"]) {
+  for (const suffix of ["", "-wal", "-shm", ".lock"]) {
     rmSync(`${path}${suffix}`, { force: true, recursive: true });
   }
 }
 
 export const LEDGER_CLI = resolve("rust-api/target/debug/ledger-cli");
 
-/** Runs `ledger-cli` on the database at `path`. Throws with its output when it fails. */
-export function ledgerCli(args: string[], path: string, env: Record<string, string> = {}): string {
-  const result = spawnSync(LEDGER_CLI, args, {
+/**
+ * Runs `ledger-cli` on the database at `path`. Throws with its output when it
+ * fails. `binary` is for the test of this message only.
+ */
+export function ledgerCli(
+  args: string[],
+  path: string,
+  env: Record<string, string> = {},
+  binary = LEDGER_CLI
+): string {
+  const result = spawnSync(binary, args, {
     encoding: "utf8",
     env: { ...process.env, DATABASE_PATH: path, DATABASE_URL: "", ...env },
   });
+  // A missing binary gives status null and the cause in result.error only.
+  if (result.error) {
+    const missing = (result.error as NodeJS.ErrnoException).code === "ENOENT";
+    throw new Error(
+      missing
+        ? `ledger-cli not found at ${binary}. Build it first: cargo build --manifest-path rust-api/Cargo.toml -p ledger-cli`
+        : `ledger-cli ${args.join(" ")} could not start: ${result.error.message}`
+    );
+  }
   if (result.status !== 0) {
     throw new Error(`ledger-cli ${args.join(" ")} failed (${result.status}):\n${result.stdout}\n${result.stderr}`);
   }

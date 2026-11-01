@@ -1,6 +1,7 @@
 //! The security tools.
 
 use axum::http::{Method, StatusCode};
+use ledger_db::store::{Sql, params};
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
 
@@ -97,7 +98,7 @@ pub(super) async fn delete(
     Ok(ok(&json!({ "success": true })))
 }
 
-fn db_error(cause: sqlx::Error) -> Box<CallToolResult> {
+fn db_error(cause: impl std::fmt::Display) -> Box<CallToolResult> {
     thrown(&cause.to_string()).into()
 }
 
@@ -143,18 +144,15 @@ pub(super) async fn detail(
     // The security route found it in this book, so both IDs fit in int4.
     let book = i32::try_from(book_id).map_err(|cause| thrown(&cause.to_string()))?;
     let security_key = i32::try_from(security_id).map_err(|cause| thrown(&cause.to_string()))?;
-    let pool = &caller.state().pool;
+    let pool = &*caller.state().database;
 
-    let prices: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT price_date, price_micros FROM security_prices WHERE security_id = $1
-         ORDER BY price_date DESC LIMIT COALESCE($2, -1) OFFSET COALESCE($3, 0)",
-    )
-    .bind(security_key)
-    .bind(price_limit)
-    .bind(price_offset)
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
+    let prices: Vec<(String, i64)> = pool
+        .query(
+            "SELECT price_date, price_micros FROM security_prices WHERE security_id = ?1
+         ORDER BY price_date DESC LIMIT COALESCE(?2, -1) OFFSET COALESCE(?3, 0)",
+            &params![security_key, price_limit, price_offset],
+        )
+        .map_err(db_error)?;
     let recent_prices: Vec<Value> = prices
         .into_iter()
         .map(|(date, price)| json!({ "date": date, "price": micros(price) }))
@@ -172,20 +170,21 @@ pub(super) async fn detail(
         Option<String>,
         i32,
     );
-    let splits: Vec<SplitRow> = sqlx::query_as(&format!(
-        "SELECT {EFFECTIVE_DATE} AS date, t.description, s.action, s.shares_micros,
+    let splits: Vec<SplitRow> = pool
+        .query(
+            &format!(
+                "SELECT {EFFECTIVE_DATE} AS date, t.description, s.action, s.shares_micros,
                 s.price_micros, s.fees_cents, s.split_numerator, s.split_denominator,
                 a.name, s.transaction_id
          FROM investment_splits s
          JOIN transactions t ON t.id = s.transaction_id
          LEFT JOIN accounts a ON a.id = s.account_id
-         WHERE s.security_id = $1
+         WHERE s.security_id = ?1
          ORDER BY {EFFECTIVE_DATE} DESC, s.id DESC"
-    ))
-    .bind(security_key)
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
+            ),
+            &params![security_key],
+        )
+        .map_err(db_error)?;
 
     let is_income = |action: &str| action == "dividend" || action == "capGain";
     let income_ids: Vec<i32> = splits
@@ -193,9 +192,7 @@ pub(super) async fn detail(
         .filter(|split| is_income(&split.2))
         .map(|split| split.9)
         .collect();
-    let cash = income_by_transaction(pool, &income_ids)
-        .await
-        .map_err(db_error)?;
+    let cash = income_by_transaction(pool, &income_ids).map_err(db_error)?;
     let transactions: Vec<Value> = splits
         .into_iter()
         .map(
@@ -264,18 +261,16 @@ pub(super) async fn detail(
     result.insert("recentPrices".to_owned(), Value::Array(recent_prices));
     result.insert("transactions".to_owned(), Value::Array(transactions));
     if include_lots {
-        let lots: Vec<(i32, i32, String, String, i64, i64)> = sqlx::query_as(
-            "SELECT l.id, l.account_id, a.name, l.acquired_date, l.remaining_shares_micros,
+        let lots: Vec<(i32, i32, String, String, i64, i64)> = pool
+            .query(
+                "SELECT l.id, l.account_id, a.name, l.acquired_date, l.remaining_shares_micros,
                     CAST(l.remaining_basis_cents AS bigint)
              FROM investment_lots l JOIN accounts a ON a.id = l.account_id
-             WHERE l.book_id = $1 AND l.security_id = $2 AND l.remaining_shares_micros > 0
+             WHERE l.book_id = ?1 AND l.security_id = ?2 AND l.remaining_shares_micros > 0
              ORDER BY l.acquired_date ASC, l.id ASC",
-        )
-        .bind(book)
-        .bind(security_key)
-        .fetch_all(pool)
-        .await
-        .map_err(db_error)?;
+                &params![book, security_key],
+            )
+            .map_err(db_error)?;
         let lots: Vec<Value> = lots
             .into_iter()
             .map(

@@ -103,16 +103,22 @@ describe("NetWorthCard", () => {
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 
-  it("hides the chart and the range group with Hide chart", async () => {
+  // The card owns the button, so the chart must be in the card. A chart next to the card stays on Hide chart.
+  it("hides the chart and the range group with Hide chart, and keeps the choice after a remount", async () => {
     vi.stubGlobal("fetch", respond(twoPoints));
-    render(<NetWorthCard bookId="1" />);
-    await screen.findByRole("img");
+    const { unmount } = render(<NetWorthCard bookId="1" />);
+    await screen.findByRole("img", { name: /^Net worth from/ });
     expect(screen.getByRole("group", { name: "Range" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Hide chart" }));
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
     expect(screen.queryByRole("group", { name: "Range" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Net worth" })).toBeInTheDocument();
     expect(localStorage.getItem("counterpoise.netWorthChart.hidden")).toBe("true");
+    unmount();
+    render(<NetWorthCard bookId="1" />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show chart" }));
+    expect(await screen.findByRole("img", { name: /^Net worth from/ })).toBeInTheDocument();
   });
 
   it("renders hidden and sends no request when the stored key is set", () => {

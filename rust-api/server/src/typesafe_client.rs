@@ -4,13 +4,13 @@
 //! Request bodies never enter logs.
 
 use crate::{
+    platform,
     typesafe::is_configured,
     typesafe_questions::TYPESAFE_MODEL,
     validation::{from_json_bytes, is_js_whitespace, js_number, js_stringify},
 };
-use reqwest::Client;
 use serde_json::{Map, Value, json};
-use std::{sync::OnceLock, time::Duration};
+use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -20,17 +20,6 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 pub(crate) struct Evaluated {
     pub(crate) answers: Map<String, Value>,
     pub(crate) usage: Option<Value>,
-}
-
-fn client() -> &'static Client {
-    static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        // `redirect: "error"`: a redirect is a network error.
-        Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("the TypeSafe HTTP client builds")
-    })
 }
 
 /// A finite number from 0 to 1, as `z.number().finite().min(0).max(1)`.
@@ -127,10 +116,10 @@ pub(crate) async fn evaluate(
     if !is_configured() {
         return Err("unavailable");
     }
-    let key = std::env::var("TYPESAFE_API_KEY").unwrap_or_default();
+    let key = ledger_db::env::var("TYPESAFE_API_KEY").unwrap_or_default();
     // TYPESAFE_API_URL replaces the origin. The HTTP parity tests point it at
     // a local mock, so no test calls TypeSafe.
-    let origin = std::env::var("TYPESAFE_API_URL")
+    let origin = ledger_db::env::var("TYPESAFE_API_URL")
         .ok()
         .filter(|origin| !origin.is_empty())
         .unwrap_or_else(|| "https://api.typesafe.ai".to_owned());
@@ -150,34 +139,34 @@ pub(crate) async fn evaluate(
             .collect::<Map<String, Value>>(),
     });
     // AbortSignal.timeout(5000) covers the request and the body.
-    let exchange = async {
-        let response = client()
-            .post(format!("{origin}/v1/systemone"))
-            .header(
-                "Authorization",
-                format!("Bearer {}", key.trim_matches(is_js_whitespace)),
-            )
-            .header("Content-Type", "application/json")
-            .body(js_stringify(&body))
-            .send()
-            .await
-            .map_err(|_| "network_error")?;
-        let status = response.status();
-        if status.is_redirection() {
+    // `redirect: "error"`: a redirect is a network error.
+    let authorization = format!("Bearer {}", key.trim_matches(is_js_whitespace));
+    let exchange = platform::outbound(async {
+        let answer = platform::post_without_redirects(
+            &format!("{origin}/v1/systemone"),
+            &[
+                ("Authorization", &authorization),
+                ("Content-Type", "application/json"),
+            ],
+            js_stringify(&body),
+        )
+        .await
+        .map_err(|_| "network_error")?;
+        if (300..400).contains(&answer.status) {
             return Err("network_error");
         }
-        if !status.is_success() {
-            return Err(if status.as_u16() == 429 {
+        if !(200..300).contains(&answer.status) {
+            return Err(if answer.status == 429 {
                 "rate_limited"
             } else {
                 "provider_error"
             });
         }
-        response.bytes().await.map_err(|_| "network_error")
-    };
-    let bytes = tokio::time::timeout(TIMEOUT, exchange)
+        Ok(answer.body)
+    });
+    let bytes = platform::timeout(TIMEOUT, exchange)
         .await
-        .map_err(|_| "timeout")??;
+        .ok_or("timeout")??;
     let parsed: Value = from_json_bytes(&bytes).map_err(|_| "invalid_response")?;
     let (answers, usage) = parse_response(&parsed).ok_or("invalid_response")?;
     let mut asked = Map::new();

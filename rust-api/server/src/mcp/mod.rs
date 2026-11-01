@@ -20,18 +20,16 @@
 //! stderr.
 
 mod call;
+mod http;
 mod tools;
 pub(crate) mod webmcp;
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, sync::OnceLock};
 
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, HeaderValue, Request, StatusCode, header, request::Parts},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use rmcp::{
@@ -41,9 +39,6 @@ use rmcp::{
         ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     },
     service::RequestContext,
-    transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
-    },
 };
 use serde_json::{Value, json};
 
@@ -55,6 +50,10 @@ use crate::{
 
 pub(crate) use call::Caller;
 pub(crate) use call::{in_oauth_tool_call, in_tool_call};
+pub(crate) use http::MAX_BODY_BYTES;
+
+/// The path of the MCP endpoint.
+pub(crate) const PATH: &str = "/api/mcp";
 
 /// The manifest's tools that have a Rust handler, and a validator for each
 /// input schema.
@@ -239,6 +238,26 @@ struct Handler {
 }
 
 impl Handler {
+    /// What `initialize` and `server/discover` describe: a server with tools.
+    fn info() -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new("counterpoise", env!("CARGO_PKG_VERSION")),
+        )
+    }
+
+    /// The `tools/list` result: every tool, in one page.
+    fn tools() -> ListToolsResult {
+        // Protocol 2026-07-28 requires ttlMs and cacheScope on a list result
+        // (SEP-2549). A client on that version, such as Claude Code, rejects
+        // the result without them. Older clients ignore the two fields. The
+        // list changes only with a deploy. It is private because the result
+        // goes to an authenticated caller. If resources or prompts are
+        // enabled, their list results need the same two fields.
+        ListToolsResult::with_all_items(registry().tools.clone())
+            .with_ttl_ms(TOOLS_TTL_MS)
+            .with_cache_scope(CacheScope::Private)
+    }
+
     async fn call(&self, request: CallToolRequestParams, headers: &HeaderMap) -> CallToolResult {
         // Over HTTP the bearer value may be an OAuth access token; the stdio
         // credential is always the key of the environment.
@@ -261,9 +280,7 @@ const TOOLS_TTL_MS: u64 = 300_000;
 
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            Implementation::new("counterpoise", env!("CARGO_PKG_VERSION")),
-        )
+        Self::info()
     }
 
     async fn list_tools(
@@ -271,29 +288,18 @@ impl ServerHandler for Handler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        // Protocol 2026-07-28 requires ttlMs and cacheScope on a list result
-        // (SEP-2549). A client on that version, such as Claude Code, rejects
-        // the result without them. Older clients ignore the two fields. The
-        // list changes only with a deploy. It is private because the result
-        // goes to an authenticated caller. If resources or prompts are
-        // enabled, their list results need the same two fields.
-        Ok(ListToolsResult::with_all_items(registry().tools.clone())
-            .with_ttl_ms(TOOLS_TTL_MS)
-            .with_cache_scope(CacheScope::Private))
+        Ok(Self::tools())
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if let Some(headers) = &self.credential {
-            return Ok(self.call(request, headers).await.into());
-        }
-        let Some(parts) = context.extensions.get::<Parts>() else {
-            return Ok(call::thrown("The request has no HTTP headers").into());
-        };
-        Ok(self.call(request, &parts.headers).await.into())
+        // rmcp serves stdio only, where the key of the environment is the
+        // credential. `http.rs` calls the tools over HTTP.
+        let headers = self.credential.clone().unwrap_or_default();
+        Ok(self.call(request, &headers).await.into())
     }
 }
 
@@ -369,7 +375,8 @@ fn is_cross_origin(headers: &HeaderMap) -> bool {
     }
 }
 
-/// `POST /api/mcp` and the other methods of the Streamable HTTP transport.
+/// `POST /api/mcp`, the Streamable HTTP transport (see `http.rs`). Other
+/// methods get 405 once the caller is authenticated.
 pub(crate) async fn http(State(state): State<AppState>, mut request: Request<Body>) -> Response {
     if is_cross_origin(request.headers()) {
         return (
@@ -395,23 +402,17 @@ pub(crate) async fn http(State(state): State<AppState>, mut request: Request<Bod
                 .into_response();
         }
     }
+    if request.method() != Method::POST {
+        return http::method_not_allowed();
+    }
     // The Origin check above guards against DNS rebinding. The Host header is
     // whatever name the reverse proxy serves, so no host list applies.
-    let config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(false)
-        .with_json_response(true)
-        .disable_allowed_hosts();
-    let service = StreamableHttpService::new(
-        move || {
-            Ok(Handler {
-                state: state.clone(),
-                credential: None,
-            })
-        },
-        Arc::new(NeverSessionManager::default()),
-        config,
-    );
-    service.handle(request).await.map(Body::new)
+    let (parts, body) = request.into_parts();
+    let handler = Handler {
+        state,
+        credential: None,
+    };
+    http::post(&handler, &parts.headers, body).await
 }
 
 /// The bearer header for a key, or no header when the key is missing or
@@ -431,6 +432,7 @@ fn key_headers(key: Option<&str>) -> HeaderMap {
 /// `counterpoise-rust-api mcp`: serves the tools over stdio until the client
 /// closes stdin. A missing or unknown key does not stop the server: each tool
 /// then answers with the auth error, as the TypeScript server did.
+#[cfg(feature = "native")]
 pub(crate) async fn stdio(
     state: AppState,
     key: Option<&str>,

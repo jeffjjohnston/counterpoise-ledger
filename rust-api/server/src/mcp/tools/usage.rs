@@ -1,7 +1,8 @@
 //! The usage tool. It has no route: it queries the
 //! PostHog project of this server.
 
-use chrono::{Duration, Utc};
+use crate::platform;
+use chrono::Duration;
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
 
@@ -75,7 +76,7 @@ pub(super) async fn analyze(
     // The schema default is 7. The JSON Schema validator does not apply it.
     let days = arguments.get("days").and_then(Value::as_f64).unwrap_or(7.0);
     let lookback = days.floor().clamp(1.0, 90.0) as i64;
-    let after = (Utc::now() - Duration::milliseconds(lookback * 86_400_000))
+    let after = (platform::now() - Duration::milliseconds(lookback * 86_400_000))
         .format("%Y-%m-%d")
         .to_string();
 

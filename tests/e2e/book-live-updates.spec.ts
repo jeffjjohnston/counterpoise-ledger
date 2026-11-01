@@ -2,21 +2,22 @@ import { test, expect } from "./fixtures";
 import { exec, row, transaction } from "../helpers/sql";
 import { toDateString } from "../../lib/formatters";
 
-// Observe actual browser EventSource delivery, including reconnect, without
-// replacing its network behavior. The writer below is outside the browser.
-test("external commits refresh the register and badge, defer edits, and recover a listener disconnect", async ({ page, bookId }) => {
+// Observe actual browser WebSocket delivery without replacing its network
+// behavior. The writer below is outside the browser.
+test("external commits refresh the register and badge, defer edits, and keep one socket", async ({ page, bookId }) => {
   await page.addInitScript(() => {
-    const Native = window.EventSource;
-    const counts = { ready: 0, reset: 0, change: 0, error: 0, connections: 0 };
+    const Native = window.WebSocket;
+    const counts = { ready: 0, change: 0, close: 0, connections: 0 };
     Object.assign(window, { bookEventCounts: counts });
-    window.EventSource = class extends Native {
-      constructor(url: string | URL, options?: EventSourceInit) {
-        super(url, options);
+    window.WebSocket = class extends Native {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols);
         counts.connections++;
-        this.addEventListener("ready", () => counts.ready++);
-        this.addEventListener("change", () => counts.change++);
-        this.addEventListener("reset", () => counts.reset++);
-        this.addEventListener("error", () => counts.error++);
+        this.addEventListener("message", (event) => {
+          const type = (JSON.parse(String(event.data)) as { type: string }).type;
+          if (type === "ready" || type === "change") counts[type]++;
+        });
+        this.addEventListener("close", () => counts.close++);
       }
     };
   });
@@ -81,9 +82,8 @@ test("external commits refresh the register and badge, defer edits, and recover 
   await exec(`update transactions set description = 'Changed by another writer', check_number = 'Changed by another writer'
     where id = $1 and book_id = $2`, [txn.id, bookId]);
   await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").filter({ hasText: "Changed by another writer" })).toBeVisible();
-  // One stream serves the whole test, and the proxy must not cut it: a
-  // timeout on the proxied body once did.
-  expect(await page.evaluate(() => (window as unknown as { bookEventCounts: { connections: number; error: number } }).bookEventCounts))
-    .toMatchObject({ connections: 1, error: 0 });
+  // One socket serves the whole test.
+  expect(await page.evaluate(() => (window as unknown as { bookEventCounts: { connections: number; close: number } }).bookEventCounts))
+    .toMatchObject({ connections: 1, close: 0 });
   await page.screenshot({ path: "test-results/book-live-updates.png" });
 });

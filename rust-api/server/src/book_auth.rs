@@ -55,6 +55,10 @@ use crate::{
     validation::{database_integer, parse_int_prefix},
 };
 use axum::http::{HeaderMap, StatusCode};
+use ledger_db::{
+    Sql,
+    store::{self, params},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BookRole {
@@ -133,15 +137,14 @@ pub(crate) async fn authenticate_book_membership(
     level: AccessLevel,
     failure_message: &'static str,
 ) -> Result<AuthenticatedBook, ApiError> {
-    let membership: Option<String> = sqlx::query_scalar(
-        "SELECT bm.role FROM books b JOIN book_members bm ON bm.book_id = b.id
-         WHERE b.id = $1 AND bm.user_id = $2",
-    )
-    .bind(book_id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, failure_message))?;
+    let membership: Option<String> = state
+        .database
+        .query_optional(
+            "SELECT bm.role FROM books b JOIN book_members bm ON bm.book_id = b.id
+         WHERE b.id = ?1 AND bm.user_id = ?2",
+            &params![book_id, user_id],
+        )
+        .map_err(|cause| internal_error(cause, failure_message))?;
     let role = match membership {
         None => None,
         Some(role) => Some(
@@ -159,11 +162,46 @@ pub(crate) async fn authenticate_book_membership(
     }
 }
 
+/// The member row of a user in a book, with no level check.
+pub(crate) enum Membership {
+    /// The user is not a member of the book.
+    None,
+    /// A stored role that this server does not know.
+    UnknownRole(String),
+    Member(AuthenticatedBook),
+}
+
+/// The membership of `user_id` in `book_id`. The MCP gate
+/// (`mcp::call::Caller::book`) uses this and then checks the level itself,
+/// because its refusals are tool errors, not HTTP responses.
+pub(crate) fn book_membership(
+    sql: &impl Sql,
+    user_id: i32,
+    book_id: i32,
+) -> Result<Membership, store::Error> {
+    let role: Option<String> = sql.query_optional(
+        "SELECT role FROM book_members WHERE book_id = ?1 AND user_id = ?2",
+        &params![book_id, user_id],
+    )?;
+    Ok(match role {
+        None => Membership::None,
+        Some(role) => match BookRole::from_database(&role) {
+            Some(role) => Membership::Member(AuthenticatedBook {
+                book_id,
+                user_id,
+                role,
+            }),
+            None => Membership::UnknownRole(role),
+        },
+    })
+}
+
 /// Carries the identity and role a write handler needs for auditing and
 /// analytics without a second authentication query.
 ///
 /// The fields are private. Only this module makes the value, so a value
-/// is proof that `authenticate_book` accepted the caller in this book.
+/// is proof that `authenticate_book` or `book_membership` found the caller
+/// as a member of this book with this role.
 #[derive(Debug)]
 pub(crate) struct AuthenticatedBook {
     book_id: i32,

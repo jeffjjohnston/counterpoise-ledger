@@ -40,6 +40,7 @@ const OWNER_ROUTES = new Set([
   "PUT /api/b/[bookId]/sync/tokens/[id]",
   "DELETE /api/b/[bookId]/sync/tokens/[id]",
   "PUT /api/b/[bookId]/sync/tokens/[id]/accounts",
+  "POST /api/b/[bookId]/sync/tokens/[id]/accounts/refresh",
   "POST /api/b/[bookId]/sync/link-sessions",
   "POST /api/b/[bookId]/sync/link-sessions/[id]/check",
 ]);

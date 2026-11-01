@@ -5,6 +5,7 @@ use chrono::{Days, NaiveDate};
 
 use super::window::format_date;
 use super::{SeedError, SeedResult, Seeder};
+use crate::store::{Sql, params};
 
 /// A Plaid row that matches no transaction in the book.
 pub(super) struct Unmatched {
@@ -57,8 +58,8 @@ struct Reconciliation {
 /// A demo Plaid connection on the card of `demo`, with reconciliation rows
 /// that the Sync page shows: two strong matches, a weak match, two rows with
 /// no match, and one row to review.
-pub(super) async fn seed_plaid(
-    seeder: &mut Seeder<'_>,
+pub(super) fn seed_plaid(
+    seeder: &mut Seeder<'_, impl Sql>,
     demo: &PlaidDemo,
     today: NaiveDate,
 ) -> SeedResult<()> {
@@ -66,62 +67,61 @@ pub(super) async fn seed_plaid(
     let book_id = seeder.book_id;
 
     // The transaction ID breaks a tie between two charges on one date.
-    let recent: Vec<CardCharge> = sqlx::query_as::<_, (String, Option<String>, i32)>(
-        "SELECT t.date, t.description, s.amount
+    let recent: Vec<CardCharge> = seeder
+        .sql
+        .query::<(String, Option<String>, i32)>(
+            "SELECT t.date, t.description, s.amount
          FROM transactions t
          JOIN transaction_splits s ON s.transaction_id = t.id
-         WHERE s.account_id = $1 AND t.book_id = $2 AND s.amount < 0
+         WHERE s.account_id = ?1 AND t.book_id = ?2 AND s.amount < 0
          ORDER BY t.date DESC, t.id DESC
          LIMIT 5",
-    )
-    .bind(demo.card)
-    .bind(book_id)
-    .fetch_all(&mut *seeder.connection)
-    .await?
-    .into_iter()
-    .map(|(date, description, amount)| CardCharge {
-        date,
-        description,
-        amount,
-    })
-    .collect();
+            &params![demo.card, book_id],
+        )?
+        .into_iter()
+        .map(|(date, description, amount)| CardCharge {
+            date,
+            description,
+            amount,
+        })
+        .collect();
 
     // plaid_tokens.item_id and plaid_accounts.plaid_account_id are unique in
     // the whole table, as real Plaid IDs are. The book ID in each value lets
     // one database hold more than one seeded book.
-    let token_id: i32 = sqlx::query_scalar(
+    let token_id: i32 = seeder.sql.query_row(
         "INSERT INTO plaid_tokens
            (book_id, financial_institution, item_id, access_token, is_demo, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, true, $5, $5)
+         VALUES (?1, ?2, ?3, ?4, true, ?5, ?5)
          RETURNING id",
-    )
-    .bind(book_id)
-    .bind(demo.institution)
-    .bind(format!("demo_item_{}_{book_id}", demo.slug))
-    .bind(format!("demo_access_token_{}_{book_id}", demo.slug))
-    .bind(seeder.now)
-    .fetch_one(&mut *seeder.connection)
-    .await?;
+        &params![
+            book_id,
+            demo.institution,
+            format!("demo_item_{}_{book_id}", demo.slug),
+            format!("demo_access_token_{}_{book_id}", demo.slug),
+            seeder.now
+        ],
+    )?;
     // is_demo keeps the scheduled sync away from this connection. Plaid can
     // only refuse its token.
 
-    let link_id: i32 = sqlx::query_scalar(
+    let link_id: i32 = seeder.sql.query_row(
         "INSERT INTO plaid_accounts
            (book_id, token_id, plaid_account_id, name, official_name, mask, type, subtype,
             counterpoise_account_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'credit', 'credit card', $7, $8, $8)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'credit', 'credit card', ?7, ?8, ?8)
          RETURNING id",
-    )
-    .bind(book_id)
-    .bind(token_id)
-    .bind(format!("demo_acct_{}_{book_id}", demo.account_slug))
-    .bind(demo.account_name)
-    .bind(demo.official_name)
-    .bind(demo.mask)
-    .bind(demo.card)
-    .bind(seeder.now)
-    .fetch_one(&mut *seeder.connection)
-    .await?;
+        &params![
+            book_id,
+            token_id,
+            format!("demo_acct_{}_{book_id}", demo.account_slug),
+            demo.account_name,
+            demo.official_name,
+            demo.mask,
+            demo.card,
+            seeder.now
+        ],
+    )?;
 
     // Plaid gives a charge as a positive amount.
     let mut items = Vec::new();
@@ -192,30 +192,31 @@ pub(super) async fn seed_plaid(
     }
 
     for item in &items {
-        sqlx::query(
+        seeder.sql.execute(
             "INSERT INTO plaid_transaction_reconciliation
                (book_id, plaid_account_link_id, plaid_transaction_id, date, authorized_date,
                 amount_cents, name, merchant_name, original_description, pending, raw_json,
                 resolution_status, review_reason, first_seen_at, last_seen_at, created_at,
-                updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, '{}', 'pending', $10,
-                     $11, $11, $11, $11)",
-        )
-        .bind(book_id)
-        .bind(link_id)
-        .bind(item.transaction_id)
-        .bind(&item.date)
-        .bind(&item.authorized_date)
-        .bind(i32::try_from(item.amount_cents).map_err(|_| {
-            SeedError::Invalid(format!("Plaid amount too large: {}", item.amount_cents))
-        })?)
-        .bind(&item.name)
-        .bind(&item.merchant_name)
-        .bind(&item.original_description)
-        .bind(item.review_reason)
-        .bind(seeder.now)
-        .execute(&mut *seeder.connection)
-        .await?;
+                updated_at, merchant_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, false, '{}', 'pending', ?10,
+                     ?11, ?11, ?11, ?11, ?12)",
+            &params![
+                book_id,
+                link_id,
+                item.transaction_id,
+                &item.date,
+                &item.authorized_date,
+                i32::try_from(item.amount_cents).map_err(|_| {
+                    SeedError::Invalid(format!("Plaid amount too large: {}", item.amount_cents))
+                })?,
+                &item.name,
+                &item.merchant_name,
+                &item.original_description,
+                item.review_reason,
+                seeder.now,
+                crate::folds::merchant_key(item.merchant_name.as_deref(), &item.name,)
+            ],
+        )?;
     }
     (seeder.log)(&format!("  Plaid reconciliation items: {}", items.len()));
     Ok(())

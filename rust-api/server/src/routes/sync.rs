@@ -1,9 +1,13 @@
 //! Plaid connections, account mappings, and the sync read routes.
 
 use crate::{
-    book_auth::{AccessLevel, BookRole, authenticate_book},
+    book_auth::{AccessLevel, authenticate_book},
+    book_scope::{BookAccess, Owner},
+    db_scope::{write_transaction, write_transaction_or},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
-    plaid::is_configuration_error,
+    plaid::{Plaid, is_configuration_error},
+    plaid_token_keys::key_failure,
+    platform,
     routes::plaid_sync::database_failure,
     routes::transactions::{AccountRow, now_millis, serialize_timestamp},
     state::AppState,
@@ -19,13 +23,11 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{Days, Local, NaiveDateTime, SecondsFormat};
-use ledger_db::engine::Db;
+use chrono::{Days, NaiveDateTime, SecondsFormat};
 use ledger_db::sql;
+use ledger_db::{Sql, store::params};
 use serde::Serialize;
 use serde_json::{Map, Value, json, to_value};
-use sqlx::FromRow;
-use sqlx::QueryBuilder;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) fn bad_request(message: &'static str) -> ApiError {
@@ -73,19 +75,19 @@ pub(crate) async fn pending_count(
         "Failed to fetch pending count",
     )
     .await?;
-    let count: i32 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS integer)
+    let count: i32 = state
+        .database
+        .query_row(
+            "SELECT CAST(COUNT(*) AS integer)
          FROM plaid_transaction_reconciliation r
          JOIN plaid_accounts a ON a.id = r.plaid_account_link_id
-         WHERE r.book_id = $1
+         WHERE r.book_id = ?1
            AND a.counterpoise_account_id IS NOT NULL
            AND ((r.resolution_status = 'pending' AND r.review_reason IS NULL)
                 OR r.review_reason IS NOT NULL)",
-    )
-    .bind(book.book_id())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, "Failed to fetch pending count"))?;
+            &params![book.book_id()],
+        )
+        .map_err(|cause| internal_error(cause, "Failed to fetch pending count"))?;
     Ok(Json(json!({ "count": count })))
 }
 
@@ -99,18 +101,29 @@ pub(crate) const DUPLICATE_ITEM: &str = "A token with this itemId already exists
 const CREATE_TOKEN_REQUIRED: &str = "financialInstitution, itemId, and accessToken are required";
 const UPDATE_TOKEN_REQUIRED: &str = "financialInstitution and itemId are required";
 
-const TOKEN_COLUMNS: &str =
-    "id, financial_institution, item_id, access_token, created_at, updated_at, is_demo";
+const TOKEN_COLUMNS: &str = "id, financial_institution, item_id, access_token, access_token_key, created_at, updated_at, is_demo";
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct TokenRow {
     id: i32,
     financial_institution: String,
     item_id: String,
+    /// The stored text: ciphertext, or plaintext when `access_token_key` is
+    /// null (`plaid_token_keys.rs`). Read it with [`TokenRow::access_token`].
     access_token: String,
+    access_token_key: Option<String>,
     created_at: NaiveDateTime,
     updated_at: NaiveDateTime,
     is_demo: bool,
+}
+
+impl TokenRow {
+    /// The plaintext access token.
+    fn access_token(&self, plaid: &Plaid) -> Result<String, ApiError> {
+        plaid
+            .open_token(&self.access_token, self.access_token_key.as_deref())
+            .map_err(key_failure)
+    }
 }
 
 /// `maskAccessToken`: the first and last four characters, with at least
@@ -127,7 +140,7 @@ fn mask_access_token(token: &str) -> String {
 }
 
 /// `toTokenListItem`: never the access token itself.
-fn token_item(row: &TokenRow) -> Map<String, Value> {
+fn token_item(plaid: &Plaid, row: &TokenRow) -> Result<Map<String, Value>, ApiError> {
     let mut item = Map::new();
     item.insert("id".into(), json!(row.id));
     item.insert(
@@ -137,14 +150,14 @@ fn token_item(row: &TokenRow) -> Map<String, Value> {
     item.insert("itemId".into(), json!(row.item_id));
     item.insert(
         "accessTokenMasked".into(),
-        json!(mask_access_token(&row.access_token)),
+        json!(mask_access_token(&row.access_token(plaid)?)),
     );
     item.insert("createdAt".into(), json!(iso_timestamp(row.created_at)));
     item.insert("updatedAt".into(), json!(iso_timestamp(row.updated_at)));
     // A demo connection has no Plaid Item, so the client does not offer
     // Reconnect for it (POST sync/link-sessions refuses it).
     item.insert("isDemo".into(), json!(row.is_demo));
-    item
+    Ok(item)
 }
 
 /// `z.string().trim().min(1)` with one message for every failure. The body
@@ -167,38 +180,35 @@ pub(crate) async fn list_tokens(
     const FAILURE: &str = "Failed to fetch sync tokens";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
-    let tokens: Vec<TokenRow> = sqlx::query_as(&format!(
-        "SELECT {TOKEN_COLUMNS} FROM plaid_tokens WHERE book_id = $1
+    let tokens: Vec<TokenRow> = state
+        .database
+        .query(
+            &format!(
+                "SELECT {TOKEN_COLUMNS} FROM plaid_tokens WHERE book_id = ?1
          ORDER BY financial_institution, item_id"
-    ))
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+            ),
+            &params![book.book_id()],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     // COUNT(column) counts the values that are not null, which is the
     // number of accounts that are mapped.
-    let counts: Vec<(i32, i32, i32)> = sqlx::query_as(
-        "SELECT token_id, CAST(COUNT(*) AS integer), CAST(COUNT(counterpoise_account_id) AS integer)
-         FROM plaid_accounts WHERE book_id = $1 GROUP BY token_id",
-    )
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
+    let counts: Vec<(i32, i32, i32)> = state.database.query("SELECT token_id, CAST(COUNT(*) AS integer), CAST(COUNT(counterpoise_account_id) AS integer)
+         FROM plaid_accounts WHERE book_id = ?1 GROUP BY token_id",&params![book.book_id()])
     .map_err(|cause| internal_error(cause, FAILURE))?;
     let counts: HashMap<i32, (i32, i32)> = counts
         .into_iter()
         .map(|(token_id, total, mapped)| (token_id, (total, mapped)))
         .collect();
-    let items: Vec<Value> = tokens
+    let items = tokens
         .iter()
         .map(|token| {
             let (total, mapped) = counts.get(&token.id).copied().unwrap_or_default();
-            let mut item = token_item(token);
+            let mut item = token_item(&state.plaid, token)?;
             item.insert("totalAccountCount".into(), json!(total));
             item.insert("mappedAccountCount".into(), json!(mapped));
-            Value::Object(item)
+            Ok(Value::Object(item))
         })
-        .collect();
+        .collect::<Result<Vec<Value>, ApiError>>()?;
     Ok(Json(Value::Array(items)))
 }
 
@@ -218,31 +228,25 @@ pub(crate) async fn create_token(
 
     // Item IDs are unique across the installation. This check covers the
     // book; a duplicate in another book fails the insert with the 500.
-    let duplicate: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE book_id = $1 AND item_id = $2)",
-    )
-    .bind(book.book_id())
-    .bind(&item_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+    let duplicate: bool = state
+        .database
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE book_id = ?1 AND item_id = ?2)",
+            &params![book.book_id(), &item_id],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if duplicate {
         return Err(error(StatusCode::CONFLICT, DUPLICATE_ITEM));
     }
+    let sealed = state.plaid.seal_token(&access_token).map_err(key_failure)?;
     let now = now_millis();
-    let token: TokenRow = sqlx::query_as(&format!(
-        "INSERT INTO plaid_tokens (financial_institution, item_id, access_token, book_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $5) RETURNING {TOKEN_COLUMNS}"
-    ))
-    .bind(&institution)
-    .bind(&item_id)
-    .bind(&access_token)
-    .bind(book.book_id())
-    .bind(now)
-    .fetch_one(&state.pool)
-    .await
+    let token: TokenRow = state.database.query_row(&format!(
+        "INSERT INTO plaid_tokens
+           (financial_institution, item_id, access_token, access_token_key, book_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) RETURNING {TOKEN_COLUMNS}"
+    ), &params![&institution, &item_id, &sealed.text, &sealed.key_id, book.book_id(), now])
     .map_err(|cause| internal_error(cause, FAILURE))?;
-    Ok(Json(Value::Object(token_item(&token))))
+    Ok(Json(Value::Object(token_item(&state.plaid, &token)?)))
 }
 
 /// The connection with this ID in this book, if there is one.
@@ -252,14 +256,13 @@ async fn token_in_book(
     token_id: i32,
     failure_message: &'static str,
 ) -> Result<Option<TokenRow>, ApiError> {
-    sqlx::query_as(&format!(
-        "SELECT {TOKEN_COLUMNS} FROM plaid_tokens WHERE id = $1 AND book_id = $2"
-    ))
-    .bind(token_id)
-    .bind(book_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, failure_message))
+    state
+        .database
+        .query_optional(
+            &format!("SELECT {TOKEN_COLUMNS} FROM plaid_tokens WHERE id = ?1 AND book_id = ?2"),
+            &params![token_id, book_id],
+        )
+        .map_err(|cause| internal_error(cause, failure_message))
 }
 
 pub(crate) async fn update_token(
@@ -290,33 +293,38 @@ pub(crate) async fn update_token(
     {
         return Err(error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND));
     }
-    let duplicate: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE book_id = $1 AND item_id = $2 AND id <> $3)",
-    )
-    .bind(book.book_id())
-    .bind(&item_id)
-    .bind(token_id)
-    .fetch_one(&state.pool)
-    .await
+    let duplicate: bool = state.database.query_row("SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE book_id = ?1 AND item_id = ?2 AND id <> ?3)",&params![book.book_id(), &item_id, token_id])
     .map_err(|cause| internal_error(cause, FAILURE))?;
     if duplicate {
         return Err(error(StatusCode::CONFLICT, DUPLICATE_ITEM));
     }
-    let token: TokenRow = sqlx::query_as(&format!(
-        "UPDATE plaid_tokens SET financial_institution = $1, item_id = $2,
-                access_token = COALESCE($3, access_token), updated_at = $4
-         WHERE id = $5 AND book_id = $6 RETURNING {TOKEN_COLUMNS}"
-    ))
-    .bind(&institution)
-    .bind(&item_id)
-    .bind(access_token)
-    .bind(now_millis())
-    .bind(token_id)
-    .bind(book.book_id())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
-    Ok(Json(Value::Object(token_item(&token))))
+    let sealed = access_token
+        .map(|token| state.plaid.seal_token(token))
+        .transpose()
+        .map_err(key_failure)?;
+    let (sealed_text, sealed_key) = sealed.map(|sealed| (sealed.text, sealed.key_id)).unzip();
+    let token: TokenRow = state
+        .database
+        .query_row(
+            &format!(
+                "UPDATE plaid_tokens SET financial_institution = ?1, item_id = ?2,
+                access_token = COALESCE(?3, access_token),
+                access_token_key = CASE WHEN ?3 IS NULL THEN access_token_key ELSE ?7 END,
+                updated_at = ?4
+         WHERE id = ?5 AND book_id = ?6 RETURNING {TOKEN_COLUMNS}"
+            ),
+            &params![
+                &institution,
+                &item_id,
+                sealed_text,
+                now_millis(),
+                token_id,
+                book.book_id(),
+                sealed_key
+            ],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
+    Ok(Json(Value::Object(token_item(&state.plaid, &token)?)))
 }
 
 /// Deletes a connection. The foreign keys cascade to its account mappings
@@ -330,13 +338,13 @@ pub(crate) async fn delete_token(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Owner, FAILURE).await?;
     let token_id = database_id(finite_path_id(&raw_id, INVALID_TOKEN_ID)?, FAILURE)?;
-    let deleted: Option<i32> =
-        sqlx::query_scalar("DELETE FROM plaid_tokens WHERE id = $1 AND book_id = $2 RETURNING id")
-            .bind(token_id)
-            .bind(book.book_id())
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
+    let deleted: Option<i32> = state
+        .database
+        .query_optional(
+            "DELETE FROM plaid_tokens WHERE id = ?1 AND book_id = ?2 RETURNING id",
+            &params![token_id, book.book_id()],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if deleted.is_none() {
         return Err(error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND));
     }
@@ -362,30 +370,26 @@ pub(crate) async fn clear_sync_data(
     {
         return Err(error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND));
     }
-    let database = |cause| internal_error(cause, FAILURE);
-    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
-        .await
+    fn database(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
+    write_transaction(&state.database, FAILURE, |tx| {
+        tx.execute(
+            "DELETE FROM plaid_transaction_reconciliation
+             WHERE resolution_status = 'pending'
+               AND plaid_account_link_id IN (SELECT id FROM plaid_accounts WHERE token_id = ?1)",
+            &params![token_id],
+        )
         .map_err(database)?;
-    sqlx::query(
-        "DELETE FROM plaid_transaction_reconciliation
-         WHERE resolution_status = 'pending'
-           AND plaid_account_link_id IN (SELECT id FROM plaid_accounts WHERE token_id = $1)",
-    )
-    .bind(token_id)
-    .execute(transaction.as_mut())
-    .await
-    .map_err(database)?;
-    sqlx::query(
-        "UPDATE plaid_tokens SET sync_cursor = NULL, last_synced_at = NULL, last_error = NULL,
-                updated_at = $2
-         WHERE id = $1",
-    )
-    .bind(token_id)
-    .bind(now_millis())
-    .execute(transaction.as_mut())
-    .await
-    .map_err(database)?;
-    transaction.commit().await.map_err(database)?;
+        tx.execute(
+            "UPDATE plaid_tokens SET sync_cursor = NULL, last_synced_at = NULL, last_error = NULL,
+                    updated_at = ?2
+             WHERE id = ?1",
+            &params![token_id, now_millis()],
+        )
+        .map_err(database)?;
+        Ok(())
+    })?;
     Ok(Json(json!({ "success": true })))
 }
 
@@ -403,7 +407,7 @@ const DUPLICATE_COUNTERPOISE_ACCOUNT_ID: &str =
 const ONLY_ASSET_OR_LIABILITY: &str =
     "Only asset or liability Counterpoise accounts can be synchronized with Plaid";
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlaidAccountRow {
     plaid_account_id: String,
@@ -421,15 +425,15 @@ async fn token_accounts(
     token_id: i32,
     failure_message: &'static str,
 ) -> Result<Vec<PlaidAccountRow>, ApiError> {
-    sqlx::query_as(
-        "SELECT plaid_account_id, name, official_name, mask, type AS account_type, subtype,
+    state
+        .database
+        .query(
+            "SELECT plaid_account_id, name, official_name, mask, type AS account_type, subtype,
                 counterpoise_account_id
-         FROM plaid_accounts WHERE token_id = $1 ORDER BY name, plaid_account_id",
-    )
-    .bind(token_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, failure_message))
+         FROM plaid_accounts WHERE token_id = ?1 ORDER BY name, plaid_account_id",
+            &params![token_id],
+        )
+        .map_err(|cause| internal_error(cause, failure_message))
 }
 
 /// A field of a Plaid account as Node binds it to a text column: a string
@@ -450,11 +454,12 @@ fn plaid_text(account: &Value, key: &str) -> Option<String> {
 /// must keep the account links and their history.
 pub(crate) async fn refresh_accounts(
     state: &AppState,
-    book_id: i32,
+    access: &BookAccess<'_, Owner>,
     token_id: i32,
     access_token: &str,
     prune: bool,
 ) -> Result<(), String> {
+    let book_id = access.book_id();
     let accounts = state.plaid.fetch_accounts(access_token).await?;
     if accounts.iter().any(Value::is_null) {
         return Err("Cannot read properties of null (reading 'account_id')".to_owned());
@@ -467,83 +472,98 @@ pub(crate) async fn refresh_accounts(
     };
     let incoming_ids = column("account_id");
     let now = now_millis();
-    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
-        .await
-        .map_err(database_failure)?;
-    if !accounts.is_empty() {
-        let columns = [
-            column("name"),
-            column("official_name"),
-            column("mask"),
-            column("type"),
-            column("subtype"),
-        ];
-        let mut insert = QueryBuilder::<Db>::new(
+    state
+        .database
+        .transaction(|tx| {
+            if !accounts.is_empty() {
+                let columns = [
+                    column("name"),
+                    column("official_name"),
+                    column("mask"),
+                    column("type"),
+                    column("subtype"),
+                ];
+                let rows: Vec<Vec<&Option<String>>> = incoming_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| {
+                        std::iter::once(id)
+                            .chain(columns.iter().map(|values| &values[index]))
+                            .collect()
+                    })
+                    .collect();
+                tx.execute(
+                    &format!(
             "INSERT INTO plaid_accounts (book_id, token_id, plaid_account_id, name, official_name,
-                                         mask, type, subtype, created_at, updated_at) ",
-        );
-        insert.push_values(incoming_ids.iter().enumerate(), |mut row, (index, id)| {
-            row.push_bind(book_id)
-                .push_bind(token_id)
-                .push_bind(id.clone());
-            for values in &columns {
-                row.push_bind(values[index].clone());
-            }
-            row.push_bind(now).push_bind(now);
-        });
-        insert.push(
-            " ON CONFLICT (plaid_account_id) DO UPDATE SET
+                                         mask, type, subtype, created_at, updated_at)
+             {}
+             ON CONFLICT (plaid_account_id) DO UPDATE SET
                token_id = excluded.token_id, name = excluded.name,
                official_name = excluded.official_name, mask = excluded.mask,
                type = excluded.type, subtype = excluded.subtype,
                updated_at = excluded.updated_at",
-        );
-        insert
-            .build()
-            .execute(transaction.as_mut())
-            .await
-            .map_err(database_failure)?;
-    }
-    if prune {
-        // `NOT IN` a list that holds a null matches no row, as `<> ALL` does.
-        sqlx::query(&format!(
-            "DELETE FROM plaid_accounts WHERE token_id = $1 AND plaid_account_id NOT {}",
-            sql::in_texts("$2")
-        ))
-        .bind(token_id)
-        .bind(sql::json_array(&incoming_ids))
-        .execute(transaction.as_mut())
-        .await
-        .map_err(database_failure)?;
-    }
-    transaction.commit().await.map_err(database_failure)
+            sql::json_rows(
+                &["?1", "?2", "#0", "#1", "#2", "#3", "#4", "#5", "?3", "?3"],
+                "?4"
+            )
+        ),
+                    &params![book_id, token_id, now, sql::json_array(&rows)],
+                )?;
+            }
+            if prune {
+                // `NOT IN` a list that holds a null matches no row, as `<> ALL` does.
+                tx.execute(&format!(
+            "DELETE FROM plaid_accounts WHERE token_id = ?1 AND plaid_account_id NOT {}",
+            sql::in_texts("?2")
+        ), &params![token_id, sql::json_array(&incoming_ids)])?;
+            }
+            Ok::<_, ledger_db::store::Error>(())
+        })
+        .map_err(database_failure)
 }
 
 pub(crate) async fn list_token_accounts(
     State(state): State<AppState>,
     Path((raw_book_id, raw_id)): Path<(String, String)>,
-    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> ApiResult {
     const FAILURE: &str = "Failed to fetch token Plaid accounts";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let token_id = database_id(finite_path_id(&raw_id, INVALID_TOKEN_ID)?, FAILURE)?;
-    let refresh = first_query_values(raw_query.as_deref())
-        .get("refresh")
-        .is_some_and(|value| value == "true");
-    // A refresh rewrites the account mappings and calls Plaid with the
-    // owner's token: a connection write, which needs the owner. The route is
-    // a GET at `Read` for the plain list, so the check is by hand here.
-    if refresh && book.role() != BookRole::Owner {
-        return Err(error(StatusCode::FORBIDDEN, "Only an owner can do this"));
-    }
+    token_in_book(&state, book.book_id(), token_id, FAILURE)
+        .await?
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND))?;
+    let accounts = token_accounts(&state, token_id, FAILURE).await?;
+    Ok(Json(to_value(accounts).expect("Plaid accounts serialize")))
+}
+
+/// `POST .../tokens/[id]/accounts/refresh`: gets the accounts of the Item
+/// from Plaid, writes the mappings, deletes the mappings that Plaid no
+/// longer reports, and gives the new list. Until 2026-10-30, this was the
+/// GET with `?refresh=true`. The cross-origin guard does not examine a GET,
+/// so another site could start the refresh with a link.
+pub(crate) async fn refresh_token_accounts(
+    State(state): State<AppState>,
+    Path((raw_book_id, raw_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult {
+    const FAILURE: &str = "Failed to fetch token Plaid accounts";
+    let book =
+        authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Owner, FAILURE).await?;
+    let owner = book.owner()?;
+    let token_id = database_id(finite_path_id(&raw_id, INVALID_TOKEN_ID)?, FAILURE)?;
     let token = token_in_book(&state, book.book_id(), token_id, FAILURE)
         .await?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND))?;
-    if refresh
-        && let Err(message) =
-            refresh_accounts(&state, book.book_id(), token_id, &token.access_token, true).await
+    if let Err(message) = refresh_accounts(
+        &state,
+        &owner,
+        token_id,
+        &token.access_token(&state.plaid)?,
+        true,
+    )
+    .await
     {
         // A refresh failure repeats its message. A configuration fault is
         // the installation's, and anything else is reported as Plaid's.
@@ -667,15 +687,16 @@ pub(crate) async fn set_token_accounts(
         .map(|id| database_id(id, FAILURE))
         .collect::<Result<Vec<i32>, _>>()?;
     if !requested.is_empty() {
-        let types: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT type FROM accounts WHERE book_id = $1 AND id {in2}",
-            in2 = sql::in_integers("$2")
-        ))
-        .bind(book.book_id())
-        .bind(sql::json_array(&requested))
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?;
+        let types: Vec<String> = state
+            .database
+            .query(
+                &format!(
+                    "SELECT type FROM accounts WHERE book_id = ?1 AND id {in2}",
+                    in2 = sql::in_integers("?2")
+                ),
+                &params![book.book_id(), sql::json_array(&requested)],
+            )
+            .map_err(|cause| internal_error(cause, FAILURE))?;
         if types.len() != requested.len() {
             return Err(bad_request(
                 "One or more counterpoiseAccountId values are invalid",
@@ -689,17 +710,18 @@ pub(crate) async fn set_token_accounts(
         {
             return Err(bad_request(ONLY_ASSET_OR_LIABILITY));
         }
-        let conflict: bool = sqlx::query_scalar(&format!(
-            "SELECT EXISTS (SELECT 1 FROM plaid_accounts
+        let conflict: bool = state
+            .database
+            .query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM plaid_accounts
                             WHERE counterpoise_account_id {in1} AND plaid_account_id NOT {in2})",
-            in1 = sql::in_integers("$1"),
-            in2 = sql::in_texts("$2")
-        ))
-        .bind(sql::json_array(&requested))
-        .bind(sql::json_array(&plaid_ids))
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?;
+                    in1 = sql::in_integers("?1"),
+                    in2 = sql::in_texts("?2")
+                ),
+                &params![sql::json_array(&requested), sql::json_array(&plaid_ids)],
+            )
+            .map_err(|cause| internal_error(cause, FAILURE))?;
         if conflict {
             return Err(bad_request(
                 "One or more Counterpoise accounts are already mapped to another Plaid account",
@@ -710,40 +732,34 @@ pub(crate) async fn set_token_accounts(
     // Clear every mapping that the request touches before it sets any.
     // counterpoise_account_id has a unique index, so a swap of two accounts
     // would otherwise collide with the mapping that it is about to move.
-    let database = |cause| internal_error(cause, FAILURE);
+    fn database(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
     let now = now_millis();
-    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
-        .await
-        .map_err(database)?;
-    if !plaid_ids.is_empty() {
-        sqlx::query(&format!(
-            "UPDATE plaid_accounts SET counterpoise_account_id = NULL, updated_at = $3
-             WHERE token_id = $1 AND plaid_account_id {in2}",
-            in2 = sql::in_texts("$2")
-        ))
-        .bind(token_id)
-        .bind(sql::json_array(&plaid_ids))
-        .bind(now)
-        .execute(transaction.as_mut())
-        .await
-        .map_err(database)?;
-    }
-    for assignment in &assignments {
-        // Each ID passed `database_id` above.
-        let account_id = assignment.counterpoise_account_id.map(|id| id as i32);
-        sqlx::query(
-            "UPDATE plaid_accounts SET counterpoise_account_id = $3, updated_at = $4
-             WHERE token_id = $1 AND plaid_account_id = $2",
-        )
-        .bind(token_id)
-        .bind(&assignment.plaid_account_id)
-        .bind(account_id)
-        .bind(now)
-        .execute(transaction.as_mut())
-        .await
-        .map_err(database)?;
-    }
-    transaction.commit().await.map_err(database)?;
+    write_transaction_or(&state.database, database, |tx| {
+        if !plaid_ids.is_empty() {
+            tx.execute(
+                &format!(
+                    "UPDATE plaid_accounts SET counterpoise_account_id = NULL, updated_at = ?3
+                     WHERE token_id = ?1 AND plaid_account_id {in2}",
+                    in2 = sql::in_texts("?2")
+                ),
+                &params![token_id, sql::json_array(&plaid_ids), now],
+            )
+            .map_err(database)?;
+        }
+        for assignment in &assignments {
+            // Each ID passed `database_id` above.
+            let account_id = assignment.counterpoise_account_id.map(|id| id as i32);
+            tx.execute(
+                "UPDATE plaid_accounts SET counterpoise_account_id = ?3, updated_at = ?4
+                 WHERE token_id = ?1 AND plaid_account_id = ?2",
+                &params![token_id, &assignment.plaid_account_id, account_id, now],
+            )
+            .map_err(database)?;
+        }
+        Ok(())
+    })?;
     let accounts = token_accounts(&state, token_id, FAILURE).await?;
     Ok(Json(to_value(accounts).expect("Plaid accounts serialize")))
 }
@@ -752,7 +768,7 @@ pub(crate) async fn set_token_accounts(
 // Book-wide reads
 // ---------------------------------------------------------------------------
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AssignedAccountRow {
     plaid_link_id: i32,
@@ -792,8 +808,7 @@ pub(crate) async fn assigned_accounts(
     const FAILURE: &str = "Failed to fetch assigned sync accounts";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
-    let rows: Vec<AssignedAccountRow> = sqlx::query_as(
-        "SELECT pa.id AS plaid_link_id, t.financial_institution, t.id AS token_id, t.item_id,
+    let rows: Vec<AssignedAccountRow> = state.database.query("SELECT pa.id AS plaid_link_id, t.financial_institution, t.id AS token_id, t.item_id,
                 pa.plaid_account_id, pa.name AS plaid_account_name, pa.mask AS plaid_account_mask,
                 pa.counterpoise_account_id, a.name AS counterpoise_account_name,
                 t.last_synced_at, t.last_error, t.is_demo,
@@ -805,17 +820,32 @@ pub(crate) async fn assigned_accounts(
          JOIN plaid_tokens t ON pa.token_id = t.id
          JOIN accounts a ON pa.counterpoise_account_id = a.id
          LEFT JOIN plaid_transaction_reconciliation r ON r.plaid_account_link_id = pa.id
-         WHERE t.book_id = $1 AND pa.counterpoise_account_id IS NOT NULL
+         WHERE t.book_id = ?1 AND pa.counterpoise_account_id IS NOT NULL
          GROUP BY pa.id, t.financial_institution, t.item_id, pa.plaid_account_id, pa.name, pa.mask,
                   pa.counterpoise_account_id, a.name, t.id, t.last_synced_at, t.last_error, t.is_demo
-         ORDER BY t.financial_institution, t.item_id, pa.name",
-    )
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
+         ORDER BY t.financial_institution, t.item_id, pa.name",&params![book.book_id()])
     .map_err(|cause| internal_error(cause, FAILURE))?;
     Ok(Json(to_value(rows).expect("assigned accounts serialize")))
 }
+
+/// The unmatched local transactions of each Plaid-linked account, from
+/// ?3 up to (not including) ?2. The CROSS JOIN keeps the transactions of
+/// the window as the outer loop, and the `+` keeps the planner from finding
+/// the splits by book, which reads every split of the book: the splits are
+/// found by transaction.
+const STALE_UNMATCHED: &str = "SELECT a.id AS account_id, a.name AS account_name,
+                CAST(COUNT(DISTINCT t.id) AS integer) AS count, MIN(t.date) AS oldest_date
+         FROM transactions t
+         CROSS JOIN transaction_splits s ON s.transaction_id = t.id AND +s.book_id = ?1
+         JOIN accounts a ON s.account_id = a.id AND a.book_id = ?1
+         JOIN plaid_accounts pa ON pa.counterpoise_account_id = a.id AND pa.book_id = ?1
+         WHERE t.book_id = ?1 AND t.is_reconciled = false AND t.date < ?2 AND t.date >= ?3
+           AND NOT EXISTS (
+             SELECT 1 FROM plaid_transaction_reconciliation r
+             WHERE r.book_id = ?1 AND r.plaid_account_link_id = pa.id
+               AND r.matched_transaction_id = t.id)
+         GROUP BY a.id, a.name
+         ORDER BY a.name, a.id";
 
 /// Unmatched local transactions older than this many days are flagged.
 const STALE_AGE_DAYS: u64 = 9;
@@ -823,12 +853,12 @@ const STALE_AGE_DAYS: u64 = 9;
 const LOOKBACK_DAYS: u64 = 60;
 
 fn local_days_ago(days: u64) -> String {
-    (Local::now().date_naive() - Days::new(days))
+    (platform::today() - Days::new(days))
         .format("%Y-%m-%d")
         .to_string()
 }
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StaleAccountRow {
     account_id: i32,
@@ -849,27 +879,17 @@ pub(crate) async fn stale_unmatched(
     const FAILURE: &str = "Failed to fetch stale unmatched transactions";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
-    let rows: Vec<StaleAccountRow> = sqlx::query_as(
-        "SELECT a.id AS account_id, a.name AS account_name,
-                CAST(COUNT(DISTINCT t.id) AS integer) AS count, MIN(t.date) AS oldest_date
-         FROM transactions t
-         JOIN transaction_splits s ON s.transaction_id = t.id AND s.book_id = $1
-         JOIN accounts a ON s.account_id = a.id AND a.book_id = $1
-         JOIN plaid_accounts pa ON pa.counterpoise_account_id = a.id AND pa.book_id = $1
-         WHERE t.book_id = $1 AND t.is_reconciled = false AND t.date < $2 AND t.date >= $3
-           AND NOT EXISTS (
-             SELECT 1 FROM plaid_transaction_reconciliation r
-             WHERE r.book_id = $1 AND r.plaid_account_link_id = pa.id
-               AND r.matched_transaction_id = t.id)
-         GROUP BY a.id, a.name
-         ORDER BY a.name, a.id",
-    )
-    .bind(book.book_id())
-    .bind(local_days_ago(STALE_AGE_DAYS))
-    .bind(local_days_ago(LOOKBACK_DAYS))
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+    let rows: Vec<StaleAccountRow> = state
+        .database
+        .query(
+            STALE_UNMATCHED,
+            &params![
+                book.book_id(),
+                local_days_ago(STALE_AGE_DAYS),
+                local_days_ago(LOOKBACK_DAYS)
+            ],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     let total: i64 = rows.iter().map(|row| i64::from(row.count)).sum();
     Ok(Json(json!({ "totalCount": total, "accounts": rows })))
 }
@@ -904,7 +924,7 @@ fn format_category(category: Option<&str>) -> Option<String> {
     Some(words.join(" "))
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct PendingRow {
     id: i32,
     date: String,
@@ -943,32 +963,33 @@ pub(crate) async fn pending_transactions(
             Some(database_id(number, FAILURE)?)
         }
     };
-    let mut rows: Vec<PendingRow> = sqlx::query_as(
-        "SELECT r.id, r.date, r.authorized_date, r.amount_cents, r.name, r.merchant_name,
+    let mut rows: Vec<PendingRow> = state
+        .database
+        .query(
+            "SELECT r.id, r.date, r.authorized_date, r.amount_cents, r.name, r.merchant_name,
                 r.category_primary, a.id AS account_id
          FROM plaid_transaction_reconciliation r
-         JOIN plaid_accounts pa ON r.plaid_account_link_id = pa.id AND pa.book_id = $1
-         JOIN accounts a ON pa.counterpoise_account_id = a.id AND a.book_id = $1
-         WHERE r.book_id = $1 AND r.resolution_status = 'pending' AND r.review_reason IS NULL
-           AND ($2 IS NULL OR a.id = $2)
+         JOIN plaid_accounts pa ON r.plaid_account_link_id = pa.id AND pa.book_id = ?1
+         JOIN accounts a ON pa.counterpoise_account_id = a.id AND a.book_id = ?1
+         WHERE r.book_id = ?1 AND r.resolution_status = 'pending' AND r.review_reason IS NULL
+           AND (?2 IS NULL OR a.id = ?2)
          ORDER BY r.id",
-    )
-    .bind(book.book_id())
-    .bind(account_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+            &params![book.book_id(), account_id],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     let account_ids: Vec<i32> = rows.iter().map(|row| row.account_id).collect();
-    let accounts: Vec<AccountRow> = sqlx::query_as(&format!(
-        "SELECT id, book_id, name, type AS account_type, subtype, parent_id, is_active,
+    let accounts: Vec<AccountRow> = state
+        .database
+        .query(
+            &format!(
+                "SELECT id, book_id, name, type AS account_type, subtype, parent_id, is_active,
                 is_favorite, is_investment_cash, icon, created_at, updated_at
          FROM accounts WHERE id {in1}",
-        in1 = sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(&account_ids))
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+                in1 = sql::in_integers("?1")
+            ),
+            &params![sql::json_array(&account_ids)],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     let accounts: HashMap<i32, AccountRow> = accounts
         .into_iter()
         .map(|account| (account.id, account))
@@ -1023,7 +1044,7 @@ pub(crate) async fn pending_transactions(
 // The bank transaction linked to one transaction
 // ---------------------------------------------------------------------------
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlaidLinkRow {
     id: i32,
@@ -1055,18 +1076,12 @@ pub(crate) async fn transaction_plaid_link(
         return Ok(Json(Value::Null));
     };
     let transaction_id = database_id(transaction_id, FAILURE)?;
-    let row: Option<PlaidLinkRow> = sqlx::query_as(
-        "SELECT id, plaid_transaction_id, date, authorized_date, amount_cents, name, merchant_name,
+    let row: Option<PlaidLinkRow> = state.database.query_optional("SELECT id, plaid_transaction_id, date, authorized_date, amount_cents, name, merchant_name,
                 original_description, pending, iso_currency_code, category_primary,
                 category_detailed, raw_json
          FROM plaid_transaction_reconciliation
-         WHERE matched_transaction_id = $1 AND book_id = $2
-         LIMIT 1",
-    )
-    .bind(transaction_id)
-    .bind(book.book_id())
-    .fetch_optional(&state.pool)
-    .await
+         WHERE matched_transaction_id = ?1 AND book_id = ?2
+         LIMIT 1",&params![transaction_id, book.book_id()])
     .map_err(|cause| internal_error(cause, FAILURE))?;
     Ok(Json(to_value(row).expect("Plaid link serializes")))
 }
@@ -1081,53 +1096,48 @@ pub(crate) async fn unlink_transaction(
     const FAILURE: &str = "Failed to unlink from Plaid";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let transaction_id =
         parse_int_prefix_number(&raw_id).ok_or_else(|| bad_request("Invalid transaction ID"))?;
     let transaction_id = database_id(transaction_id, FAILURE)?;
-    let database = |cause| internal_error(cause, FAILURE);
-    let linked: Vec<i32> = sqlx::query_scalar(
-        "SELECT id FROM plaid_transaction_reconciliation
-         WHERE matched_transaction_id = $1 AND book_id = $2",
-    )
-    .bind(transaction_id)
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
-    .map_err(database)?;
+    fn database(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
+    let linked: Vec<i32> = state
+        .database
+        .query(
+            "SELECT id FROM plaid_transaction_reconciliation
+         WHERE matched_transaction_id = ?1 AND book_id = ?2",
+            &params![transaction_id, book.book_id()],
+        )
+        .map_err(database)?;
     if linked.is_empty() {
         return Err(error(StatusCode::NOT_FOUND, "No Plaid link found"));
     }
     let now = now_millis();
-    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
-        .await
+    write_transaction(&state.database, FAILURE, |tx| {
+        tx.execute(
+            &format!(
+                "UPDATE plaid_transaction_reconciliation
+                 SET resolution_status = 'pending', matched_transaction_id = NULL,
+                     review_reason = NULL, review_metadata_json = NULL, resolved_at = NULL,
+                     updated_at = ?3
+                 WHERE id {in1} AND book_id = ?2",
+                in1 = sql::in_integers("?1")
+            ),
+            &params![sql::json_array(&linked), book.book_id(), now],
+        )
         .map_err(database)?;
-    sqlx::query(&format!(
-        "UPDATE plaid_transaction_reconciliation
-         SET resolution_status = 'pending', matched_transaction_id = NULL, review_reason = NULL,
-             review_metadata_json = NULL, resolved_at = NULL, updated_at = $3
-         WHERE id {in1} AND book_id = $2",
-        in1 = sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(&linked))
-    .bind(book.book_id())
-    .bind(now)
-    .execute(transaction.as_mut())
-    .await
-    .map_err(database)?;
-    sqlx::query(
-        "UPDATE transactions SET is_reconciled = false, updated_at = $3, updated_by = $4
-         WHERE id = $1 AND book_id = $2",
-    )
-    .bind(transaction_id)
-    .bind(book.book_id())
-    .bind(now)
-    .bind(book.user_id())
-    .execute(transaction.as_mut())
-    .await
-    .map_err(database)?;
-    transaction.commit().await.map_err(database)?;
+        tx.execute(
+            "UPDATE transactions SET is_reconciled = false, updated_at = ?3, updated_by = ?4
+             WHERE id = ?1 AND book_id = ?2",
+            &params![transaction_id, book.book_id(), now, book.user_id()],
+        )
+        .map_err(database)?;
+        Ok(())
+    })?;
 
-    record_unlink(&state.pool, book.book_id(), transaction_id).await;
+    record_unlink(&state.database, &access, transaction_id);
     state.analytics.capture_event(
         book.user_id(),
         "sync_transaction_unlinked",
@@ -1139,6 +1149,32 @@ pub(crate) async fn unlink_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The query starts from the transactions of the date window and finds
+    /// their splits by transaction, so its cost follows the window, not the
+    /// book's history. Started from the book's splits, it read every split
+    /// of the book on each page load.
+    #[test]
+    fn stale_unmatched_reads_only_the_date_window() {
+        let database = crate::routes::accounts::tests::balance_fixture();
+        let steps: Vec<String> = database
+            .query::<(i64, i64, i64, String)>(
+                &format!("EXPLAIN QUERY PLAN {STALE_UNMATCHED}"),
+                &params![1, "2025-03-01", "2025-01-01"],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect();
+        assert_eq!(
+            steps[..2],
+            [
+                "SEARCH t USING INDEX idx_transactions_book_date_id (book_id=? AND date>? AND date<?)",
+                "SEARCH s USING INDEX idx_transaction_splits_txn_amount (transaction_id=?)",
+            ],
+            "{steps:?}"
+        );
+    }
 
     #[test]
     fn access_tokens_are_masked_as_javascript_counts_them() {

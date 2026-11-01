@@ -5,9 +5,9 @@ import {
 } from "../helpers/db-utils";
 import { row, rows } from "../helpers/sql";
 import type { Account } from "../../types/db";
-import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { onWorker, sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { contract, type Contract } from "../helpers/contract";
-import { changeFrame, frameReader, settle } from "../helpers/sse-frames";
+import { changeHint, openSocket } from "../helpers/book-socket";
 
 const accountNodeSchema = contract("AccountNode");
 const accountWithChildrenSchema = contract("AccountWithChildren");
@@ -26,35 +26,41 @@ describe("account write HTTP parity", () => {
   let baseUrl: string;
   let stop: () => Promise<void>;
   let client: Client;
-  let frames: ReturnType<typeof frameReader>;
+  let socket: ReturnType<typeof openSocket> | undefined;
 
   beforeAll(async () => {
     await setupTestDatabase();
     ({ baseUrl, stop } = await startHttpTestServer());
   }, 120_000);
 
-  // Each test reads the live-update stream of book 1. A fixture write sends
-  // a hint too, so a test calls `quiet()` after its fixtures. The next
-  // change frame then comes from the write that the test checks.
+  // Each test reads the live-update socket of book 1. A fixture write sends
+  // a hint too, so a test calls `quiet()` after its fixtures. The next hint
+  // then comes from the write that the test checks. The Worker's object sees
+  // the fixtures' writes only at its next request, so there the tests check
+  // the writes only.
   beforeEach(async () => {
     await resetTestDatabase();
     client = await sessionHttpClient(baseUrl);
-    frames = frameReader(await client.request("/api/b/1/events"));
-    expect(await frames.next()).toEqual({ event: "ready", data: "{}" });
+    if (onWorker) return;
+    socket = openSocket(`${baseUrl.replace(/^http/, "ws")}/api/b/1/socket`, { cookie: client.cookie });
+    expect(await socket.next()).toEqual({ type: "ready" });
   });
 
-  afterEach(async () => { await frames?.cancel(); });
+  afterEach(() => {
+    socket?.close();
+    socket = undefined;
+  });
 
   afterAll(async () => { await stop?.(); });
 
   /** Waits until the hints of the earlier writes have arrived. */
   async function quiet() {
-    await settle(frames);
+    await socket?.settle();
   }
 
   /** The next frame is one hint for the accounts table of book 1. */
   async function expectAccountsHint() {
-    expect(await frames.next()).toEqual(changeFrame("accounts"));
+    if (socket) expect(await socket.next()).toEqual(changeHint("accounts"));
   }
 
   async function expectError(path: string, init: RequestInit, status: number, error: string) {
@@ -104,6 +110,7 @@ describe("account write HTTP parity", () => {
     await createAccount({ name: "Taken", type: "asset" });
     for (const [body, status, error] of [
       [[], 400, "Name and type are required"],
+      [{ type: "asset" }, 400, "Name and type are required"],
       [{ name: "", type: "asset" }, 400, "Name and type are required"],
       [{ name: "A", type: "banana" }, 400, "Invalid account type"],
       [{ name: "A", type: "asset", subtype: "bad" }, 400, "Invalid account subtype"],

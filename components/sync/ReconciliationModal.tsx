@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useBookId } from "@/hooks/useBookId";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
+import { ConfirmModal } from "@/components/ui/ConfirmModal";
 import { Select } from "@/components/ui/Select";
 import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
 import { PayeeAutocomplete } from "@/components/ui/PayeeAutocomplete";
@@ -17,7 +18,12 @@ import { DisclosureChevron, ReconciliationCandidates, type MatchAction } from ".
 import { cn } from "@/lib/utils";
 import { useRegisterShortcuts } from "@/hooks/useRegisterShortcuts";
 import type { ShortcutDef } from "@/components/KeyboardShortcutProvider";
-import type { AccountWithBalance, AssignedSyncAccount, SyncReconciliationItem } from "@/types";
+import type {
+  AccountWithBalance,
+  AssignedSyncAccount,
+  SyncReconciliationItem,
+  TransactionWithSplits,
+} from "@/types";
 
 type ReconciliationResponse = {
   items: SyncReconciliationItem[];
@@ -78,6 +84,14 @@ function queueReason(item: SyncReconciliationItem): { text: string; warn: boolea
 // the two-key prefix indicator in KeyboardShortcutProvider.tsx, so a key hint
 // on this screen looks like a key hint everywhere else. Existing tokens only
 // — no new palette colours.
+/** The date, payee and amount of the linked transaction, on the linked account. */
+function linkedSummary(transaction: TransactionWithSplits, accountId: number | null): string {
+  const split = transaction.splits.find((candidate) => candidate.accountId === accountId);
+  const parts = [formatDate(transaction.date), transaction.payee?.name ?? transaction.description ?? ""];
+  if (split) parts.push(formatCurrency(split.amount));
+  return parts.filter(Boolean).join(" · ");
+}
+
 function KeyCap({ children }: { children: React.ReactNode }) {
   return (
     <kbd className="inline-flex items-center justify-center min-w-[1.5rem] h-6 px-1.5 font-mono text-xs font-semibold bg-surface-tertiary border border-border rounded text-fg">
@@ -156,6 +170,38 @@ export function ReconciliationModal({
   const typesafe = useTypeSafeSuggestion(bookId, selectedLinkId, selectedItem?.id ?? null,
     isOpen && !submitting && !!selectedItem && selectedItem.resolutionStatus === "pending" && !selectedItem.reviewReason && !selectedItem.pending);
   const typesafeObservation = typesafe.observation;
+
+  // A row the bank changed can still be linked to a transaction. Keep local
+  // keeps that link. Match or Create moves the link to another transaction,
+  // and Create adds a second transaction for the same bank charge.
+  const linkedTransactionId =
+    selectedItem?.reviewReason === "plaid_modified" ? selectedItem.matchedTransactionId : null;
+  const [linkedState, setLinkedState] = useState<{
+    id: number;
+    transaction: TransactionWithSplits;
+  } | null>(null);
+  const linkedTransaction =
+    linkedState !== null && linkedState.id === linkedTransactionId ? linkedState.transaction : null;
+  // The row is part of the pending Create, so the confirmation can only
+  // write to the row that it was opened for.
+  const [pendingCreate, setPendingCreate] = useState<{
+    reconciliationId: number;
+    counterAccountId: number;
+    payeeName: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (linkedTransactionId === null) return;
+    const controller = new AbortController();
+    apiGet<TransactionWithSplits>(`/api/b/${bookId}/transactions/${linkedTransactionId}`, {
+      signal: controller.signal,
+    })
+      .then((transaction) => setLinkedState({ id: linkedTransactionId, transaction }))
+      .catch(() => {
+        // The box then shows only the transaction number.
+      });
+    return () => controller.abort();
+  }, [bookId, linkedTransactionId]);
 
   const eligibleCounterAccounts = useMemo(
     () => accounts.filter((account) => account.id !== selectedLink?.counterpoiseAccountId),
@@ -376,8 +422,9 @@ export function ReconciliationModal({
     // Registered only while the modal is open, so these keys do not shadow
     // the page behind it. The array identity has to stay stable across
     // renders, or useRegisterShortcuts re-registers on every one (see
-    // PriceEntryPill.tsx).
-    if (!isOpen) return [];
+    // PriceEntryPill.tsx). While the Create confirmation is open, the queue
+    // keys stop, so they cannot move or resolve the row behind it.
+    if (!isOpen || pendingCreate !== null) return [];
 
     return [
       {
@@ -439,7 +486,7 @@ export function ReconciliationModal({
         action: () => setShowCreate(true),
       },
     ];
-  }, [bestMatch, canReview, isOpen, moveSelection, resolveSelected, submitting, setShowCreate]);
+  }, [bestMatch, canReview, isOpen, moveSelection, pendingCreate, resolveSelected, submitting, setShowCreate]);
 
   useRegisterShortcuts(shortcuts);
 
@@ -460,269 +507,315 @@ export function ReconciliationModal({
   }, [filterLinkId, links]);
 
   return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      title={filterLink ? `Reconcile ${linkLabel(filterLink)}` : "Reconcile all accounts"}
-      size="xl"
-    >
-      <div className="mb-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="w-64">
-              <Select
-                id="reconcile-account-filter"
-                aria-label="Account"
-                size="compact"
-                value={filterLinkId ?? ""}
-                options={filterOptions}
-                disabled={submitting}
-                onChange={(event) =>
-                  setFilterLinkId(event.target.value === "" ? null : Number(event.target.value))
-                }
-              />
-            </div>
-            <span className="text-xs text-fg-tertiary tabular-nums">
-              {items.length > 0 ? `${position} of ${totalCount}` : ""}
-            </span>
-          </div>
-          {items.length > 0 && (
-            <div className="hidden sm:flex items-center gap-1.5 text-xs text-fg-tertiary">
-              <KeyCap>↑</KeyCap>
-              <KeyCap>↓</KeyCap>
-              <span>move</span>
-              <KeyCap>⏎</KeyCap>
-              <span>match</span>
-            </div>
-          )}
-        </div>
-        <div className="mt-1 h-[3px] w-full overflow-hidden rounded-full bg-surface-tertiary">
-          <div
-            className="h-full rounded-full bg-accent transition-all"
-            style={{ width: `${totalCount > 0 ? (position / totalCount) * 100 : 0}%` }}
-          />
-        </div>
-      </div>
-
-      {loading ? (
-        <p className="text-sm text-fg-secondary">Loading reconciliation queue…</p>
-      ) : error ? (
-        <div className="space-y-3">
-          <p className="text-sm text-fg-danger">{error}</p>
-          <div className="flex justify-end">
-            <Button variant="secondary" onClick={onClose}>
-              Close
-            </Button>
-          </div>
-        </div>
-      ) : (
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-4">
-            <div className="border border-border rounded-lg overflow-hidden">
-              <div className="px-3 py-2 bg-surface-secondary border-b border-border text-xs text-fg-secondary">
-                Queue ({items.length}/{totalCount})
+    <>
+      <Modal
+        isOpen={isOpen}
+        onClose={onClose}
+        title={filterLink ? `Reconcile ${linkLabel(filterLink)}` : "Reconcile all accounts"}
+        size="xl"
+      >
+        <div className="mb-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-64">
+                <Select
+                  id="reconcile-account-filter"
+                  aria-label="Account"
+                  size="compact"
+                  value={filterLinkId ?? ""}
+                  options={filterOptions}
+                  disabled={submitting}
+                  onChange={(event) =>
+                    setFilterLinkId(event.target.value === "" ? null : Number(event.target.value))
+                  }
+                />
               </div>
-              <div className="max-h-[60vh] overflow-auto divide-y divide-border">
-                {items.length === 0 ? (
-                  <p className="p-4 text-sm text-fg-tertiary">No pending reconciliation items.</p>
-                ) : (
-                  items.map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      data-testid={`queue-item-${item.id}`}
-                      aria-current={selectedId === item.id ? "true" : undefined}
-                      onClick={() => setSelectedId(item.id)}
-                      className={`w-full text-left p-3 transition-colors ${
-                        selectedId === item.id ? "bg-accent-subtle" : "hover:bg-surface-tertiary"
-                      }`}
-                    >
-                      <div className="flex items-start gap-2">
-                        {item.reviewReason !== null && (
-                          <span
-                            aria-hidden="true"
-                            className="mt-1.5 h-1.5 w-1.5 flex-none rounded-full bg-(--fg-warning)"
-                          />
-                        )}
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center justify-between gap-2">
-                            <p className="text-sm font-medium text-fg truncate">{item.name}</p>
-                            <span className="text-sm font-semibold text-fg tabular-nums">
-                              {formatCurrency(signedAmount(item.amountCents))}
-                            </span>
-                          </div>
-                          {showAccountTags && linksById.has(item.plaidAccountLinkId) && (
-                            <p
-                              data-testid={`queue-item-account-${item.id}`}
-                              className="mt-0.5 text-xs text-fg-secondary truncate"
-                            >
-                              {linkLabel(linksById.get(item.plaidAccountLinkId)!)}
-                            </p>
+              <span className="text-xs text-fg-tertiary tabular-nums">
+                {items.length > 0 ? `${position} of ${totalCount}` : ""}
+              </span>
+            </div>
+            {items.length > 0 && (
+              <div className="hidden sm:flex items-center gap-1.5 text-xs text-fg-tertiary">
+                <KeyCap>↑</KeyCap>
+                <KeyCap>↓</KeyCap>
+                <span>move</span>
+                <KeyCap>⏎</KeyCap>
+                <span>match</span>
+              </div>
+            )}
+          </div>
+          <div className="mt-1 h-[3px] w-full overflow-hidden rounded-full bg-surface-tertiary">
+            <div
+              className="h-full rounded-full bg-accent transition-all"
+              style={{ width: `${totalCount > 0 ? (position / totalCount) * 100 : 0}%` }}
+            />
+          </div>
+        </div>
+
+        {loading ? (
+          <p className="text-sm text-fg-secondary">Loading reconciliation queue…</p>
+        ) : error ? (
+          <div className="space-y-3">
+            <p className="text-sm text-fg-danger">{error}</p>
+            <div className="flex justify-end">
+              <Button variant="secondary" onClick={onClose}>
+                Close
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-4">
+              <div className="border border-border rounded-lg overflow-hidden">
+                <div className="px-3 py-2 bg-surface-secondary border-b border-border text-xs text-fg-secondary">
+                  Queue ({items.length}/{totalCount})
+                </div>
+                <div className="max-h-[60vh] overflow-auto divide-y divide-border">
+                  {items.length === 0 ? (
+                    <p className="p-4 text-sm text-fg-tertiary">No pending reconciliation items.</p>
+                  ) : (
+                    items.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        data-testid={`queue-item-${item.id}`}
+                        aria-current={selectedId === item.id ? "true" : undefined}
+                        onClick={() => setSelectedId(item.id)}
+                        className={`w-full text-left p-3 transition-colors ${
+                          selectedId === item.id ? "bg-accent-subtle" : "hover:bg-surface-tertiary"
+                        }`}
+                      >
+                        <div className="flex items-start gap-2">
+                          {item.reviewReason !== null && (
+                            <span
+                              aria-hidden="true"
+                              className="mt-1.5 h-1.5 w-1.5 flex-none rounded-full bg-(--fg-warning)"
+                            />
                           )}
-                          {(() => {
-                            const reason = queueReason(item);
-                            return (
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="text-sm font-medium text-fg truncate">{item.name}</p>
+                              <span className="text-sm font-semibold text-fg tabular-nums">
+                                {formatCurrency(signedAmount(item.amountCents))}
+                              </span>
+                            </div>
+                            {showAccountTags && linksById.has(item.plaidAccountLinkId) && (
                               <p
-                                className={cn(
-                                  "mt-0.5 text-xs",
-                                  reason.warn ? "text-fg-warning" : "text-fg-tertiary"
-                                )}
+                                data-testid={`queue-item-account-${item.id}`}
+                                className="mt-0.5 text-xs text-fg-secondary truncate"
                               >
-                                {formatDateShort(item.authorizedDate ?? item.date)} · {reason.text}
+                                {linkLabel(linksById.get(item.plaidAccountLinkId)!)}
                               </p>
-                            );
-                          })()}
+                            )}
+                            {(() => {
+                              const reason = queueReason(item);
+                              return (
+                                <p
+                                  className={cn(
+                                    "mt-0.5 text-xs",
+                                    reason.warn ? "text-fg-warning" : "text-fg-tertiary"
+                                  )}
+                                >
+                                  {formatDateShort(item.authorizedDate ?? item.date)} · {reason.text}
+                                </p>
+                              );
+                            })()}
+                          </div>
                         </div>
-                      </div>
-                    </button>
-                  ))
+                      </button>
+                    ))
+                  )}
+                </div>
+                {hasMore && (
+                  <div className="p-3 border-t border-border">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => void fetchQueue(offset, false)}
+                      disabled={loadingMore}
+                    >
+                      {loadingMore ? "Loading…" : "Load more"}
+                    </Button>
+                  </div>
                 )}
               </div>
-              {hasMore && (
-                <div className="p-3 border-t border-border">
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => void fetchQueue(offset, false)}
-                    disabled={loadingMore}
-                  >
-                    {loadingMore ? "Loading…" : "Load more"}
-                  </Button>
-                </div>
-              )}
-            </div>
 
-            <div className="border border-border rounded-lg p-4 min-h-[60vh]">
-              {!selectedItem ? (
-                <p className="text-sm text-fg-tertiary">Select a transaction to reconcile.</p>
-              ) : (
-                <div className="space-y-4">
-                  <div>
-                    <div className="flex items-center justify-between gap-3">
-                      <h3 className="text-lg font-semibold text-fg">{selectedItem.name}</h3>
-                      <span className="text-lg font-semibold text-fg tabular-nums">
-                        {formatCurrency(signedAmount(selectedItem.amountCents))}
-                      </span>
-                    </div>
-                    <p className="text-sm text-fg-secondary mt-1">
-                      {formatDate(selectedItem.authorizedDate ?? selectedItem.date)}
-                      {selectedItem.merchantName ? ` · ${selectedItem.merchantName}` : ""}
-                    </p>
-                    {selectedLink && (
-                      <p
-                        data-testid="selected-account"
-                        className="text-xs text-fg-tertiary mt-1"
-                      >
-                        {linkLabel(selectedLink)} → {selectedLink.counterpoiseAccountName}
-                      </p>
-                    )}
-                    {selectedItem.reviewReason && (
-                      <p className="text-sm text-fg-warning mt-2">{queueReason(selectedItem).text}</p>
-                    )}
-                  </div>
-
-                  <TypeSafeSuggestion result={typesafe.result} loading={typesafe.loading} candidates={selectedItem.candidates}
-                    submitting={submitting} onRefresh={typesafe.refresh}
-                    onMatch={(evaluationId) => void resolveSelected({ action: "typesafe", evaluationId, kind: "match" })}
-                    onCreate={(evaluationId) => void resolveSelected({ action: "typesafe", evaluationId, kind: "create" })}
-                    onEdit={(proposal) => {
-                      // Edit copies the proposal into the ordinary Create form.
-                      // The user's Create click then sends the TypeSafe
-                      // observation, and the server records what was kept.
-                      setSelectedCounterAccountId(proposal.category.accountId);
-                      setPayeeName(proposal.payee.name);
-                      setShowCreate(true);
-                    }} />
-
-                  <ReconciliationCandidates
-                    candidates={selectedItem.candidates}
-                    showOthers={showOthers}
-                    onToggleOthers={() => setShowOthers((prev) => !prev)}
-                    submitting={submitting}
-                    matchingAction={matchingAction}
-                    onMatch={(action) => void resolveSelected(action)}
-                  />
-
-                  <div>
-                    <button
-                      type="button"
-                      aria-expanded={showCreate}
-                      onClick={() => setShowCreate((prev) => !prev)}
-                      className="flex w-full items-center gap-2 rounded-lg border border-border px-3 py-2 text-left text-sm hover:bg-surface-tertiary"
-                    >
-                      <DisclosureChevron expanded={showCreate} />
-                      <span className="font-medium text-fg">Create new transaction</span>
-                    </button>
-                    {showCreate && (
-                      <div className="mt-2 space-y-3 rounded-lg border border-border p-3">
-                        <AccountAutocomplete
-                          accounts={eligibleCounterAccounts}
-                          value={selectedCounterAccountId}
-                          onChange={setSelectedCounterAccountId}
-                          label="Counter account"
-                          placeholder="Search accounts…"
-                        />
-                        <PayeeAutocomplete
-                          payees={payeeSuggestions}
-                          textValue={payeeName}
-                          onTextChange={setPayeeName}
-                          label="Payee"
-                          placeholder="Search for a payee…"
-                        />
-                        <div className="flex justify-end">
-                          <Button
-                            onClick={() =>
-                              selectedCounterAccountId &&
-                              void resolveSelected({
-                                action: "create",
-                                counterAccountId: selectedCounterAccountId,
-                                payeeName,
-                              })
-                            }
-                            disabled={submitting || !selectedCounterAccountId}
-                          >
-                            Create
-                          </Button>
-                        </div>
+              <div className="border border-border rounded-lg p-4 min-h-[60vh]">
+                {!selectedItem ? (
+                  <p className="text-sm text-fg-tertiary">Select a transaction to reconcile.</p>
+                ) : (
+                  <div className="space-y-4">
+                    <div>
+                      <div className="flex items-center justify-between gap-3">
+                        <h3 className="text-lg font-semibold text-fg">{selectedItem.name}</h3>
+                        <span className="text-lg font-semibold text-fg tabular-nums">
+                          {formatCurrency(signedAmount(selectedItem.amountCents))}
+                        </span>
                       </div>
-                    )}
+                      <p className="text-sm text-fg-secondary mt-1">
+                        {formatDate(selectedItem.authorizedDate ?? selectedItem.date)}
+                        {selectedItem.merchantName ? ` · ${selectedItem.merchantName}` : ""}
+                      </p>
+                      {selectedLink && (
+                        <p
+                          data-testid="selected-account"
+                          className="text-xs text-fg-tertiary mt-1"
+                        >
+                          {linkLabel(selectedLink)} → {selectedLink.counterpoiseAccountName}
+                        </p>
+                      )}
+                      {selectedItem.reviewReason && (
+                        <p className="text-sm text-fg-warning mt-2">{queueReason(selectedItem).text}</p>
+                      )}
+                      {linkedTransactionId !== null && (
+                        <div
+                          data-testid="linked-transaction"
+                          className="mt-2 rounded-lg border border-border px-3 py-2 text-sm"
+                        >
+                          <p className="text-fg">
+                            Linked to{" "}
+                            {linkedTransaction
+                              ? linkedSummary(linkedTransaction, selectedLink?.counterpoiseAccountId ?? null)
+                              : `transaction #${linkedTransactionId}`}
+                          </p>
+                          <p className="text-xs text-fg-tertiary mt-1">
+                            Keep local keeps this link. Match or Create moves it to another transaction.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    <TypeSafeSuggestion result={typesafe.result} loading={typesafe.loading} candidates={selectedItem.candidates}
+                      submitting={submitting} onRefresh={typesafe.refresh}
+                      onMatch={(evaluationId) => void resolveSelected({ action: "typesafe", evaluationId, kind: "match" })}
+                      onCreate={(evaluationId) => void resolveSelected({ action: "typesafe", evaluationId, kind: "create" })}
+                      onEdit={(proposal) => {
+                        // Edit copies the proposal into the ordinary Create form.
+                        // The user's Create click then sends the TypeSafe
+                        // observation, and the server records what was kept.
+                        setSelectedCounterAccountId(proposal.category.accountId);
+                        setPayeeName(proposal.payee.name);
+                        setShowCreate(true);
+                      }} />
+
+                    <ReconciliationCandidates
+                      candidates={selectedItem.candidates}
+                      showOthers={showOthers}
+                      onToggleOthers={() => setShowOthers((prev) => !prev)}
+                      submitting={submitting}
+                      matchingAction={matchingAction}
+                      onMatch={(action) => void resolveSelected(action)}
+                    />
+
+                    <div>
+                      <button
+                        type="button"
+                        aria-expanded={showCreate}
+                        onClick={() => setShowCreate((prev) => !prev)}
+                        className="flex w-full items-center gap-2 rounded-lg border border-border px-3 py-2 text-left text-sm hover:bg-surface-tertiary"
+                      >
+                        <DisclosureChevron expanded={showCreate} />
+                        <span className="font-medium text-fg">Create new transaction</span>
+                      </button>
+                      {showCreate && (
+                        <div className="mt-2 space-y-3 rounded-lg border border-border p-3">
+                          <AccountAutocomplete
+                            accounts={eligibleCounterAccounts}
+                            value={selectedCounterAccountId}
+                            onChange={setSelectedCounterAccountId}
+                            label="Counter account"
+                            placeholder="Search accounts…"
+                          />
+                          <PayeeAutocomplete
+                            payees={payeeSuggestions}
+                            textValue={payeeName}
+                            onTextChange={setPayeeName}
+                            label="Payee"
+                            placeholder="Search for a payee…"
+                          />
+                          <div className="flex justify-end">
+                            <Button
+                              onClick={() => {
+                                if (!selectedCounterAccountId) return;
+                                const create = { counterAccountId: selectedCounterAccountId, payeeName };
+                                if (linkedTransactionId !== null) {
+                                  setPendingCreate({ reconciliationId: selectedItem.id, ...create });
+                                } else {
+                                  void resolveSelected({ action: "create", ...create });
+                                }
+                              }}
+                              disabled={submitting || !selectedCounterAccountId}
+                            >
+                              Create
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              )}
+                )}
+              </div>
+            </div>
+
+            <div
+              data-testid="resolve-footer"
+              className="flex flex-wrap items-center gap-2 border-t border-border pt-4"
+            >
+              <Button
+                variant="secondary"
+                disabled={submitting}
+                onClick={() => void resolveSelected({ action: "ignore" })}
+              >
+                Ignore
+              </Button>
+              <Button
+                variant={linkedTransactionId !== null ? "primary" : "secondary"}
+                disabled={submitting || !canReview}
+                onClick={() => void resolveSelected({ action: "keep_local" })}
+              >
+                Keep local
+              </Button>
+              <Button
+                variant="secondary"
+                disabled={submitting || !canReview}
+                onClick={() => void resolveSelected({ action: "unlink" })}
+              >
+                Unlink
+              </Button>
+              <span className="ml-auto text-xs text-fg-tertiary">
+                Keep local and Unlink apply to rows the bank changed
+              </span>
             </div>
           </div>
-
-          <div
-            data-testid="resolve-footer"
-            className="flex flex-wrap items-center gap-2 border-t border-border pt-4"
-          >
-            <Button
-              variant="secondary"
-              disabled={submitting}
-              onClick={() => void resolveSelected({ action: "ignore" })}
-            >
-              Ignore
-            </Button>
-            <Button
-              variant="secondary"
-              disabled={submitting || !canReview}
-              onClick={() => void resolveSelected({ action: "keep_local" })}
-            >
-              Keep local
-            </Button>
-            <Button
-              variant="secondary"
-              disabled={submitting || !canReview}
-              onClick={() => void resolveSelected({ action: "unlink" })}
-            >
-              Unlink
-            </Button>
-            <span className="ml-auto text-xs text-fg-tertiary">
-              Keep local and Unlink apply to rows the bank changed
-            </span>
-          </div>
-        </div>
-      )}
-    </Modal>
+        )}
+      </Modal>
+      <ConfirmModal
+        isOpen={pendingCreate !== null}
+        title="Create a second transaction?"
+        body={
+          <>
+            <p>
+              This bank transaction is linked to transaction #{linkedTransactionId}. Create adds a
+              new transaction and moves the link to it. The old transaction stays in the register,
+              and it is no longer reconciled.
+            </p>
+            <p>To keep the old transaction, use Keep local.</p>
+          </>
+        }
+        confirmLabel="Create anyway"
+        busy={submitting}
+        onConfirm={() => {
+          const pending = pendingCreate;
+          setPendingCreate(null);
+          if (!pending || pending.reconciliationId !== selectedItem?.id) return;
+          void resolveSelected({
+            action: "create",
+            counterAccountId: pending.counterAccountId,
+            payeeName: pending.payeeName,
+          });
+        }}
+        onClose={() => setPendingCreate(null)}
+      />
+    </>
   );
 }

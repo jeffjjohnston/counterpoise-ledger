@@ -222,7 +222,7 @@ export default function PayeeDetailPage() {
     splits: SplitInput[];
     investmentSplits?: InvestmentSplitInput[];
   }) => {
-    if (!editingTransaction) return;
+    if (!editingTransaction) return false;
 
     // Caught here (rather than left to TransactionForm): its onSubmit prop is
     // called synchronously with no await and no catch of its own, so an
@@ -231,14 +231,16 @@ export default function PayeeDetailPage() {
       await putTransaction(bookId, editingTransaction, data);
       setEditingTransaction(null);
       await refreshAfterChange();
+      return true;
     } catch (e) {
       if (isTransactionConflict(e)) {
         toast.error(TRANSACTION_CONFLICT_MESSAGE);
         setEditingTransaction(null);
         await refreshAfterChange();
-        return;
+        return false;
       }
       toast.error(toMessage(e, "Failed to update transaction"));
+      return false;
     }
   };
 

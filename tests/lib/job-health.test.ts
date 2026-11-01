@@ -34,14 +34,16 @@ describe("JOB_SCHEDULES", () => {
     }
   });
 
-  it("covers exactly the six scheduled jobs", () => {
+  it("covers exactly the eight scheduled jobs", () => {
     expect(Object.keys(JOB_SCHEDULES).sort()).toEqual([
       "backup",
+      "issue-sync",
       "plaid-sync",
       "price-sync",
       "prune",
       "recurring",
       "reindex",
+      "weekly-review",
     ]);
   });
 

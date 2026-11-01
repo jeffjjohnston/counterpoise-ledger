@@ -14,6 +14,7 @@ mod securities;
 mod security_prices;
 mod transactions;
 mod usage;
+mod weekly_review;
 
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value};
@@ -61,6 +62,7 @@ pub(crate) const IMPLEMENTED: &[&str] = &[
     "get_security_detail",
     "get_system_status",
     "get_transaction_plaid_link",
+    "get_weekly_review",
     "list_accounts",
     "list_book_members",
     "list_books",
@@ -179,6 +181,7 @@ pub(crate) async fn call(
         "get_report_data" => reports::report_data(caller, arguments).await,
         "get_account_balance_history" => reports::balance_history(caller, arguments).await,
         "get_plaid_status" => plaid::status(caller, arguments).await,
+        "get_weekly_review" => weekly_review::get(caller, arguments).await,
         "list_plaid_token_accounts" => plaid::token_accounts(caller, arguments).await,
         "update_plaid_token" => plaid::update_token(caller, arguments).await,
         "delete_plaid_token" => plaid::delete_token(caller, arguments).await,

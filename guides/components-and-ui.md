@@ -114,10 +114,17 @@ use d3-scale, d3-shape and d3-array for the math, and React for the SVG.
   second line under the title. If they are still too wide, the groups wrap
   onto more lines. Each group and the button keep their labels whole
   (`whitespace-nowrap` on each, not on the row), so a header of three
-  controls does not make the page scroll sideways at 320 px. Put the data fetch in a child of the card: a hidden chart
-  then sends no request. A repository test fails when a file in `app/` or
-  `components/` renders `<BarChart`, `<LineChart` or `<AreaChart` and does not
-  render `<ChartCard`.
+  controls does not make the page scroll sideways at 320 px. A hidden chart
+  keeps only the header row, with `py-2` in place of `py-4` and no margin
+  under the header, so that it takes little height above a register or a
+  table. Put the data fetch in a child of the card: a hidden chart
+  then sends no request. Each component that draws a chart has a DOM test
+  that clicks "Hide chart", mounts the component again, and checks that the
+  chart stays hidden and that "Show chart" brings it back
+  (`tests/components/charts/ChartCard.test.tsx` and the test of each chart
+  component). Give a new chart component the same test. A scan for a
+  `<ChartCard` tag next to a chart tag cannot tell a chart inside the card
+  from a chart beside it.
 - `AreaChart` draws stacked areas over time, with d3-shape `stack` and
   `stackOffsetDiverging`: positive series stack up from zero, negative
   series stack down. All series have the same dates. The optional `total`
@@ -241,6 +248,12 @@ Search, Report an issue and the user menu off-screen entirely, and scrolled the
 whole document sideways. The book-name button is capped (`sm:max-w-[10rem]`) so
 that width stays bounded no matter how long a book is named.
 
+The cap alone is not sufficient. At 1024px, a long book name at the full 10rem
+went 31px under the Dashboard link. The left group (brand and book menu) has
+`min-w-0` and the right cluster has `shrink-0`, so when the row is too narrow
+the book name truncates further and the links stay where they are.
+`tests/e2e/book-navbar-layout.spec.ts` measures this at 1024px.
+
 Two register tables are `table-fixed` with a `<colgroup>` mixing `rem` and `%`
 widths. Fixed widths are satisfied first, so when they exceed the container the
 percentage column collapses to **0px** and its text paints over its neighbour —
@@ -251,8 +264,24 @@ register at 1024px after you change a column width.
 
 Use `useBookChanges` from `components/BookChangesProvider.tsx` within the book
 layout. Subscribers receive table invalidations or a reset, never row contents.
-The provider owns the EventSource; adding a subscriber does not open another
+The provider owns the WebSocket; adding a subscriber does not open another
 connection. It closes on book navigation, unmount, and successful navbar logout.
+
+A reset comes on each focus or return to the tab, and each time a socket opens,
+also the first: the socket's baseline is taken when the server admits it, so a
+write between a page's first read and that moment reaches the page only through
+this reset.
+
+`useBookChangesLive()` tells whether the socket is open. A poll for data that
+only the hint tables hold skips its turn while it is: on the Worker, each request
+wakes the Durable Object, which starts again after a short idle time. The navbar's
+pending-count poll does this, and still polls after a read that failed, since no
+hint follows a failed read. The sync page keeps its poll, because the last
+sync time and error are in `plaid_tokens`, which sends no hint.
+
+For a load on each return to the tab, use `onTabReturn()` from
+`lib/tab-return.ts`, not your own `focus` and `visibilitychange` listeners. One
+return fires both events, and two listeners load the data twice.
 
 The transaction data hook serializes refreshes and retains a pending refresh
 when another event arrives during a request. Automatic refreshes preserve the
@@ -265,7 +294,7 @@ scroll behavior. No unsaved form state is replaced by live updates.
 Local write refreshes and automatic invalidations share a fixed 400 ms scheduling
 window, covering the usual server/browser notification delay without resetting
 the timer on every event. Initial loads and filter changes run immediately.
-Explicit refreshes still run when SSE is disconnected and retain their ensureId
+Explicit refreshes still run when the socket is disconnected and retain their ensureId
 and scroll behavior. Hints received after a fetch starts always queue a trailing
 fetch; a late self-echo can therefore cause a second fetch. With hint-only events,
 ignoring that echo could also discard an unrelated external write.

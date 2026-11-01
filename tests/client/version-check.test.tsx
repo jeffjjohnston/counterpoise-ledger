@@ -14,8 +14,8 @@ let reload: ReturnType<typeof vi.fn>;
 let fetchMock: ReturnType<typeof vi.fn>;
 let stop: (() => void) | undefined;
 
-function serverVersion(version: string) {
-  fetchMock.mockResolvedValue(new Response(JSON.stringify({ version, apiContract: 1 })));
+function serverVersion(version: string, commit?: string) {
+  fetchMock.mockResolvedValue(new Response(JSON.stringify({ version, apiContract: 1, ...(commit && { commit }) })));
 }
 
 beforeEach(() => {
@@ -172,6 +172,54 @@ describe("version check", () => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
     expect(await screen.findByText(/new version of Counterpoise/)).toBeInTheDocument();
+  });
+
+  // Commits between releases share a version: a deploy of a later commit
+  // is a new build too.
+  describe("with the commit of the build", () => {
+    beforeEach(() => vi.stubEnv("NEXT_PUBLIC_BUILD_COMMIT", "aaaa111"));
+
+    it("shows the banner for a new commit of the same version", async () => {
+      serverVersion("1.0.0", "bbbb222");
+      const { router } = await start();
+
+      expect(screen.getByText(/new version of Counterpoise/)).toBeInTheDocument();
+      await go(router, "/loaded");
+      expect(assign).toHaveBeenCalledExactlyOnceWith("/loaded");
+    });
+
+    it("does nothing when the server runs the same commit", async () => {
+      serverVersion("1.0.0", "aaaa111");
+      await start();
+
+      expect(screen.queryByText(/new version/)).not.toBeInTheDocument();
+    });
+
+    it("does nothing when the server names no commit", async () => {
+      serverVersion("1.0.0");
+      await start();
+
+      expect(screen.queryByText(/new version/)).not.toBeInTheDocument();
+    });
+
+    it("does not load again for a commit that it loaded before in this tab", async () => {
+      serverVersion("1.0.0", "bbbb222");
+      const { router } = await start();
+      await go(router, "/loaded");
+      expect(assign).toHaveBeenCalledTimes(1);
+
+      // The reload came back to the old build: no second reload.
+      await go(router, "/");
+      await go(router, "/loaded");
+      expect(assign).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("ignores the server's commit when this build has none", async () => {
+    serverVersion("1.0.0", "bbbb222");
+    await start();
+
+    expect(screen.queryByText(/new version/)).not.toBeInTheDocument();
   });
 
   it("keeps the last known version when a check fails", async () => {

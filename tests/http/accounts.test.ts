@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { API_CONTRACT } from "../../lib/api-contract";
 import {
   createAccount,
   createTransactionWithSplits,
@@ -11,6 +13,7 @@ import { contract, type Contract } from "../helpers/contract";
 const accountDetailSchema = contract("AccountDetail");
 const accountNodeListSchema = contract("AccountNodeList");
 const versionSchema = contract("Version");
+const packageVersion = (JSON.parse(readFileSync("package.json", "utf8")) as { version: string }).version;
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 
@@ -46,6 +49,7 @@ describe("account HTTP parity", () => {
       type: string;
       balance: number;
       hasTransactions: boolean;
+      createdAt: string;
       children: Array<{ name: string; balance: number }>;
     }>;
   }
@@ -53,8 +57,26 @@ describe("account HTTP parity", () => {
   it("serves the public version with its strict response shape", async () => {
     const response = await client.anonymous("/api/version");
     expect(response.status).toBe(200);
-    expectShape(versionSchema, await response.json());
+    const body = await response.json();
+    expectShape(versionSchema, body);
+    // The server reads both values from the source tree when it is built.
+    // A native client compares them, so the exact values are the contract.
+    expect(body).toEqual({ version: packageVersion, apiContract: API_CONTRACT });
   });
+
+  // Commits between releases share a version, so a deploy names its commit
+  // (BUILD_COMMIT), and an open page compares it with its own build.
+  it("names the deployed commit in the version", async () => {
+    const deployed = await startHttpTestServer({ BUILD_COMMIT: "0123abc" });
+    try {
+      const response = await fetch(`${deployed.baseUrl}/api/version`);
+      const body = await response.json();
+      expectShape(versionSchema, body);
+      expect(body).toEqual({ version: packageVersion, apiContract: API_CONTRACT, commit: "0123abc" });
+    } finally {
+      await deployed.stop();
+    }
+  }, 120_000);
 
   it("probes the owning server's database connection", async () => {
     const probe = await client.anonymous("/health");
@@ -98,7 +120,9 @@ describe("account HTTP parity", () => {
     expect(list.map((account) => account.name)).toEqual(["Checking", "Groceries"]);
     expect(list[0].children.map((child) => child.name)).toEqual(["Savings Sub"]);
     expect(list[0]).toMatchObject({ balance: 0, hasTransactions: false });
-    expect(list[0].children[0]).toMatchObject({ balance: 0 });
+    expect(list[0].children[0]).toMatchObject({ balance: 0, hasTransactions: false });
+    // The timestamp is a UTC instant with milliseconds and a Z suffix.
+    expect(list[0].createdAt).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
   });
 
   it("sums split balances and applies the asOfDate boundary", async () => {
@@ -118,6 +142,10 @@ describe("account HTTP parity", () => {
     expect((await accounts("?asOfDate=2025-03-01")).find((account) => account.id === checking.id)).toMatchObject({
       balance: -1000, hasTransactions: true,
     });
+    // Before the first split, hasTransactions follows asOfDate too.
+    expect((await accounts("?asOfDate=2024-12-31")).find((account) => account.id === checking.id)).toMatchObject({
+      balance: 0, hasTransactions: false,
+    });
   });
 
   it("filters type and inactive rows", async () => {
@@ -126,12 +154,14 @@ describe("account HTTP parity", () => {
     await createAccount({ name: "Groceries", type: "expense" });
     expect((await accounts("?type=asset")).map((account) => account.name)).toEqual(["Checking"]);
     expect((await accounts("?type=asset&includeInactive=true")).map((account) => account.name)).toEqual(["Checking", "Closed"]);
-    expect((await accounts("?type=asset&type=banana")).map((account) => account.name)).toEqual(["Checking"]);
+    expect((await accounts("?type=asset&type=banana&ignored=anything")).map((account) => account.name)).toEqual(["Checking"]);
   });
 
   it("rejects invalid filters and inaccessible books with the same bodies", async () => {
     for (const [path, status, body] of [
       ["/api/b/1/accounts?asOfDate=2025-02-30", 400, { error: "Invalid ISO date" }],
+      // The decoded value "2025-01- 1" is not in canonical form.
+      ["/api/b/1/accounts?asOfDate=2025-01-%201", 400, { error: "Invalid ISO date" }],
       ["/api/b/1/accounts?type=banana", 400, { error: 'Invalid option: expected one of "asset"|"liability"|"equity"|"income"|"expense"' }],
       ["/api/b/999999/accounts", 404, { error: "Book not found" }],
       ["/api/b/not-a-book/accounts", 400, { error: "Invalid book ID" }],

@@ -13,3 +13,12 @@ export const API_CONTRACT = 1;
 export function getAppVersion(): string {
   return process.env.NEXT_PUBLIC_APP_VERSION ?? "0.0.0-dev";
 }
+
+/**
+ * The commit of this build, when the build names one
+ * (`NEXT_PUBLIC_BUILD_COMMIT`, which the Worker deploy sets). Null for a
+ * local build.
+ */
+export function getBuildCommit(): string | null {
+  return process.env.NEXT_PUBLIC_BUILD_COMMIT || null;
+}

@@ -145,6 +145,21 @@ describe("AccountBalanceChart", () => {
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 
+  // The card owns the button, so the chart must be in the card. A chart next to the card stays on Hide chart.
+  it("hides the chart with Hide chart, keeps it hidden after a remount, and shows it with Show chart", async () => {
+    vi.stubGlobal("fetch", respond(twoPoints));
+    const props = { bookId: "1", accountId: 5, accountType: "asset", refreshKey: 0 };
+    const { unmount } = render(<AccountBalanceChart {...props} />);
+    await screen.findByRole("img", { name: /^Balance, last year/ });
+    fireEvent.click(screen.getByRole("button", { name: "Hide chart" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    unmount();
+    render(<AccountBalanceChart {...props} />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show chart" }));
+    expect(await screen.findByRole("img", { name: /^Balance, last year/ })).toBeInTheDocument();
+  });
+
   it("renders hidden and sends no request when the stored key is set", () => {
     localStorage.setItem("counterpoise.accountBalanceChart.hidden", "true");
     const fetchMock = respond(twoPoints);

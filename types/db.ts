@@ -248,7 +248,10 @@ export interface PlaidToken {
   bookId: number;
   financialInstitution: string;
   itemId: string;
+  /** Ciphertext when `accessTokenKey` is set; plaintext only when it is null. */
   accessToken: string;
+  /** The ID of the key that sealed `accessToken`, never the key. */
+  accessTokenKey: string | null;
   syncCursor: string | null;
   lastSyncedAt: Date | null;
   lastError: string | null;

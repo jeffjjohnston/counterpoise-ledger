@@ -172,13 +172,12 @@ pub(super) async fn search(
     let book = i32::try_from(book_id).map_err(|cause| thrown(&cause.to_string()))?;
     let text = |key: &str| arguments.get(key).and_then(Value::as_str);
     let results = search_book(
-        &caller.state().pool,
+        &*caller.state().database,
         book,
         text("query").unwrap_or_default(),
         text("startDate"),
         text("endDate"),
     )
-    .await
     .map_err(|cause| thrown(&cause.to_string()))?;
     let accounts = &results["accounts"];
     let items: Vec<Value> = accounts["items"]

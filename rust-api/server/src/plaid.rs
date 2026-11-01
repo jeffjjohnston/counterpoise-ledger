@@ -6,10 +6,14 @@
 //! message the status 502. A body that is not JSON gets a different message
 //! from the Node SyntaxError.
 
+use crate::plaid_token_keys::{Sealed, TokenKeys};
 use crate::validation::{from_json_bytes, js_string, js_truthy};
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
+/// How long one Plaid request may take.
+const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The origin of each Plaid environment. Plaid retired the Development
 /// environment, so `PLAID_ENV=development` is refused.
@@ -51,6 +55,10 @@ pub(crate) struct Plaid {
     secret: Option<String>,
     environment: Option<String>,
     base_url: Option<String>,
+    /// The keys of the stored access tokens (`plaid_token_keys.rs`), or why
+    /// the environment does not give them. The server refuses to start on
+    /// the error, so a route meets it only in a process that skipped that.
+    token_keys: Result<Arc<TokenKeys>, String>,
 }
 
 struct Credentials<'a> {
@@ -62,9 +70,14 @@ struct Credentials<'a> {
 /// `isPlaidConfigurationError`: the message names a Plaid variable, so the
 /// installation is at fault, not the bank.
 pub(crate) fn is_configuration_error(message: &str) -> bool {
-    ["PLAID_CLIENT_ID", "PLAID_SECRET", "PLAID_ENV"]
-        .iter()
-        .any(|name| message.contains(name))
+    [
+        "PLAID_CLIENT_ID",
+        "PLAID_SECRET",
+        "PLAID_ENV",
+        "PLAID_TOKEN_KEY",
+    ]
+    .iter()
+    .any(|name| message.contains(name))
 }
 
 /// True when Plaid refused the request itself, for example an expired or a
@@ -97,13 +110,36 @@ fn format_error(prefix: &str, payload: Option<&Value>) -> String {
 
 impl Plaid {
     pub(crate) fn from_env() -> Self {
-        let read = |name: &str| std::env::var(name).ok();
+        let read = |name: &str| ledger_db::env::var(name).ok();
         Self::new(
             read("PLAID_CLIENT_ID"),
             read("PLAID_SECRET"),
             read("PLAID_ENV"),
             read("PLAID_API_URL"),
         )
+        .with_token_keys(TokenKeys::from_env())
+    }
+
+    /// Replaces the token keys, which [`Plaid::new`] leaves empty.
+    pub(crate) fn with_token_keys(mut self, keys: Result<TokenKeys, String>) -> Self {
+        self.token_keys = keys.map(Arc::new);
+        self
+    }
+
+    /// The token keys, or the reason the environment gives none.
+    pub(crate) fn token_keys(&self) -> Result<&TokenKeys, String> {
+        self.token_keys.as_deref().map_err(Clone::clone)
+    }
+
+    /// Encrypts an access token to store it (`plaid_token_keys.rs`).
+    pub(crate) fn seal_token(&self, token: &str) -> Result<Sealed, String> {
+        self.token_keys()?.seal(token)
+    }
+
+    /// The plaintext of a stored access token: the `access_token` and
+    /// `access_token_key` columns.
+    pub(crate) fn open_token(&self, text: &str, key_id: Option<&str>) -> Result<String, String> {
+        self.token_keys()?.open(text, key_id)
     }
 
     /// `PLAID_API_URL` replaces the origin of the selected environment. The
@@ -118,14 +154,14 @@ impl Plaid {
         Self {
             // Node's fetch has no deadline of its own. This one stops a
             // stalled request from holding the route open.
-            client: Client::builder()
-                .timeout(Duration::from_secs(120))
-                .build()
-                .expect("HTTP client"),
+            client: crate::platform::http_client(),
             client_id: set(client_id),
             secret: set(secret),
             environment: set(environment),
             base_url: set(base_url),
+            token_keys: Ok(Arc::new(
+                TokenKeys::parse(None, None).expect("no keys parse"),
+            )),
         }
     }
 
@@ -169,36 +205,40 @@ impl Plaid {
     /// Sends one request. `Ok` holds the parsed body of a 2xx response; `Err`
     /// holds the message that the Node function throws.
     async fn post(&self, path: &str, fields: Value) -> Result<Value, String> {
-        let credentials = self.credentials()?;
-        let mut body = json!({
-            "client_id": credentials.client_id,
-            "secret": credentials.secret,
-        });
-        body.as_object_mut()
-            .expect("an object")
-            .extend(fields.as_object().expect("an object").clone());
-        // `fetch` rejects every network failure with this message.
-        let response = self
-            .client
-            .post(format!("{}{path}", credentials.base_url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| "fetch failed".to_owned())?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| "fetch failed".to_owned())?;
-        if !status.is_success() {
-            let payload = from_json_bytes::<Value>(&bytes).ok();
-            return Err(format_error(
-                &format!("Plaid {path} request failed"),
-                payload.as_ref(),
-            ));
-        }
-        from_json_bytes(&bytes)
-            .map_err(|cause| format!("Plaid {path} sent a body that is not JSON: {cause}"))
+        crate::platform::outbound(async {
+            let credentials = self.credentials()?;
+            let mut body = json!({
+                "client_id": credentials.client_id,
+                "secret": credentials.secret,
+            });
+            body.as_object_mut()
+                .expect("an object")
+                .extend(fields.as_object().expect("an object").clone());
+            // `fetch` rejects every network failure with this message.
+            let response = self
+                .client
+                .post(format!("{}{path}", credentials.base_url))
+                .timeout(TIMEOUT)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|_| "fetch failed".to_owned())?;
+            let status = response.status();
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| "fetch failed".to_owned())?;
+            if !status.is_success() {
+                let payload = from_json_bytes::<Value>(&bytes).ok();
+                return Err(format_error(
+                    &format!("Plaid {path} request failed"),
+                    payload.as_ref(),
+                ));
+            }
+            from_json_bytes(&bytes)
+                .map_err(|cause| format!("Plaid {path} sent a body that is not JSON: {cause}"))
+        })
+        .await
     }
 
     /// `fetchPlaidTransactionsSync`: one page of `/transactions/sync`. Items

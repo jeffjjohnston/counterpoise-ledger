@@ -4,7 +4,10 @@ use axum::http::Method;
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
 
-use crate::mcp::call::{Caller, Level, Role, ToolResult, fail, integer, ok, without};
+use crate::{
+    book_auth::BookRole,
+    mcp::call::{Caller, Level, ToolResult, fail, integer, ok, without},
+};
 
 fn members_path(book_id: i64) -> String {
     format!("/api/books/{book_id}/members")
@@ -61,8 +64,8 @@ pub(super) async fn remove(
 ) -> ToolResult<CallToolResult> {
     let book_id = integer(arguments, "bookId");
     let user_id = integer(arguments, "userId");
-    let (caller_id, role) = caller.book(book_id, Level::Read).await?;
-    if user_id != i64::from(caller_id) && role != Role::Owner {
+    let book = caller.book(book_id, Level::Read).await?;
+    if user_id != i64::from(book.user_id()) && book.role() != BookRole::Owner {
         return Err(fail("Only an owner can do this").into());
     }
     caller

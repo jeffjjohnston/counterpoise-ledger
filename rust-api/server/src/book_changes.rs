@@ -1,5 +1,5 @@
-//! Live-update hints for `GET /api/b/{bookId}/events`, as in
-//! `lib/book-change-hub.ts`. One hub serves the process.
+//! Live-update hints for `GET /api/b/{bookId}/socket`. One hub serves the
+//! process.
 //!
 //! Triggers on each table of [`CHANGE_TABLES`] count the row changes of each
 //! (book, table) in `change_marks` (migration 0001). Every writer runs them:
@@ -9,17 +9,17 @@
 //! a count that moved is a hint for that table. The hints are invalidation
 //! hints only: a book and a table, never row data.
 
-use ledger_db::{engine::DbPool, sql};
-use serde_json::json;
+use crate::platform;
+use ledger_db::{
+    Database, Sql, sql,
+    store::{self, params},
+};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Once, Weak},
     time::Duration,
 };
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-};
+use tokio::sync::{mpsc, watch};
 
 /// The tables that send a hint. Each has the `*_mark` triggers.
 pub(crate) const CHANGE_TABLES: [&str; 14] = [
@@ -59,14 +59,6 @@ pub(crate) enum BookChange {
     Change(Vec<String>),
 }
 
-impl BookChange {
-    /// The SSE frame, byte for byte as the Node route writes it.
-    pub(crate) fn frame(&self) -> String {
-        let Self::Change(tables) = self;
-        format!("event: change\ndata: {}\n\n", json!({ "tables": tables }))
-    }
-}
-
 #[derive(Default)]
 struct Book {
     subscribers: HashMap<u64, mpsc::Sender<BookChange>>,
@@ -79,7 +71,7 @@ struct Book {
 struct Window {
     id: u64,
     tables: Vec<String>,
-    timer: JoinHandle<()>,
+    timer: platform::Task,
 }
 
 #[derive(Default)]
@@ -91,7 +83,7 @@ struct Books {
 struct Inner {
     books: Mutex<Books>,
     /// `None` for a hub that the tests drive by hand.
-    pool: Option<DbPool>,
+    database: Option<Arc<Database>>,
     poller: Once,
     closing: watch::Sender<bool>,
 }
@@ -113,7 +105,9 @@ impl Subscription {
     /// a change after this point is a hint. The route sends `ready` after
     /// this, and the page fetches after `ready`, so the page misses nothing.
     pub(crate) async fn ready(&self) {
-        let Some(pool) = &self.inner.pool else { return };
+        let Some(database) = &self.inner.database else {
+            return;
+        };
         let known = lock(&self.inner.books)
             .books
             .get(&self.book_id)
@@ -121,7 +115,7 @@ impl Subscription {
         if known {
             return;
         }
-        match read_counts(pool, &[self.book_id]).await {
+        match read_counts(database, &[self.book_id]) {
             Ok(mut counts) => {
                 let mut books = lock(&self.inner.books);
                 if let Some(book) = books.books.get_mut(&self.book_id)
@@ -150,31 +144,31 @@ impl Drop for Subscription {
 }
 
 impl BookChangeHub {
-    pub(crate) fn new(pool: DbPool) -> Self {
-        Self::with_pool(Some(pool))
+    pub(crate) fn new(database: Arc<Database>) -> Self {
+        Self::with_database(Some(database))
     }
 
-    fn with_pool(pool: Option<DbPool>) -> Self {
+    fn with_database(database: Option<Arc<Database>>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 books: Mutex::default(),
-                pool,
+                database,
                 poller: Once::new(),
                 closing: watch::Sender::new(false),
             }),
         }
     }
 
-    /// A hub with no database, that a test drives with `notify`.
-    #[cfg(test)]
+    /// A hub with no database: it never polls. A test drives it with
+    /// `notify`; a Durable Object uses it so that it can hibernate.
     pub(crate) fn detached() -> Self {
-        Self::with_pool(None)
+        Self::with_database(None)
     }
 
     pub(crate) fn subscribe(&self, book_id: i32) -> Subscription {
-        if let Some(pool) = &self.inner.pool {
+        if let Some(database) = &self.inner.database {
             self.inner.poller.call_once(|| {
-                tokio::spawn(poll(Arc::downgrade(&self.inner), pool.clone()));
+                platform::spawn(poll(Arc::downgrade(&self.inner), database.clone()));
             });
         }
         let (sender, receiver) = mpsc::channel(QUEUE);
@@ -207,17 +201,17 @@ impl BookChangeHub {
 }
 
 /// The counts of `books`, by book, then by table.
-async fn read_counts(
-    pool: &DbPool,
+pub(crate) fn read_counts(
+    database: &Database,
     books: &[i32],
-) -> Result<HashMap<i32, HashMap<String, i64>>, sqlx::Error> {
-    let rows: Vec<(i32, String, i64)> = sqlx::query_as(&format!(
-        "SELECT book_id, table_name, version FROM change_marks WHERE book_id {}",
-        sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(books))
-    .fetch_all(pool)
-    .await?;
+) -> Result<HashMap<i32, HashMap<String, i64>>, store::Error> {
+    let rows: Vec<(i32, String, i64)> = database.query(
+        &format!(
+            "SELECT book_id, table_name, version FROM change_marks WHERE book_id {}",
+            sql::in_integers("?1")
+        ),
+        &params![sql::json_array(books)],
+    )?;
     let mut counts: HashMap<i32, HashMap<String, i64>> = HashMap::new();
     for (book_id, table, version) in rows {
         counts.entry(book_id).or_default().insert(table, version);
@@ -227,15 +221,15 @@ async fn read_counts(
 
 /// Reads the counts of the books that have a subscriber, and sends a hint
 /// for each count that moved. Ends when the hub is gone.
-async fn poll(inner: Weak<Inner>, pool: DbPool) {
+async fn poll(inner: Weak<Inner>, database: Arc<Database>) {
     loop {
-        tokio::time::sleep(POLL).await;
+        platform::sleep(POLL).await;
         let Some(hub) = inner.upgrade() else { return };
         let books: Vec<i32> = lock(&hub.books).books.keys().copied().collect();
         if books.is_empty() {
             continue;
         }
-        let counts = match read_counts(&pool, &books).await {
+        let counts = match read_counts(&database, &books) {
             Ok(counts) => counts,
             Err(cause) => {
                 tracing::warn!(error = %cause, "Book change counts unreadable");
@@ -295,8 +289,8 @@ impl Inner {
         book.window = Some(Window {
             id: next_id,
             tables: vec![table.to_owned()],
-            timer: tokio::spawn(async move {
-                tokio::time::sleep(WINDOW).await;
+            timer: platform::spawn(async move {
+                platform::sleep(WINDOW).await;
                 if let Some(inner) = inner.upgrade() {
                     inner.flush(book_id, next_id);
                 }
@@ -369,14 +363,6 @@ mod tests {
             .expect("an open stream")
     }
 
-    #[test]
-    fn frames_match_the_node_route() {
-        assert_eq!(
-            BookChange::Change(vec!["transactions".into()]).frame(),
-            "event: change\ndata: {\"tables\":[\"transactions\"]}\n\n"
-        );
-    }
-
     #[tokio::test(start_paused = true)]
     async fn windows_collect_tables_per_book_and_ignore_invalid_hints() {
         let hub = BookChangeHub::detached();
@@ -431,51 +417,50 @@ mod tests {
     /// table has one.
     #[tokio::test]
     async fn each_change_table_has_its_triggers() {
-        let database = TempDatabase::new(1).await;
-        let mut marked: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT tbl_name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%\\_mark'",
-        )
-        .fetch_all(database.pool())
-        .await
-        .unwrap();
+        let database = Database::open_in_memory().unwrap();
+        ledger_db::migrate(&database).unwrap();
+        let mut marked: Vec<String> = database
+            .query(
+                "SELECT DISTINCT tbl_name FROM sqlite_master WHERE type = 'trigger' AND name GLOB '*_mark'",
+                &[],
+            )
+            .unwrap();
         marked.sort();
         let mut expected: Vec<String> = CHANGE_TABLES.iter().map(|t| (*t).to_owned()).collect();
         expected.sort();
         assert_eq!(marked, expected);
-        let triggers: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%\\_mark'",
-        )
-        .fetch_one(database.pool())
-        .await
-        .unwrap();
+        let triggers: i64 = database
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name GLOB '*_mark'",
+                &[],
+            )
+            .unwrap();
         assert_eq!(triggers, 3 * CHANGE_TABLES.len() as i64);
     }
 
-    /// A committed write sends its tables, from this pool or from another
+    /// A committed write sends its tables, from this database or from another
     /// connection (another process). A rolled back write sends nothing, and
     /// a row that moves to another book tells both books.
     #[tokio::test]
     async fn committed_writes_of_any_connection_reach_the_hub() {
-        let database = TempDatabase::new(2).await;
-        let pool = database.pool().clone();
+        let file = TempDatabase::new();
+        let database = Arc::new(Database::open(file.path(), false).unwrap());
         // Another writer on the same file, as ledger-cli would be.
-        let other = ledger_db::connect(database.path(), false).unwrap();
-        let hub = BookChangeHub::new(pool.clone());
-        let now = chrono::Utc::now().naive_utc();
-        sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'u', 'h', $1)",
-        )
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let other = Database::open(file.path(), false).unwrap();
+        let hub = BookChangeHub::new(database.clone());
+        let now = crate::platform::timestamp();
+        database
+            .execute(
+                "INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'u', 'h', ?1)",
+                &params![now],
+            )
+            .unwrap();
         for id in [1, 2] {
-            sqlx::query("INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES ($1, 1, $2, $3, $3)")
-                .bind(id)
-                .bind(format!("Book {id}"))
-                .bind(now)
-                .execute(&pool)
-                .await
+            database
+                .execute(
+                    "INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES (?1, 1, ?2, ?3, ?3)",
+                    &params![id, format!("Book {id}"), now],
+                )
                 .unwrap();
         }
         let mut first = subscribe(&hub, 1);
@@ -483,32 +468,33 @@ mod tests {
         first.ready().await;
         second.ready().await;
 
-        let mut transaction = ledger_db::locks::begin_pool(&pool).await.unwrap();
-        sqlx::query("INSERT INTO payees (book_id, name, created_at) VALUES (1, 'Rolled back', $1)")
-            .bind(now)
-            .execute(transaction.as_mut())
-            .await
-            .unwrap();
-        transaction.rollback().await.unwrap();
+        let rolled_back: Result<(), store::Error> = database.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO payees (book_id, name, created_at) VALUES (1, 'Rolled back', ?1)",
+                &params![now],
+            )?;
+            Err(store::Error::Invalid("roll back".into()))
+        });
+        assert!(rolled_back.is_err());
         tokio::time::sleep(POLL * 3 + WINDOW).await;
         assert!(
             first.receiver.try_recv().is_err(),
             "the rollback sent nothing"
         );
 
-        sqlx::query("INSERT INTO payees (book_id, name, created_at) VALUES (1, 'Kept', $1)")
-            .bind(now)
-            .execute(&other)
-            .await
+        other
+            .execute(
+                "INSERT INTO payees (book_id, name, created_at) VALUES (1, 'Kept', ?1)",
+                &params![now],
+            )
             .unwrap();
         assert_eq!(
             receive(&mut first).await,
             BookChange::Change(vec!["payees".into()])
         );
 
-        sqlx::query("UPDATE payees SET book_id = 2 WHERE name = 'Kept'")
-            .execute(&pool)
-            .await
+        database
+            .execute("UPDATE payees SET book_id = 2 WHERE name = 'Kept'", &[])
             .unwrap();
         assert_eq!(
             receive(&mut first).await,

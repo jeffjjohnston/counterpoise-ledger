@@ -904,7 +904,7 @@ describe("TransactionForm investment mode", () => {
     expect(screen.getByLabelText("Price")).toHaveValue("2.50");
   });
 
-  // Report #37 fixed simple mode only. On macOS, Safari and Firefox keep
+  // An earlier fix covered simple mode only. On macOS, Safari and Firefox keep
   // buttons out of the tab order unless Full Keyboard Access is on, so the
   // form moves the focus from the row's last field to Add itself.
   describe("Tab from the last field reaches Add", () => {

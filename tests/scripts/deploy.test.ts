@@ -27,6 +27,8 @@ let binDir: string;
 let buildDir: string;
 /** Every `docker` invocation the stub saw, with the directory it ran in. */
 let dockerLog: string;
+/** Every `gh` invocation the stub saw. */
+let ghLog: string;
 /** The commit the release PR merged onto main — what a deploy is given. */
 let mergeCommit: string;
 /** The tip of the release branch, a parent of the merge commit. */
@@ -83,7 +85,10 @@ function deploy(
         PATH: `${binDir}:${process.env.PATH}`,
         DOCKER_FAIL: options.dockerFails ? "1" : "0",
         DOCKER_LOG: dockerLog,
+        GH_LOG: ghLog,
         COUNTERPOISE_BUILD_DIR: buildDir,
+        // The operator's own setting must not choose the target of a test.
+        COUNTERPOISE_DEPLOY_TARGET: undefined,
         ...options.env,
       } as NodeJS.ProcessEnv,
       stdio: ["ignore", "pipe", "pipe"],
@@ -98,6 +103,17 @@ function deploy(
 /** What the stub docker recorded, or "" when it was never called. */
 function dockerCalls(): string {
   return existsSync(dockerLog) ? readFileSync(dockerLog, "utf8") : "";
+}
+
+/** What the stub gh recorded, or "" when it was never called. */
+function ghCalls(): string {
+  return existsSync(ghLog) ? readFileSync(ghLog, "utf8") : "";
+}
+
+/** The pause lengths the polling loop asked for, one per `sleep`. */
+function sleepCalls(): string[] {
+  const file = join(binDir, "sleep-calls");
+  return existsSync(file) ? readFileSync(file, "utf8").trim().split("\n") : [];
 }
 
 /** The directory `docker compose` was invoked from. */
@@ -168,6 +184,73 @@ beforeEach(() => {
       "exit 0\n"
   );
   chmodSync(join(binDir, "docker"), 0o755);
+
+  // gh, for the repository variables and the worker-release.yml run. Each
+  // GH_* variable sets one answer. A variable that is not set is "not found",
+  // as gh reports it. `run list` lists the run of the push of main, at the
+  // commit main is at, after a run that is at another commit. The real jq
+  // applies the script's own --jq filter, so the filter is tested too.
+  // `run watch` does what the workflow does: it publishes the annotated tag
+  // at that commit, from a clone that then forgets it, so the deploy must
+  // fetch it. GH_RUN_NO_TAG is a run that passed and published nothing.
+  ghLog = join(root, "gh.log");
+  writeFileSync(
+    join(binDir, "gh"),
+    String.raw`#!/bin/sh
+echo "args=$*" >>"$GH_LOG"
+if [ "$GH_FAIL" = "1" ]; then echo "gh: cannot reach GitHub" >&2; exit 1; fi
+case "$1 $2" in
+  "variable get")
+    case "$3" in
+      WORKER_TAG_TARGET) value="$GH_WORKER_TAG_TARGET" ;;
+      WORKER_DEPLOY) value="$GH_WORKER_DEPLOY" ;;
+      *) value="" ;;
+    esac
+    if [ -z "$value" ]; then echo "variable $3 was not found" >&2; exit 1; fi
+    echo "$value"
+    ;;
+  "run list")
+    count_file="$GH_LOG.list"
+    n=0
+    [ -f "$count_file" ] && n=$(cat "$count_file")
+    n=$((n + 1))
+    echo "$n" >"$count_file"
+    runs='[{"databaseId":1,"headSha":"0000000000000000000000000000000000000000"}'
+    if [ "$n" -gt "0$GH_RUN_APPEARS_AFTER" ]; then
+      sha=$(git ls-remote origin refs/heads/main | cut -f1)
+      runs="$runs,{\"databaseId\":4242,\"headSha\":\"$sha\"}"
+    fi
+    runs="$runs]"
+    filter="."
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--jq" ]; then filter="$2"; fi
+      shift
+    done
+    printf '%s\n' "$runs" | jq -r "$filter"
+    ;;
+  "run watch")
+    if [ "$GH_RUN_FAILS" = "1" ]; then echo "Run $3 failed" >&2; exit 1; fi
+    if [ "$GH_RUN_NO_TAG" != "1" ]; then
+      sha=$(git ls-remote origin refs/heads/main | cut -f1)
+      git fetch -q origin
+      version=$(git show "$sha:package.json" | node -p "JSON.parse(require('fs').readFileSync(0)).version")
+      if ! git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+        git tag -a "v$version" "$sha" -m "release: v$version (worker-release.yml)"
+        git push -q origin "refs/tags/v$version"
+        git tag -d "v$version" >/dev/null
+      fi
+    fi
+    echo "Run $3 completed with success"
+    ;;
+esac
+exit 0
+`
+  );
+  chmodSync(join(binDir, "gh"), 0o755);
+  // The run poll pauses with `sleep`. The stub records each pause and returns
+  // at once.
+  writeFileSync(join(binDir, "sleep"), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$(dirname "$0")/sleep-calls"\n');
+  chmodSync(join(binDir, "sleep"), 0o755);
 
   origin = join(root, "origin.git");
   repo = join(root, "repo");
@@ -869,5 +952,202 @@ describe("the database volume is checked before anything changes", () => {
     const result = deploy({ env: { DOCKER_RUN_STATUS: "1" } });
     expect(result.code, result.output).toBe(0);
     expect(dockerCalls()).not.toContain("args=run");
+  });
+});
+
+describe("the worker target waits for the worker-release.yml run, which publishes the tag", () => {
+  /** The environment of a deploy to the production Worker that may go ahead. */
+  const WORKER = {
+    COUNTERPOISE_DEPLOY_TARGET: "worker",
+    GH_WORKER_DEPLOY: "true",
+    GH_WORKER_TAG_TARGET: "production",
+  };
+
+  it("waits for the run at the merge commit, pushes no tag itself, and never calls docker", () => {
+    const productionHead = git(["rev-parse", "HEAD"], buildDir);
+
+    const { code, output } = deploy({ env: WORKER });
+
+    expect(code, output).toBe(0);
+    // 4242 is the run at the deployed commit. The stub lists run 1, at another
+    // commit, first, so a filter that took the newest run would watch run 1.
+    expect(ghCalls()).toContain("args=run list --workflow worker-release.yml");
+    expect(ghCalls()).toContain("args=run watch 4242 --exit-status");
+    expect(ghCalls()).not.toContain("args=run watch 1 ");
+    // The tag is the one the run published, fetched from origin.
+    expect(remoteTagCommit()).toBe(mergeCommit);
+    expect(tagType()).toBe("tag");
+    expect(tagMessage()).toContain("(worker-release.yml)");
+    expect(dockerCalls()).toBe("");
+    expect(git(["rev-parse", "HEAD"], buildDir), "the production checkout moved").toBe(productionHead);
+    expect(output).toContain("to the production Worker");
+  });
+
+  it("does not read the production checkout at all", () => {
+    // The Docker target refuses a missing clone. The worker target has no use
+    // for one, so it must not look.
+    const { code, output } = deploy({ env: { ...WORKER, COUNTERPOISE_BUILD_DIR: join(root, "absent") } });
+
+    expect(code, output).toBe(0);
+    expect(dockerCalls()).toBe("");
+  });
+
+  it("waits for a run that appears some seconds after the merge", () => {
+    const { code, output } = deploy({
+      env: { ...WORKER, GH_RUN_APPEARS_AFTER: "2", DEPLOY_RUN_POLL_SECONDS: "3" },
+    });
+
+    expect(code, output).toBe(0);
+    expect(sleepCalls()).toEqual(["3", "3"]);
+    expect(ghCalls()).toContain("args=run watch 4242 --exit-status");
+  });
+
+  it("fails, and publishes no tag, when no run appears in time", () => {
+    const { code, output } = deploy({
+      env: { ...WORKER, GH_RUN_APPEARS_AFTER: "99", DEPLOY_RUN_WAIT_SECONDS: "10", DEPLOY_RUN_POLL_SECONDS: "5" },
+    });
+
+    expect(code).not.toBe(0);
+    expect(output).toContain("no worker-release.yml run");
+    expect(output).toContain("gh workflow run worker-release.yml --ref main");
+    expect(output).toContain("Deploy failed during");
+    expect(sleepCalls()).toEqual(["5", "5"]);
+    expect(git(["ls-remote", "--tags", "origin"])).toBe("");
+    expect(git(["tag", "--list"])).toBe("");
+    expect(ghCalls()).not.toContain("args=run watch");
+  });
+
+  it("fails the deploy when the run fails", () => {
+    const { code, output } = deploy({ env: { ...WORKER, GH_RUN_FAILS: "1" } });
+
+    expect(code).not.toBe(0);
+    expect(output).toContain("the worker-release.yml run 4242 did not pass");
+    expect(output).toContain("gh run rerun 4242 --failed");
+    expect(output).toContain("Deploy failed during: wait for the worker-release.yml run 4242");
+    expect(output).not.toContain("to the production Worker");
+    expect(git(["ls-remote", "--tags", "origin"])).toBe("");
+    expect(dockerCalls()).toBe("");
+  });
+
+  it("fails when the run passed but published no tag at the commit", () => {
+    const { code, output } = deploy({ env: { ...WORKER, GH_RUN_NO_TAG: "1" } });
+
+    expect(code).not.toBe(0);
+    expect(output).toContain("did not deploy this release");
+    expect(output).not.toContain("to the production Worker");
+  });
+
+  it("waits for the same run again on a re-run, and asks nothing", () => {
+    // Nothing restarts on a re-run, so there is nothing to confirm: no --yes.
+    expect(deploy({ env: { ...WORKER, GH_RUN_FAILS: "1" } }).code).not.toBe(0);
+
+    const again = deploy({ env: WORKER, args: [`--ref=${mergeCommit}`] });
+
+    expect(again.code, again.output).toBe(0);
+    expect(ghCalls().match(/args=run watch 4242/g)).toHaveLength(2);
+    expect(remoteTagCommit()).toBe(mergeCommit);
+  });
+
+  it("refuses before the wait when the tag names another commit", () => {
+    git(["tag", "-a", "v9.9.9", releaseHead, "-m", "release: v9.9.9"]);
+    git(["push", "origin", "refs/tags/v9.9.9"]);
+
+    const { code, output } = deploy({ env: WORKER });
+
+    expect(code).not.toBe(0);
+    expect(output).toContain("already points at");
+    expect(ghCalls()).not.toContain("args=run");
+  });
+
+  it.each([
+    ["is not set", undefined],
+    ["is staging", "staging"],
+  ])("refuses before the wait when WORKER_TAG_TARGET %s", (_label, value) => {
+    const { code, output } = deploy({ env: { ...WORKER, GH_WORKER_TAG_TARGET: value } });
+
+    expect(code).not.toBe(0);
+    expect(output).toContain("WORKER_TAG_TARGET");
+    expect(output).toContain("not 'production'");
+    expect(git(["tag", "--list"])).toBe("");
+    expect(git(["ls-remote", "--tags", "origin"])).toBe("");
+    expect(dockerCalls()).toBe("");
+  });
+
+  it("refuses before the wait when WORKER_DEPLOY is not true", () => {
+    const { code, output } = deploy({ env: { ...WORKER, GH_WORKER_DEPLOY: undefined } });
+
+    expect(code).not.toBe(0);
+    expect(output).toContain("WORKER_DEPLOY");
+    expect(git(["ls-remote", "--tags", "origin"])).toBe("");
+    expect(dockerCalls()).toBe("");
+  });
+
+  it("refuses before the wait when gh cannot read the variables", () => {
+    const { code } = deploy({ env: { ...WORKER, GH_FAIL: "1" } });
+
+    expect(code).not.toBe(0);
+    expect(git(["ls-remote", "--tags", "origin"])).toBe("");
+    expect(dockerCalls()).toBe("");
+  });
+
+  it("reads the target from .env.deploy.local", () => {
+    writeFileSync(join(repo, ".env.deploy.local"), "# deploy settings\nCOUNTERPOISE_DEPLOY_TARGET='worker'\n");
+
+    const { code, output } = deploy({ env: { ...WORKER, COUNTERPOISE_DEPLOY_TARGET: undefined } });
+
+    expect(code, output).toBe(0);
+    expect(output).toContain("Deploy target: worker");
+    expect(dockerCalls()).toBe("");
+  });
+
+  it("lets the environment variable win over .env.deploy.local", () => {
+    writeFileSync(join(repo, ".env.deploy.local"), "COUNTERPOISE_DEPLOY_TARGET=docker\n");
+
+    const { code, output } = deploy({ env: WORKER });
+
+    expect(code, output).toBe(0);
+    expect(dockerCalls()).toBe("");
+  });
+
+  it.each([
+    ["the environment", { COUNTERPOISE_DEPLOY_TARGET: "workers" }, ""],
+    ["the environment", { COUNTERPOISE_DEPLOY_TARGET: "Docker" }, ""],
+    [".env.deploy.local", {}, "COUNTERPOISE_DEPLOY_TARGET=cloudflare\n"],
+  ])("refuses a target that is not docker or worker, from %s", (_source, env, file) => {
+    if (file) writeFileSync(join(repo, ".env.deploy.local"), file);
+
+    const { code, output } = deploy({ env });
+
+    expect(code).not.toBe(0);
+    expect(output).toContain("is not valid. Use docker or worker");
+    expect(git(["tag", "--list"])).toBe("");
+    expect(dockerCalls()).toBe("");
+  });
+});
+
+describe("the docker target refuses while production is on the Worker", () => {
+  it("refuses before anything moves when WORKER_TAG_TARGET is production", () => {
+    const productionHead = git(["rev-parse", "HEAD"], buildDir);
+
+    const { code, output } = deploy({ env: { GH_WORKER_TAG_TARGET: "production" } });
+
+    expect(code).not.toBe(0);
+    expect(output).toContain("second live database");
+    expect(git(["tag", "--list"])).toBe("");
+    expect(dockerCalls()).toBe("");
+    expect(git(["rev-parse", "HEAD"], buildDir)).toBe(productionHead);
+  });
+
+  it.each([
+    ["gh fails", { GH_FAIL: "1" }],
+    ["the variable is not set", {}],
+    ["the variable is staging", { GH_WORKER_TAG_TARGET: "staging" }],
+  ])("deploys as before when %s", (_label, env) => {
+    const { code, output } = deploy({ env });
+
+    expect(code, output).toBe(0);
+    expect(ghCalls()).toContain("args=variable get WORKER_TAG_TARGET");
+    expect(dockerCalls()).toContain("args=compose");
+    expect(ghCalls()).not.toContain("args=run");
   });
 });

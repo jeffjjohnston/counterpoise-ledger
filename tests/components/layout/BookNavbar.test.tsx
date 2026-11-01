@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BookNavbar } from "@/components/layout/BookNavbar";
 import { BookRoleProvider } from "@/components/BookRoleProvider";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 
 const pushMock = vi.fn();
 
@@ -26,6 +28,61 @@ describe("BookNavbar", () => {
     pushMock.mockReset();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  // Each poll wakes the server's Durable Object. The socket sends the Plaid
+  // tables' changes, so the badge needs no poll while it is open.
+  it("polls the pending count only while the book socket is not open", async () => {
+    vi.useFakeTimers();
+    try {
+      FakeWebSocket.instances = [];
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      vi.spyOn(Math, "random").mockReturnValue(1);
+      let polls = 0;
+      let failing = false;
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url === "/api/books") return { ok: true, json: async () => [{ id: 1, name: "Primary Book" }] } as Response;
+        if (url.includes("/sync/pending-count")) {
+          polls++;
+          if (failing) return { ok: false, status: 503, json: async () => ({ error: "busy" }) } as Response;
+          return { ok: true, json: async () => ({ count: 0 }) } as Response;
+        }
+        return { ok: false, status: 404, json: async () => ({}) } as Response;
+      }));
+      const view = render(<BookChangesProvider><BookRoleProvider><BookNavbar /></BookRoleProvider></BookChangesProvider>);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(polls).toBe(1);
+      const socket = FakeWebSocket.instances[0];
+      // Readiness catches up once.
+      socket.emit("ready");
+      await act(() => vi.advanceTimersByTimeAsync(100));
+      expect(polls).toBe(2);
+      await act(() => vi.advanceTimersByTimeAsync(3 * 60_000));
+      expect(polls).toBe(2);
+      // A hint for the queue still refreshes the badge.
+      socket.emit("change", { tables: ["plaid_transaction_reconciliation"] });
+      await act(() => vi.advanceTimersByTimeAsync(100));
+      expect(polls).toBe(3);
+      // A read that fails is tried again at the next poll, socket or not,
+      // and the polls stop once one succeeds.
+      failing = true;
+      socket.emit("change", { tables: ["plaid_accounts"] });
+      await act(() => vi.advanceTimersByTimeAsync(100));
+      expect(polls).toBe(4);
+      failing = false;
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(polls).toBe(5);
+      await act(() => vi.advanceTimersByTimeAsync(2 * 60_000));
+      expect(polls).toBe(5);
+      // A dropped socket, until the next one is ready: the poll runs.
+      socket.drop(1013);
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(polls).toBe(6);
+      view.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("opens the Settings modal from the user dropdown", async () => {
@@ -74,67 +131,6 @@ describe("BookNavbar", () => {
     fireEvent.click(screen.getByLabelText("Open user menu"));
 
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
-  });
-
-  it("shows active nav link with bottom border class, not background pill", async () => {
-    // usePathname is mocked to "/b/1/transactions" at file top
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      json: async () => [{ id: 1, name: "Primary Book" }],
-    } as Response));
-    vi.stubGlobal("fetch", fetchMock);
-
-    renderNavbar();
-    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
-
-    const transactionsLink = screen.getByRole("link", { name: "Transactions" });
-    expect(transactionsLink).toHaveClass("border-b-2");
-    expect(transactionsLink).toHaveClass("border-fg-accent");
-    expect(transactionsLink).not.toHaveClass("bg-accent-subtle");
-
-    const dashboardLink = screen.getByRole("link", { name: "Dashboard" });
-    expect(dashboardLink).not.toHaveClass("border-fg-accent");
-    expect(dashboardLink).toHaveClass("border-transparent");
-  });
-
-  it("keeps the brand from shrinking when the navbar is tight", async () => {
-    // The brand shares a flex row with the book switcher and every nav link. At the
-    // default shrink it is the first thing to give up width, and the wordmark
-    // renders clipped as "Counterpois".
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      json: async () => [{ id: 1, name: "Primary Book" }],
-    } as Response));
-    vi.stubGlobal("fetch", fetchMock);
-
-    renderNavbar();
-    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
-
-    const brand = screen.getByRole("link", { name: "Counterpoise" });
-    expect(brand).toHaveClass("shrink-0");
-  });
-
-  it("switches between mobile and desktop chrome at the lg breakpoint", async () => {
-    // The desktop nav needs ~1000px, so it must not appear at md (768px) — every
-    // portrait iPad sits between the two and would render a nav it cannot fit,
-    // pushing More, Search and the user menu off-screen. This has to agree with
-    // MOBILE_BREAKPOINT in useIsMobile, which swaps the register table for cards.
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      json: async () => [{ id: 1, name: "Primary Book" }],
-    } as Response));
-    vi.stubGlobal("fetch", fetchMock);
-
-    const { container } = renderNavbar();
-    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
-
-    const desktopNav = screen.getByRole("link", { name: "Transactions" }).closest("div.hidden");
-    expect(desktopNav).toHaveClass("lg:flex");
-
-    const hamburger = screen.getByLabelText("Open menu");
-    expect(hamburger.parentElement).toHaveClass("lg:hidden");
-
-    expect(container.innerHTML).not.toMatch(/\bmd:(flex|hidden|block)\b/);
   });
 
   it("releases the body scroll lock when the viewport leaves the mobile range", async () => {
@@ -240,6 +236,21 @@ describe("BookNavbar", () => {
 
     // More button exists
     expect(screen.getByRole("button", { name: /more/i })).toBeInTheDocument();
+  });
+
+  it("marks only the active desktop nav link with aria-current", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ id: 1, name: "Primary Book" }],
+    } as Response)));
+
+    renderNavbar();
+    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
+
+    // The pathname is /b/1/transactions. Dashboard is /b/1, a prefix of that
+    // path, and must still not be marked: it matches only its exact path.
+    const current = screen.getAllByRole("link").filter((link) => link.getAttribute("aria-current") === "page");
+    expect(current.map((link) => link.textContent)).toEqual(["Transactions"]);
   });
 
   it("reveals Accounts, Payees, and Reports when More is clicked", async () => {

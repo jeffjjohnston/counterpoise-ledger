@@ -6,15 +6,21 @@
 
 use crate::validation::parse_pg_int4;
 use crate::{
-    book_auth::{AccessLevel, AuthenticatedBook, authenticate_book},
+    book_auth::{AccessLevel, authenticate_book},
+    book_scope::{
+        Account, BalancedSplits, BookAccess, InBook, Payee, ProvedSplits, RecurringRule, Write,
+        resolve_payee, row_in_book, rows_in_book,
+    },
+    db_scope::write_transaction,
     error::{ApiError, ApiResult, error},
     recurring_input::{
         CreateRule, TemplateSplit, UpdateRule, validate_create, validate_process, validate_update,
     },
     routes::transactions::{
-        AccountRow, PayeeRow, database_error, now_millis, resolve_payee_id, serialize_timestamp,
+        AccountRow, PayeeRow, database_error, now_millis, same_book, serialize_timestamp,
     },
     state::AppState,
+    transaction_input::SplitInput,
     validation::{
         database_integer, first_query_values, js_number, js_string, js_stringify, js_truthy,
         local_today, parse_int_auto_radix, parse_js_number, parse_json_body, query_date_param,
@@ -34,12 +40,12 @@ use ledger_core::{
         next_date, occurrence_date, schedule_key,
     },
 };
-use ledger_db::engine::{Db, DbConnection, DbPool};
-use ledger_db::sql;
-use ledger_db::sql::EFFECTIVE_DATE;
+use ledger_db::folds::{fold, fold_option};
+use ledger_db::sql::{EFFECTIVE_DATE, in_integers, json_array, json_rows};
+use ledger_db::store::{self, Builder, params};
+use ledger_db::{Database, Sql};
 use serde::Serialize;
 use serde_json::{Value, json, to_value};
-use sqlx::{FromRow, QueryBuilder};
 use std::collections::{HashMap, HashSet};
 
 const NOT_FOUND: &str = "Recurring rule not found";
@@ -80,7 +86,7 @@ const RULE_COLUMNS: &str = "id, book_id, name, frequency, interval, days_of_week
     days_of_month, start_date, end_date, next_date, business_days_only, auto_create_days_before,
     template_description, payee_id, is_active, created_at";
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuleRow {
     id: i32,
@@ -103,7 +109,7 @@ struct RuleRow {
     created_at: NaiveDateTime,
 }
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TemplateSplitRow {
     id: i32,
@@ -128,48 +134,50 @@ struct LoadedRule {
 /// Loads the payee and the template splits of each rule, in the order of
 /// `rules`. A relational query has no ORDER BY for its children. Rust
 /// returns them in ID order, which is their insertion order.
-async fn attach(pool: &DbPool, rules: Vec<RuleRow>) -> Result<Vec<LoadedRule>, sqlx::Error> {
+fn attach(database: &impl Sql, rules: Vec<RuleRow>) -> Result<Vec<LoadedRule>, store::Error> {
     if rules.is_empty() {
         return Ok(Vec::new());
     }
     let rule_ids: Vec<i32> = rules.iter().map(|rule| rule.id).collect();
     let payee_ids: Vec<i32> = rules.iter().filter_map(|rule| rule.payee_id).collect();
-    let payees: HashMap<i32, Value> = sqlx::query_as::<_, PayeeRow>(&format!(
-        "SELECT id, book_id, name, created_at FROM payees WHERE id {in1}",
-        in1 = sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(&payee_ids))
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|payee| (payee.id, to_value(&payee).expect("payee serializes")))
-    .collect();
-    let splits: Vec<TemplateSplitRow> = sqlx::query_as(&format!(
+    let payees: HashMap<i32, Value> = database
+        .query::<PayeeRow>(
+            &format!(
+                "SELECT id, book_id, name, created_at FROM payees WHERE id {in1}",
+                in1 = in_integers("?1")
+            ),
+            &params![json_array(&payee_ids)],
+        )?
+        .into_iter()
+        .map(|payee| (payee.id, to_value(&payee).expect("payee serializes")))
+        .collect();
+    let splits: Vec<TemplateSplitRow> = database.query(
+        &format!(
         "SELECT id, book_id, recurring_rule_id, account_id, amount FROM recurring_template_splits
          WHERE recurring_rule_id {in1} ORDER BY id",
-        in1 = sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(&rule_ids))
-    .fetch_all(pool)
-    .await?;
+        in1 = in_integers("?1")
+    ),
+        &params![json_array(&rule_ids)],
+    )?;
     let account_ids: Vec<i32> = splits
         .iter()
         .map(|split| split.account_id)
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let accounts: HashMap<i32, AccountRow> = sqlx::query_as::<_, AccountRow>(&format!(
-        "SELECT id, book_id, name, type AS account_type, subtype, parent_id, is_active,
+    let accounts: HashMap<i32, AccountRow> = database
+        .query::<AccountRow>(
+            &format!(
+                "SELECT id, book_id, name, type AS account_type, subtype, parent_id, is_active,
                 is_favorite, is_investment_cash, icon, created_at, updated_at
          FROM accounts WHERE id {in1}",
-        in1 = sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(&account_ids))
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|account| (account.id, account))
-    .collect();
+                in1 = in_integers("?1")
+            ),
+            &params![json_array(&account_ids)],
+        )?
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect();
     let mut splits_by_rule: HashMap<i32, Vec<LoadedSplit>> = HashMap::new();
     for row in splits {
         let account = accounts.get(&row.account_id);
@@ -212,31 +220,25 @@ fn rule_json(loaded: &LoadedRule) -> Value {
     value
 }
 
-async fn load_rule(
-    pool: &DbPool,
+fn load_rule(
+    database: &impl Sql,
     book_id: i32,
     rule_id: i32,
-) -> Result<Option<LoadedRule>, sqlx::Error> {
-    let rule: Option<RuleRow> = sqlx::query_as(&format!(
-        "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE id = $1 AND book_id = $2"
-    ))
-    .bind(rule_id)
-    .bind(book_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(attach(pool, rule.into_iter().collect()).await?.pop())
+) -> Result<Option<LoadedRule>, store::Error> {
+    let rule: Option<RuleRow> = database.query_optional(
+        &format!("SELECT {RULE_COLUMNS} FROM recurring_rules WHERE id = ?1 AND book_id = ?2"),
+        &params![rule_id, book_id],
+    )?;
+    Ok(attach(database, rule.into_iter().collect())?.pop())
 }
 
 /// The active rules of a book. Node reads them without an ORDER BY, which
 /// gives heap order. Rust uses ID order.
-async fn load_active_rules(pool: &DbPool, book_id: i32) -> Result<Vec<LoadedRule>, sqlx::Error> {
-    let rules = sqlx::query_as(&format!(
-        "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE book_id = $1 AND is_active ORDER BY id"
-    ))
-    .bind(book_id)
-    .fetch_all(pool)
-    .await?;
-    attach(pool, rules).await
+fn load_active_rules(database: &impl Sql, book_id: i32) -> Result<Vec<LoadedRule>, store::Error> {
+    let rules = database.query(&format!(
+        "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE book_id = ?1 AND is_active ORDER BY id"
+    ), &params![book_id])?;
+    attach(database, rules)
 }
 
 /// `parseInt(id)` with no radix. The caller turns `None` (NaN, or a value
@@ -341,93 +343,82 @@ fn balanced_amounts(splits: &[TemplateSplit]) -> Option<Vec<i32>> {
     .then_some(amounts)
 }
 
-/// `validateTemplateSplitAccounts`. An ID outside the int4 range makes the
-/// Node query fail.
-async fn require_template_accounts(
-    pool: &DbPool,
-    book_id: i32,
-    splits: &[TemplateSplit],
+/// The template splits as the split proofs take them. `amounts` comes from
+/// `balanced_amounts`, in the order of `splits`.
+fn template_inputs(splits: &[TemplateSplit], amounts: &[i32]) -> Vec<SplitInput> {
+    splits
+        .iter()
+        .zip(amounts)
+        .map(|(split, amount)| SplitInput {
+            account_id: split.account_id,
+            amount: i64::from(*amount),
+        })
+        .collect()
+}
+
+/// `validateTemplateSplitAccounts`, as a proof: the template splits, each
+/// on an account of this book. An ID outside the int4 range makes the Node
+/// query fail.
+fn prove_template_splits(
+    database: &impl Sql,
+    access: &BookAccess<'_, Write>,
+    splits: &[SplitInput],
     failure: &'static str,
-) -> Result<(), ApiError> {
+) -> Result<ProvedSplits, ApiError> {
+    // `balanced_amounts` passed, so this refusal does not occur.
+    let balanced = BalancedSplits::new(splits).ok_or_else(|| bad_request(UNBALANCED))?;
     let ids = splits
         .iter()
         .map(|split| database_integer(split.account_id, failure))
-        .collect::<Result<HashSet<_>, _>>()?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let found: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM accounts WHERE book_id = $1 AND id {in2}",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(book_id)
-    .bind(sql::json_array(&ids))
-    .fetch_one(pool)
-    .await
-    .map_err(database_error(failure))?;
-    if found == ids.len() as i64 {
-        Ok(())
-    } else {
-        Err(bad_request(FOREIGN_ACCOUNT))
-    }
+        .collect::<Result<Vec<_>, _>>()?;
+    let accounts = rows_in_book::<Account, _>(database, access, &ids)
+        .map_err(database_error(failure))?
+        .ok_or_else(|| bad_request(FOREIGN_ACCOUNT))?;
+    ProvedSplits::on_accounts(access, balanced, &accounts)
+        .ok_or_else(|| bad_request(FOREIGN_ACCOUNT))
 }
 
 /// `resolvePayeeId`. A finite numeric `payeeId` must name a payee in this
 /// book, or it resolves to null. A `payeeName` string that normalizes to a
 /// name wins over it. Node binds the ID as text, so a fraction or a value
 /// outside the int4 range makes the query fail.
-async fn resolve_rule_payee(
-    connection: &mut DbConnection,
-    book_id: i32,
+///
+/// `recurring_rules.payee_id` has a single-column foreign key, so the proof
+/// is what keeps a payee of another book out of a rule.
+fn resolve_rule_payee(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     payee_id: Option<&Value>,
     payee_name: Option<&Value>,
-) -> Result<Option<i32>, sqlx::Error> {
+) -> Result<Option<InBook<Payee>>, store::Error> {
     let mut fallback = None;
     if let Some(value @ Value::Number(number)) = payee_id
         && js_number(number).is_finite()
     {
-        let id = parse_pg_int4(&js_string(value)).map_err(sqlx::Error::Protocol)?;
-        fallback =
-            sqlx::query_scalar("SELECT id FROM payees WHERE id = $1 AND book_id = $2 LIMIT 1")
-                .bind(id)
-                .bind(book_id)
-                .fetch_optional(&mut *connection)
-                .await?;
+        let id = parse_pg_int4(&js_string(value)).map_err(store::Error::Invalid)?;
+        fallback = row_in_book::<Payee, _>(sql, access, id)?;
     }
     match payee_name {
-        Some(Value::String(name)) => Ok(resolve_payee_id(connection, book_id, name)
-            .await?
-            .or(fallback)),
+        Some(Value::String(name)) => Ok(resolve_payee(sql, access, name)?.or(fallback)),
         _ => Ok(fallback),
     }
 }
 
-async fn insert_template_splits(
-    connection: &mut DbConnection,
-    book_id: i32,
+/// Inserts the template splits of a rule. `ProvedSplits` holds only
+/// balanced splits on accounts of this book.
+fn insert_template_splits(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     rule_id: i32,
-    splits: &[TemplateSplit],
-    amounts: &[i32],
+    splits: &ProvedSplits,
     failure: &'static str,
 ) -> Result<(), ApiError> {
-    let rows = splits
-        .iter()
-        .zip(amounts)
-        .map(|(split, amount)| Ok((database_integer(split.account_id, failure)?, *amount)))
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    let mut insert = QueryBuilder::<Db>::new(
-        "INSERT INTO recurring_template_splits (recurring_rule_id, account_id, amount, book_id) ",
-    );
-    insert.push_values(rows, |mut row, (account_id, amount)| {
-        row.push_bind(rule_id)
-            .push_bind(account_id)
-            .push_bind(amount)
-            .push_bind(book_id);
-    });
-    insert
-        .build()
-        .execute(&mut *connection)
-        .await
-        .map_err(database_error(failure))?;
+    let book_id = same_book(access, splits.book_id(), failure)?;
+    sql.execute(&format!(
+        "INSERT INTO recurring_template_splits (recurring_rule_id, account_id, amount, book_id) {}",
+        json_rows(&["?1", "#0", "#1", "?2"], "?3")
+    ), &params![rule_id, book_id, splits.json_rows()])
+    .map_err(database_error(failure))?;
     Ok(())
 }
 
@@ -445,17 +436,17 @@ pub(crate) async fn list_rules(
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     // The name breaks a tie between rules that share a nextDate. Node stops
     // there; Rust adds the ID so that the order is stable.
-    let rules = sqlx::query_as(&format!(
-        "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE book_id = $1
+    let rules = state
+        .database
+        .query(
+            &format!(
+                "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE book_id = ?1
          ORDER BY is_active DESC, next_date, name, id"
-    ))
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
-    .map_err(database_error(FAILURE))?;
-    let rules = attach(&state.pool, rules)
-        .await
+            ),
+            &params![book.book_id()],
+        )
         .map_err(database_error(FAILURE))?;
+    let rules = attach(&state.database, rules).map_err(database_error(FAILURE))?;
     Ok(Json(rules.iter().map(rule_json).collect()))
 }
 
@@ -468,8 +459,7 @@ pub(crate) async fn get_rule(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let id = rule_path_id(&raw_id).ok_or_else(|| failed(FAILURE))?;
-    load_rule(&state.pool, book.book_id(), id)
-        .await
+    load_rule(&state.database, book.book_id(), id)
         .map_err(database_error(FAILURE))?
         .map(|rule| Json(rule_json(&rule)))
         .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))
@@ -481,9 +471,9 @@ pub(crate) async fn get_rule(
 
 /// `createRecurringRule`. The checks run in the Node order, so a request
 /// with several problems gets the message that Node gives.
-async fn create(
-    pool: &DbPool,
-    book: &AuthenticatedBook,
+fn create(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     input: &CreateRule,
     failure: &'static str,
 ) -> Result<i32, ApiError> {
@@ -496,7 +486,12 @@ async fn create(
     }
     let amounts =
         balanced_amounts(&input.template_splits).ok_or_else(|| bad_request(UNBALANCED))?;
-    require_template_accounts(pool, book.book_id(), &input.template_splits, failure).await?;
+    let splits = prove_template_splits(
+        database,
+        access,
+        &template_inputs(&input.template_splits, &amounts),
+        failure,
+    )?;
 
     let loose = &input.loose;
     // `interval || 1`.
@@ -519,62 +514,35 @@ async fn create(
     )
     .map_err(schedule_error(failure))?;
 
-    let mut tx = ledger_db::locks::begin_pool(pool)
-        .await
+    write_transaction(database, failure, |tx| {
+        // Resolved in the transaction, so a payee that `payeeName` creates rolls
+        // back with a failed write.
+        let payee = resolve_rule_payee(
+            tx,
+            access,
+            loose.payee_id.as_ref(),
+            loose.payee_name.as_ref(),
+        )
         .map_err(database_error(failure))?;
-    // Resolved in the transaction, so a payee that `payeeName` creates rolls
-    // back with a failed write.
-    let payee_id = resolve_rule_payee(
-        &mut tx,
-        book.book_id(),
-        loose.payee_id.as_ref(),
-        loose.payee_name.as_ref(),
-    )
-    .await
-    .map_err(database_error(failure))?;
-    let truthy = |value: &Option<Value>| value.as_ref().filter(|value| js_truthy(value)).cloned();
-    // Node sent the interval as text for PostgreSQL to cast, so the same
-    // values are accepted and refused here.
-    let interval = parse_pg_int4(&interval.map_or_else(|| "1".to_owned(), js_string))
-        .map_err(|message| database_error(failure)(sqlx::Error::Protocol(message)))?;
-    let rule_id: i32 = sqlx::query_scalar(
-        "INSERT INTO recurring_rules (name, frequency, interval, days_of_week, week_of_month,
+        let truthy =
+            |value: &Option<Value>| value.as_ref().filter(|value| js_truthy(value)).cloned();
+        // Node sent the interval as text for PostgreSQL to cast, so the same
+        // values are accepted and refused here.
+        let interval = parse_pg_int4(&interval.map_or_else(|| "1".to_owned(), js_string))
+            .map_err(|message| database_error(failure)(store::Error::Invalid(message)))?;
+        let template_description =
+            truthy(&loose.template_description).map(|value| js_string(&value));
+        let rule_id: i32 = tx.query_row("INSERT INTO recurring_rules (name, frequency, interval, days_of_week, week_of_month,
            days_of_month, start_date, end_date, next_date, business_days_only,
            auto_create_days_before, template_description, payee_id, is_active, book_id,
-           created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true,
-           $14, $15)
-         RETURNING id",
-    )
-    .bind(&input.name)
-    .bind(&input.frequency)
-    .bind(interval)
-    .bind(truthy(&loose.days_of_week).map(|value| js_stringify(&value)))
-    .bind(truthy(&loose.week_of_month).map(|value| js_string(&value)))
-    .bind(truthy(&loose.days_of_month).map(|value| js_stringify(&value)))
-    .bind(&input.start_date)
-    .bind(&input.end_date)
-    .bind(&next)
-    .bind(business_days_only)
-    .bind(input.auto_create_days_before.unwrap_or(0) as i32)
-    .bind(truthy(&loose.template_description).map(|value| js_string(&value)))
-    .bind(payee_id)
-    .bind(book.book_id())
-    .bind(now_millis())
-    .fetch_one(&mut *tx)
-    .await
+           created_at, name_fold, template_description_fold)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, true,
+           ?14, ?15, ?16, ?17)
+         RETURNING id", &params![&input.name, &input.frequency, interval, truthy(&loose.days_of_week).map(|value| js_stringify(&value)), truthy(&loose.week_of_month).map(|value| js_string(&value)), truthy(&loose.days_of_month).map(|value| js_stringify(&value)), &input.start_date, &input.end_date, &next, business_days_only, input.auto_create_days_before.unwrap_or(0) as i32, &template_description, payee.map(|payee| payee.id()), access.book_id(), now_millis(), fold(&input.name), fold_option(template_description.as_deref())])
     .map_err(database_error(failure))?;
-    insert_template_splits(
-        &mut tx,
-        book.book_id(),
-        rule_id,
-        &input.template_splits,
-        &amounts,
-        failure,
-    )
-    .await?;
-    tx.commit().await.map_err(database_error(failure))?;
-    Ok(rule_id)
+        insert_template_splits(tx, access, rule_id, &splits, failure)?;
+        Ok(rule_id)
+    })
 }
 
 pub(crate) async fn create_rule(
@@ -586,10 +554,10 @@ pub(crate) async fn create_rule(
     const FAILURE: &str = "Failed to create recurring rule";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let input = validate_create(&parse_json_body(&body, FAILURE)?)?;
-    let id = create(&state.pool, &book, &input, FAILURE).await?;
-    let created = load_rule(&state.pool, book.book_id(), id)
-        .await
+    let id = create(&state.database, &access, &input, FAILURE)?;
+    let created = load_rule(&state.database, book.book_id(), id)
         .map_err(database_error(FAILURE))?
         .ok_or_else(|| failed(FAILURE))?;
     state.analytics.capture_event(
@@ -640,15 +608,15 @@ fn updated_config(
 
 /// Adds each field that the request names to the SET list.
 fn push_updates(
-    set: &mut QueryBuilder<'_, Db>,
+    set: &mut Builder,
     input: &UpdateRule,
     interval: Option<Option<i32>>,
     next: Option<String>,
-    payee_id: Option<Option<i32>>,
+    payee: Option<Option<InBook<Payee>>>,
 ) -> bool {
     let loose = &input.loose;
     let mut any = false;
-    let mut column = |set: &mut QueryBuilder<'_, Db>, name: &str| {
+    let mut column = |set: &mut Builder, name: &str| {
         if any {
             set.push(", ");
         }
@@ -658,6 +626,8 @@ fn push_updates(
     if let Some(name) = &input.name {
         column(set, "name");
         set.push_bind(name.clone());
+        column(set, "name_fold");
+        set.push_bind(fold(name));
     }
     if let Some(frequency) = &input.frequency {
         column(set, "frequency");
@@ -693,12 +663,15 @@ fn push_updates(
         set.push_bind(next);
     }
     if let Some(value) = &loose.template_description {
+        let description = text_value(value);
+        column(set, "template_description_fold");
+        set.push_bind(fold_option(description.as_deref()));
         column(set, "template_description");
-        set.push_bind(text_value(value));
+        set.push_bind(description);
     }
-    if let Some(payee_id) = payee_id {
+    if let Some(payee) = payee {
         column(set, "payee_id");
-        set.push_bind(payee_id);
+        set.push_bind(payee.map(|payee| payee.id()));
     }
     if let Some(is_active) = input.is_active {
         column(set, "is_active");
@@ -717,9 +690,9 @@ fn push_updates(
 
 /// `updateRecurringRule`. It applies only the fields it is given, and it
 /// reads the stored rule only when the write needs it.
-async fn update(
-    pool: &DbPool,
-    book: &AuthenticatedBook,
+fn update(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     rule_id: Option<i32>,
     input: &UpdateRule,
     failure: &'static str,
@@ -744,14 +717,14 @@ async fn update(
     let end_date = input.end_date.as_ref().and_then(Option::as_ref);
     let recompute = schedule_fields && input.next_date.is_none();
     let existing: Option<RuleRow> = if end_date.is_some() || recompute {
-        sqlx::query_as(&format!(
-            "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE id = $1 AND book_id = $2"
-        ))
-        .bind(id()?)
-        .bind(book.book_id())
-        .fetch_optional(pool)
-        .await
-        .map_err(database_error(failure))?
+        database
+            .query_optional(
+                &format!(
+                    "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE id = ?1 AND book_id = ?2"
+                ),
+                &params![id()?, access.book_id()],
+            )
+            .map_err(database_error(failure))?
     } else {
         None
     };
@@ -765,9 +738,15 @@ async fn update(
             return Err(bad_request(END_BEFORE_START));
         }
     }
-    if let Some(splits) = &input.template_splits {
-        require_template_accounts(pool, book.book_id(), splits, failure).await?;
-    }
+    let splits = match (&input.template_splits, &amounts) {
+        (Some(splits), Some(amounts)) => Some(prove_template_splits(
+            database,
+            access,
+            &template_inputs(splits, amounts),
+            failure,
+        )?),
+        _ => None,
+    };
 
     let mut computed = None;
     if let Some(existing) = existing.as_ref().filter(|_| recompute) {
@@ -789,13 +768,7 @@ async fn update(
             .map_err(schedule_error(failure))?;
             // Resume after the last transaction that this rule created, so
             // the recompute does not go back before it.
-            let last_created: Option<String> = sqlx::query_scalar(
-                "SELECT max(date) FROM transactions WHERE recurring_rule_id = $1 AND book_id = $2",
-            )
-            .bind(id()?)
-            .bind(book.book_id())
-            .fetch_one(pool)
-            .await
+            let last_created: Option<String> = database.query_row("SELECT max(date) FROM transactions WHERE recurring_rule_id = ?1 AND book_id = ?2", &params![id()?, access.book_id()])
             .map_err(database_error(failure))?;
             if let Some(last_created) = last_created {
                 next = advance_next_date_to_future(
@@ -817,67 +790,51 @@ async fn update(
         None => computed,
     };
 
-    let mut tx = ledger_db::locks::begin_pool(pool)
-        .await
-        .map_err(database_error(failure))?;
-    // Prove the rule is in this book before anything names its ID. Nothing
-    // is written before this check, so a payee is not created for a rule
-    // that is not the caller's.
-    let exists: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM recurring_rules WHERE id = $1 AND book_id = $2 LIMIT 1")
-            .bind(id()?)
-            .bind(book.book_id())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(database_error(failure))?;
-    let rule_id = exists.ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))?;
-    // An absent key leaves the payee alone; a resolved null clears it.
-    let payee_id = if loose.payee_id.is_some() || loose.payee_name.is_some() {
-        Some(
-            resolve_rule_payee(
-                &mut tx,
-                book.book_id(),
-                loose.payee_id.as_ref(),
-                loose.payee_name.as_ref(),
+    write_transaction(database, failure, |tx| {
+        // Prove the rule is in this book before anything names its ID. Nothing
+        // is written before this check, so a payee is not created for a rule
+        // that is not the caller's.
+        let rule: InBook<RecurringRule> = row_in_book(tx, access, id()?)
+            .map_err(database_error(failure))?
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))?;
+        let rule_id = rule.id();
+        // An absent key leaves the payee alone; a resolved null clears it.
+        let payee = if loose.payee_id.is_some() || loose.payee_name.is_some() {
+            Some(
+                resolve_rule_payee(
+                    tx,
+                    access,
+                    loose.payee_id.as_ref(),
+                    loose.payee_name.as_ref(),
+                )
+                .map_err(database_error(failure))?,
             )
-            .await
-            .map_err(database_error(failure))?,
-        )
-    } else {
-        None
-    };
-    // Node sent the interval as text for PostgreSQL to cast.
-    let interval = input
-        .loose
-        .interval
-        .as_ref()
-        .map(|value| text_value(value).as_deref().map(parse_pg_int4).transpose())
-        .transpose()
-        .map_err(|message| database_error(failure)(sqlx::Error::Protocol(message)))?;
-    let mut set = QueryBuilder::<Db>::new("UPDATE recurring_rules SET ");
-    if push_updates(&mut set, input, interval, next, payee_id) {
-        set.push(" WHERE id = ")
-            .push_bind(rule_id)
-            .push(" AND book_id = ")
-            .push_bind(book.book_id());
-        set.build()
-            .execute(&mut *tx)
-            .await
-            .map_err(database_error(failure))?;
-    }
-    if let (Some(splits), Some(amounts)) = (&input.template_splits, &amounts) {
-        sqlx::query(
-            "DELETE FROM recurring_template_splits WHERE recurring_rule_id = $1 AND book_id = $2",
-        )
-        .bind(rule_id)
-        .bind(book.book_id())
-        .execute(&mut *tx)
-        .await
+        } else {
+            None
+        };
+        // Node sent the interval as text for PostgreSQL to cast.
+        let interval = input
+            .loose
+            .interval
+            .as_ref()
+            .map(|value| text_value(value).as_deref().map(parse_pg_int4).transpose())
+            .transpose()
+            .map_err(|message| database_error(failure)(store::Error::Invalid(message)))?;
+        let mut set = Builder::new("UPDATE recurring_rules SET ");
+        if push_updates(&mut set, input, interval, next, payee) {
+            set.push(" WHERE id = ")
+                .push_bind(rule_id)
+                .push(" AND book_id = ")
+                .push_bind(access.book_id());
+            set.execute(tx).map_err(database_error(failure))?;
+        }
+        if let Some(splits) = &splits {
+            tx.execute("DELETE FROM recurring_template_splits WHERE recurring_rule_id = ?1 AND book_id = ?2", &params![rule_id, access.book_id()])
         .map_err(database_error(failure))?;
-        insert_template_splits(&mut tx, book.book_id(), rule_id, splits, amounts, failure).await?;
-    }
-    tx.commit().await.map_err(database_error(failure))?;
-    Ok(())
+            insert_template_splits(tx, access, rule_id, splits, failure)?;
+        }
+        Ok(())
+    })
 }
 
 pub(crate) async fn update_rule(
@@ -889,12 +846,12 @@ pub(crate) async fn update_rule(
     const FAILURE: &str = "Failed to update recurring rule";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let rule_id = rule_path_id(&raw_id);
     let input = validate_update(&parse_json_body(&body, FAILURE)?)?;
-    update(&state.pool, &book, rule_id, &input, FAILURE).await?;
+    update(&state.database, &access, rule_id, &input, FAILURE)?;
     let id = rule_id.ok_or_else(|| failed(FAILURE))?;
-    load_rule(&state.pool, book.book_id(), id)
-        .await
+    load_rule(&state.database, book.book_id(), id)
         .map_err(database_error(FAILURE))?
         .map(|rule| Json(rule_json(&rule)))
         .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))
@@ -915,14 +872,13 @@ pub(crate) async fn delete_rule(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let id = rule_path_id(&raw_id).ok_or_else(|| failed(FAILURE))?;
-    let deleted: Option<i32> = sqlx::query_scalar(
-        "DELETE FROM recurring_rules WHERE id = $1 AND book_id = $2 RETURNING id",
-    )
-    .bind(id)
-    .bind(book.book_id())
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(database_error(FAILURE))?;
+    let deleted: Option<i32> = state
+        .database
+        .query_optional(
+            "DELETE FROM recurring_rules WHERE id = ?1 AND book_id = ?2 RETURNING id",
+            &params![id, book.book_id()],
+        )
+        .map_err(database_error(FAILURE))?;
     deleted.ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))?;
     Ok(Json(json!({ "success": true })))
 }
@@ -940,9 +896,9 @@ pub(crate) struct Processed {
 /// `createTransactionFromRule`: one transaction from the template, dated
 /// `date`. It does not use the transaction service: a rule makes an ordinary
 /// transaction with no investment splits, check number, or notes.
-async fn create_transaction_from_rule(
-    connection: &mut DbConnection,
-    book_id: i32,
+fn create_transaction_from_rule(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     rule: &LoadedRule,
     date: &str,
     failure: &'static str,
@@ -957,70 +913,63 @@ async fn create_transaction_from_rule(
         );
         return Err(failed(failure));
     }
-    let amounts: Vec<i64> = rule
+    let inputs: Vec<SplitInput> = rule
         .splits
         .iter()
-        .map(|split| i64::from(split.row.amount))
+        .map(|split| SplitInput {
+            account_id: i64::from(split.row.account_id),
+            amount: i64::from(split.row.amount),
+        })
         .collect();
-    if !validate_splits(&amounts) {
+    let Some(balanced) = BalancedSplits::new(&inputs) else {
         tracing::error!(
             rule = rule.rule.id,
             "Recurring rule template splits must sum to zero"
         );
         return Err(failed(failure));
-    }
+    };
     let account_ids: Vec<i32> = rule
         .splits
         .iter()
         .map(|split| split.row.account_id)
-        .collect::<HashSet<_>>()
-        .into_iter()
         .collect();
-    let found: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM accounts WHERE book_id = $1 AND id {in2}",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(book_id)
-    .bind(sql::json_array(&account_ids))
-    .fetch_one(&mut *connection)
-    .await
-    .map_err(database_error(failure))?;
-    if found != account_ids.len() as i64 {
+    let accounts =
+        rows_in_book::<Account, _>(sql, access, &account_ids).map_err(database_error(failure))?;
+    let Some(splits) =
+        accounts.and_then(|accounts| ProvedSplits::on_accounts(access, balanced, &accounts))
+    else {
         tracing::error!(
             rule = rule.rule.id,
             "Recurring rule template contains accounts outside this book"
         );
         return Err(failed(failure));
-    }
+    };
+    let book_id = same_book(access, splits.book_id(), failure)?;
     let now = now_millis();
-    let transaction_id: i32 = sqlx::query_scalar(
-        "INSERT INTO transactions (book_id, date, description, payee_id, recurring_rule_id,
-           created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING id",
-    )
-    .bind(book_id)
-    .bind(date)
-    .bind(&rule.rule.template_description)
-    .bind(rule.rule.payee_id)
-    .bind(rule.rule.id)
-    .bind(now)
-    .fetch_one(&mut *connection)
-    .await
-    .map_err(database_error(failure))?;
-    let mut insert = QueryBuilder::<Db>::new(
-        "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) ",
-    );
-    insert.push_values(&rule.splits, |mut row, split| {
-        row.push_bind(book_id)
-            .push_bind(transaction_id)
-            .push_bind(split.row.account_id)
-            .push_bind(split.row.amount);
-    });
-    insert
-        .build()
-        .execute(&mut *connection)
-        .await
+    let transaction_id: i32 = sql
+        .query_row(
+            "INSERT INTO transactions (book_id, date, description, payee_id, recurring_rule_id,
+           created_at, updated_at, description_fold)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7) RETURNING id",
+            &params![
+                book_id,
+                date,
+                &rule.rule.template_description,
+                rule.rule.payee_id,
+                rule.rule.id,
+                now,
+                fold_option(rule.rule.template_description.as_deref())
+            ],
+        )
         .map_err(database_error(failure))?;
+    sql.execute(
+        &format!(
+            "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) {}",
+            json_rows(&["?1", "?2", "#0", "#1"], "?3")
+        ),
+        &params![book_id, transaction_id, splits.json_rows()],
+    )
+    .map_err(database_error(failure))?;
     Ok(Some(transaction_id))
 }
 
@@ -1028,43 +977,37 @@ async fn create_transaction_from_rule(
 /// of the transaction. A concurrent processor blocks on the row, then
 /// matches no row once this one commits, so a due date never makes two
 /// transactions.
-async fn claim(
-    connection: &mut DbConnection,
-    book_id: i32,
+fn claim(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     rule_id: i32,
     due: &str,
     next: &str,
     deactivate: bool,
     failure: &'static str,
 ) -> Result<bool, ApiError> {
-    let claimed: Option<i32> = sqlx::query_scalar(
-        "UPDATE recurring_rules
-         SET next_date = $1, is_active = CASE WHEN $2 THEN false ELSE is_active END
-         WHERE id = $3 AND book_id = $4 AND next_date = $5
+    let claimed: Option<i32> = sql
+        .query_optional(
+            "UPDATE recurring_rules
+         SET next_date = ?1, is_active = CASE WHEN ?2 THEN false ELSE is_active END
+         WHERE id = ?3 AND book_id = ?4 AND next_date = ?5
          RETURNING id",
-    )
-    .bind(next)
-    .bind(deactivate)
-    .bind(rule_id)
-    .bind(book_id)
-    .bind(due)
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(database_error(failure))?;
+            &params![next, deactivate, rule_id, access.book_id(), due],
+        )
+        .map_err(database_error(failure))?;
     Ok(claimed.is_some())
 }
 
 /// `processRecurringRuleById`: create the rule's next occurrence whether or
 /// not it is due, active, or past its end date, and advance the rule.
-async fn process_rule(
-    pool: &DbPool,
-    book_id: i32,
+fn process_rule(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     rule_id: i32,
     failure: &'static str,
 ) -> Result<Option<Processed>, ApiError> {
-    let Some(rule) = load_rule(pool, book_id, rule_id)
-        .await
-        .map_err(database_error(failure))?
+    let Some(rule) =
+        load_rule(database, access.book_id(), rule_id).map_err(database_error(failure))?
     else {
         return Ok(None);
     };
@@ -1080,33 +1023,35 @@ async fn process_rule(
     let schedule = schedule_error(failure);
     let occurrence = occurrence_date(due, rule.rule.business_days_only).map_err(&schedule)?;
     let next = next_date(due, &stored_config(&rule.rule).map_err(&schedule)?).map_err(&schedule)?;
-    let mut tx = ledger_db::locks::begin_pool(pool)
-        .await
-        .map_err(database_error(failure))?;
-    let mut processed = Processed::default();
-    if claim(&mut tx, book_id, rule_id, due, &next, false, failure).await? {
-        processed.transaction_ids.extend(
-            create_transaction_from_rule(&mut tx, book_id, &rule, &occurrence, failure).await?,
-        );
-    }
-    tx.commit().await.map_err(database_error(failure))?;
-    Ok(Some(processed))
+    write_transaction(database, failure, |tx| {
+        let mut processed = Processed::default();
+        if claim(tx, access, rule_id, due, &next, false, failure)? {
+            processed
+                .transaction_ids
+                .extend(create_transaction_from_rule(
+                    tx,
+                    access,
+                    &rule,
+                    &occurrence,
+                    failure,
+                )?);
+        }
+        Ok(Some(processed))
+    })
 }
 
 /// `processAllRecurringRules`: each active rule whose observed next date is
 /// within its lead window creates every occurrence due up to that horizon.
 /// A rule whose schedule passes its end date is deactivated. The end date
 /// bounds the scheduled date, not the observed one.
-pub(crate) async fn process_all(
-    pool: &DbPool,
-    book_id: i32,
+pub(crate) fn process_all(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     failure: &'static str,
 ) -> Result<Processed, ApiError> {
     let schedule = schedule_error(failure);
     let today = local_today();
-    let rules = load_active_rules(pool, book_id)
-        .await
-        .map_err(database_error(failure))?;
+    let rules = load_active_rules(database, access.book_id()).map_err(database_error(failure))?;
     let mut processed = Processed::default();
     for rule in &rules {
         let row = &rule.rule;
@@ -1148,28 +1093,26 @@ pub(crate) async fn process_all(
             processed.skipped.push((row.id, DOES_NOT_ADVANCE));
             continue;
         }
-        let mut tx = ledger_db::locks::begin_pool(pool)
-            .await
-            .map_err(database_error(failure))?;
-        if claim(
-            &mut tx,
-            book_id,
-            row.id,
-            &row.next_date,
-            &current,
-            deactivate,
-            failure,
-        )
-        .await?
-        {
-            for occurrence in &occurrences {
-                processed.transaction_ids.extend(
-                    create_transaction_from_rule(&mut tx, book_id, rule, occurrence, failure)
-                        .await?,
-                );
+        write_transaction(database, failure, |tx| {
+            if claim(
+                tx,
+                access,
+                row.id,
+                &row.next_date,
+                &current,
+                deactivate,
+                failure,
+            )? {
+                for occurrence in &occurrences {
+                    processed
+                        .transaction_ids
+                        .extend(create_transaction_from_rule(
+                            tx, access, rule, occurrence, failure,
+                        )?);
+                }
             }
-        }
-        tx.commit().await.map_err(database_error(failure))?;
+            Ok(())
+        })?;
     }
     Ok(processed)
 }
@@ -1183,18 +1126,16 @@ pub(crate) async fn process_rules(
     const FAILURE: &str = "Failed to process recurring rules";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let input = validate_process(&parse_json_body(&body, FAILURE)?)?;
     // `if (ruleId)`: a ruleId of 0 counts as absent.
     let processed = match input.rule_id.filter(|id| *id != 0) {
         Some(rule_id) => {
             let rule_id = i32::try_from(rule_id).map_err(|_| failed(FAILURE))?;
-            process_rule(&state.pool, book.book_id(), rule_id, FAILURE)
-                .await?
+            process_rule(&state.database, &access, rule_id, FAILURE)?
                 .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))?
         }
-        None if input.process_all == Some(true) => {
-            process_all(&state.pool, book.book_id(), FAILURE).await?
-        }
+        None if input.process_all == Some(true) => process_all(&state.database, &access, FAILURE)?,
         None => Processed::default(),
     };
     Ok(Json(json!({
@@ -1274,10 +1215,12 @@ pub(crate) async fn projected(
 
     let schedule = schedule_error(FAILURE);
     let today = local_today();
-    let upcoming_days: i32 = sqlx::query_scalar("SELECT upcoming_days FROM books WHERE id = $1")
-        .bind(book.book_id())
-        .fetch_one(&state.pool)
-        .await
+    let upcoming_days: i32 = state
+        .database
+        .query_row(
+            "SELECT upcoming_days FROM books WHERE id = ?1",
+            &params![book.book_id()],
+        )
         .map_err(database_error(FAILURE))?;
     let start_date = match start_date {
         Some(date) => date,
@@ -1287,9 +1230,8 @@ pub(crate) async fn projected(
         Some(date) => date,
         None => add_days_to_date_string(&today, upcoming_days.into()).map_err(&schedule)?,
     };
-    let rules = load_active_rules(&state.pool, book.book_id())
-        .await
-        .map_err(database_error(FAILURE))?;
+    let rules =
+        load_active_rules(&state.database, book.book_id()).map_err(database_error(FAILURE))?;
 
     let mut projected: Vec<(String, Value)> = Vec::new();
     for rule in &rules {
@@ -1341,7 +1283,7 @@ pub(crate) async fn projected(
 // GET /recurring/transactions
 // ---------------------------------------------------------------------------
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RecurringTransactionRow {
     transaction_id: i32,
@@ -1372,21 +1314,21 @@ pub(crate) async fn rule_transactions(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     // Node gives no ORDER BY. Rust uses the transaction ID.
-    let rows: Vec<RecurringTransactionRow> = sqlx::query_as(&format!(
-        "SELECT t.id AS transaction_id, {EFFECTIVE_DATE} AS date,
+    let rows: Vec<RecurringTransactionRow> = state
+        .database
+        .query(
+            &format!(
+                "SELECT t.id AS transaction_id, {EFFECTIVE_DATE} AS date,
                 t.recurring_rule_id, r.name AS rule_name
          FROM transactions t
          JOIN recurring_rules r ON t.recurring_rule_id = r.id
-         WHERE t.book_id = $1 AND t.recurring_rule_id IS NOT NULL
-           AND {EFFECTIVE_DATE} >= $2 AND {EFFECTIVE_DATE} <= $3
+         WHERE t.book_id = ?1 AND t.recurring_rule_id IS NOT NULL
+           AND {EFFECTIVE_DATE} >= ?2 AND {EFFECTIVE_DATE} <= ?3
          ORDER BY t.id"
-    ))
-    .bind(book.book_id())
-    .bind(start_date)
-    .bind(end_date)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(database_error(FAILURE))?;
+            ),
+            &params![book.book_id(), start_date, end_date],
+        )
+        .map_err(database_error(FAILURE))?;
     Ok(Json(to_value(rows).expect("rows serialize")))
 }
 

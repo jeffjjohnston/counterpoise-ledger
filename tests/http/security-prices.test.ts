@@ -94,7 +94,9 @@ async function startTiingoMock(): Promise<{ url: string; requests: string[]; ser
     requests.push(request.url ?? "");
     const url = new URL(request.url ?? "/", "http://mock");
     const match = /^\/tiingo\/daily\/([^/]*)\/prices$/.exec(url.pathname);
-    const reply = match && url.searchParams.get("token") === TIINGO_KEY
+    // The key goes only in the Authorization header, never in the URL:
+    // traces record the URL of each outgoing request.
+    const reply = match && request.headers.authorization === `Token ${TIINGO_KEY}` && url.search === ""
       ? TIINGO_REPLIES[decodeURIComponent(match[1])]
       : undefined;
     const { status, body, raw } = reply ?? { status: 404, body: { detail: "Not found." } };
@@ -510,8 +512,8 @@ describe("security price HTTP parity", () => {
       errors: [{ symbol: null, error: "Failed to fetch price for Infinity: Not Found" }],
     });
     expect([...tiingo.requests].sort()).toEqual([
-      `/tiingo/daily/Infinity/prices?token=${TIINGO_KEY}`,
-      `/tiingo/daily/OVER/prices?token=${TIINGO_KEY}`,
+      "/tiingo/daily/Infinity/prices",
+      "/tiingo/daily/OVER/prices",
     ]);
   });
 

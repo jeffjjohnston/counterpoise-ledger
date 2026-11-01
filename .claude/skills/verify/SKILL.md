@@ -45,7 +45,7 @@ Pick target rows by querying the dev DB directly:
 sqlite3 data/counterpoise.db
 ```
 
-The shell does not have the app's SQL functions (Unicode `lower()`, case-sensitive `LIKE`, `cp_today()`), so a text search there can differ from the app. Dev data is disposable seed data, but restore any rows you mutate (UPDATE back to original values) so repeat runs stay deterministic. The volume `counterpoise_data` holds the **production** database — don't open it during verification.
+SQLite's own `lower()` folds ASCII only, so a text search there should compare a `*_fold` column, as the app does. Dev data is disposable seed data, but restore any rows you mutate (UPDATE back to original values) so repeat runs stay deterministic. The volume `counterpoise_data` holds the **production** database — don't open it during verification.
 
 ## Cleanup
 

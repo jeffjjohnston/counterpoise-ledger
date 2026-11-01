@@ -1,5 +1,7 @@
 export type TypeSafeSettings = {
   enabled: boolean;
+  /** The entry suggestions of the transaction form; a second opt-in. */
+  entrySuggestionsEnabled: boolean;
   configured: boolean;
   revision: number;
 };
@@ -91,3 +93,22 @@ export type Proposal = {
   payee: { name: string; payeeId: number | null };
   category: { accountId: number; name: string };
 };
+
+/** A pattern of a payee in one account (`GET …/payees/{id}/entry-patterns`). */
+export type EntryPattern = {
+  key: string;
+  /** Every split of the latest use, the splits on the account included. */
+  splits: { accountId: number; amount: number }[];
+  count: number;
+  lastDate: string;
+  /** The last uses have the same amounts, so the fill includes them. */
+  stable: boolean;
+  range: { min: number; max: number };
+};
+
+/** The answer of `POST …/entry-suggestion`. */
+export type EntrySuggestion =
+  | { status: "ready"; evaluationId: number; choice: string | null; confidence: number }
+  | { status: "skipped"; evaluationId: number }
+  | { status: "failed"; evaluationId: number; error: string }
+  | { status: "busy" | "limited" | "stale" };

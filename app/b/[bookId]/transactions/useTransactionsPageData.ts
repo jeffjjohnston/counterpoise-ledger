@@ -102,14 +102,23 @@ function pageParams(offset: number, limit: number, context: PageContext) {
 
 // Fetch a whole register snapshot before publishing any of it. Optional panels
 // may fail independently; accounts and the transaction page remain required.
-async function fetchRefreshSnapshot(context: RefreshContext, request: RefreshRequest, loadedCount: number, signal: AbortSignal) {
+// With `pickAccount`, the account list comes first: when it gives an account
+// to select, the snapshot stops there, because the redirect to that account
+// loads the page data again.
+async function fetchRefreshSnapshot(context: RefreshContext, request: RefreshRequest, loadedCount: number,
+  signal: AbortSignal, pickAccount: boolean) {
   const { bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming } = context;
   const today = toDateString(new Date());
   const prefix = `/api/b/${bookId}`;
   const init = { signal };
   const accountQuery = accountId ? `?accountId=${accountId}` : "";
+  const accountList = apiGet<AccountWithBalance[]>(`${prefix}/accounts?includeInactive=true&asOfDate=${today}`, init);
+  if (pickAccount) {
+    const target = preferredAccountId(flattenAccounts(await accountList), bookId);
+    if (target !== null) return { redirectTo: target } as const;
+  }
   const [accountRows, values, payeeRows, projected, pending] = await Promise.all([
-    apiGet<AccountWithBalance[]>(`${prefix}/accounts?includeInactive=true&asOfDate=${today}`, init),
+    accountList,
     apiGet<AccountMarketValue[]>(`${prefix}/investments/account-values?asOfDate=${today}`, init).catch(() => []),
     apiGet<Array<{ id: number; name: string }>>(`${prefix}/payees`, init).catch(() => []),
     showUpcoming ? apiGet<DisplayTransaction[]>(`${prefix}/recurring/projected${accountQuery}`, init).catch(() => []) : Promise.resolve([]),
@@ -126,7 +135,7 @@ async function fetchRefreshSnapshot(context: RefreshContext, request: RefreshReq
   const page = await apiGet<PageResponse>(`${prefix}/transactions?${params}`, init);
   const transactions = page.transactions ?? [];
   return {
-    accounts, transactions,
+    redirectTo: null, accounts, transactions,
     marketValues: Array.isArray(values) ? values : [],
     payees: Array.isArray(payeeRows) ? payeeRows : [],
     projectedTransactions: Array.isArray(projected) ? projected : [],
@@ -135,6 +144,8 @@ async function fetchRefreshSnapshot(context: RefreshContext, request: RefreshReq
     totalCount: page.totalCount ?? transactions.length,
   };
 }
+
+type Snapshot = Exclude<Awaited<ReturnType<typeof fetchRefreshSnapshot>>, { redirectTo: number }>;
 
 function preferredAccountId(accounts: AccountWithBalance[], bookId: string): number | null {
   try {
@@ -182,7 +193,7 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
   const contextKey = JSON.stringify([bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming]);
   const scopeRef = useRef<RefreshScope | null>(null);
 
-  const applySnapshot = useCallback((snapshot: Awaited<ReturnType<typeof fetchRefreshSnapshot>>) => {
+  const applySnapshot = useCallback((snapshot: Snapshot) => {
     setAccounts(snapshot.accounts); setMarketValues(snapshot.marketValues);
     setPayees(snapshot.payees); setProjectedTransactions(snapshot.projectedTransactions);
     setPlaidPendingTransactions(snapshot.plaidPendingTransactions);
@@ -191,14 +202,6 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
     setPositionsVersion((v) => v + 1);
     setLoadMoreFailed(false); setError(null);
   }, []);
-
-  const autoSelectAccount = useCallback((accounts: AccountWithBalance[]) => {
-    if (autoSelectDone.current) return;
-    autoSelectDone.current = true;
-    if (accountId) return;
-    const target = preferredAccountId(accounts, bookId);
-    if (target !== null) routerRef.current.replace(`/b/${bookId}/transactions?accountId=${target}`, { scroll: false });
-  }, [accountId, bookId]);
 
   const drain = useCallback((): Promise<void> => {
     const scope = scopeRef.current;
@@ -222,10 +225,22 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
           const request = scope.pending;
           scope.pending = null;
           if (request.showLoading) setLoading(true);
+          // The first snapshot without an account picks one (the stored
+          // account, else the first favorite).
+          const pickAccount = !autoSelectDone.current && !accountId;
+          let redirected = false;
           try {
             const snapshot = await fetchRefreshSnapshot({ bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming },
-              request, scope.loadedCount, scope.controller.signal);
+              request, scope.loadedCount, scope.controller.signal, pickAccount);
             if (!scope.active) return;
+            autoSelectDone.current = true;
+            if (snapshot.redirectTo !== null) {
+              // The page stays loading: the scope of the chosen account loads
+              // its data.
+              redirected = true;
+              routerRef.current.replace(`/b/${bookId}/transactions?accountId=${snapshot.redirectTo}`, { scroll: false });
+              return;
+            }
             // An editor opened while the requests were in flight. Discard the
             // snapshot and fetch again on close, retaining an explicit request.
             if (request.background && scope.paused) {
@@ -237,14 +252,13 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
             if (!request.background) {
               scope.frame = requestAnimationFrame(() => { if (scope.active) scrollRef.current(); });
             }
-            autoSelectAccount(snapshot.accounts);
           } catch {
             if (scope.active) {
               if (request.showLoading) setError("Could not load transactions.");
               else toastRef.current.error("Could not refresh transactions.");
             }
           } finally {
-            if (scope.active) {
+            if (scope.active && !redirected) {
               initialLoad.current = false;
               setTransactionsLoading(false);
               setLoading(false);
@@ -254,7 +268,7 @@ export function useTransactionsPageData(args: UseTransactionsPageDataArgs): UseT
       } finally { scope.running = false; }
     })();
     return scope.promise;
-  }, [contextKey, bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming, applySnapshot, autoSelectAccount]);
+  }, [contextKey, bookId, accountId, startDate, endDate, selectedPayeeId, showUpcoming, applySnapshot]);
 
   const enqueue = useCallback((request: RefreshRequest) => {
     const scope = scopeRef.current;

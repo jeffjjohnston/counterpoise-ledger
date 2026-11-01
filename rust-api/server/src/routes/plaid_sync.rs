@@ -1,14 +1,15 @@
 //! The Plaid transaction sync and the auto-matcher.
 //!
-//! A sync holds a session advisory lock on its connection for its whole
-//! life, so the scheduled sync and a manual sync cannot fetch the same Plaid
-//! pages twice. Every query of the sync runs on that connection.
+//! A sync holds the lease of its connection for its whole life, so the
+//! scheduled sync and a manual sync cannot fetch the same Plaid pages twice.
+//! The Plaid calls run between the statements, never inside a transaction.
 
+use crate::platform;
 use crate::validation::{parse_pg_int4, pg_float8_to_int4};
 use crate::{
     analytics::PostHogCapture,
     book_auth::{AccessLevel, authenticate_book},
-    db_scope::with_transaction,
+    book_scope::{BookAccess, Write},
     error::{ApiResult, error, error_owned},
     plaid::{Plaid, is_configuration_error},
     routes::{
@@ -23,13 +24,12 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{Days, Local, NaiveDate, NaiveDateTime};
-use ledger_db::engine::{Db, DbArguments, DbConnection};
-use ledger_db::locks::{SessionLock, with_session_lock};
+use chrono::{Days, NaiveDate, NaiveDateTime};
+use ledger_db::Database;
 use ledger_db::sql;
+use ledger_db::store::{self, Sql, Value as Bind, params};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::FromRow;
 use std::collections::{HashMap, HashSet};
 
 const MAX_SYNC_RETRIES: u32 = 2;
@@ -61,17 +61,17 @@ pub(crate) const DATABASE_FAILURE: &str =
 
 /// Logs a database error and gives the fixed message for the client. The
 /// routes store the same message in `plaid_tokens.last_error`.
-pub(crate) fn database_failure(cause: sqlx::Error) -> String {
+pub(crate) fn database_failure(cause: impl std::fmt::Display) -> String {
     tracing::error!(error = %cause, "Database error in a Plaid operation");
     DATABASE_FAILURE.to_owned()
 }
 
-/// A protocol error carries the message of a check that the Rust code does
+/// An invalid value carries the message of a check that the Rust code does
 /// for the database, as `parse_pg_int4`; it is the route's own text. Any
 /// other error gets the fixed message.
-fn failed(cause: sqlx::Error) -> SyncError {
+fn failed(cause: store::Error) -> SyncError {
     SyncError::Failed(match cause {
-        sqlx::Error::Protocol(message) => message,
+        store::Error::Invalid(message) => message,
         other => database_failure(other),
     })
 }
@@ -104,50 +104,53 @@ impl SyncResult {
 /// already running is refused with 409 and does not wait.
 pub(crate) async fn sync_token(
     state: &AppState,
-    book_id: i32,
+    access: &BookAccess<'_, Write>,
     token_id: i32,
 ) -> Result<SyncResult, SyncError> {
-    let plaid = state.plaid.clone();
-    let analytics = state.analytics.clone();
-    let outcome = with_session_lock(
-        &state.pool,
-        SessionLock::plaid_sync(token_id),
-        move |connection| {
-            Box::pin(async move {
-                Ok(sync_locked(connection, &plaid, &analytics, book_id, token_id).await)
-            })
-        },
-    )
-    .await;
-    match outcome {
-        Err(cause) => Err(failed(cause)),
-        Ok(None) => Err(SyncError::Refused(
+    // Dropping the lease releases it, also when the caller goes away.
+    let Some(running) =
+        crate::leases::try_take(&state.database, &crate::leases::plaid_sync(token_id))
+            .map_err(|cause| SyncError::Failed(database_failure(cause)))?
+    else {
+        return Err(SyncError::Refused(
             StatusCode::CONFLICT,
             "A sync is already running for this connection",
-        )),
-        Ok(Some(result)) => result,
-    }
+        ));
+    };
+    running
+        .guard(sync_locked(
+            &state.database,
+            &state.plaid,
+            &state.analytics,
+            access,
+            token_id,
+        ))
+        .await
+        .unwrap_or_else(|lost| {
+            tracing::error!(token_id, error = %lost, "Plaid sync stopped");
+            Err(SyncError::Failed(
+                "The sync stopped before it finished. Try again.".to_owned(),
+            ))
+        })
 }
 
 /// The sync inside the lock. A demo connection is refused before the step
 /// that records `last_error`: it is not a failed connection.
 async fn sync_locked(
-    connection: &mut DbConnection,
+    database: &Database,
     plaid: &Plaid,
     analytics: &PostHogCapture,
-    book_id: i32,
+    access: &BookAccess<'_, Write>,
     token_id: i32,
 ) -> Result<SyncResult, SyncError> {
-    let token: Option<(bool, String, Option<String>)> = sqlx::query_as(
-        "SELECT is_demo, access_token, sync_cursor FROM plaid_tokens
-         WHERE id = $1 AND book_id = $2 LIMIT 1",
-    )
-    .bind(token_id)
-    .bind(book_id)
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(failed)?;
-    let Some((is_demo, access_token, cursor)) = token else {
+    let token: Option<(bool, String, Option<String>, Option<String>)> = database
+        .query_optional(
+            "SELECT is_demo, access_token, access_token_key, sync_cursor FROM plaid_tokens
+             WHERE id = ?1 AND book_id = ?2 LIMIT 1",
+            &params![token_id, access.book_id()],
+        )
+        .map_err(failed)?;
+    let Some((is_demo, stored_token, token_key, cursor)) = token else {
         return Err(SyncError::Refused(StatusCode::NOT_FOUND, "Token not found"));
     };
     if is_demo {
@@ -156,23 +159,29 @@ async fn sync_locked(
             "This is a demo connection and cannot sync with Plaid",
         ));
     }
-    let result = sync_steps(
-        connection,
-        plaid,
-        analytics,
-        book_id,
-        token_id,
-        &access_token,
-        cursor,
-    )
-    .await;
-    if let Err(cause) = &result {
-        sqlx::query("UPDATE plaid_tokens SET last_error = $2, updated_at = $3 WHERE id = $1")
-            .bind(token_id)
-            .bind(cause.message())
-            .bind(now_millis())
-            .execute(&mut *connection)
+    // A token that does not open is a failed sync of this connection, so
+    // its `last_error` says why.
+    let result = match plaid.open_token(&stored_token, token_key.as_deref()) {
+        Ok(access_token) => {
+            sync_steps(
+                database,
+                plaid,
+                analytics,
+                access,
+                token_id,
+                &access_token,
+                cursor,
+            )
             .await
+        }
+        Err(message) => Err(SyncError::Failed(message)),
+    };
+    if let Err(cause) = &result {
+        database
+            .execute(
+                "UPDATE plaid_tokens SET last_error = ?2, updated_at = ?3 WHERE id = ?1",
+                &params![token_id, cause.message(), now_millis()],
+            )
             .map_err(failed)?;
     }
     result
@@ -257,23 +266,22 @@ fn is_pending(item: &Value) -> bool {
 }
 
 async fn sync_steps(
-    connection: &mut DbConnection,
+    database: &Database,
     plaid: &Plaid,
     analytics: &PostHogCapture,
-    book_id: i32,
+    access: &BookAccess<'_, Write>,
     token_id: i32,
     access_token: &str,
     cursor: Option<String>,
 ) -> Result<SyncResult, SyncError> {
-    let linked: Vec<(i32, String, String)> = sqlx::query_as(
-        "SELECT pa.id, pa.plaid_account_id, a.type
-         FROM plaid_accounts pa JOIN accounts a ON pa.counterpoise_account_id = a.id
-         WHERE pa.token_id = $1 ORDER BY pa.id",
-    )
-    .bind(token_id)
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(failed)?;
+    let linked: Vec<(i32, String, String)> = database
+        .query(
+            "SELECT pa.id, pa.plaid_account_id, a.type
+             FROM plaid_accounts pa JOIN accounts a ON pa.counterpoise_account_id = a.id
+             WHERE pa.token_id = ?1 ORDER BY pa.id",
+            &params![token_id],
+        )
+        .map_err(failed)?;
     if linked.is_empty() {
         return Err(SyncError::Refused(
             StatusCode::BAD_REQUEST,
@@ -302,7 +310,7 @@ async fn sync_steps(
             .map_err(SyncError::Failed)?;
     let now = now_millis();
     if is_initial {
-        let cutoff = (Local::now().date_naive() - Days::new(INITIAL_SYNC_DAYS.into()))
+        let cutoff = (platform::today() - Days::new(INITIAL_SYNC_DAYS.into()))
             .format("%Y-%m-%d")
             .to_string();
         added.retain(|item| item["date"].as_str().expect("a checked sync item") >= cutoff.as_str());
@@ -311,67 +319,59 @@ async fn sync_steps(
     let added_groups = group_by_link(&added, &links);
     for (link_id, items) in &added_groups {
         for item in items.iter().filter(|item| !is_pending(item)) {
-            stage_added(connection, book_id, *link_id, item, now)
-                .await
-                .map_err(failed)?;
+            stage_added(database, access, *link_id, item, now).map_err(failed)?;
         }
     }
     let modified_groups = group_by_link(&modified, &links);
     for (link_id, items) in &modified_groups {
         for item in items.iter().filter(|item| !is_pending(item)) {
-            stage_modified(connection, book_id, *link_id, item, now)
-                .await
-                .map_err(failed)?;
+            stage_modified(database, access, *link_id, item, now).map_err(failed)?;
         }
     }
     if !removed.is_empty() {
-        let matches: Vec<(i32, String)> = sqlx::query_as(&format!(
-            "SELECT plaid_account_link_id, plaid_transaction_id
-             FROM plaid_transaction_reconciliation
-             WHERE plaid_account_link_id {in1} AND plaid_transaction_id {in2}
-             ORDER BY id",
-            in1 = sql::in_integers("$1"),
-            in2 = sql::in_texts("$2")
-        ))
-        .bind(sql::json_array(&link_ids))
-        .bind(sql::json_array(&removed))
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(failed)?;
+        let matches: Vec<(i32, String)> = database
+            .query(
+                &format!(
+                    "SELECT plaid_account_link_id, plaid_transaction_id
+                     FROM plaid_transaction_reconciliation
+                     WHERE plaid_account_link_id {in1} AND plaid_transaction_id {in2}
+                     ORDER BY id",
+                    in1 = sql::in_integers("?1"),
+                    in2 = sql::in_texts("?2")
+                ),
+                &params![sql::json_array(&link_ids), sql::json_array(&removed)],
+            )
+            .map_err(failed)?;
         for (link_id, plaid_transaction_id) in matches {
-            stage_removed(connection, link_id, &plaid_transaction_id, now)
-                .await
-                .map_err(failed)?;
+            stage_removed(database, link_id, &plaid_transaction_id, now).map_err(failed)?;
         }
     }
 
-    sqlx::query(
-        "UPDATE plaid_tokens SET sync_cursor = $2, last_synced_at = $3, last_error = NULL,
-                updated_at = $3
-         WHERE id = $1",
-    )
-    .bind(token_id)
-    .bind(&next_cursor)
-    .bind(now)
-    .execute(&mut *connection)
-    .await
-    .map_err(failed)?;
-
-    let auto_matched = auto_match(connection, analytics, book_id, &link_ids)
-        .await
+    database
+        .execute(
+            "UPDATE plaid_tokens SET sync_cursor = ?2, last_synced_at = ?3, last_error = NULL,
+                    updated_at = ?3
+             WHERE id = ?1",
+            &params![token_id, &next_cursor, now],
+        )
         .map_err(failed)?;
-    let (pending_count, review_count): (i32, i32) = sqlx::query_as(&format!(
-        "SELECT
-           CAST(COALESCE(SUM(CASE WHEN resolution_status = 'pending' AND review_reason IS NULL
-                                  THEN 1 ELSE 0 END), 0) AS integer),
-           CAST(COALESCE(SUM(CASE WHEN review_reason IS NOT NULL THEN 1 ELSE 0 END), 0) AS integer)
-         FROM plaid_transaction_reconciliation WHERE plaid_account_link_id {in1}",
-        in1 = sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(&link_ids))
-    .fetch_one(&mut *connection)
-    .await
-    .map_err(failed)?;
+
+    let auto_matched = auto_match(database, analytics, access, &link_ids).map_err(failed)?;
+    let (pending_count, review_count): (i32, i32) = database
+        .query_row(
+            &format!(
+                "SELECT
+                   CAST(COALESCE(SUM(CASE WHEN resolution_status = 'pending'
+                                           AND review_reason IS NULL
+                                          THEN 1 ELSE 0 END), 0) AS integer),
+                   CAST(COALESCE(SUM(CASE WHEN review_reason IS NOT NULL
+                                          THEN 1 ELSE 0 END), 0) AS integer)
+                 FROM plaid_transaction_reconciliation WHERE plaid_account_link_id {in1}",
+                in1 = sql::in_integers("?1")
+            ),
+            &params![sql::json_array(&link_ids)],
+        )
+        .map_err(failed)?;
 
     let staged = |groups: &[(i32, Vec<&Value>)]| {
         groups
@@ -527,7 +527,7 @@ fn kept_when_missing(first: usize, table: &str, value: impl Fn(&str) -> String) 
         .enumerate()
         .map(|(index, column)| {
             format!(
-                "{column} = CASE WHEN ${} THEN {} ELSE {table}{column} END",
+                "{column} = CASE WHEN ?{} THEN {} ELSE {table}{column} END",
                 first + index,
                 value(column)
             )
@@ -541,51 +541,53 @@ const STAGED_COLUMNS: &str = "book_id, plaid_account_link_id, plaid_transaction_
     pending_transaction_id, iso_currency_code, unofficial_currency_code, category_primary,
     category_detailed, raw_json, resolution_status, first_seen_at, last_seen_at, created_at,
     updated_at";
-const STAGED_VALUES: &str = "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-    $14, $15, $16, 'pending', $17, $17, $17, $17";
+const STAGED_VALUES: &str = "?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+    ?14, ?15, ?16, 'pending', ?17, ?17, ?17, ?17";
 
 /// The amount as the `integer` column stores it. Node sent a float for
 /// PostgreSQL to cast.
-fn amount_column(staged: &Staged) -> Result<i32, sqlx::Error> {
-    pg_float8_to_int4(staged.amount_cents).map_err(sqlx::Error::Protocol)
+fn amount_column(staged: &Staged) -> Result<i32, store::Error> {
+    pg_float8_to_int4(staged.amount_cents).map_err(store::Error::Invalid)
 }
 
-fn bind_staged<'q>(
-    query: sqlx::query::Query<'q, Db, DbArguments<'q>>,
-    book_id: i32,
+/// The values of `STAGED_VALUES`, `?1` to `?17`.
+fn staged_params(
+    access: &BookAccess<'_, Write>,
     link_id: i32,
-    staged: &'q Staged,
+    staged: &Staged,
     now: NaiveDateTime,
-) -> Result<sqlx::query::Query<'q, Db, DbArguments<'q>>, sqlx::Error> {
-    Ok(query
-        .bind(book_id)
-        .bind(link_id)
-        .bind(&staged.plaid_transaction_id)
-        .bind(&staged.date)
-        .bind(staged.authorized_date.clone().flatten())
-        .bind(amount_column(staged)?)
-        .bind(&staged.name)
-        .bind(staged.merchant_name.clone().flatten())
-        .bind(staged.original_description.clone().flatten())
-        .bind(staged.pending)
-        .bind(staged.pending_transaction_id.clone().flatten())
-        .bind(staged.iso_currency_code.clone().flatten())
-        .bind(staged.unofficial_currency_code.clone().flatten())
-        .bind(&staged.category_primary)
-        .bind(&staged.category_detailed)
-        .bind(&staged.raw_json)
-        .bind(now))
+) -> Result<Vec<Bind>, store::Error> {
+    Ok(params![
+        access.book_id(),
+        link_id,
+        &staged.plaid_transaction_id,
+        &staged.date,
+        staged.authorized_date.clone().flatten(),
+        amount_column(staged)?,
+        &staged.name,
+        staged.merchant_name.clone().flatten(),
+        staged.original_description.clone().flatten(),
+        staged.pending,
+        staged.pending_transaction_id.clone().flatten(),
+        staged.iso_currency_code.clone().flatten(),
+        staged.unofficial_currency_code.clone().flatten(),
+        &staged.category_primary,
+        &staged.category_detailed,
+        &staged.raw_json,
+        now,
+    ]
+    .to_vec())
 }
 
 /// `stageAddedTransactions` for one item. A row already resolved keeps its
 /// resolution; any review flag is cleared.
-async fn stage_added(
-    connection: &mut DbConnection,
-    book_id: i32,
+fn stage_added(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     link_id: i32,
     item: &Value,
     now: NaiveDateTime,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), store::Error> {
     let staged = Staged::from_item(item);
     let optional_columns = kept_when_missing(18, "r.", |column| format!("excluded.{column}"));
     let sql = format!(
@@ -601,17 +603,41 @@ async fn stage_added(
                                     THEN r.resolution_status ELSE 'pending' END,
            resolved_at = CASE WHEN r.resolution_status IN ('matched', 'created', 'ignored')
                               THEN r.resolved_at ELSE NULL END,
-           last_seen_at = $17, updated_at = $17"
+           last_seen_at = ?17, updated_at = ?17
+         RETURNING id, merchant_name, name"
     );
-    let mut query = bind_staged(sqlx::query(&sql), book_id, link_id, &staged, now)?;
-    for present in staged.present() {
-        query = query.bind(present);
-    }
-    query.execute(&mut *connection).await?;
+    let mut values = staged_params(access, link_id, &staged, now)?;
+    values.extend(staged.present().map(Bind::from));
+    database.transaction(|tx| {
+        let row = tx.query_row(&sql, &values)?;
+        store_merchant_key(tx, row)
+    })
+}
+
+/// A staged row that a write returned with `RETURNING id, merchant_name, name`.
+#[derive(ledger_db::store::FromRow)]
+struct Returned {
+    id: i32,
+    merchant_name: Option<String>,
+    name: String,
+}
+
+/// Stores the merchant key of a staged row that a write just returned. A
+/// kept merchant name is one the write did not send, so the key is computed
+/// from the stored values. The caller holds the write and this update in one
+/// transaction, so no reader sees a row whose key does not match its names.
+fn store_merchant_key(sql: &impl Sql, row: Returned) -> Result<(), store::Error> {
+    sql.execute(
+        "UPDATE plaid_transaction_reconciliation SET merchant_key = ?1 WHERE id = ?2",
+        &params![
+            ledger_db::folds::merchant_key(row.merchant_name.as_deref(), &row.name),
+            row.id
+        ],
+    )?;
     Ok(())
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct ExistingRow {
     id: i32,
     resolution_status: String,
@@ -646,138 +672,135 @@ struct ReviewFields<'a> {
 /// `stageModifiedTransactions` for one item. A modification of a row that is
 /// already matched or created is flagged for review with the values before
 /// and after it.
-async fn stage_modified(
-    connection: &mut DbConnection,
-    book_id: i32,
+fn stage_modified(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     link_id: i32,
     item: &Value,
     now: NaiveDateTime,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), store::Error> {
     let staged = Staged::from_item(item);
-    let existing: Option<ExistingRow> = sqlx::query_as(
-        "SELECT id, resolution_status, review_reason, review_metadata_json, date, amount_cents,
-                name, merchant_name, original_description, category_primary, category_detailed
-         FROM plaid_transaction_reconciliation
-         WHERE plaid_account_link_id = $1 AND plaid_transaction_id = $2 LIMIT 1",
-    )
-    .bind(link_id)
-    .bind(&staged.plaid_transaction_id)
-    .fetch_optional(&mut *connection)
-    .await?;
-    let Some(existing) = existing else {
-        let sql = format!(
-            "INSERT INTO plaid_transaction_reconciliation ({STAGED_COLUMNS})
-             VALUES ({STAGED_VALUES})"
-        );
-        bind_staged(sqlx::query(&sql), book_id, link_id, &staged, now)?
-            .execute(&mut *connection)
-            .await?;
-        return Ok(());
-    };
-    let flag = matches!(existing.resolution_status.as_str(), "matched" | "created");
-    let (review_reason, review_metadata) = if flag {
-        let metadata = json!({
-            "event": "modified",
-            "previous": ReviewFields {
-                date: &existing.date,
-                amount_cents: f64::from(existing.amount_cents),
-                name: &existing.name,
-                merchant_name: Some(existing.merchant_name.as_deref()),
-                original_description: Some(existing.original_description.as_deref()),
-                category_primary: existing.category_primary.as_deref(),
-                category_detailed: existing.category_detailed.as_deref(),
-            },
-            "incoming": ReviewFields {
-                date: &staged.date,
-                amount_cents: staged.amount_cents,
-                name: &staged.name,
-                merchant_name: staged.merchant_name.as_ref().map(Option::as_deref),
-                original_description: staged.original_description.as_ref().map(Option::as_deref),
-                category_primary: staged.category_primary.as_deref(),
-                category_detailed: staged.category_detailed.as_deref(),
-            },
+    database.transaction(|tx| {
+        let existing: Option<ExistingRow> = tx.query_optional(
+            "SELECT id, resolution_status, review_reason, review_metadata_json, date,
+                    amount_cents, name, merchant_name, original_description, category_primary,
+                    category_detailed
+             FROM plaid_transaction_reconciliation
+             WHERE plaid_account_link_id = ?1 AND plaid_transaction_id = ?2 LIMIT 1",
+            &params![link_id, &staged.plaid_transaction_id],
+        )?;
+        let Some(existing) = existing else {
+            let sql = format!(
+                "INSERT INTO plaid_transaction_reconciliation ({STAGED_COLUMNS})
+                 VALUES ({STAGED_VALUES}) RETURNING id, merchant_name, name"
+            );
+            let row = tx.query_row(&sql, &staged_params(access, link_id, &staged, now)?)?;
+            return store_merchant_key(tx, row);
+        };
+        let flag = matches!(existing.resolution_status.as_str(), "matched" | "created");
+        let (review_reason, review_metadata) = if flag {
+            let metadata = json!({
+                "event": "modified",
+                "previous": ReviewFields {
+                    date: &existing.date,
+                    amount_cents: f64::from(existing.amount_cents),
+                    name: &existing.name,
+                    merchant_name: Some(existing.merchant_name.as_deref()),
+                    original_description: Some(existing.original_description.as_deref()),
+                    category_primary: existing.category_primary.as_deref(),
+                    category_detailed: existing.category_detailed.as_deref(),
+                },
+                "incoming": ReviewFields {
+                    date: &staged.date,
+                    amount_cents: staged.amount_cents,
+                    name: &staged.name,
+                    merchant_name: staged.merchant_name.as_ref().map(Option::as_deref),
+                    original_description: staged
+                        .original_description
+                        .as_ref()
+                        .map(Option::as_deref),
+                    category_primary: staged.category_primary.as_deref(),
+                    category_detailed: staged.category_detailed.as_deref(),
+                },
+            });
+            (
+                Some("plaid_modified".to_owned()),
+                Some(js_stringify(&metadata)),
+            )
+        } else if existing.resolution_status == "pending" {
+            (None, existing.review_metadata_json)
+        } else {
+            (existing.review_reason, existing.review_metadata_json)
+        };
+        // Parameters 12 to 17 hold the optional values, 18 to 23 whether each
+        // was sent.
+        let optional_columns = kept_when_missing(18, "", |column| {
+            let index = KEPT_WHEN_MISSING
+                .iter()
+                .position(|name| name == &column)
+                .expect("a listed column");
+            format!("?{}", 12 + index)
         });
-        (
-            Some("plaid_modified".to_owned()),
-            Some(js_stringify(&metadata)),
-        )
-    } else if existing.resolution_status == "pending" {
-        (None, existing.review_metadata_json)
-    } else {
-        (existing.review_reason, existing.review_metadata_json)
-    };
-    // Parameters 12 to 17 hold the optional values, 18 to 23 whether each
-    // was sent.
-    let optional_columns = kept_when_missing(18, "", |column| {
-        let index = KEPT_WHEN_MISSING
-            .iter()
-            .position(|name| name == &column)
-            .expect("a listed column");
-        format!("${}", 12 + index)
-    });
-    let sql = format!(
-        "UPDATE plaid_transaction_reconciliation SET
-           date = $2, amount_cents = $3, name = $4, pending = $5,
-           category_primary = $6, category_detailed = $7, raw_json = $8, review_reason = $9,
-           review_metadata_json = $10, last_seen_at = $11, updated_at = $11, {optional_columns}
-         WHERE id = $1"
-    );
-    let mut query = sqlx::query(&sql)
-        .bind(existing.id)
-        .bind(&staged.date)
-        .bind(amount_column(&staged)?)
-        .bind(&staged.name)
-        .bind(staged.pending)
-        .bind(&staged.category_primary)
-        .bind(&staged.category_detailed)
-        .bind(&staged.raw_json)
-        .bind(review_reason)
-        .bind(review_metadata)
-        .bind(now);
-    for value in [
-        &staged.authorized_date,
-        &staged.merchant_name,
-        &staged.original_description,
-        &staged.pending_transaction_id,
-        &staged.iso_currency_code,
-        &staged.unofficial_currency_code,
-    ] {
-        query = query.bind(value.clone().flatten());
-    }
-    for present in staged.present() {
-        query = query.bind(present);
-    }
-    query.execute(&mut *connection).await?;
-    Ok(())
+        let sql = format!(
+            "UPDATE plaid_transaction_reconciliation SET
+               date = ?2, amount_cents = ?3, name = ?4, pending = ?5,
+               category_primary = ?6, category_detailed = ?7, raw_json = ?8,
+               review_reason = ?9, review_metadata_json = ?10, last_seen_at = ?11,
+               updated_at = ?11, {optional_columns}
+             WHERE id = ?1 RETURNING id, merchant_name, name"
+        );
+        let mut values = params![
+            existing.id,
+            &staged.date,
+            amount_column(&staged)?,
+            &staged.name,
+            staged.pending,
+            &staged.category_primary,
+            &staged.category_detailed,
+            &staged.raw_json,
+            review_reason,
+            review_metadata,
+            now,
+        ]
+        .to_vec();
+        for value in [
+            &staged.authorized_date,
+            &staged.merchant_name,
+            &staged.original_description,
+            &staged.pending_transaction_id,
+            &staged.iso_currency_code,
+            &staged.unofficial_currency_code,
+        ] {
+            values.push(value.clone().flatten().into());
+        }
+        values.extend(staged.present().map(Bind::from));
+        let row = tx.query_row(&sql, &values)?;
+        store_merchant_key(tx, row)
+    })
 }
 
 /// `stageRemovedTransactions` for one staged row that Plaid removed. A row
 /// that is pending, matched, or created is flagged for review; an ignored
 /// row is left alone.
-async fn stage_removed(
-    connection: &mut DbConnection,
+fn stage_removed(
+    database: &Database,
     link_id: i32,
     plaid_transaction_id: &str,
     now: NaiveDateTime,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), store::Error> {
     let metadata = js_stringify(&json!({
         "event": "removed",
         "removedTransactionId": plaid_transaction_id,
     }));
-    sqlx::query(
+    database.execute(
         "UPDATE plaid_transaction_reconciliation
-         SET review_reason = 'plaid_removed', review_metadata_json = $3, last_seen_at = $4,
-             updated_at = $4
+         SET review_reason = 'plaid_removed', review_metadata_json = ?3, last_seen_at = ?4,
+             updated_at = ?4
          WHERE id = (SELECT id FROM plaid_transaction_reconciliation
-                     WHERE plaid_account_link_id = $1 AND plaid_transaction_id = $2 LIMIT 1)
+                     WHERE plaid_account_link_id = ?1 AND plaid_transaction_id = ?2 LIMIT 1)
            AND resolution_status IN ('pending', 'matched', 'created')",
-    )
-    .bind(link_id)
-    .bind(plaid_transaction_id)
-    .bind(metadata)
-    .bind(now)
-    .execute(&mut *connection)
-    .await?;
+        &params![link_id, plaid_transaction_id, metadata, now],
+    )?;
     Ok(())
 }
 
@@ -813,7 +836,7 @@ pub(crate) fn pick_matched_date<'a>(
 /// learned payee map.
 pub(crate) use ledger_core::names::merchant_key;
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct PendingRow {
     id: i32,
     plaid_account_link_id: i32,
@@ -827,24 +850,23 @@ struct PendingRow {
 /// `autoMatchPendingTransactions`: matches pending rows to existing
 /// transactions through the payees of earlier matches. Returns the number
 /// of matches.
-async fn auto_match(
-    connection: &mut DbConnection,
+fn auto_match(
+    database: &Database,
     analytics: &PostHogCapture,
-    book_id: i32,
+    access: &BookAccess<'_, Write>,
     link_ids: &[i32],
-) -> Result<usize, sqlx::Error> {
+) -> Result<usize, store::Error> {
+    let book_id = access.book_id();
     if link_ids.is_empty() {
         return Ok(0);
     }
-    let history: Vec<(Option<String>, String, i32)> = sqlx::query_as(
+    let history: Vec<(Option<String>, String, i32)> = database.query(
         "SELECT r.merchant_name, r.name, t.payee_id
          FROM plaid_transaction_reconciliation r
          JOIN transactions t ON r.matched_transaction_id = t.id
-         WHERE r.book_id = $1 AND r.resolution_status = 'matched' AND t.payee_id IS NOT NULL",
-    )
-    .bind(book_id)
-    .fetch_all(&mut *connection)
-    .await?;
+         WHERE r.book_id = ?1 AND r.resolution_status = 'matched' AND t.payee_id IS NOT NULL",
+        &params![book_id],
+    )?;
     let mut payee_map: HashMap<String, HashSet<i32>> = HashMap::new();
     for (merchant_name, name, payee_id) in history {
         let key = merchant_key(merchant_name.as_deref(), &name);
@@ -856,43 +878,43 @@ async fn auto_match(
         return Ok(0);
     }
 
-    let pending: Vec<PendingRow> = sqlx::query_as(&format!(
-        "SELECT id, plaid_account_link_id, date, authorized_date, amount_cents, name, merchant_name
-         FROM plaid_transaction_reconciliation
-         WHERE book_id = $1 AND plaid_account_link_id {in2}
-           AND resolution_status = 'pending' AND review_reason IS NULL
-         ORDER BY id",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(book_id)
-    .bind(sql::json_array(link_ids))
-    .fetch_all(&mut *connection)
-    .await?;
+    let pending: Vec<PendingRow> = database.query(
+        &format!(
+            "SELECT id, plaid_account_link_id, date, authorized_date, amount_cents, name,
+                    merchant_name
+             FROM plaid_transaction_reconciliation
+             WHERE book_id = ?1 AND plaid_account_link_id {in2}
+               AND resolution_status = 'pending' AND review_reason IS NULL
+             ORDER BY id",
+            in2 = sql::in_integers("?2")
+        ),
+        &params![book_id, sql::json_array(link_ids)],
+    )?;
     if pending.is_empty() {
         return Ok(0);
     }
-    let accounts: HashMap<i32, i32> = sqlx::query_as::<_, (i32, Option<i32>)>(&format!(
-        "SELECT id, counterpoise_account_id FROM plaid_accounts WHERE id {}",
-        sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(link_ids))
-    .fetch_all(&mut *connection)
-    .await?
-    .into_iter()
-    .filter_map(|(link_id, account_id)| account_id.map(|account_id| (link_id, account_id)))
-    .collect();
+    let accounts: HashMap<i32, i32> = database
+        .query::<(i32, Option<i32>)>(
+            &format!(
+                "SELECT id, counterpoise_account_id FROM plaid_accounts WHERE id {}",
+                sql::in_integers("?1")
+            ),
+            &params![sql::json_array(link_ids)],
+        )?
+        .into_iter()
+        .filter_map(|(link_id, account_id)| account_id.map(|account_id| (link_id, account_id)))
+        .collect();
     // Uniqueness is per link, so a transfer can match on both of its links.
     let mut linked: HashMap<i32, HashSet<i32>> = HashMap::new();
-    for (link_id, transaction_id) in sqlx::query_as::<_, (i32, i32)>(&format!(
-        "SELECT plaid_account_link_id, matched_transaction_id
-         FROM plaid_transaction_reconciliation
-         WHERE plaid_account_link_id {} AND matched_transaction_id IS NOT NULL",
-        sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(link_ids))
-    .fetch_all(&mut *connection)
-    .await?
-    {
+    for (link_id, transaction_id) in database.query::<(i32, i32)>(
+        &format!(
+            "SELECT plaid_account_link_id, matched_transaction_id
+             FROM plaid_transaction_reconciliation
+             WHERE plaid_account_link_id {} AND matched_transaction_id IS NOT NULL",
+            sql::in_integers("?1")
+        ),
+        &params![sql::json_array(link_ids)],
+    )? {
         linked.entry(link_id).or_default().insert(transaction_id);
     }
 
@@ -909,20 +931,23 @@ async fn auto_match(
         let payee_ids: Vec<i32> = payee_ids.iter().copied().collect();
         // A candidate within one day of the posted date or of the
         // authorization date. Ordered by date and ID.
-        let candidates: Vec<(i32, String)> = sqlx::query_as(&format!(
-            "SELECT t.id, {} AS date
-             FROM transaction_splits s JOIN transactions t ON s.transaction_id = t.id
-             WHERE s.account_id = $1 AND s.amount = $2 AND t.book_id = $3 AND t.payee_id {in4}
-             ORDER BY 2, t.id",
-            sql::EFFECTIVE_DATE,
-            in4 = sql::in_integers("$4")
-        ))
-        .bind(account_id)
-        .bind(-i64::from(row.amount_cents))
-        .bind(book_id)
-        .bind(sql::json_array(&payee_ids))
-        .fetch_all(&mut *connection)
-        .await?;
+        let candidates: Vec<(i32, String)> = database.query(
+            &format!(
+                "SELECT t.id, {} AS date
+                 FROM transaction_splits s JOIN transactions t ON s.transaction_id = t.id
+                 WHERE s.account_id = ?1 AND s.amount = ?2 AND t.book_id = ?3
+                   AND t.payee_id {in4}
+                 ORDER BY 2, t.id",
+                sql::EFFECTIVE_DATE,
+                in4 = sql::in_integers("?4")
+            ),
+            &params![
+                account_id,
+                -i64::from(row.amount_cents),
+                book_id,
+                sql::json_array(&payee_ids)
+            ],
+        )?;
         let already = linked.entry(row.plaid_account_link_id).or_default();
         let dates: Vec<&str> = std::iter::once(row.date.as_str())
             .chain(row.authorized_date.as_deref())
@@ -953,36 +978,25 @@ async fn auto_match(
             (chosen.0, matched_date.to_owned(), row.id);
         // Claim the row only while it is still pending and not flagged: a
         // person or a concurrent sync may have resolved it since it was read.
-        let claimed = with_transaction(connection, |transaction| {
-            Box::pin(async move {
-                let claimed: Option<i32> = sqlx::query_scalar(
-                    "UPDATE plaid_transaction_reconciliation
-                     SET resolution_status = 'matched', matched_transaction_id = $2,
-                         resolved_at = $3, updated_at = $3
-                     WHERE id = $1 AND resolution_status = 'pending' AND review_reason IS NULL
-                     RETURNING id",
-                )
-                .bind(reconciliation_id)
-                .bind(transaction_id)
-                .bind(now)
-                .fetch_optional(&mut *transaction)
-                .await?;
-                if claimed.is_some() {
-                    sqlx::query(
-                        "UPDATE transactions SET is_reconciled = true, is_floating = false,
-                                date = $2, updated_at = $3
-                         WHERE id = $1",
-                    )
-                    .bind(transaction_id)
-                    .bind(matched_date)
-                    .bind(now)
-                    .execute(&mut *transaction)
-                    .await?;
-                }
-                Ok(claimed.is_some())
-            })
-        })
-        .await?;
+        let claimed = database.transaction(|tx| {
+            let claimed: Option<i32> = tx.query_optional(
+                "UPDATE plaid_transaction_reconciliation
+                 SET resolution_status = 'matched', matched_transaction_id = ?2,
+                     resolved_at = ?3, updated_at = ?3
+                 WHERE id = ?1 AND resolution_status = 'pending' AND review_reason IS NULL
+                 RETURNING id",
+                &params![reconciliation_id, transaction_id, now],
+            )?;
+            if claimed.is_some() {
+                tx.execute(
+                    "UPDATE transactions SET is_reconciled = true, is_floating = false,
+                            date = ?2, updated_at = ?3
+                     WHERE id = ?1",
+                    &params![transaction_id, matched_date, now],
+                )?;
+            }
+            Ok::<_, store::Error>(claimed.is_some())
+        })?;
         if claimed {
             linked
                 .entry(row.plaid_account_link_id)
@@ -994,10 +1008,8 @@ async fn auto_match(
 
     if matched > 0 {
         // A sync has no session user, so the events go to the book owner.
-        let owner: Option<i32> = sqlx::query_scalar("SELECT user_id FROM books WHERE id = $1")
-            .bind(book_id)
-            .fetch_optional(&mut *connection)
-            .await?;
+        let owner: Option<i32> = database
+            .query_optional("SELECT user_id FROM books WHERE id = ?1", &params![book_id])?;
         if let Some(owner) = owner {
             for _ in 0..matched {
                 analytics.capture_event(
@@ -1028,6 +1040,7 @@ pub(crate) async fn sync_now(
         "Failed to sync token",
     )
     .await?;
+    let access = book.write()?;
     let token_id = finite_path_id(&raw_id, "Invalid token id")?;
     // The PostgreSQL release refused an ID outside the int4 range. The route
     // keeps that refusal and its message.
@@ -1040,7 +1053,7 @@ pub(crate) async fn sync_now(
             return Err(error_owned(StatusCode::BAD_GATEWAY, refused));
         }
     };
-    match sync_token(&state, book.book_id(), token_id).await {
+    match sync_token(&state, &access, token_id).await {
         Ok(result) => Ok(Json(result.to_json())),
         Err(SyncError::Refused(status, message)) => Err(error(status, message)),
         Err(SyncError::Failed(message)) => {

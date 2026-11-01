@@ -534,6 +534,49 @@ describe("TransactionsPage", () => {
     );
   });
 
+  it("navigates to the payee page from the transaction list callback", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return { ok: true, json: async () => transactionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/positions")) {
+        return { ok: true, json: async () => positionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/account-values")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url === "/api/b/1/payees") {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      if (url.startsWith("/api/b/1/sync/stale-unmatched")) {
+        return {
+          ok: true,
+          json: async () => ({ totalCount: 0, accounts: [] }),
+        } as Response;
+      }
+      if (url.startsWith("/api/b/1/sync/pending-transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<TransactionsPage />);
+
+    await waitFor(() => {
+      expect(transactionListProps?.onNavigateToPayee).toBeTypeOf("function");
+    });
+
+    (transactionListProps?.onNavigateToPayee as (p: number) => void)(7);
+
+    expect(pushMock).toHaveBeenCalledWith("/b/1/payees/7");
+  });
+
   it("navigates client-side even outside the test environment", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();

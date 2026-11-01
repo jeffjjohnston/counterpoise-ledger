@@ -34,6 +34,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::Duration;
+use ledger_db::{Sql, store::params};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -288,10 +289,12 @@ pub(super) async fn details(
         Ok(approved) => approved,
         Err(invalid) => return invalid_response(invalid),
     };
-    let username: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await
+    let username: Option<String> = state
+        .database
+        .query_optional(
+            "SELECT username FROM users WHERE id = ?1",
+            &params![user_id],
+        )
         .unwrap_or_default();
     let loopback_only = approved.client.redirect_uris.iter().all(|uri| {
         url::Url::parse(uri)
@@ -368,36 +371,34 @@ pub(super) async fn decide(
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Could not make a code").into_response();
     };
     let now = now();
-    let stored = async {
-        let mut transaction = ledger_db::locks::begin_pool(&state.pool).await?;
-        let grant_id: i32 = sqlx::query_scalar(
+    let stored = state.database.transaction(|tx| {
+        let grant_id: i32 = tx.query_row(
             "INSERT INTO oauth_grants (user_id, client_id, scope, resource, redirect_uri, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-        )
-        .bind(user_id)
-        .bind(approved.client.id)
-        .bind(SCOPE)
-        .bind(issuer.resource())
-        .bind(&approved.redirect_uri)
-        .bind(now)
-        .fetch_one(&mut *transaction)
-        .await?;
-        sqlx::query(
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id",
+            &params![
+                user_id,
+                approved.client.id,
+                SCOPE,
+                issuer.resource(),
+                &approved.redirect_uri,
+                now
+            ],
+        )?;
+        tx.execute(
             "INSERT INTO oauth_codes
                  (code_hash, grant_id, redirect_uri, code_challenge, expires_at, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(token_hash(&code))
-        .bind(grant_id)
-        .bind(&approved.redirect_uri)
-        .bind(&approved.code_challenge)
-        .bind(now + Duration::seconds(CODE_SECONDS))
-        .bind(now)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await
-    }
-    .await;
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &params![
+                token_hash(&code),
+                grant_id,
+                &approved.redirect_uri,
+                &approved.code_challenge,
+                now + Duration::seconds(CODE_SECONDS),
+                now
+            ],
+        )?;
+        Ok::<_, ledger_db::store::Error>(())
+    });
     if let Err(cause) = stored {
         tracing::error!(error = %cause, "Could not store an OAuth grant");
         return error(

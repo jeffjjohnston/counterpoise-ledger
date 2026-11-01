@@ -10,6 +10,7 @@ let root: string;
 let repo: string;
 let binDir: string;
 let denyFile: string;
+let prCreateFile: string;
 let releaseBase: string;
 
 /**
@@ -187,13 +188,14 @@ beforeEach(() => {
   binDir = join(root, "bin");
   mkdirSync(binDir);
   denyFile = join(root, "deny-push");
+  prCreateFile = join(root, "pr-create");
 
   writeFileSync(
     join(binDir, "gh"),
     [
       "#!/bin/sh",
       'case "$1 $2" in',
-      '  "pr create") echo "https://github.com/o/r/pull/1" ;;',
+      `  "pr create") echo "$*" >'${prCreateFile}'; echo "https://github.com/o/r/pull/1" ;;`,
       '  "pr list") echo 1 ;;',
       '  "repo view") echo "o/r" ;;',
       "esac",
@@ -274,6 +276,27 @@ describe("release.sh prepares WASM for a fresh checkout", () => {
   });
 });
 
+describe("release.sh argument parsing", () => {
+  // The parser is the only thing between a mistyped flag and `npm version`.
+  // An argument it accepted in silence would run the release with the
+  // defaults: a patch bump with every check.
+  it.each(["--skip-check", "patch --bogus", "prerelease"])(
+    "refuses `%s` before it runs a check or changes anything",
+    (line) => {
+      const checks = prepareChecks();
+
+      const run = release(line.split(" "));
+
+      expect(run.code, run.output).toBe(1);
+      expect(run.output).toContain("Usage:");
+      expect(checks()).toEqual([]);
+      expect(version()).toBe("1.0.0");
+      expect(head()).toBe(releaseBase);
+      expect(remoteBranches().sort()).toEqual(["dev", "main"]);
+    },
+  );
+});
+
 describe("release.sh runs in a release checkout, never on a shared branch", () => {
   // THE BUMP ON dev IS WHAT USED TO REWRITE IT. release.sh committed the
   // version onto dev, that commit reached main only as a squash, and the
@@ -318,6 +341,30 @@ describe("release.sh runs in a release checkout, never on a shared branch", () =
     const run = release();
 
     expect(run.code, run.output).toBe(0);
+  });
+});
+
+// The pull request body lists the commits that the release adds to main. A
+// local main can be far behind origin/main, because no step of the release
+// moves it. The list must thus come from origin/main.
+describe("release.sh lists only the commits that main does not have", () => {
+  it("ignores a stale local main and its old tag", () => {
+    git(["tag", "v0.9.0", "main"]);
+    git(["checkout", "-q", "dev"]);
+    commit("shipped.txt", "already on main");
+    git(["push", "origin", "dev:main", "dev"]);
+    commit("new.txt", "new since the last release");
+    git(["push", "origin", "dev"]);
+    detachAtDev();
+
+    const run = release();
+
+    expect(run.code, run.output).toBe(0);
+    const body = readFileSync(prCreateFile, "utf8");
+    expect(body).toContain("release: v1.0.1");
+    expect(body).toContain("new since the last release");
+    expect(body).not.toContain("already on main");
+    expect(body).not.toContain("first work");
   });
 });
 

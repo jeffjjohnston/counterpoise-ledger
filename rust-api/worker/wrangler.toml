@@ -1,0 +1,102 @@
+# The Cloudflare target: one Worker and one Durable Object (src/lib.rs).
+#
+# This file is generic on purpose: no account ID, no routes or hostname, no
+# real bucket name. A deploy reads the account from CLOUDFLARE_ACCOUNT_ID and
+# takes its routes and bucket from an untracked override.
+#
+# Local: build the client (`npm run build` at the root), then run
+# `npm run worker:dev` there. No Cloudflare account is needed. Run wrangler
+# through scripts/wrangler.sh, which pins it and approves its install.
+name = "counterpoise"
+main = "build/index.js"
+compatibility_date = "2026-10-01"
+# Every outbound `fetch` goes out as if from the public internet, also to a
+# host in this Worker's own zone. Without it, such a request goes straight
+# to the zone's origin and skips its Workers and Access, and a client
+# metadata document URL is chosen by whoever signs in.
+compatibility_flags = ["global_fetch_strictly_public"]
+
+# The workspace's release profile strips the binaries, which removes the
+# table that wasm-bindgen needs, so the Worker build keeps it. The build also
+# puts `_headers` in the client build, for the files the Worker never sees.
+[build]
+command = "CARGO_PROFILE_RELEASE_STRIP=false worker-build --release && mkdir -p ../../build && cp _headers ../../build/_headers"
+
+# The client build. The Worker runs first for every path but the hashed
+# chunks, so it can gate the pages; it serves the files through the ASSETS
+# binding. The chunks take their security headers from `_headers`. A path with no file gets index.html: the client routes it.
+[assets]
+directory = "../../build"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/*", "!/assets/*"]
+
+[[durable_objects.bindings]]
+name = "LEDGER"
+class_name = "LedgerObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LedgerObject"]
+
+# The daily database export. A local run gets a local bucket of this name.
+[[r2_buckets]]
+binding = "EXPORTS"
+bucket_name = "counterpoise-exports"
+
+[vars]
+ENABLE_HSTS = "false"
+
+# Workers Logs and traces. Cloudflare keeps them for 7 days. The query string
+# can hold search text, so it is removed from the logged and traced URLs.
+# The logs hold request metadata only: do not add log lines that write
+# request bodies or amounts. Set these here, not in the dashboard, because a
+# deploy applies this file.
+[observability]
+enabled = true
+redact_query_string = true
+
+[observability.logs]
+invocation_logs = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+
+# A staging Worker beside the one above (`--env staging`): its own name,
+# counterpoise-staging, so its own Durable Object, and its own export
+# bucket, so its daily dump never lands where the other Worker's does. A
+# binding and a variable are not inherited, so each is repeated here.
+[env.staging]
+vars = { ENABLE_HSTS = "false" }
+
+[[env.staging.durable_objects.bindings]]
+name = "LEDGER"
+class_name = "LedgerObject"
+
+[[env.staging.r2_buckets]]
+binding = "EXPORTS"
+bucket_name = "counterpoise-exports-staging"
+
+# Workers Logs and traces for the staging Worker, with the same settings as
+# the Worker above. An environment does not get the top-level block, so it is
+# repeated here.
+[env.staging.observability]
+enabled = true
+redact_query_string = true
+
+[env.staging.observability.logs]
+invocation_logs = true
+head_sampling_rate = 1
+
+[env.staging.observability.traces]
+enabled = true
+head_sampling_rate = 1
+
+# Secrets, set with `../../scripts/wrangler.sh secret put <NAME>`, or in `.dev.vars` for a
+# local run: CRON_SECRET, PLAID_CLIENT_ID, PLAID_SECRET, PLAID_TOKEN_KEY,
+# PLAID_TOKEN_KEY_PREVIOUS, TIINGO_API_KEY, ANTHROPIC_API_KEY,
+# TYPESAFE_API_KEY, ISSUE_SYNC_GITHUB_TOKEN, POSTHOG_PERSONAL_API_KEY.
+# IMPORT_SECRET turns on the admin import and restore routes; delete it
+# afterwards.

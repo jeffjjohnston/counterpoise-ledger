@@ -3,6 +3,7 @@
 //! more strictly than the tools, and leave out fields the tools report.
 
 use ledger_core::accounting::display_balance;
+use ledger_db::store::Builder;
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
 
@@ -15,7 +16,7 @@ use crate::{
     },
 };
 
-fn db_error(cause: sqlx::Error) -> Box<CallToolResult> {
+fn db_error(cause: impl std::fmt::Display) -> Box<CallToolResult> {
     thrown(&cause.to_string()).into()
 }
 
@@ -43,12 +44,11 @@ pub(super) async fn income_statement(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let rows = income_rows(
-        &caller.state().pool,
+        &caller.state().database,
         book_key(book_id)?,
         Some((start, end)),
         include_inactive,
     )
-    .await
     .map_err(db_error)?;
     let (mut income, mut expenses) = (Vec::new(), Vec::new());
     let (mut total_income, mut total_expenses) = (0_i64, 0_i64);
@@ -107,7 +107,7 @@ pub(super) async fn report_data(
         .filter_map(Value::as_str)
         .collect();
     let (splits, total) = report_splits(
-        &caller.state().pool,
+        &caller.state().database,
         book_key(book_id)?,
         &ReportFilter {
             start_date: text(arguments, "startDate"),
@@ -118,7 +118,6 @@ pub(super) async fn report_data(
         },
         Some(limit),
     )
-    .await
     .map_err(db_error)?;
     let rows: Vec<Value> = splits
         .into_iter()
@@ -159,13 +158,11 @@ pub(super) async fn balance_history(
         .unwrap_or(200);
     let start = text(arguments, "startDate");
     let end = text(arguments, "endDate");
-    let pool = &caller.state().pool;
+    let pool = &*caller.state().database;
 
     let book_id = book_key(book_id)?;
     let account = match i32::try_from(account_id) {
-        Ok(key) => find_book_account(pool, book_id, key)
-            .await
-            .map_err(db_error)?,
+        Ok(key) => find_book_account(pool, book_id, key).map_err(db_error)?,
         Err(_) => None,
     };
     let Some(account) = account else {
@@ -175,36 +172,31 @@ pub(super) async fn balance_history(
     let (id, name, account_type) = (account.id, account.name, account.account_type);
 
     let starting = match start {
-        Some(start) => balance_before(pool, book_id, id, start)
-            .await
-            .map_err(db_error)?,
+        Some(start) => balance_before(pool, book_id, id, start).map_err(db_error)?,
         None => 0,
     };
 
-    let mut sql = format!(
+    let mut query = Builder::new(format!(
         "SELECT {EFFECTIVE_DATE} AS date, t.description, s.amount, s.transaction_id
          FROM transaction_splits s JOIN transactions t ON s.transaction_id = t.id
-         WHERE s.account_id = $1"
-    );
-    if start.is_some() {
-        sql.push_str(&format!(" AND {EFFECTIVE_DATE} >= $2"));
-    }
-    if end.is_some() {
-        let index = if start.is_some() { 3 } else { 2 };
-        sql.push_str(&format!(" AND {EFFECTIVE_DATE} <= ${index}"));
-    }
-    let limit_index = 2 + usize::from(start.is_some()) + usize::from(end.is_some());
-    sql.push_str(&format!(
-        " ORDER BY {EFFECTIVE_DATE}, s.id LIMIT COALESCE(${limit_index}, -1)"
+         WHERE s.account_id = "
     ));
-    let mut query = sqlx::query_as::<_, (String, Option<String>, i32, i32)>(&sql).bind(id);
+    query.push_bind(id);
     if let Some(start) = start {
-        query = query.bind(start);
+        query
+            .push(format!(" AND {EFFECTIVE_DATE} >= "))
+            .push_bind(start);
     }
     if let Some(end) = end {
-        query = query.bind(end);
+        query
+            .push(format!(" AND {EFFECTIVE_DATE} <= "))
+            .push_bind(end);
     }
-    let rows = query.bind(limit).fetch_all(pool).await.map_err(db_error)?;
+    query
+        .push(format!(" ORDER BY {EFFECTIVE_DATE}, s.id LIMIT COALESCE("))
+        .push_bind(limit)
+        .push(", -1)");
+    let rows: Vec<(String, Option<String>, i32, i32)> = query.query(pool).map_err(db_error)?;
 
     let mut running = starting;
     let entries: Vec<Value> = rows

@@ -5,7 +5,9 @@ use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    mcp::call::{Caller, Level, ToolResult, fail, integer, ok, outcome, thrown, without},
+    mcp::call::{
+        Caller, Level, ToolResult, fail, integer, ok, outcome, thrown, without, write_access,
+    },
     routes::security_prices::{SetPricesError, set_prices},
 };
 
@@ -56,13 +58,13 @@ pub(super) async fn set(
     arguments: &Map<String, Value>,
 ) -> ToolResult<CallToolResult> {
     let book_id = integer(arguments, "bookId");
-    caller.book(book_id, Level::Write).await?;
-    let book = i32::try_from(book_id).map_err(|cause| thrown(&cause.to_string()))?;
+    let book = caller.book(book_id, Level::Write).await?;
+    let access = write_access(&book)?;
     let items = arguments
         .get("priceUpdates")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    match set_prices(&caller.state().pool, book, items).await {
+    match set_prices(&caller.state().database, &access, items) {
         Ok(result) => Ok(ok(&json!({
             "count": result.written.len(),
             "written": result.written,

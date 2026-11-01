@@ -110,17 +110,17 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     const read = await client.request(SETTINGS);
     expect(read.status).toBe(200);
     expect(read.headers.get("cache-control")).toBe("no-store");
-    expect(await read.text()).toBe('{"enabled":false,"revision":0,"configured":true}');
+    expect(await read.text()).toBe('{"enabled":false,"entrySuggestionsEnabled":false,"revision":0,"configured":true}');
 
     const pending = await evaluation({ status: "pending", startedAt: new Date() });
     const on = await client.request(SETTINGS, json("PATCH", { enabled: true }));
-    expect(await on.json()).toEqual({ enabled: true, revision: 1, configured: true });
+    expect(await on.json()).toEqual({ enabled: true, entrySuggestionsEnabled: false, revision: 1, configured: true });
     expect(await scalar("SELECT status FROM typesafe_evaluations WHERE id = $1", [pending.id])).toBe("stale");
     // No change of state: the revision stays.
     expect(await (await client.request(SETTINGS, json("PATCH", { enabled: true }))).json())
-      .toEqual({ enabled: true, revision: 1, configured: true });
+      .toEqual({ enabled: true, entrySuggestionsEnabled: false, revision: 1, configured: true });
     expect(await (await client.request(SETTINGS, json("PATCH", { enabled: false }))).json())
-      .toEqual({ enabled: false, revision: 2, configured: true });
+      .toEqual({ enabled: false, entrySuggestionsEnabled: false, revision: 2, configured: true });
 
     const kept = await evaluation({ startedAt: new Date() });
     await decision(kept.id, {});
@@ -131,11 +131,38 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     await evaluation({ bookId: other.id });
 
     const cleared = await client.request(SETTINGS, { method: "DELETE" });
-    expect(await cleared.json()).toEqual({ enabled: false, revision: 3, configured: true });
+    expect(await cleared.json()).toEqual({ enabled: false, entrySuggestionsEnabled: false, revision: 3, configured: true });
     expect(await rows("SELECT * FROM typesafe_evaluations ORDER BY id")).toMatchObject([{ bookId: other.id }]);
     expect(await rows("SELECT * FROM typesafe_decisions ORDER BY id")).toEqual([]);
     expect(await rows("SELECT * FROM typesafe_aggregates ORDER BY book_id")).toEqual([]);
     expect(await rows("SELECT * FROM typesafe_quotas ORDER BY book_id, day")).toMatchObject([{ bookId: 1, day: today, attempts: 4 }]);
+  });
+
+  it("turns the entry suggestions on and off apart from the reconciliation", async () => {
+    const on = await client.request(SETTINGS, json("PATCH", { entrySuggestionsEnabled: true }));
+    expect(on.status).toBe(200);
+    expect(await on.json()).toEqual({ enabled: false, entrySuggestionsEnabled: true, revision: 1, configured: true });
+    const both = await client.request(SETTINGS, json("PATCH", { enabled: true, entrySuggestionsEnabled: false }));
+    expect(await both.json()).toEqual({ enabled: true, entrySuggestionsEnabled: false, revision: 2, configured: true });
+    for (const bad of [{ entrySuggestionsEnabled: 1 }, { entrySuggestionsEnabled: true, extra: true }]) {
+      await expectError(client, SETTINGS, json("PATCH", bad), 400, "Expected enabled or entrySuggestionsEnabled: true or false");
+    }
+  });
+
+  it("clears the entry records and turns both off", async () => {
+    await client.request(SETTINGS, json("PATCH", { enabled: true, entrySuggestionsEnabled: true }));
+    const now = new Date();
+    const stored = await insert<{ id: number }>("typesafe_entry_evaluations", {
+      bookId: 1, accountId: 1, payeeId: 1, revision: 1, fingerprint: "f", attempt: "a", snapshot: {},
+      status: "ready", baselineKey: "k", startedAt: now,
+    });
+    await insert("typesafe_entry_outcomes", {
+      bookId: 1, evaluationId: stored.id, outcome: "kept", source: "typesafe", chipVisible: true, decidedAt: now,
+    });
+    const cleared = await client.request(SETTINGS, { method: "DELETE" });
+    expect(await cleared.json()).toEqual({ enabled: false, entrySuggestionsEnabled: false, revision: 2, configured: true });
+    expect(await scalar("SELECT COUNT(*) FROM typesafe_entry_evaluations")).toBe(0);
+    expect(await scalar("SELECT COUNT(*) FROM typesafe_entry_outcomes")).toBe(0);
   });
 
   it("validates the ID and the body, and enforces the access level", async () => {
@@ -145,7 +172,7 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     await expectError(client, "/api/b/99999999999/settings/typesafe", {}, 503, "TypeSafe is temporarily unavailable");
     await expectError(client, SETTINGS, json("PATCH", "{"), 400, "Invalid JSON");
     for (const body of [{ enabled: "yes" }, { enabled: true, extra: 1 }, {}, null, [true]]) {
-      await expectError(client, SETTINGS, json("PATCH", body), 400, "Expected enabled: true or false");
+      await expectError(client, SETTINGS, json("PATCH", body), 400, "Expected enabled or entrySuggestionsEnabled: true or false");
     }
     expect(await scalar("SELECT typesafe_revision FROM books WHERE id = $1", [1])).toBe(0);
 
@@ -164,10 +191,10 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     const plain = await startHttpTestServer({ TYPESAFE_ENABLED: "false", TYPESAFE_API_KEY: "" });
     try {
       const unconfigured = await sessionHttpClient(plain.baseUrl);
-      expect(await (await unconfigured.request(SETTINGS)).json()).toEqual({ enabled: false, revision: 0, configured: false });
+      expect(await (await unconfigured.request(SETTINGS)).json()).toEqual({ enabled: false, entrySuggestionsEnabled: false, revision: 0, configured: false });
       await expectError(unconfigured, SETTINGS, json("PATCH", { enabled: true }), 409, "TypeSafe is unavailable on this installation");
       expect(await (await unconfigured.request(SETTINGS, json("PATCH", { enabled: false }))).json())
-        .toEqual({ enabled: false, revision: 0, configured: false });
+        .toEqual({ enabled: false, entrySuggestionsEnabled: false, revision: 0, configured: false });
     } finally {
       await plain.stop();
     }
@@ -236,5 +263,34 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     // A second run finds nothing more to archive.
     const again = await client.anonymous(CLEANUP, { headers: { authorization: "Bearer test-cron-secret" } });
     expect(await again.json()).toEqual({ deleted: 0, batchLimit: 1000 });
+  });
+
+  it("archives and deletes expired entry evaluations and outcomes", async () => {
+    const old = new Date(Date.now() - 40 * DAY);
+    const stored = await insert<{ id: number }>("typesafe_entry_evaluations", {
+      bookId: 1, accountId: 1, payeeId: 1, revision: 0, fingerprint: "old", attempt: "a", snapshot: {},
+      status: "ready", choice: "10:in", baselineKey: "10:in", latencyMs: 400, startedAt: old,
+    });
+    await insert("typesafe_entry_evaluations", {
+      bookId: 1, accountId: 1, payeeId: 1, revision: 0, fingerprint: "new", attempt: "b", snapshot: {},
+      status: "ready", choice: null, baselineKey: "10:in", startedAt: new Date(),
+    });
+    await insert("typesafe_entry_outcomes", {
+      bookId: 1, evaluationId: stored.id, outcome: "kept", source: "typesafe", chipVisible: true, decidedAt: old,
+    });
+    // A newer outcome stays, also when its evaluation is deleted.
+    await insert("typesafe_entry_outcomes", {
+      bookId: 1, evaluationId: stored.id, outcome: "abandoned", source: "typesafe", chipVisible: false, decidedAt: new Date(),
+    });
+
+    const response = await client.anonymous(CLEANUP, { headers: { authorization: "Bearer test-cron-secret" } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ deleted: 1, batchLimit: 1000 });
+    expect(await rows("SELECT fingerprint FROM typesafe_entry_evaluations")).toEqual([{ fingerprint: "new" }]);
+    expect(await rows("SELECT outcome, evaluation_id AS e FROM typesafe_entry_outcomes")).toEqual([{ outcome: "abandoned", e: null }]);
+    expect(await scalar("SELECT counts FROM typesafe_aggregates WHERE book_id = 1")).toEqual({
+      entry_evaluations: 1, entry_status_ready: 1, entry_choice: 1, entry_agrees_with_baseline: 1,
+      entry_latency_samples: 1, entry_latency_total_ms: 400, entry_outcome_typesafe_kept: 1, entry_chip_visible: 1,
+    });
   });
 });

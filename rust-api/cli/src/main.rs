@@ -14,28 +14,48 @@
 //! file.
 //!
 //! `migrate` creates the database file when it is missing and applies the
-//! migrations. It refuses while a server uses the file; the server applies
-//! them itself when it starts.
+//! migrations, then fills the folded columns as `repair-folds` does. It
+//! refuses while a server uses the file; the server does both itself when it
+//! starts.
+//!
+//! `repair-folds` recomputes every `*_fold` column (`ledger_db::folds`) and
+//! rewrites the values that differ from their column, as the server's start
+//! does. Run it after editing names or descriptions in the sqlite3 shell.
 //!
 //! `list-books` prints each book with its owner and ID.
 //!
 //! `backup [--dir D]` writes a checked copy of the database into D (default
 //! `BACKUP_DIR`, else `backups`), as the scheduled backup does. It exits 1
-//! when the copy fails `PRAGMA integrity_check`. It also writes the "backup"
-//! status record, as the scheduled backup does, but only when the target is
+//! when the copy fails `PRAGMA integrity_check`. It also records the run of
+//! the "backup" job, as the scheduled backup does, but only when the target is
 //! the scheduler's directory: no `--dir`, or a `--dir` that is `BACKUP_DIR`
 //! (else `/backups`). See `record_backup`.
 //!
+//! `dump <file>` writes a portable dump of the database (`ledger_db::dump`)
+//! at `<file>`, which must not exist. A server may run meanwhile: the dump
+//! reads one snapshot.
+//!
+//! `load <file>` creates the database file from the dump at `<file>`: the
+//! dump's migrations, its rows, then the migrations that it lacks. The
+//! database file must not exist yet, and no server may hold it. A failed
+//! load removes the file it made.
+//!
 //! Every command uses the file that `DATABASE_PATH` names, default
 //! `data/counterpoise.db`.
+//!
+//! `merge-payee-case --book-id N [--keep NAME]... [--apply]` merges the payees
+//! of a book whose names differ only by letter case. Without `--apply` it only
+//! prints the plan. See `merge_payee_case`.
 //!
 //! `import-moneydance <path> --book-id N [options]` imports a Moneydance JSON
 //! export into an existing book. One transaction holds the run, so a failure
 //! leaves the book as it was.
 
 mod import_moneydance;
+mod merge_payee_case;
 
-use ledger_db::engine::DbPool;
+use ledger_db::Database;
+use ledger_db::store::{Sql, params};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -54,9 +74,14 @@ fn database_path() -> PathBuf {
         .map_or_else(|| PathBuf::from("data/counterpoise.db"), PathBuf::from)
 }
 
-/// A pool on the existing, migrated database. A server may use the same
-/// file at the same time: SQLite serializes the writers.
-async fn connect() -> CliResult<DbPool> {
+/// The existing, migrated database. A server may use the same file at the
+/// same time: SQLite serializes the writers.
+fn connect() -> CliResult<Database> {
+    Ok(Database::open(&existing_database_path()?, false)?)
+}
+
+/// The database file, or an error when there is none yet.
+fn existing_database_path() -> CliResult<PathBuf> {
     let path = database_path();
     if !path.exists() {
         return Err(format!(
@@ -65,26 +90,33 @@ async fn connect() -> CliResult<DbPool> {
         )
         .into());
     }
-    Ok(ledger_db::connect(&path, false)?)
+    Ok(path)
 }
 
 /// Creates the file when it is missing and applies the migrations. Refuses
 /// while a server holds the file.
-async fn migrate(path: &Path) -> CliResult<()> {
+fn migrate(path: &Path) -> CliResult<()> {
     if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
     let _lock = ledger_db::lock_server(path)?;
-    let pool = ledger_db::connect(path, true)?;
-    let result = ledger_db::migrate(&pool).await;
-    pool.close().await;
-    Ok(result?)
+    let database = ledger_db::Database::open(path, true)?;
+    ledger_db::migrate(&database)?;
+    // The folded columns, as the server's start fills them.
+    ledger_db::folds::repair(&database)?;
+    Ok(())
 }
 
 /// Deletes the database file and its WAL files. Refuses while a server
 /// holds the file.
 fn delete_database(path: &Path) -> CliResult<()> {
     let _lock = ledger_db::lock_server(path)?;
+    remove_database_files(path)
+}
+
+/// Removes the database file and its WAL sidecars. The caller holds the
+/// server lock.
+fn remove_database_files(path: &Path) -> CliResult<()> {
     for suffix in ["", "-wal", "-shm"] {
         let mut name = path.as_os_str().to_owned();
         name.push(suffix);
@@ -98,7 +130,7 @@ fn delete_database(path: &Path) -> CliResult<()> {
 
 /// Writes a checked backup. The directory is `--dir D`, else `BACKUP_DIR`,
 /// else `backups`.
-async fn backup(args: &[String]) -> CliResult<ledger_db::backup::Snapshot> {
+fn backup(args: &[String]) -> CliResult<ledger_db::backup::Snapshot> {
     let explicit = match args.iter().position(|arg| arg == "--dir") {
         Some(index) => Some(PathBuf::from(
             args.get(index + 1).ok_or("--dir requires a directory")?,
@@ -110,11 +142,11 @@ async fn backup(args: &[String]) -> CliResult<ledger_db::backup::Snapshot> {
             .filter(|dir| !dir.is_empty())
             .map_or_else(|| PathBuf::from("backups"), PathBuf::from)
     });
-    let pool = connect().await?;
-    let snapshot = ledger_db::backup::snapshot(&pool, &dir).await;
-    pool.close().await;
+    let database = ledger_db::Database::open(&database_path(), false)?;
+    let snapshot = ledger_db::backup::snapshot(&database, &dir);
     if explicit.is_none() || is_scheduler_dir(&dir) {
-        record_backup(&snapshot);
+        // A failure to record is not an error of the backup.
+        let _ = record_backup(&database, &snapshot);
     }
     Ok(snapshot?)
 }
@@ -139,21 +171,16 @@ fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
     )
 }
 
-/// Writes the "backup" status record that the scheduled backup writes, so a
+/// Records the run of the "backup" job, as the scheduled backup does, so a
 /// manual backup shows in `/api/system/status`. It runs only for a backup
 /// into the scheduler's own directory (no `--dir`, or a `--dir` that is that
 /// directory). A copy in any other directory, such as a snapshot for a
 /// development copy, must not replace the record of the scheduled backup.
-/// Without a status directory (`job_status::configured_status_dir`), this
-/// does nothing. A failure to write is not an error of the backup.
-fn record_backup(snapshot: &Result<ledger_db::backup::Snapshot, String>) {
-    if let Some(dir) = ledger_db::job_status::configured_status_dir() {
-        record_backup_in(&dir, snapshot);
-    }
-}
-
-fn record_backup_in(dir: &std::path::Path, snapshot: &Result<ledger_db::backup::Snapshot, String>) {
-    use ledger_db::job_status::{Status, record_text, write_record};
+fn record_backup(
+    database: &ledger_db::Database,
+    snapshot: &Result<ledger_db::backup::Snapshot, String>,
+) -> Result<(), ledger_db::store::Error> {
+    use ledger_db::jobs::{Status, record_run};
     let problem = match snapshot {
         Ok(snapshot) => snapshot
             .problem
@@ -170,20 +197,60 @@ fn record_backup_in(dir: &std::path::Path, snapshot: &Result<ledger_db::backup::
         verified: snapshot.as_ref().ok().map(|snapshot| snapshot.verified),
         not_configured: false,
     };
-    let text = record_text("backup", &status, chrono::Utc::now());
-    let _ = write_record(dir, "backup", &text);
+    record_run(database, "backup", &status, chrono::Utc::now())
+}
+
+/// Writes a dump of the database at `path`. Returns its size in bytes.
+fn dump(path: &Path) -> CliResult<u64> {
+    Ok(ledger_db::backup::write_dump(&connect()?, path)?)
+}
+
+/// Creates the database file from the dump at `from`. Returns the tables
+/// and rows loaded.
+fn load(from: &Path) -> CliResult<ledger_db::dump::Loaded> {
+    let path = database_path();
+    let refuse_existing = |path: &Path| -> CliResult<()> {
+        if path.exists() {
+            return Err(format!(
+                "{} exists; load creates a new database file, so move it away first",
+                path.display()
+            )
+            .into());
+        }
+        Ok(())
+    };
+    refuse_existing(&path)?;
+    let text = std::fs::read_to_string(from)
+        .map_err(|cause| format!("cannot read {}: {cause}", from.display()))?;
+    if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = ledger_db::lock_server(&path)?;
+    // Another process may have made the file while this one read the dump.
+    // Checked again under the lock, the file that the cleanup below removes
+    // is always the one that this run made.
+    refuse_existing(&path)?;
+    let loaded = Database::open(&path, true)
+        .map_err(|cause| cause.to_string())
+        .and_then(|database| {
+            ledger_db::dump::load(&database, &text).map_err(|cause| cause.to_string())
+        });
+    if loaded.is_err() {
+        // The file is new and half made: a second try starts again. The
+        // lock is still held, so a server that starts now cannot open the
+        // half-made file and serve it.
+        remove_database_files(&path)?;
+    }
+    Ok(loaded?)
 }
 
 /// Each book with its owner, as `username | book name | book id`, sorted by
 /// user, then book name (English collation), then ID.
-async fn list_books() -> CliResult<String> {
-    let pool = connect().await?;
-    let mut rows: Vec<(String, String, i32)> = sqlx::query_as(
+fn list_books() -> CliResult<String> {
+    let mut rows: Vec<(String, String, i32)> = connect()?.query(
         "SELECT u.username, b.name, b.id FROM books b JOIN users u ON u.id = b.user_id",
-    )
-    .fetch_all(&pool)
-    .await?;
-    pool.close().await;
+        &[],
+    )?;
     let compare = ledger_core::collation::compare_names;
     rows.sort_by(|left, right| {
         compare(&left.0, &right.0)
@@ -233,11 +300,19 @@ fn format_books(rows: &[(String, String, i32)]) -> String {
     lines.join("\n")
 }
 
-async fn rebuild_lots(force: bool) -> CliResult<ledger_db::lots::BackfillResult> {
-    let pool = connect().await?;
-    let result = ledger_db::lots::backfill_lots(&pool, force).await;
-    pool.close().await;
-    Ok(result?)
+fn rebuild_lots(force: bool) -> CliResult<ledger_db::lots::BackfillResult> {
+    let path = existing_database_path()?;
+    Ok(ledger_db::lots::backfill_lots(
+        &ledger_db::Database::open(&path, false)?,
+        force,
+    )?)
+}
+
+fn repair_folds() -> CliResult<usize> {
+    let path = existing_database_path()?;
+    Ok(ledger_db::folds::repair(&ledger_db::Database::open(
+        &path, false,
+    )?)?)
 }
 
 /// The `salt:key` hex format of `hashPassword` in `lib/auth.ts`.
@@ -291,11 +366,11 @@ fn dataset_argument(args: &[String]) -> Result<ledger_db::seed::DemoDataset, Str
     }
 }
 
-/// The date of `--today`, default today in the local time zone (`TZ`), the
-/// same value as `cp_today()`.
+/// The date of `--today`, default today in the app's zone
+/// (`ledger_db::clock`), the date the server uses.
 fn today_argument(args: &[String]) -> Result<chrono::NaiveDate, String> {
     match flag_value(args, "--today")? {
-        None => Ok(chrono::Local::now().date_naive()),
+        None => Ok(ledger_db::clock::today()),
         Some(text) => chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
             .map_err(|_| format!("Error: invalid date \"{text}\". Use YYYY-MM-DD")),
     }
@@ -303,20 +378,25 @@ fn today_argument(args: &[String]) -> Result<chrono::NaiveDate, String> {
 
 /// Seeds `book_id`, or a new `admin` user and book when it is `None`. One
 /// transaction holds the whole run, so a failure leaves no partial book.
-async fn seed(
+fn seed(
+    book_id: Option<i32>,
+    dataset: ledger_db::seed::DemoDataset,
+    today: chrono::NaiveDate,
+) -> CliResult<Result<(), String>> {
+    connect()?.transaction(|tx| seed_in(tx, book_id, dataset, today))
+}
+
+fn seed_in(
+    tx: &impl Sql,
     book_id: Option<i32>,
     dataset: ledger_db::seed::DemoDataset,
     today: chrono::NaiveDate,
 ) -> CliResult<Result<(), String>> {
     use ledger_db::seed::DemoDataset;
-    let pool = connect().await?;
-    let mut transaction = ledger_db::locks::begin_pool(&pool).await?;
     let book_id = match book_id {
         Some(book_id) => {
-            let name: Option<String> = sqlx::query_scalar("SELECT name FROM books WHERE id = $1")
-                .bind(book_id)
-                .fetch_optional(&mut *transaction)
-                .await?;
+            let name: Option<String> =
+                tx.query_optional("SELECT name FROM books WHERE id = ?1", &params![book_id])?;
             let Some(name) = name else {
                 return Ok(Err(format!(
                     "Error: book {book_id} not found. Use 'ledger-cli list-books' to see available books."
@@ -327,47 +407,35 @@ async fn seed(
         }
         None => {
             let now = chrono::Utc::now().naive_utc();
-            let user_id: i32 = sqlx::query_scalar(
+            let user_id: i32 = tx.query_row(
                 "INSERT INTO users (username, password_hash, created_at)
-                 VALUES ('admin', $1, $2) RETURNING id",
-            )
-            .bind(hash_password("password")?)
-            .bind(now)
-            .fetch_one(&mut *transaction)
-            .await?;
+                 VALUES ('admin', ?1, ?2) RETURNING id",
+                &params![hash_password("password")?, now],
+            )?;
             // A trigger adds the creator as the owner of the book.
             let book_name = if dataset == DemoDataset::Household {
                 "Family Finances"
             } else {
                 dataset.book_name()
             };
-            let book_id: i32 = sqlx::query_scalar(
+            let book_id: i32 = tx.query_row(
                 "INSERT INTO books (user_id, name, created_at, updated_at)
-                 VALUES ($1, $2, $3, $3) RETURNING id",
-            )
-            .bind(user_id)
-            .bind(book_name)
-            .bind(now)
-            .fetch_one(&mut *transaction)
-            .await?;
+                 VALUES (?1, ?2, ?3, ?3) RETURNING id",
+                &params![user_id, book_name, now],
+            )?;
             println!(
                 "  Created user 'admin' (password: 'password') and book '{book_name}' (id: {book_id})"
             );
             book_id
         }
     };
-    ledger_db::seed::seed_book(&mut transaction, book_id, dataset, today, &mut |line| {
-        println!("{line}")
-    })
-    .await?;
-    transaction.commit().await?;
-    pool.close().await;
+    ledger_db::seed::seed_book(tx, book_id, dataset, today, &mut |line| println!("{line}"))?;
     Ok(Ok(()))
 }
 
 /// Imports a Moneydance export. The file is read and checked before the
 /// transaction starts, so a bad file cannot clear the book.
-async fn import(args: import_moneydance::ImportArgs) -> CliResult<Result<(), String>> {
+fn import(args: import_moneydance::ImportArgs) -> CliResult<Result<(), String>> {
     let started = Instant::now();
     let options = args.options;
     println!("╔═══════════════════════════════════════════════════════════╗");
@@ -405,37 +473,51 @@ async fn import(args: import_moneydance::ImportArgs) -> CliResult<Result<(), Str
         Err(message) => return Ok(Err(message)),
     };
 
-    let pool = connect().await?;
-    let mut transaction = ledger_db::locks::begin_pool(&pool).await?;
-    let book: Option<String> = sqlx::query_scalar("SELECT name FROM books WHERE id = $1")
-        .bind(args.book_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
-    if book.is_none() {
-        return Ok(Err(format!(
-            "Error: book {} not found. Use 'ledger-cli list-books' to see available books.",
-            args.book_id
-        )));
+    /// Why the import transaction ended without a commit.
+    enum Unwritten {
+        Failed(ledger_db::store::Error),
+        NoBook,
+        /// A dry run writes nothing, and the rollback makes sure of it.
+        DryRun(import_moneydance::ImportSummary),
     }
-    if args.overwrite && options.dry_run {
-        println!("⚠️  --overwrite ignored in dry-run mode");
-    } else if args.overwrite {
-        println!("\n🧹 --overwrite enabled: clearing existing book data...");
-        import_moneydance::overwrite_book(&mut transaction, args.book_id).await?;
-        println!("✓ Cleared existing book data");
+    impl From<ledger_db::store::Error> for Unwritten {
+        fn from(cause: ledger_db::store::Error) -> Self {
+            Self::Failed(cause)
+        }
     }
-
-    let today = chrono::Local::now().date_naive();
-    let summary =
-        import_moneydance::run_import(&mut transaction, &export, args.book_id, options, today)
-            .await?;
-    // A dry run writes nothing, and the rollback makes sure of it.
-    if options.dry_run {
-        transaction.rollback().await?;
-    } else {
-        transaction.commit().await?;
-    }
-    pool.close().await;
+    let outcome = connect()?.transaction(|tx| {
+        let book: Option<String> = tx.query_optional(
+            "SELECT name FROM books WHERE id = ?1",
+            &params![args.book_id],
+        )?;
+        if book.is_none() {
+            return Err(Unwritten::NoBook);
+        }
+        if args.overwrite && options.dry_run {
+            println!("⚠️  --overwrite ignored in dry-run mode");
+        } else if args.overwrite {
+            println!("\n🧹 --overwrite enabled: clearing existing book data...");
+            import_moneydance::overwrite_book(tx, args.book_id)?;
+            println!("✓ Cleared existing book data");
+        }
+        let today = ledger_db::clock::today();
+        let summary = import_moneydance::run_import(tx, &export, args.book_id, options, today)?;
+        if options.dry_run {
+            Err(Unwritten::DryRun(summary))
+        } else {
+            Ok(summary)
+        }
+    });
+    let summary = match outcome {
+        Ok(summary) | Err(Unwritten::DryRun(summary)) => summary,
+        Err(Unwritten::NoBook) => {
+            return Ok(Err(format!(
+                "Error: book {} not found. Use 'ledger-cli list-books' to see available books.",
+                args.book_id
+            )));
+        }
+        Err(Unwritten::Failed(cause)) => return Err(cause.into()),
+    };
 
     println!("\n╔═══════════════════════════════════════════════════════════╗");
     println!("║                    Import Complete!                       ║");
@@ -458,13 +540,16 @@ async fn import(args: import_moneydance::ImportArgs) -> CliResult<Result<(), Str
     Ok(Ok(()))
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let Err(message) = ledger_db::clock::resolve() {
+        eprintln!("Error: {message}");
+        return ExitCode::FAILURE;
+    }
     match args.first().map(String::as_str) {
         Some("rebuild-lots") => {
             let force = args.iter().skip(1).any(|arg| arg == "--force");
-            match rebuild_lots(force).await {
+            match rebuild_lots(force) {
                 Ok(result) if result.skipped => {
                     println!("Lot rebuild: already populated, skipping.");
                     ExitCode::SUCCESS
@@ -482,7 +567,17 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Some("migrate") => match migrate(&database_path()).await {
+        Some("repair-folds") => match repair_folds() {
+            Ok(repaired) => {
+                println!("Folded columns: {repaired} value(s) rewritten.");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Fold repair FAILED: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("migrate") => match migrate(&database_path()) {
             Ok(()) => {
                 println!("Migrations applied to {}.", database_path().display());
                 ExitCode::SUCCESS
@@ -492,7 +587,7 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("backup") => match backup(&args[1..]).await {
+        Some("backup") => match backup(&args[1..]) {
             Ok(snapshot) if snapshot.verified => {
                 println!(
                     "Backup written: {} ({} bytes), integrity_check ok.",
@@ -514,7 +609,44 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("list-books") => match list_books().await {
+        Some("dump") => match args.get(1) {
+            Some(file) => match dump(Path::new(file)) {
+                Ok(bytes) => {
+                    println!("Dump written: {file} ({bytes} bytes).");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("Dump FAILED: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("Usage: ledger-cli dump <file>");
+                ExitCode::FAILURE
+            }
+        },
+        Some("load") => match args.get(1) {
+            Some(file) => match load(Path::new(file)) {
+                Ok(loaded) => {
+                    println!(
+                        "Loaded {} rows in {} tables into {}.",
+                        loaded.rows,
+                        loaded.tables,
+                        database_path().display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("Load FAILED: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("Usage: ledger-cli load <file>");
+                ExitCode::FAILURE
+            }
+        },
+        Some("list-books") => match list_books() {
             Ok(table) => {
                 println!("{table}");
                 ExitCode::SUCCESS
@@ -552,13 +684,13 @@ async fn main() -> ExitCode {
                     eprintln!("Reset failed: {error}");
                     return ExitCode::FAILURE;
                 }
-                if let Err(error) = migrate(&path).await {
+                if let Err(error) = migrate(&path) {
                     eprintln!("Migration FAILED: {error}");
                     return ExitCode::FAILURE;
                 }
                 println!("  Reset {}", path.display());
             }
-            match seed(book_id, dataset, today).await {
+            match seed(book_id, dataset, today) {
                 Ok(Ok(())) => ExitCode::SUCCESS,
                 Ok(Err(message)) => {
                     eprintln!("{message}");
@@ -583,7 +715,7 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match import(parsed).await {
+            match import(parsed) {
                 Ok(Ok(())) => ExitCode::SUCCESS,
                 Ok(Err(message)) => {
                     eprintln!("{message}");
@@ -595,14 +727,41 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        Some("merge-payee-case") => {
+            let options = match merge_payee_case::parse_args(&args[1..]) {
+                Ok(options) => options,
+                Err(message) => {
+                    eprintln!("{message}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let outcome = connect().and_then(|database| {
+                merge_payee_case::run(&database, &options).map_err(|cause| cause.into())
+            });
+            match outcome {
+                Ok(Ok(())) => ExitCode::SUCCESS,
+                Ok(Err(message)) => {
+                    eprintln!("{message}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("Merge FAILED: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             eprintln!("usage: ledger-cli migrate");
             eprintln!("       ledger-cli rebuild-lots [--force]");
+            eprintln!("       ledger-cli repair-folds");
             eprintln!(
                 "       ledger-cli seed [--book-id N | --reset] [--dataset ID] [--today YYYY-MM-DD]"
             );
             eprintln!("       ledger-cli list-books");
             eprintln!("       ledger-cli backup [--dir D]");
+            eprintln!("       ledger-cli dump <file>");
+            eprintln!("       ledger-cli load <file>");
+            eprintln!("       ledger-cli merge-payee-case --book-id N [--keep NAME]... [--apply]");
             eprintln!("       ledger-cli import-moneydance <path-to-json> --book-id N [options]");
             ExitCode::from(2)
         }
@@ -613,8 +772,10 @@ async fn main() -> ExitCode {
 mod tests {
     use ledger_db::backup::Snapshot;
 
-    fn read_backup_record(dir: &std::path::Path) -> serde_json::Value {
-        serde_json::from_str(&std::fs::read_to_string(dir.join("backup.json")).unwrap()).unwrap()
+    fn read_backup_record(database: &ledger_db::Database) -> serde_json::Value {
+        let records = ledger_db::jobs::runs(database).unwrap();
+        assert_eq!(records.len(), 1);
+        records.into_iter().next().unwrap()
     }
 
     #[test]
@@ -633,10 +794,9 @@ mod tests {
     }
 
     #[test]
-    fn a_manual_backup_writes_the_backup_status_record() {
-        let dir =
-            std::env::temp_dir().join(format!("counterpoise-cli-status-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_manual_backup_records_the_backup_run() {
+        let database = ledger_db::Database::open_in_memory().unwrap();
+        ledger_db::migrate(&database).unwrap();
         let copy = |verified: bool| {
             Ok(Snapshot {
                 path: "counterpoise-x.db".into(),
@@ -646,8 +806,8 @@ mod tests {
             })
         };
 
-        super::record_backup_in(&dir, &copy(true));
-        let record = read_backup_record(&dir);
+        super::record_backup(&database, &copy(true)).unwrap();
+        let record = read_backup_record(&database);
         assert_eq!(record["job"], "backup");
         assert_eq!(record["lastOk"], record["lastRun"]);
         assert_eq!(record["verified"], true);
@@ -655,17 +815,16 @@ mod tests {
         assert_eq!(record["detail"], serde_json::Value::Null);
 
         // A copy that fails its check: the run completed, the copy is bad.
-        super::record_backup_in(&dir, &copy(false));
-        let record = read_backup_record(&dir);
+        super::record_backup(&database, &copy(false)).unwrap();
+        let record = read_backup_record(&database);
         assert_eq!(record["lastOk"], record["lastRun"]);
         assert_eq!(record["verified"], false);
         assert_eq!(record["detail"], "integrity_check: row 3 missing");
 
-        super::record_backup_in(&dir, &Err("disk full".to_owned()));
-        let record = read_backup_record(&dir);
+        super::record_backup(&database, &Err("disk full".to_owned())).unwrap();
+        let record = read_backup_record(&database);
         assert_eq!(record["lastOk"], serde_json::Value::Null);
         assert_eq!(record["detail"], "disk full");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

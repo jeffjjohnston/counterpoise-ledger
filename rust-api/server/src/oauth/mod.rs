@@ -30,7 +30,7 @@ mod clients;
 mod grants;
 mod token;
 
-use crate::{auth::token_hash, error::error, state::AppState};
+use crate::{auth::token_hash, error::error, platform, state::AppState};
 use axum::{
     Json, Router,
     extract::State,
@@ -38,7 +38,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use chrono::{Duration, NaiveDateTime, Utc};
+use chrono::{Duration, NaiveDateTime};
+use ledger_db::{
+    Sql,
+    store::{self, params},
+};
 use serde_json::{Value, json};
 
 /// The prefix of an access token. `auth.rs` sends a bearer value with this
@@ -55,10 +59,6 @@ const SCOPE: &str = "mcp";
 const ACCESS_TOKEN_SECONDS: i64 = 60 * 60;
 const REFRESH_TOKEN_DAYS: i64 = 30;
 const CODE_SECONDS: i64 = 5 * 60;
-/// A refresh token sent again within this time after its exchange gets
-/// `invalid_grant` only. Later, the second use revokes the grant. A client
-/// that retries a refresh after a timeout must not lose its connection.
-const REFRESH_REUSE_GRACE_SECONDS: i64 = 60;
 /// How seldom a grant's `last_used_at` changes, so that each tool request
 /// does not write.
 const STAMP_SECONDS: i64 = 5 * 60;
@@ -77,7 +77,7 @@ impl Issuer {
     /// value that is not an acceptable origin is an error, and the server
     /// refuses to start (`config.rs`).
     pub(crate) fn from_env() -> Result<Option<Self>, String> {
-        match std::env::var("COUNTERPOISE_PUBLIC_URL") {
+        match ledger_db::env::var("COUNTERPOISE_PUBLIC_URL") {
             Ok(value) if !value.trim().is_empty() => Self::parse(value.trim()).map(Some),
             _ => Ok(None),
         }
@@ -274,13 +274,13 @@ fn no_store(mut response: Response) -> Response {
 }
 
 fn now() -> NaiveDateTime {
-    Utc::now().naive_utc()
+    platform::timestamp()
 }
 
 /// A new secret: `prefix` and 32 random bytes as lowercase hex.
 fn new_secret(prefix: &str) -> Result<String, getrandom::Error> {
     let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes)?;
+    platform::random(&mut bytes)?;
     Ok(format!("{prefix}{}", hex::encode(bytes)))
 }
 
@@ -299,7 +299,7 @@ fn secret_shape(value: &str, prefix: &str) -> bool {
 pub(crate) async fn access_token_user(
     state: &AppState,
     token: &str,
-) -> Result<Option<i32>, sqlx::Error> {
+) -> Result<Option<i32>, store::Error> {
     let Some(issuer) = &state.oauth else {
         return Ok(None);
     };
@@ -307,15 +307,12 @@ pub(crate) async fn access_token_user(
         return Ok(None);
     }
     let now = now();
-    let row: Option<(i32, i32, String, Option<NaiveDateTime>)> = sqlx::query_as(
+    let row: Option<(i32, i32, String, Option<NaiveDateTime>)> = state.database.query_optional(
         "SELECT g.id, g.user_id, g.resource, g.last_used_at
          FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id
-         WHERE t.token_hash = $1 AND t.kind = 'access' AND t.expires_at > $2",
-    )
-    .bind(token_hash(token))
-    .bind(now)
-    .fetch_optional(&state.pool)
-    .await?;
+         WHERE t.token_hash = ?1 AND t.kind = 'access' AND t.expires_at > ?2",
+        &params![token_hash(token), now],
+    )?;
     let Some((grant_id, user_id, resource, last_used_at)) = row else {
         return Ok(None);
     };
@@ -324,15 +321,11 @@ pub(crate) async fn access_token_user(
     }
     let stale = now - Duration::seconds(STAMP_SECONDS);
     if last_used_at.is_none_or(|at| at < stale)
-        && let Err(cause) = sqlx::query(
-            "UPDATE oauth_grants SET last_used_at = $2
-             WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $3)",
+        && let Err(cause) = state.database.execute(
+            "UPDATE oauth_grants SET last_used_at = ?2
+             WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?3)",
+            &params![grant_id, now, stale],
         )
-        .bind(grant_id)
-        .bind(now)
-        .bind(stale)
-        .execute(&state.pool)
-        .await
     {
         tracing::error!(error = %cause, "Could not stamp OAuth grant lastUsedAt");
     }
@@ -346,43 +339,37 @@ pub(crate) async fn access_token_user(
 /// small.
 async fn sweep(state: &AppState) {
     let now = now();
-    let result = async {
-        sqlx::query("DELETE FROM oauth_codes WHERE expires_at <= $1")
-            .bind(now)
-            .execute(&state.pool)
-            .await?;
+    let result = (|| {
+        state.database.execute(
+            "DELETE FROM oauth_codes WHERE expires_at <= ?1",
+            &params![now],
+        )?;
         // A used refresh token stays while its grant has a token that is not
         // expired. If the token comes back, the server can then find its
         // grant and revoke it (RFC 9700 section 4.14.2).
-        sqlx::query(
+        state.database.execute(
             "DELETE FROM oauth_tokens
-             WHERE expires_at <= $1
+             WHERE expires_at <= ?1
                AND NOT (kind = 'refresh' AND used_at IS NOT NULL
                         AND EXISTS (SELECT 1 FROM oauth_tokens live
                                     WHERE live.grant_id = oauth_tokens.grant_id
-                                      AND live.expires_at > $1))",
-        )
-        .bind(now)
-        .execute(&state.pool)
-        .await?;
-        sqlx::query(
+                                      AND live.expires_at > ?1))",
+            &params![now],
+        )?;
+        state.database.execute(
             "DELETE FROM oauth_grants
              WHERE NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.grant_id = oauth_grants.id)
                AND NOT EXISTS (SELECT 1 FROM oauth_codes c WHERE c.grant_id = oauth_grants.id)",
-        )
-        .execute(&state.pool)
-        .await?;
-        sqlx::query(
+            &[],
+        )?;
+        state.database.execute(
             "DELETE FROM oauth_clients
-             WHERE created_at <= $1
+             WHERE created_at <= ?1
                AND NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = oauth_clients.id)",
-        )
-        .bind(now - Duration::days(1))
-        .execute(&state.pool)
-        .await?;
-        Ok::<_, sqlx::Error>(())
-    }
-    .await;
+            &params![now - Duration::days(1)],
+        )?;
+        Ok::<_, store::Error>(())
+    })();
     if let Err(cause) = result {
         tracing::error!(error = %cause, "Could not delete expired OAuth rows");
     }

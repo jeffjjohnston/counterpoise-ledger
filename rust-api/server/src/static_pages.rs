@@ -5,6 +5,9 @@
 //! each page path that is not a file gets `index.html`. The page gate in
 //! `security.rs` runs first: this service gets only a public path or a
 //! request that has a session.
+//!
+//! The native server reads the build from disk. On Workers the build is the
+//! Worker's static assets, so only [`ASSETS_PREFIX`] is shared.
 
 use axum::{
     Router,
@@ -14,6 +17,7 @@ use axum::{
     response::Response,
 };
 use std::path::Path;
+#[cfg(feature = "native")]
 use tower_http::services::{ServeDir, ServeFile};
 
 /// The folder of the build that holds the hashed chunks. A new build gives
@@ -39,6 +43,7 @@ pub(crate) fn check(dir: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(feature = "native")]
 pub(crate) fn service(dir: &Path) -> Router {
     Router::new()
         // A chunk that is not there gets 404, not index.html: a browser that

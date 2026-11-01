@@ -2,6 +2,7 @@ use crate::{
     auth::{cookie_token, principal, run_scrypt, token_hash},
     client_ip,
     error::{ApiError, error, internal_error},
+    platform,
     rate_limit::{Keys, Scope},
     state::AppState,
     validation::parse_json_body,
@@ -13,12 +14,12 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use chrono::{Duration, NaiveDateTime, SecondsFormat, Utc};
-use getrandom::fill;
-use ledger_db::locks::{TransactionLock, lock_transaction};
+use chrono::{Duration, NaiveDateTime, SecondsFormat};
+use ledger_db::{
+    Sql,
+    store::{self, params},
+};
 use serde_json::{Value, json};
-use sqlx::Row;
-use std::time::Instant;
 use subtle::ConstantTimeEq;
 
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -31,7 +32,7 @@ fn fail(status: StatusCode, message: &'static str) -> Response {
     error(status, message).into_response()
 }
 
-fn db_error(cause: sqlx::Error, message: &'static str) -> ApiError {
+fn db_error(cause: impl std::fmt::Display, message: &'static str) -> ApiError {
     internal_error(cause, message)
 }
 
@@ -41,22 +42,20 @@ fn db_error(cause: sqlx::Error, message: &'static str) -> ApiError {
 pub(crate) async fn cookie_session(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<Option<(i32, i32)>, sqlx::Error> {
+) -> Result<Option<(i32, i32)>, store::Error> {
     let Some(token) = cookie_token(headers) else {
         return Ok(None);
     };
-    let row =
-        sqlx::query("SELECT id, user_id FROM sessions WHERE token_hash = $1 AND expires_at > $2")
-            .bind(token_hash(&token))
-            .bind(Utc::now().naive_utc())
-            .fetch_optional(&state.pool)
-            .await?;
-    Ok(row.map(|row| (row.get("user_id"), row.get("id"))))
+    let row = state.database.query_optional(
+        "SELECT user_id, id FROM sessions WHERE token_hash = ?1 AND expires_at > ?2",
+        &params![token_hash(&token), platform::timestamp()],
+    )?;
+    Ok(row)
 }
 
 fn random_hex(bytes: usize) -> Result<String, getrandom::Error> {
     let mut value = vec![0; bytes];
-    fill(&mut value)?;
+    platform::random(&mut value)?;
     Ok(hex::encode(value))
 }
 
@@ -162,24 +161,19 @@ fn credentials(body: &Value, register: bool) -> Result<(String, String), ApiErro
     }
 }
 
-async fn registration_open<'e, E>(executor: E) -> Result<bool, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = ledger_db::engine::Db>,
-{
-    match std::env::var("REGISTRATION_ENABLED").as_deref() {
+fn registration_open(sql: &impl Sql) -> Result<bool, store::Error> {
+    match ledger_db::env::var("REGISTRATION_ENABLED").as_deref() {
         Ok("true") => Ok(true),
         Ok("false") => Ok(false),
         _ => {
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-                .fetch_one(executor)
-                .await?;
+            let count: i64 = sql.query_row("SELECT COUNT(*) FROM users", &[])?;
             Ok(count == 0)
         }
     }
 }
 
 pub(crate) async fn registration_status(State(state): State<AppState>) -> Response {
-    match registration_open(&state.pool).await {
+    match registration_open(&state.database) {
         Ok(open) => json_response(json!({ "open": open })),
         Err(cause) => db_error(cause, "Failed to check registration").into_response(),
     }
@@ -195,16 +189,23 @@ async fn create_session(
         tracing::error!(error = %cause, "Could not generate session token");
         error(StatusCode::INTERNAL_SERVER_ERROR, failure)
     })?;
-    sqlx::query("DELETE FROM sessions WHERE expires_at < $1")
-        .bind(Utc::now().naive_utc())
-        .execute(&state.pool)
-        .await
+    state
+        .database
+        .execute(
+            "DELETE FROM sessions WHERE expires_at < ?1",
+            &params![platform::timestamp()],
+        )
         .map_err(|cause| db_error(cause, failure))?;
-    let expires_at = (Utc::now() + Duration::seconds(SESSION_SECONDS)).naive_utc();
-    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES ($1, $2, $3, $4)")
-        .bind(token_hash(&token)).bind(user_id).bind(expires_at).bind(Utc::now().naive_utc())
-        .execute(&state.pool).await.map_err(|cause| db_error(cause, failure))?;
-    let secure = std::env::var("NODE_ENV").as_deref() == Ok("production");
+    let expires_at = platform::timestamp() + Duration::seconds(SESSION_SECONDS);
+    state.database.execute("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)", &params![token_hash(&token), user_id, expires_at, platform::timestamp()]).map_err(|cause| db_error(cause, failure))?;
+    // A Worker is only ever reached through Cloudflare's HTTPS edge, so its
+    // cookie is always Secure: a deployment sets no NODE_ENV, and the plain
+    // HTTP request the edge redirects would otherwise carry the session.
+    // Browsers keep a Secure cookie on http://localhost, so `wrangler dev`
+    // still signs in. The native server serves plain HTTP in development and
+    // marks the cookie Secure under NODE_ENV=production (the Docker image).
+    let secure = cfg!(target_arch = "wasm32")
+        || ledger_db::env::var("NODE_ENV").as_deref() == Ok("production");
     if secure {
         let host = client_host(headers);
         let hostname = if host.starts_with('[') {
@@ -248,16 +249,18 @@ async fn login_inner(
     };
     if let Err(denied) = state
         .rate_limits
-        .enforce(Scope::Login, &keys, Instant::now())
+        .enforce(Scope::Login, &keys, platform::timestamp())
     {
         return Ok(denied.into_response());
     }
-    let row = sqlx::query("SELECT id, username, password_hash FROM users WHERE username = $1")
-        .bind(&username)
-        .fetch_optional(&state.pool)
-        .await
+    let row: Option<(i32, String, String)> = state
+        .database
+        .query_optional(
+            "SELECT id, username, password_hash FROM users WHERE username = ?1",
+            &params![&username],
+        )
         .map_err(|cause| db_error(cause, "Failed to log in"))?;
-    let Some(row) = row else {
+    let Some((id, stored_username, stored)) = row else {
         let _ = run_scrypt(
             &state,
             password,
@@ -267,18 +270,16 @@ async fn login_inner(
         .await;
         state
             .rate_limits
-            .failure(Scope::Login, &keys, Instant::now());
+            .failure(Scope::Login, &keys, platform::timestamp());
         return Ok(fail(
             StatusCode::UNAUTHORIZED,
             "Invalid username or password",
         ));
     };
-    let id: i32 = row.get("id");
-    let stored: String = row.get("password_hash");
     if !verify_password(&state, password, stored).await {
         state
             .rate_limits
-            .failure(Scope::Login, &keys, Instant::now());
+            .failure(Scope::Login, &keys, platform::timestamp());
         return Ok(fail(
             StatusCode::UNAUTHORIZED,
             "Invalid username or password",
@@ -286,8 +287,7 @@ async fn login_inner(
     }
     let cookie = create_session(&state, &headers, id, "Failed to log in").await?;
     state.rate_limits.success(Scope::Login, &keys);
-    let mut response =
-        json_response(json!({ "id": id, "username": row.get::<String, _>("username") }));
+    let mut response = json_response(json!({ "id": id, "username": stored_username }));
     response.headers_mut().insert(header::SET_COOKIE, cookie);
     Ok(response)
 }
@@ -319,10 +319,7 @@ async fn register_inner(
 ) -> Result<Response, ApiError> {
     let body = parse_json_body(&body, "Failed to register")?;
     let (username, password) = credentials(&body, true)?;
-    if !registration_open(&state.pool)
-        .await
-        .map_err(|cause| db_error(cause, "Failed to register"))?
-    {
+    if !registration_open(&state.database).map_err(|cause| db_error(cause, "Failed to register"))? {
         return Ok(fail(StatusCode::FORBIDDEN, "Registration is closed"));
     }
     let keys = Keys {
@@ -331,46 +328,47 @@ async fn register_inner(
     };
     if let Err(denied) = state
         .rate_limits
-        .enforce(Scope::Register, &keys, Instant::now())
+        .enforce(Scope::Register, &keys, platform::timestamp())
     {
         return Ok(denied.into_response());
     }
     let password_hash = hash_password(&state, password, "Failed to register").await?;
-    let mut tx = ledger_db::locks::begin_pool(&state.pool)
-        .await
-        .map_err(|cause| db_error(cause, "Failed to register"))?;
-    lock_transaction(&mut tx, TransactionLock::Registration)
-        .await
-        .map_err(|cause| db_error(cause, "Failed to register"))?;
-    let open = registration_open(&mut *tx)
-        .await
-        .map_err(|cause| db_error(cause, "Failed to register"))?;
-    if !open {
-        return Ok(fail(StatusCode::FORBIDDEN, "Registration is closed"));
+    enum Registered {
+        Closed,
+        Taken,
+        User(i32),
     }
-    let existing: Option<i32> = sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
-        .bind(&username)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|cause| db_error(cause, "Failed to register"))?;
-    if existing.is_some() {
-        state
-            .rate_limits
-            .failure(Scope::Register, &keys, Instant::now());
-        return Ok(fail(StatusCode::CONFLICT, "Username already taken"));
-    }
-    let id: i32 = sqlx::query_scalar(
-        "INSERT INTO users (username, password_hash, created_at) VALUES ($1, $2, $3) RETURNING id",
-    )
-    .bind(&username)
-    .bind(password_hash)
-    .bind(Utc::now().naive_utc())
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|cause| db_error(cause, "Failed to register"))?;
-    tx.commit()
-        .await
-        .map_err(|cause| db_error(cause, "Failed to register"))?;
+    // The first-user check and the insert run in one write transaction, so
+    // two registrations cannot both see an empty table.
+    let registered = state
+        .database
+        .transaction(|tx| {
+        if !registration_open(tx)? {
+            return Ok(Registered::Closed);
+        }
+        let existing: Option<i32> = tx.query_optional(
+            "SELECT id FROM users WHERE username = ?1",
+            &params![&username],
+        )?;
+        if existing.is_some() {
+            return Ok(Registered::Taken);
+        }
+        Ok(Registered::User(tx.query_row(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?1, ?2, ?3) RETURNING id",
+            &params![&username, password_hash, platform::timestamp()],
+        )?))
+    })
+    .map_err(|cause: store::Error| db_error(cause, "Failed to register"))?;
+    let id = match registered {
+        Registered::Closed => return Ok(fail(StatusCode::FORBIDDEN, "Registration is closed")),
+        Registered::Taken => {
+            state
+                .rate_limits
+                .failure(Scope::Register, &keys, platform::timestamp());
+            return Ok(fail(StatusCode::CONFLICT, "Username already taken"));
+        }
+        Registered::User(id) => id,
+    };
     let cookie = create_session(&state, &headers, id, "Failed to register").await?;
     let mut response = json_response(json!({ "id": id, "username": username }));
     response.headers_mut().insert(header::SET_COOKIE, cookie);
@@ -379,13 +377,15 @@ async fn register_inner(
 
 pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(token) = cookie_token(&headers)
-        && let Err(cause) = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
-            .bind(token_hash(&token))
-            .execute(&state.pool)
-            .await
+        && let Err(cause) = state.database.execute(
+            "DELETE FROM sessions WHERE token_hash = ?1",
+            &params![token_hash(&token)],
+        )
     {
         return db_error(cause, "Failed to log out").into_response();
     }
+    // An open book socket of this session closes.
+    state.revocations.notify();
     let mut response = json_response(json!({ "success": true }));
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -402,14 +402,11 @@ pub(crate) async fn me(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(None) => return fail(StatusCode::UNAUTHORIZED, "Not authenticated"),
         Err(cause) => return db_error(cause, "Failed to fetch user").into_response(),
     };
-    match sqlx::query("SELECT id, username FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await
-    {
-        Ok(Some(row)) => json_response(
-            json!({ "id": row.get::<i32, _>("id"), "username": row.get::<String, _>("username") }),
-        ),
+    match state.database.query_optional::<(i32, String)>(
+        "SELECT id, username FROM users WHERE id = ?1",
+        &params![user_id],
+    ) {
+        Ok(Some((id, username))) => json_response(json!({ "id": id, "username": username })),
         Ok(None) => fail(StatusCode::UNAUTHORIZED, "User not found"),
         Err(cause) => db_error(cause, "Failed to fetch user").into_response(),
     }
@@ -473,40 +470,45 @@ async fn change_password_inner(
     };
     if let Err(denied) = state
         .rate_limits
-        .enforce(Scope::Password, &keys, Instant::now())
+        .enforce(Scope::Password, &keys, platform::timestamp())
     {
         return Ok(denied.into_response());
     }
-    let row = sqlx::query("SELECT password_hash FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await
+    let row: Option<String> = state
+        .database
+        .query_optional(
+            "SELECT password_hash FROM users WHERE id = ?1",
+            &params![user_id],
+        )
         .map_err(|cause| db_error(cause, "Failed to update password"))?;
-    let Some(row) = row else {
+    let Some(stored) = row else {
         return Ok(fail(StatusCode::UNAUTHORIZED, "User not found"));
     };
-    if !verify_password(&state, current, row.get("password_hash")).await {
+    if !verify_password(&state, current, stored).await {
         state
             .rate_limits
-            .failure(Scope::Password, &keys, Instant::now());
+            .failure(Scope::Password, &keys, platform::timestamp());
         return Ok(fail(
             StatusCode::UNAUTHORIZED,
             "Current password is incorrect",
         ));
     }
     state.rate_limits.success(Scope::Password, &keys);
-    sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND id <> $2")
-        .bind(user_id)
-        .bind(session_id)
-        .execute(&state.pool)
-        .await
+    state
+        .database
+        .execute(
+            "DELETE FROM sessions WHERE user_id = ?1 AND id <> ?2",
+            &params![user_id, session_id],
+        )
         .map_err(|cause| db_error(cause, "Failed to update password"))?;
+    state.revocations.notify();
     let hash = hash_password(&state, new, "Failed to update password").await?;
-    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-        .bind(hash)
-        .bind(user_id)
-        .execute(&state.pool)
-        .await
+    state
+        .database
+        .execute(
+            "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+            &params![hash, user_id],
+        )
         .map_err(|cause| db_error(cause, "Failed to update password"))?;
     Ok(json_response(json!({ "success": true })))
 }
@@ -530,14 +532,14 @@ pub(crate) async fn list_keys(State(state): State<AppState>, headers: HeaderMap)
     }) else {
         return fail(StatusCode::UNAUTHORIZED, "Not authenticated");
     };
-    match sqlx::query("SELECT id, name, key_prefix, last_used_at, created_at FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC")
-        .bind(user_id).fetch_all(&state.pool).await {
-        Ok(rows) => json_response(Value::Array(rows.into_iter().map(|row| json!({
-            "id": row.get::<i32, _>("id"),
-            "name": row.get::<String, _>("name"),
-            "keyPrefix": row.get::<String, _>("key_prefix"),
-            "lastUsedAt": row.get::<Option<NaiveDateTime>, _>("last_used_at").map(iso_timestamp),
-            "createdAt": iso_timestamp(row.get("created_at")),
+    type KeyRow = (i32, String, String, Option<NaiveDateTime>, NaiveDateTime);
+    match state.database.query::<KeyRow>("SELECT id, name, key_prefix, last_used_at, created_at FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC", &params![user_id]) {
+        Ok(rows) => json_response(Value::Array(rows.into_iter().map(|(id, name, key_prefix, last_used_at, created_at)| json!({
+            "id": id,
+            "name": name,
+            "keyPrefix": key_prefix,
+            "lastUsedAt": last_used_at.map(iso_timestamp),
+            "createdAt": iso_timestamp(created_at),
         })).collect())),
         Err(cause) => db_error(cause, "Failed to fetch API keys").into_response(),
     }
@@ -598,12 +600,10 @@ async fn create_key_inner(
             )
         })?;
     let key_prefix = &key[..8];
-    let row = sqlx::query("INSERT INTO api_keys (user_id, name, key_hash, key_prefix, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at")
-        .bind(user_id).bind(name).bind(format!("{salt}:{}", hex::encode(derived))).bind(key_prefix).bind(Utc::now().naive_utc())
-        .fetch_one(&state.pool).await.map_err(|cause| db_error(cause, "Failed to create API key"))?;
+    let (key_id, created_at): (i32, NaiveDateTime) = state.database.query_row("INSERT INTO api_keys (user_id, name, key_hash, key_prefix, created_at) VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id, created_at", &params![user_id, name, format!("{salt}:{}", hex::encode(derived)), key_prefix, platform::timestamp()]).map_err(|cause| db_error(cause, "Failed to create API key"))?;
     Ok(json_response(
-        json!({ "id": row.get::<i32, _>("id"), "name": name, "key": key,
-        "keyPrefix": key_prefix, "createdAt": iso_timestamp(row.get("created_at")) }),
+        json!({ "id": key_id, "name": name, "key": key,
+        "keyPrefix": key_prefix, "createdAt": iso_timestamp(created_at) }),
     ))
 }
 
@@ -638,13 +638,14 @@ pub(crate) async fn delete_key(
             "Failed to delete API key",
         );
     };
-    match sqlx::query("DELETE FROM api_keys WHERE id = $1 AND user_id = $2 RETURNING id")
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await
-    {
-        Ok(Some(_)) => json_response(json!({ "success": true })),
+    match state.database.query_optional::<i32>(
+        "DELETE FROM api_keys WHERE id = ?1 AND user_id = ?2 RETURNING id",
+        &params![id, user_id],
+    ) {
+        Ok(Some(_)) => {
+            state.revocations.notify();
+            json_response(json!({ "success": true }))
+        }
         Ok(None) => fail(StatusCode::NOT_FOUND, "API key not found"),
         Err(cause) => db_error(cause, "Failed to delete API key").into_response(),
     }

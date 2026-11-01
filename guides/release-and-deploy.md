@@ -22,9 +22,12 @@ MERGE the PR (a merge commit)   ← never squash: the release commits have to st
     │                             in the ancestry of main
     ▼
 ./scripts/deploy.sh --ref <the merge commit>
-    │                          ← publishes tag vX.Y.Z once, at that commit, then
-    │                            builds the image and restarts the container;
-    │                            the server applies the migrations as it starts
+    │                          ← target docker: publishes tag vX.Y.Z once, at
+    │                            that commit, builds the image and restarts the
+    │                            container; the server applies the migrations as
+    │                            it starts. Target worker: the merge already
+    │                            started worker-release.yml, which publishes the
+    │                            tag and deploys; deploy.sh waits for that run
     ▼
 PR: main → dev, merged (not squashed)   ← carries the bump and any release fix
                                           back without rewriting dev
@@ -63,9 +66,10 @@ problem that squash-merging a long-running branch produces:
   package version, so the release commit includes the regenerated
   `openapi/openapi.json`.
 - **The version tag is published once, and never moves.** `release.sh` creates
-  no tag at all. `deploy.sh` creates it, annotated, against the commit named by
-  `--ref` — the commit the PR actually merged — and pushes it **without
-  `--force`**. A re-deploy of the same commit leaves it alone; a tag already
+  no tag at all. On the Docker target `deploy.sh` creates it; on the Worker
+  target `scripts/release-tag.sh` in `worker-release.yml` does. Each creates
+  it annotated, against the commit the PR actually merged, and pushes it
+  **without `--force`**. A re-deploy of the same commit leaves it alone; a tag already
   pointing somewhere else is a refusal, not a force-push. So a clone that
   fetched the tag is never contradicted, and a plain `git fetch` is the whole
   of catching up.
@@ -77,8 +81,10 @@ problem that squash-merging a long-running branch produces:
   report already, and `%(contents)` has the matching trap — on a lightweight tag
   it returns the *commit* message.
 - **`deploy.sh` deploys one named commit and touches nothing else.** It requires
-  `--ref`, refuses a commit that is not on `origin/main`, publishes the tag,
-  and rebuilds. The version is read out of the commit with `git show`, not out
+  `--ref`, and refuses a commit that is not on `origin/main`. Then it
+  publishes the tag and rebuilds (target `docker`), or waits for the
+  `worker-release.yml` run that publishes the tag and deploys (target
+  `worker`). The version is read out of the commit with `git show`, not out
   of a checkout. **The early refusals run before anything moves**, but not all
   of them: production's `main` is fast-forwarded to the deploy commit before
   the tree check and the Compose validation, so a refusal from either of those
@@ -86,6 +92,16 @@ problem that squash-merging a long-running branch produces:
   next run fast-forwards to the same commit, but the checkout is not restored. It does **not** rebase `dev`, force-push, keep a resume file, or take a fork
   point. If `.git/DEPLOY_FORK_POINT` exists, it refuses: that file marks a deploy
   that expects a `dev` rebase, which this script does not perform.
+- **`COUNTERPOISE_DEPLOY_TARGET` says where production runs.** The value is
+  `docker` (the default) or `worker`. Set it in the environment, or in one
+  line of the gitignored `.env.deploy.local` at the dev checkout root:
+  `COUNTERPOISE_DEPLOY_TARGET=worker`. The environment wins. The script reads
+  only that one key and does not source the file. Any other value is a
+  refusal. `scripts/lib/deploy-target.sh` holds the rule, one time, so a
+  script that calls `deploy.sh` can read the same target. An install on its
+  own machine keeps `docker`, and everything below about the production
+  checkout, Compose and the volume is for that target. For `worker`, see
+  [The Cloudflare Worker deploy](#the-cloudflare-worker-deploy).
 - **Production owns its checkout and configuration.** Builds and production
   Compose run in a separate checkout on `main`. The default is
   `~/counterpoise-production`. `COUNTERPOISE_BUILD_DIR` can name another
@@ -119,7 +135,8 @@ problem that squash-merging a long-running branch produces:
 - **Backups default to the production checkout's `backups/`.** The deploy passes
   the resolved absolute path to the `rust-api` service, which mounts it
   read-write at `/backups`. The server writes the hourly snapshots
-  (`counterpoise-*.db`) there, and the job status records in `status/`. The
+  (`counterpoise-*.db`) there. An older release also kept the job status
+  records in `status/`; the server copies them into its database once. The
   directory must be writable by uid 1000, the user of the image.
   `COUNTERPOISE_BACKUPS_DIR` can
   name another existing absolute directory; a missing directory is refused so
@@ -149,11 +166,24 @@ problem that squash-merging a long-running branch produces:
 - **CI** (the workflow file itself is maintainer tooling and is not published;
   a fork supplies its own). It runs on every PR to **main
   and to dev** — lint, type-check, the tests (each on its own SQLite files),
-  and a `production-build` job that runs `npm run build` (the Vite client
-  build) with **no database service**, as `docker build` does. The job was
+  and a `static-checks` job whose build step runs `npm run build` (the Vite
+  client build) with **no database service**, as `docker build` does. That
+  job also runs lint, the type check and the vacuity pass, each as its own
+  step, so the short checks share one machine and one setup. The build step was
   added when a page that queried the database at build time passed E2E (which
   has one) and failed `docker build` (which does not). The back-merge PR targets `dev`, so it is
   checked exactly as a feature PR is.
+- **CI keeps its build output and downloads on the CI machine.** The CI
+  machines keep their home directory from job to job. Each job that runs Cargo
+  links `rust-api/target` to a directory there, keyed by machine, toolchain and
+  checkout path, because the checkout clean deletes `rust-api/target` before
+  each job. Cargo still checks every crate and builds again what changed. npm
+  and Playwright use their own caches in the home directory; no job restores a
+  remote cache, and E2E installs only Chromium's headless shell. A machine
+  with an empty home directory downloads and builds everything, and takes
+  longer, but runs the same checks. The fork example
+  (`.github/workflows/ci.yml.example`) runs on hosted machines that start empty, so it keeps
+  `cache: npm`.
 - **Why dev is a CI branch too**: dev is where day-to-day work lands and what
   releases are cut from, so CI on dev checks work before it reaches the release path. dev gets the **same
   jobs** main gets; no *job* is conditioned on the target branch, so adding a job
@@ -197,7 +227,12 @@ problem that squash-merging a long-running branch produces:
   redeploying the previous image.** The previous code queries a column that no
   longer exists and returns 500. For example, after `sessions.token` became
   `token_hash`, the old image failed every authenticated request. Roll back with
-  a forward migration or a fix-forward deploy.
+  a forward migration or a fix-forward deploy. On the Worker it is worse:
+  `wrangler rollback` past any migration that succeeded gives a build that has
+  no file for the applied version, and the object refuses to start, so every
+  request gets 503. A migration that failed rolled back its own transaction,
+  so a rollback to the build before it is safe (see
+  [database-management.md](database-management.md#making-schema-changes)).
 - **The move to SQLite is not undone by a revert.** After an install converts,
   its data is in `counterpoise_data`. A release of the PostgreSQL code would
   start on the old `counterpoise_pgdata` volume, without the changes made
@@ -243,3 +278,132 @@ problem that squash-merging a long-running branch produces:
   that the compose file no longer has: the Next `app` service before, and the
   `postgres` and `scheduler` services since the move to SQLite. Their volumes
   stay.
+
+## The Cloudflare Worker deploy
+
+The Worker (`rust-api/worker/`) is a second target beside the Docker image
+(see [architecture.md](architecture.md#deployment-targets)). The owner's
+production runs on it, so on the owner's machine `.env.deploy.local` sets
+`COUNTERPOISE_DEPLOY_TARGET=worker` and the repository sets
+`WORKER_TAG_TARGET=production`. `.github/workflows/worker-deploy.yml`
+deploys it:
+
+- **A release merge into `main` deploys it.** `.github/workflows/worker-release.yml`
+  runs when `main` moves. `scripts/release-tag.sh` compares the version in
+  `package.json` with the version before the merge. A changed version is a
+  release: the script publishes the tag at the merge commit, and the
+  workflow calls `worker-deploy.yml` (`workflow_call`) for that commit and
+  the target `production`. A change to `main` that keeps the version is not
+  a release and deploys nothing. A tag already at the merge commit is a
+  re-run and deploys again; a tag at another commit is a refusal. The
+  workflow runs only when `WORKER_DEPLOY` is `true` and `WORKER_TAG_TARGET`
+  is `production`. A manual run of it (on `main`) does the same for the tip
+  of `main`.
+- **The tag that the workflow pushes starts nothing.** It is pushed with
+  `GITHUB_TOKEN`, and a push with that token starts no workflow. So the tag
+  trigger of `worker-deploy.yml` does not deploy the release a second time.
+  That trigger stays for the Docker target: there `deploy.sh` pushes the tag
+  with the owner's credentials, and the tag deploys to `WORKER_TAG_TARGET`
+  (staging). A manual run of `worker-deploy.yml` (`workflow_dispatch`)
+  deploys the ref it names to the target it names (`staging` by default),
+  for a check before a release.
+- **The gate is the merge of the release PR.** It merges after CI and the
+  release review. To also approve each production deploy, add a required
+  reviewer to the `worker` environment. The deploy job then waits for the
+  approval, and so does `deploy.sh`.
+- **With `COUNTERPOISE_DEPLOY_TARGET=worker`, `deploy.sh` waits for that
+  run.** It keeps the checks that do not need Docker: a clean tree, `--ref`
+  on `origin/main`, the version read from the commit, and the refusal of a
+  tag at another commit. It does not publish the tag, and does not touch the
+  production checkout, the Docker volume or `docker`. First it reads the
+  repository variables with `gh variable get`. It refuses unless
+  `WORKER_DEPLOY` is `true` and `WORKER_TAG_TARGET` is `production`, because
+  otherwise the workflow deploys nothing, and production does not get the
+  release. Then it looks for the `worker-release.yml` run at the merge
+  commit. A new run takes some seconds to appear, so it looks again every
+  `DEPLOY_RUN_POLL_SECONDS` (5) until `DEPLOY_RUN_WAIT_SECONDS` (120) have
+  gone. Then it waits for the run with `gh run watch --exit-status`, and
+  fails when the run fails. Last, it fetches the tag and refuses unless the
+  tag is at the merge commit: a run that passed without a tag there did not
+  deploy this release. The probe of the run checks `/health` and
+  `/api/version`, so a passed deploy needs no other health check: do not
+  look for the Docker container or port 3000.
+- **A re-run waits for the same run again.** `deploy.sh` publishes nothing
+  and asks nothing, because nothing restarts. If the run failed, fix the
+  cause, run `gh run rerun <id> --failed`, then run `deploy.sh` again. If no
+  run appeared (for example, the workflow was off), start one with
+  `gh workflow run worker-release.yml --ref main` while `main` is still at
+  the merge commit.
+- **While production is on the Worker, the Docker target refuses.** When
+  `gh variable get WORKER_TAG_TARGET` answers `production`, `deploy.sh` with
+  target `docker` stops before anything moves. A Docker deploy would start the
+  old server on old data beside the Worker: two live databases. The stopped
+  container stays stopped. When `gh` is not installed or the call fails (an
+  install on its own machine has no such variable), the Docker deploy goes
+  on as before.
+- **Two targets, each its own Worker.** `staging` deploys `[env.staging]` in
+  `wrangler.toml`, the Worker `counterpoise-staging`, with its own Durable
+  Object and its own export bucket, so its daily dump never overwrites the
+  other Worker's. `production` deploys the top-level Worker. A pushed tag
+  deploys to the repository variable `WORKER_TAG_TARGET` (`staging` when
+  unset); a manual run and a call from `worker-release.yml` never read it,
+  so a staging check cannot land on production by accident. The job fails
+  on any other value.
+- **It is off until the repository turns it on.** The job runs only when the
+  repository variable `WORKER_DEPLOY` is `true`. Until then a tag or a
+  release merge deploys nothing and fails nothing.
+- **One deploy at a time, and none cancelled.** The deploy job of
+  `worker-deploy.yml` holds the concurrency group `worker-deploy`, on the job
+  so that it also holds when `worker-release.yml` calls it.
+  `worker-release.yml` holds `worker-release`, so the tag and the deploy of
+  one release finish before the next. A cancelled `wrangler deploy` can leave
+  the Worker and its assets at different versions, and a cancelled release
+  run gets no tag and no deploy. So both groups set `cancel-in-progress:
+  false` and `queue: max`: with the default, `single`, a newly queued run
+  replaces the run that waits, whatever `cancel-in-progress` says.
+- **The account lives in GitHub environments, not in the tree.** The
+  public mirror ships `wrangler.toml` and the workflow, so neither names an
+  account, a hostname or a token. Each target has an environment,
+  `worker-staging` and `worker`, and each holds the secrets
+  `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` and `WORKER_DOMAIN` (the
+  custom domain the Worker serves), the Access service
+  token `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET` when Access is in
+  front. Each also holds the variables `NEXT_PUBLIC_POSTHOG_KEY` and
+  `NEXT_PUBLIC_POSTHOG_HOST` for the client build, as the Docker build
+  arguments do; without them the client sends no analytics. The Worker's own secrets (`CRON_SECRET`, the Plaid and other integration keys)
+  are set once with `scripts/wrangler.sh secret put` (adding `--env staging` for
+  the staging Worker); a deploy keeps them.
+- **The deploy does not attach the custom domain.** The domain, its DNS
+  record and its certificate are managed outside this repository. Do not pass
+  `--domain` or add `routes` to `wrangler.toml`: a deploy with a custom domain
+  replaces the Worker's domains. A new target needs its domain made before
+  its first deploy is reachable there.
+- **Logs and traces are in `wrangler.toml`.** Both Workers have them: the
+  top-level `[observability]` block for production and
+  `[env.staging.observability]` for staging. Each keeps Workers Logs and
+  traces for 7 days, with the query string removed from the URLs. Set them in
+  the file, not in the dashboard, so the file stays the record. The data is
+  production data, so do not add log lines that write request bodies or
+  amounts.
+- **The job builds the client, then deploys.** `wrangler deploy` runs the
+  build command in `wrangler.toml` (`worker-build`), uploads the Worker and
+  the client build as its assets, and applies the Durable Object migrations
+  in `wrangler.toml`. The database migrations run when the object starts.
+- **The deploy sets `COUNTERPOISE_PUBLIC_URL`** to `https://` and the
+  environment's `WORKER_DOMAIN`, so OAuth for MCP is on wherever the Worker
+  runs. It is a deploy variable and not a secret: a `wrangler deploy`
+  replaces the plain variables set in the dashboard, and the hostname must
+  stay out of `wrangler.toml`.
+- **A probe stands in for `up --wait`.** The deploy sets the Worker's
+  variable `BUILD_COMMIT` to the commit, and the Worker names it on `/health`
+  in `x-build-commit`. `scripts/worker-probe.sh` retries `/health`
+  until it answers 200 from that commit, which means the new version's
+  object opened its database, then `/api/version` until it names the version
+  in `package.json`. Commits between releases share a version, so the
+  commit is what tells the new deploy from the one before it. A probe
+  that runs out of retries fails the job. The previous version keeps serving
+  until the new one is live, so a failed probe needs a fix and a new deploy,
+  or a rollback of the Worker that failed, in `rust-api/worker/`:
+  `../../scripts/wrangler.sh rollback --env staging` for staging, and
+  `../../scripts/wrangler.sh rollback` for production. Without `--env
+  staging` the command rolls back production, at once.

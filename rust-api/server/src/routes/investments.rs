@@ -16,14 +16,13 @@ use ledger_core::{
         SecurityRow, aggregate_market_values_by_account, aggregate_positions, fixed_price_row,
     },
 };
-use ledger_db::engine::{Db, DbPool};
+use ledger_db::store::{self, Builder, Sql, params};
 use serde_json::to_value;
-use sqlx::QueryBuilder;
 use std::collections::{HashMap, HashSet};
 
 /// `effectiveDateSql`: a floating transaction resolves to today in the
 /// session time zone.
-pub(crate) const EFFECTIVE_DATE: &str = ledger_db::sql::EFFECTIVE_DATE;
+pub(crate) use ledger_db::sql::EFFECTIVE_DATE;
 
 /// The largest integer JavaScript represents exactly. Zod's `int()` rejects
 /// anything beyond it.
@@ -44,11 +43,11 @@ type SplitJson = (
 );
 
 /// Pushes the effective date of the transaction `t`, with today bound as a
-/// value. [`EFFECTIVE_DATE`] calls `cp_today()` for each row.
-fn push_effective_date(query: &mut QueryBuilder<'_, Db>, today: &str) {
+/// value, for a statement that must use the caller's `today`.
+fn push_effective_date(query: &mut Builder, today: &str) {
     query
         .push("(CASE WHEN t.is_floating THEN ")
-        .push_bind(today.to_owned())
+        .push_bind(today)
         .push(" ELSE t.date END)");
 }
 
@@ -58,18 +57,18 @@ fn push_effective_date(query: &mut QueryBuilder<'_, Db>, today: &str) {
 /// have no account. With `as_of_date`, only the splits on or before that
 /// effective date.
 ///
-/// The query gives all the splits as one JSON array in one value. sqlx
-/// copies each column value of each row. In the production image (musl), the
+/// The query gives all the splits as one JSON array in one value. Reading it
+/// as rows copied each column value of each row. In the production image (musl), the
 /// 4,041 splits of a large book took about 10 ms as rows and 2.2 ms as one
 /// array, and the query without its output took 0.9 ms.
-pub(super) async fn investment_splits(
-    pool: &DbPool,
+pub(super) fn investment_splits(
+    sql: &impl Sql,
     book_id: i32,
     account_id: Option<i32>,
     as_of_date: Option<&str>,
-) -> Result<Vec<InvestmentSplitRow>, sqlx::Error> {
+) -> Result<Vec<InvestmentSplitRow>, store::Error> {
     let today = local_today();
-    let mut query = QueryBuilder::<Db>::new(
+    let mut query = Builder::new(
         "SELECT json_group_array(json_array(s.account_id, s.security_id, s.shares_micros,
                 s.price_micros, s.fees_cents, s.action, s.split_numerator,
                 s.split_denominator, ",
@@ -94,11 +93,11 @@ pub(super) async fn investment_splits(
     if let Some(as_of_date) = as_of_date {
         query.push(" AND ");
         push_effective_date(&mut query, &today);
-        query.push(" <= ").push_bind(as_of_date.to_owned());
+        query.push(" <= ").push_bind(as_of_date);
     }
-    let text: String = query.build_query_scalar().fetch_one(pool).await?;
+    let text: String = query.query_row(sql)?;
     let splits: Vec<SplitJson> =
-        serde_json::from_str(&text).map_err(|cause| sqlx::Error::Decode(Box::new(cause)))?;
+        serde_json::from_str(&text).map_err(|cause| store::Error::Invalid(cause.to_string()))?;
     Ok(splits
         .into_iter()
         .map(
@@ -130,28 +129,24 @@ pub(super) async fn investment_splits(
 /// `getLatestPrices`: the newest recorded price of each security. A fixed
 /// price replaces every recorded price, dated today so it wins every "newest"
 /// comparison.
-pub(super) async fn latest_prices(
-    pool: &DbPool,
+pub(super) fn latest_prices(
+    sql: &impl Sql,
     book_id: i32,
-) -> Result<Vec<SecurityPriceRow>, sqlx::Error> {
-    let recorded: Vec<(i32, i64, String)> = sqlx::query_as(
+) -> Result<Vec<SecurityPriceRow>, store::Error> {
+    let recorded: Vec<(i32, i64, String)> = sql.query(
         "SELECT s.id, p.price_micros, p.price_date
          FROM securities s
-         JOIN security_prices p ON p.security_id = s.id AND p.book_id = $1
-         WHERE s.book_id = $1
+         JOIN security_prices p ON p.security_id = s.id AND p.book_id = ?1
+         WHERE s.book_id = ?1
            AND p.price_date = (SELECT MAX(q.price_date) FROM security_prices q
-                               WHERE q.security_id = s.id AND q.book_id = $1)",
-    )
-    .bind(book_id)
-    .fetch_all(pool)
-    .await?;
-    let fixed: Vec<(i32, i64)> = sqlx::query_as(
+                               WHERE q.security_id = s.id AND q.book_id = ?1)",
+        &params![book_id],
+    )?;
+    let fixed: Vec<(i32, i64)> = sql.query(
         "SELECT id, fixed_price_micros FROM securities
-         WHERE book_id = $1 AND fixed_price_micros IS NOT NULL",
-    )
-    .bind(book_id)
-    .fetch_all(pool)
-    .await?;
+         WHERE book_id = ?1 AND fixed_price_micros IS NOT NULL",
+        &params![book_id],
+    )?;
     let fixed_ids: HashSet<i32> = fixed.iter().map(|(id, _)| *id).collect();
     let today = local_today();
     Ok(recorded
@@ -173,18 +168,17 @@ pub(super) async fn latest_prices(
 /// `getPositions`: shares, price, and market value from the split replay;
 /// cost basis from the open FIFO lots. `account_id` follows the Node truthy
 /// check, so zero means the whole book.
-pub(super) async fn positions(
-    pool: &DbPool,
+pub(super) fn positions(
+    sql: &impl Sql,
     book_id: i32,
     account_id: Option<i32>,
-) -> Result<Vec<PositionSummary>, sqlx::Error> {
-    let splits = investment_splits(pool, book_id, account_id, None).await?;
-    let securities: Vec<(i32, String, String)> =
-        sqlx::query_as("SELECT id, name, symbol FROM securities WHERE book_id = $1")
-            .bind(book_id)
-            .fetch_all(pool)
-            .await?;
-    let prices = latest_prices(pool, book_id).await?;
+) -> Result<Vec<PositionSummary>, store::Error> {
+    let splits = investment_splits(sql, book_id, account_id, None)?;
+    let securities: Vec<(i32, String, String)> = sql.query(
+        "SELECT id, name, symbol FROM securities WHERE book_id = ?1",
+        &params![book_id],
+    )?;
+    let prices = latest_prices(sql, book_id)?;
     let positions = aggregate_positions(&PositionInput {
         splits,
         securities: securities
@@ -198,7 +192,7 @@ pub(super) async fn positions(
         prices,
     });
 
-    let mut basis = QueryBuilder::<Db>::new(
+    let mut basis = Builder::new(
         "SELECT security_id, CAST(COALESCE(SUM(remaining_basis_cents), 0) AS integer)
          FROM investment_lots WHERE book_id = ",
     );
@@ -208,9 +202,7 @@ pub(super) async fn positions(
     }
     basis.push(" AND remaining_shares_micros > 0 GROUP BY security_id");
     let basis: HashMap<i64, i64> = basis
-        .build_query_as::<(i32, i32)>()
-        .fetch_all(pool)
-        .await?
+        .query::<(i32, i32)>(sql)?
         .into_iter()
         .map(|(security_id, cents)| (i64::from(security_id), i64::from(cents)))
         .collect();
@@ -268,8 +260,7 @@ pub(crate) async fn get_positions(
             Some(i32::try_from(id).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?)
         }
     };
-    let rows = positions(&state.pool, book.book_id(), account_id)
-        .await
+    let rows = positions(&state.database, book.book_id(), account_id)
         .map_err(|cause| internal_error(cause, FAILURE))?;
     Ok(Json(to_value(rows).expect("positions serialize")))
 }
@@ -285,13 +276,11 @@ pub(crate) async fn account_values(
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let params = first_query_values(raw_query.as_deref());
     let as_of_date = query_date_param(&params, "asOfDate")?;
-    let splits = investment_splits(&state.pool, book.book_id(), None, as_of_date.as_deref())
-        .await
+    let splits = investment_splits(&state.database, book.book_id(), None, as_of_date.as_deref())
         .map_err(|cause| internal_error(cause, FAILURE))?;
     // Prices are not limited by asOfDate: an as-of value combines that date's
     // shares with today's prices, as the Node route does.
-    let prices = latest_prices(&state.pool, book.book_id())
-        .await
+    let prices = latest_prices(&state.database, book.book_id())
         .map_err(|cause| internal_error(cause, FAILURE))?;
     let values = aggregate_market_values_by_account(&MarketValueInput { splits, prices });
     Ok(Json(to_value(values).expect("market values serialize")))
@@ -301,6 +290,7 @@ pub(crate) async fn account_values(
 mod tests {
     use super::{investment_splits, positions_account_id};
     use ledger_core::accounting::InvestmentAction::{self, Buy, Sell, Split};
+    use ledger_db::store::Sql;
 
     type Columns = (
         Option<i64>,
@@ -318,11 +308,12 @@ mod tests {
     /// then the transaction id, then the split id. A floating transaction
     /// is dated today. The account filter keeps the stock split, which has
     /// no account, and the date filter uses the effective date.
-    #[tokio::test]
-    async fn investment_splits_read_each_column_in_replay_order() {
-        let database = ledger_db::testing::TempDatabase::new(1).await;
-        let pool = database.pool();
-        let now = chrono::Utc::now().naive_utc();
+    #[test]
+    fn investment_splits_read_each_column_in_replay_order() {
+        let database = ledger_db::Database::open_in_memory().unwrap();
+        ledger_db::migrate(&database).unwrap();
+        let pool = &database;
+        let now = crate::platform::timestamp();
         for sql in [
             "INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'u', 'h', $1)",
             "INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES (1, 1, 'A', $1, $1)",
@@ -341,12 +332,14 @@ mod tests {
                     (4, 1, 4, NULL, 7, 'split', 0, 0, 0, 2, 1),
                     (5, 1, 1, 2, 7, 'buy', 4000000, 9000000, 1, NULL, NULL)",
         ] {
-            sqlx::query(sql).bind(now).execute(pool).await.unwrap();
+            // The splits name no timestamp.
+            let binds = ledger_db::store::params![now];
+            let binds: &[_] = if sql.contains("$1") { &binds } else { &[] };
+            pool.execute(&sql.replace("$1", "?1"), binds).unwrap();
         }
         let today = crate::validation::local_today();
-        let splits = |account_id, as_of_date| async move {
+        let splits = |account_id, as_of_date| {
             investment_splits(pool, 1, account_id, as_of_date)
-                .await
                 .unwrap()
                 .into_iter()
                 .map(|row| {
@@ -424,18 +417,9 @@ mod tests {
                 ),
             }
         };
-        assert_eq!(
-            splits(None, None).await,
-            [row(2), row(5), row(1), row(4), row(3)]
-        );
-        assert_eq!(
-            splits(Some(1), None).await,
-            [row(2), row(1), row(4), row(3)]
-        );
-        assert_eq!(
-            splits(None, Some("2025-01-31")).await,
-            [row(2), row(5), row(1)]
-        );
+        assert_eq!(splits(None, None), [row(2), row(5), row(1), row(4), row(3)]);
+        assert_eq!(splits(Some(1), None), [row(2), row(1), row(4), row(3)]);
+        assert_eq!(splits(None, Some("2025-01-31")), [row(2), row(5), row(1)]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     mcp::call::{
         Caller, Level, ToolResult, fail, integer, invalid_arguments, ok, thrown, with_query,
-        without,
+        without, write_access,
     },
     routes::investments::MAX_SAFE_INTEGER,
     routes::plaid_sync::{SyncError, sync_token},
@@ -263,8 +263,8 @@ pub(super) async fn sync(
 ) -> ToolResult<CallToolResult> {
     let book_id = integer(arguments, "bookId");
     let token_id = integer(arguments, "tokenId");
-    caller.book(book_id, Level::Write).await?;
-    let book = i32::try_from(book_id).map_err(|cause| thrown(&cause.to_string()))?;
+    let book = caller.book(book_id, Level::Write).await?;
+    let access = write_access(&book)?;
     let Ok(token) = i32::try_from(token_id) else {
         // PostgreSQL refuses the ID in the lock query, as it does for Node.
         return Err(thrown(&format!(
@@ -272,7 +272,7 @@ pub(super) async fn sync(
         ))
         .into());
     };
-    match sync_token(caller.state(), book, token).await {
+    match sync_token(caller.state(), &access, token).await {
         Ok(result) => Ok(ok(&result.to_json())),
         Err(SyncError::Refused(_, message)) => Err(fail(message).into()),
         Err(SyncError::Failed(message)) => Err(thrown(&message).into()),

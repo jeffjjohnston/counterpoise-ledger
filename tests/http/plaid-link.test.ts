@@ -9,6 +9,7 @@ import {
 } from "../helpers/db-utils";
 import { contract } from "../helpers/contract";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { expectSealed } from "../helpers/plaid-tokens";
 import { count, exec, row, rows } from "../helpers/sql";
 
 const sessionSchema = contract<PlaidLinkSession>("PlaidLinkSession");
@@ -264,9 +265,10 @@ describe("Plaid Hosted Link sessions", () => {
     plaid.replies.accounts["access-sandbox-new-secret"] = accounts({ id: "acc-1", name: "Plaid Checking" }, { id: "acc-2", name: "Plaid Saving" });
     const done = await post(check);
     const [token] = await rows<PlaidToken>("SELECT * FROM plaid_tokens");
-    expect(token).toMatchObject({
-      bookId: 1, financialInstitution: "First Platypus Bank", itemId: "item-new", accessToken: "access-sandbox-new-secret",
-    });
+    expect(token).toMatchObject({ bookId: 1, financialInstitution: "First Platypus Bank", itemId: "item-new" });
+    // Only the ciphertext is stored. The account load above used the
+    // plaintext, so the token opens.
+    expectSealed(token, "access-sandbox-new-secret");
     expect(done.session).toMatchObject({
       status: "complete", tokenId: token.id, financialInstitution: "First Platypus Bank", hostedLinkUrl: null, error: null,
     });
@@ -688,7 +690,8 @@ describe("Plaid Hosted Link sessions", () => {
     release();
     const done = await checking;
     const [token] = await rows<PlaidToken>("SELECT * FROM plaid_tokens");
-    expect(token).toMatchObject({ itemId: "item-live", accessToken: "access-live" });
+    expect(token).toMatchObject({ itemId: "item-live" });
+    expectSealed(token, "access-live");
     expect(done.session).toMatchObject({ id: started.session.id, status: "complete", tokenId: token.id });
     expect(await rows("SELECT id, status FROM plaid_link_sessions")).toEqual([{ id: started.session.id, status: "complete" }]);
     expect(paths("/item/public_token/exchange")).toHaveLength(1);
@@ -721,7 +724,9 @@ describe("Plaid Hosted Link sessions", () => {
     // The first exchange gave an access token: the connection is saved.
     release();
     const done = await checking;
-    expect(await rows("SELECT item_id, access_token FROM plaid_tokens")).toEqual([{ itemId: "item-slow", accessToken: "access-slow" }]);
+    const saved = await rows<PlaidToken>("SELECT * FROM plaid_tokens");
+    expect(saved.map(({ itemId }) => itemId)).toEqual(["item-slow"]);
+    expectSealed(saved[0], "access-slow");
     expect(done.session).toMatchObject({ id: started.session.id, status: "expired" });
     expect(await rows("SELECT id, status, result_token_id FROM plaid_link_sessions ORDER BY id")).toEqual([
       { id: started.session.id, status: "expired", resultTokenId: null },

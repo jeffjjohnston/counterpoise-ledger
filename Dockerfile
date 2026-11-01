@@ -5,10 +5,10 @@
 # scheduled jobs and the backups.
 
 # --- Compile the shared Rust core for the browser ---
-FROM rust:1.98 AS wasm-builder
+FROM rust:1.99 AS wasm-builder
 WORKDIR /app
 RUN rustup target add wasm32-unknown-unknown
-RUN cargo install wasm-bindgen-cli --version 0.2.128 --locked
+RUN cargo install wasm-bindgen-cli --version 0.2.129 --locked
 RUN apt-get update && apt-get install -y --no-install-recommends binaryen \
     && rm -rf /var/lib/apt/lists/*
 COPY rust-api ./rust-api
@@ -40,13 +40,12 @@ ENV NEXT_PUBLIC_POSTHOG_HOST=$NEXT_PUBLIC_POSTHOG_HOST
 RUN CORE_WASM_PREBUILT=1 npm run build
 
 # --- Build the server and ledger-cli ---
-FROM rust:1.98-alpine AS builder
+FROM rust:1.99-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY package.json ./package.json
 COPY lib/api-contract.ts ./lib/api-contract.ts
 COPY rust-api ./rust-api
-ENV SQLX_OFFLINE=true
 # Every checkout on a host shares these caches: production, dev and each
 # worktree. A registry crate is fixed by its version and checksum, so sharing
 # it is safe. A workspace crate has the same path in every checkout, and cargo
@@ -57,7 +56,8 @@ ENV SQLX_OFFLINE=true
 RUN --mount=type=cache,id=counterpoise-rust-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=counterpoise-rust-target,target=/app/rust-api/target,sharing=locked \
     cargo clean --release --manifest-path rust-api/Cargo.toml \
-      -p ledger-core -p ledger-db -p counterpoise-rust-api -p ledger-cli && \
+      -p ledger-core -p ledger-db -p ledger-db-derive -p counterpoise-rust-api -p counterpoise-worker \
+      -p ledger-cli && \
     cargo build --release --locked --manifest-path rust-api/Cargo.toml \
       -p counterpoise-rust-api -p ledger-cli && \
     cp rust-api/target/release/counterpoise-rust-api rust-api/target/release/ledger-cli /app/
@@ -69,18 +69,17 @@ FROM alpine:3.24
 # chrono::Local reads TZ from these files. Without them it uses UTC in silence.
 RUN apk add --no-cache tzdata
 # The server runs as uid 1000. /data holds counterpoise.db with its -wal,
-# -shm and lock files; /backups holds the snapshots and the job status
-# records. A new named volume takes this ownership from the image.
+# -shm and lock files; /backups holds the snapshots. A new named volume takes this ownership from the image.
 RUN addgroup -g 1000 counterpoise \
     && adduser -D -H -u 1000 -G counterpoise counterpoise \
-    && mkdir -p /data /backups/status \
+    && mkdir -p /data /backups \
     && chown -R counterpoise:counterpoise /data /backups
 
 COPY --from=builder /app/counterpoise-rust-api /app/ledger-cli /usr/local/bin/
 COPY --from=client /app/build /srv/client
 
 # COUNTERPOISE_SCHEDULER=on: the server runs the scheduled jobs itself
-# (rust-api/server/src/scheduler.rs).
+# (rust-api/server/src/scheduler/mod.rs).
 ENV NODE_ENV=production \
     RUST_BIND=0.0.0.0:4000 \
     DATABASE_PATH=/data/counterpoise.db \

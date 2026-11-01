@@ -87,10 +87,16 @@ function makeItem(
 function stubQueueList(
   items: SyncReconciliationItem[],
   onPost?: (body: unknown) => Promise<Response> | Response,
-  typesafeTarget?: number
+  typesafeTarget?: number,
+  transactions: Record<number, unknown> = {}
 ) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
+
+    const transaction = /^\/api\/b\/1\/transactions\/(\d+)$/.exec(url);
+    if (transaction && transactions[Number(transaction[1])]) {
+      return new Response(JSON.stringify(transactions[Number(transaction[1])]));
+    }
 
     if (url.endsWith("/settings/typesafe")) return new Response(JSON.stringify({ enabled: typesafeTarget !== undefined, configured: true, revision: 1 }));
     if (url.endsWith("/reconcile/suggestion")) return new Response(JSON.stringify({ status: "ready", evaluationId: 123, transactionId: typesafeTarget, revision: 1 }));
@@ -741,6 +747,111 @@ describe("ReconciliationModal", () => {
 
     await screen.findByTestId("queue-item-2");
     expect(queueGets).toBe(2);
+  });
+
+  // A row the bank changed can still be linked to a transaction. Create then
+  // adds a second transaction, so Keep local is the main action and Create
+  // asks first.
+  describe("a changed row that is still linked", () => {
+    const row = baseRow;
+    const linked = makeItem({
+      id: 31,
+      amountCents: 880,
+      reviewReason: "plaid_modified",
+      resolutionStatus: "matched",
+      matchedTransactionId: 701,
+      candidates: [],
+    });
+    const transactions = {
+      701: {
+        id: 701,
+        date: "2026-02-08",
+        description: "D J*WSJ",
+        payee: { id: 4, name: "Wall Street Journal" },
+        splits: [
+          { id: 1, transactionId: 701, accountId: 1, amount: -880, account: { id: 1, name: "Checking" } },
+          { id: 2, transactionId: 701, accountId: 2, amount: 880, account: { id: 2, name: "News" } },
+        ],
+        investmentSplits: [],
+      },
+    };
+
+    it("shows the linked transaction and makes Keep local the main action", async () => {
+      stubQueueList([linked], undefined, undefined, transactions);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      const box = await screen.findByTestId("linked-transaction");
+      await waitFor(() => expect(box).toHaveTextContent("Wall Street Journal"));
+      expect(box).toHaveTextContent("−$8.80");
+
+      const keep = within(screen.getByTestId("resolve-footer")).getByRole("button", { name: /Keep local/ });
+      expect(keep).toHaveClass("bg-accent");
+    });
+
+    it("asks before Create adds a second transaction", async () => {
+      const posts: unknown[] = [];
+      stubQueueList([linked], (body) => {
+        posts.push(body);
+        return new Response(JSON.stringify({ ...linked, reviewReason: null, resolutionStatus: "created", matchedTransactionId: 702 }));
+      }, undefined, transactions);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      await screen.findByTestId("linked-transaction");
+      await flushEffects();
+      await waitFor(() => expect(screen.getByRole("button", { name: "Create" })).toBeEnabled());
+
+      fireEvent.click(screen.getByRole("button", { name: "Create" }));
+      expect(await screen.findByText("Create a second transaction?")).toBeInTheDocument();
+      expect(posts).toEqual([]);
+
+      fireEvent.click(screen.getByRole("button", { name: "Create anyway" }));
+      await waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0]).toMatchObject({ action: "create", reconciliationId: 31, counterAccountId: 2 });
+    });
+
+    it("ignores the queue keys while the confirmation is open", async () => {
+      const posts: Array<{ action: string; reconciliationId: number }> = [];
+      stubQueueList([linked, makeItem({ id: 33, candidates: [] })], (body) => {
+        posts.push(body as { action: string; reconciliationId: number });
+        return new Response(JSON.stringify({ ...linked, reviewReason: null, resolutionStatus: "created", matchedTransactionId: 702 }));
+      }, undefined, transactions);
+      render(
+        <KeyboardShortcutProvider>
+          <ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />
+        </KeyboardShortcutProvider>
+      );
+      await screen.findByTestId("linked-transaction");
+      await flushEffects();
+      await waitFor(() => expect(screen.getByRole("button", { name: "Create" })).toBeEnabled());
+      fireEvent.click(screen.getByRole("button", { name: "Create" }));
+      await screen.findByText("Create a second transaction?");
+      await flushEffects();
+
+      // The selection must not move, and no key may resolve the row behind.
+      fireEvent.keyDown(document, { key: "ArrowDown" });
+      fireEvent.keyDown(document, { key: "i" });
+      fireEvent.keyDown(document, { key: "k" });
+      await flushEffects();
+      expect(posts).toEqual([]);
+      expect(screen.getByTestId("queue-item-31")).toHaveAttribute("aria-current", "true");
+
+      fireEvent.click(screen.getByRole("button", { name: "Create anyway" }));
+      await waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0]).toMatchObject({ action: "create", reconciliationId: 31 });
+    });
+
+    it("does not show the linked box or ask on a row the bank did not change", async () => {
+      const posts: unknown[] = [];
+      stubQueueList([makeItem({ id: 32, candidates: [] })], (body) => {
+        posts.push(body);
+        return new Response(JSON.stringify(makeItem({ id: 32, resolutionStatus: "created", matchedTransactionId: 703 })));
+      });
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      await screen.findByTestId("queue-item-32");
+      await flushEffects();
+      expect(screen.queryByTestId("linked-transaction")).toBeNull();
+      await waitFor(() => expect(screen.getByRole("button", { name: "Create" })).toBeEnabled());
+      fireEvent.click(screen.getByRole("button", { name: "Create" }));
+      await waitFor(() => expect(posts).toHaveLength(1));
+    });
   });
 
   describe("keyboard flow", () => {

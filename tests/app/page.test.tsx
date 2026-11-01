@@ -225,4 +225,74 @@ describe("HomePage", () => {
     // Description should NOT appear as the primary label when payee exists
     expect(screen.queryByText("Monthly groceries")).not.toBeInTheDocument();
   });
+  it("links each recent transaction to the register of its asset or liability account", async () => {
+    // The register without accountId opens the favorite account and drops
+    // highlight, so each link must name an account.
+    const transactionsPayload = [
+      {
+        id: 20,
+        date: "2026-03-03",
+        description: "Card purchase",
+        payeeId: null,
+        payee: null,
+        splits: [
+          { id: 5, amount: 2500, account: { id: 4, name: "Groceries", type: "expense" } },
+          { id: 6, amount: -2500, account: { id: 7, name: "Visa", type: "liability" } },
+        ],
+        investmentSplits: [],
+      },
+      {
+        id: 21,
+        date: "2026-03-04",
+        description: "Transfer to savings",
+        payeeId: null,
+        payee: null,
+        splits: [
+          { id: 7, amount: -1000, account: { id: 3, name: "Checking", type: "asset" } },
+          { id: 8, amount: 1000, account: { id: 8, name: "Savings", type: "asset" } },
+        ],
+        investmentSplits: [],
+      },
+      {
+        id: 22,
+        date: "2026-03-05",
+        description: "Opening entry",
+        payeeId: null,
+        payee: null,
+        splits: [
+          { id: 9, amount: 500, account: { id: 4, name: "Groceries", type: "expense" } },
+          { id: 10, amount: -500, account: { id: 9, name: "Salary", type: "income" } },
+        ],
+        investmentSplits: [],
+      },
+    ];
+
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return { ok: true, json: async () => transactionsPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/investments/account-values")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }));
+
+    render(<HomePage />);
+
+    const card = await screen.findByText("Card purchase");
+    expect(card.closest("a")).toHaveAttribute("href", "/b/1/transactions?accountId=7&highlight=20");
+    expect(screen.getByText("Transfer to savings").closest("a")).toHaveAttribute(
+      "href",
+      "/b/1/transactions?accountId=3&highlight=21"
+    );
+    // No asset or liability split: the first split's account has a register too.
+    expect(screen.getByText("Opening entry").closest("a")).toHaveAttribute(
+      "href",
+      "/b/1/transactions?accountId=4&highlight=22"
+    );
+  });
 });

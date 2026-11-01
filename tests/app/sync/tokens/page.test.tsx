@@ -491,7 +491,7 @@ describe("SyncTokensPage", () => {
   });
 
   it("offers a retry when the Plaid account refresh fails", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url === "/api/b/1/sync/tokens") {
         return {
@@ -518,7 +518,7 @@ describe("SyncTokensPage", () => {
         } as Response;
       }
 
-      if (url === "/api/b/1/sync/tokens/1/accounts?refresh=true") {
+      if (url === "/api/b/1/sync/tokens/1/accounts/refresh" && init?.method === "POST") {
         return {
           ok: false,
           status: 500,
@@ -570,7 +570,7 @@ describe("SyncTokensPage", () => {
         } as Response;
       }
 
-      if (url === "/api/b/1/sync/tokens/1/accounts?refresh=true") {
+      if (url === "/api/b/1/sync/tokens/1/accounts/refresh" && init?.method === "POST") {
         return {
           ok: true,
           json: async () => [
@@ -644,7 +644,7 @@ describe("SyncTokensPage", () => {
     // The row's "N of M accounts mapped" is the branch's headline unblocking
     // fix. It was computed once at page load and never re-read, so the two
     // operations that change it both left it reporting the state before the
-    // fix: the ?refresh=true load (which upserts plaidAccounts server-side)
+    // fix: the refresh load (which upserts plaidAccounts server-side)
     // and the save itself.
     const tokenPages = [
       { mappedAccountCount: 0, totalAccountCount: 0 },
@@ -680,7 +680,7 @@ describe("SyncTokensPage", () => {
         return { ok: true, json: async () => accountsPayload } as Response;
       }
 
-      if (url === "/api/b/1/sync/tokens/1/accounts?refresh=true") {
+      if (url === "/api/b/1/sync/tokens/1/accounts/refresh" && init?.method === "POST") {
         return {
           ok: true,
           json: async () => [

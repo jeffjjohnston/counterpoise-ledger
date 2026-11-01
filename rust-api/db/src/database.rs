@@ -1,16 +1,12 @@
-//! Opening the database file: pragmas, SQL functions, the file lock of the
-//! server, and the embedded migrations.
+//! The database file: its pragma values, the file lock of the server, and
+//! the safe publication of a new file. `engine.rs` opens it; the migrations
+//! are in `migrations.rs`.
 
-use crate::{engine::DbPool, functions};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     time::Duration,
 };
-
-/// The schema migrations, embedded in each binary from `rust-api/db/migrations`.
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// How long a writer waits for another writer before SQLite reports
 /// `SQLITE_BUSY`.
@@ -28,50 +24,6 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// of the file, and not the size of the file for each connection. A file that
 /// is larger than the map is read without the map after this limit.
 pub const MMAP_SIZE: i64 = 256 * 1024 * 1024;
-
-/// What a caller of [`open`] wants.
-pub struct Open<'a> {
-    pub path: &'a Path,
-    pub max_connections: u32,
-    /// Create the file when it is missing. Only a process that then applies
-    /// the migrations should create it.
-    pub create: bool,
-}
-
-/// Opens a pool on the database file. Each connection uses WAL, foreign keys,
-/// a busy timeout of five seconds, `synchronous=FULL` and a memory map of
-/// [`MMAP_SIZE`], and registers the SQL functions of [`functions`]. The pool
-/// connects lazily.
-///
-/// `synchronous=FULL`: each commit syncs the WAL to the disk before it
-/// returns. With `NORMAL`, a commit that returned can be lost when the power
-/// fails or the machine stops. This is a ledger: a lost commit is a lost
-/// transaction, so the cost of one sync for each commit is correct.
-pub fn open(open: Open<'_>) -> Result<DbPool, sqlx::Error> {
-    let options = SqliteConnectOptions::new()
-        .filename(open.path)
-        .create_if_missing(open.create)
-        .journal_mode(SqliteJournalMode::Wal)
-        .foreign_keys(true)
-        .busy_timeout(BUSY_TIMEOUT)
-        .synchronous(SqliteSynchronous::Full)
-        .pragma("mmap_size", MMAP_SIZE.to_string());
-    Ok(SqlitePoolOptions::new()
-        .max_connections(open.max_connections)
-        .after_connect(|connection, _| {
-            Box::pin(async move {
-                let mut handle = connection.lock_handle().await?;
-                functions::register(handle.as_raw_handle())?;
-                Ok(())
-            })
-        })
-        .connect_lazy_with(options))
-}
-
-/// Applies the migrations that the file does not have yet.
-pub async fn migrate(pool: &DbPool) -> Result<(), sqlx::migrate::MigrateError> {
-    MIGRATOR.run(pool).await
-}
 
 /// The lock that keeps a second server off the same database file. It holds
 /// while the value lives.
@@ -155,24 +107,24 @@ pub(crate) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use crate::store::{Database, Error, Sql, params};
     use crate::testing::TempDatabase;
-    use chrono::Local;
 
-    /// Every pooled connection gets the pragmas and the SQL functions, not
-    /// only the first one.
     /// The migration starts the transaction change log with a floor marker
     /// (book 0) at the current time in microseconds. A restore of a snapshot
     /// from before the migration runs it again with a larger time.
-    #[tokio::test]
-    async fn the_change_log_starts_at_a_floor_of_the_current_time() {
+    #[test]
+    fn the_change_log_starts_at_a_floor_of_the_current_time() {
         let before = chrono::Utc::now().timestamp() * 1_000_000;
-        let database = TempDatabase::new(1).await;
+        let database = TempDatabase::new();
         let after = chrono::Utc::now().timestamp() * 1_000_000;
-        let rows: Vec<(i64, i64, i64)> =
-            sqlx::query_as("SELECT seq, book_id, transaction_id FROM transaction_changes")
-                .fetch_all(database.pool())
-                .await
-                .unwrap();
+        let rows: Vec<(i64, i64, i64)> = database
+            .database()
+            .query(
+                "SELECT seq, book_id, transaction_id FROM transaction_changes",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         let (seq, book_id, transaction_id) = rows[0];
         assert_eq!((book_id, transaction_id), (0, 0));
@@ -182,109 +134,96 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn every_pooled_connection_has_the_pragmas_and_the_functions() {
-        let database = TempDatabase::new(4).await;
-        let mut held = Vec::new();
-        for _ in 0..4 {
-            held.push(database.pool().acquire().await.unwrap());
-        }
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        for connection in &mut held {
-            let pragmas: (i64, String, i64, i64) = sqlx::query_as(
-                "SELECT (SELECT foreign_keys FROM pragma_foreign_keys),
-                        (SELECT journal_mode FROM pragma_journal_mode),
-                        (SELECT timeout FROM pragma_busy_timeout),
-                        (SELECT synchronous FROM pragma_synchronous)",
-            )
-            .fetch_one(&mut **connection)
-            .await
+    /// No app function is registered: lower() and LIKE are SQLite's own, as
+    /// on a Durable Object.
+    #[test]
+    fn a_connection_has_only_the_builtin_functions() {
+        let file = TempDatabase::new();
+        let builtins: (String, i64) = file
+            .database()
+            .query_row("SELECT lower('ÉCLAIR'), 'A' LIKE 'a' ESCAPE '\\'", &[])
             .unwrap();
-            // synchronous: 2 is FULL. NORMAL (1) can lose a commit on power loss.
-            assert_eq!(pragmas, (1, "wal".to_owned(), 5000, 2));
-            // `PRAGMA mmap_size` has no table-valued form.
-            let mmap_size: i64 = sqlx::query_scalar("PRAGMA mmap_size")
-                .fetch_one(&mut **connection)
-                .await
-                .unwrap();
-            assert_eq!(mmap_size, super::MMAP_SIZE);
-            let functions: (String, i64, i64, i64, String, String) = sqlx::query_as(
-                "SELECT lower('ÉCLAIR Straße'), 'A' LIKE 'a', '50% off' LIKE '50\\%%',
-                        '500 off' LIKE '50\\%%', cp_today(),
-                        cp_merchant_key(NULL, '  Blue\u{2019}s   CAFE ')",
-            )
-            .fetch_one(&mut **connection)
-            .await
+        assert_eq!(builtins, ("Éclair".to_owned(), 1));
+    }
+
+    /// The bulk form that stays under the limit of 100 parameters: 2,000
+    /// rows from one parameter, in order.
+    #[test]
+    fn json_rows_inserts_any_number_of_rows_from_one_parameter() {
+        let file = TempDatabase::new();
+        let database = file.database();
+        database
+            .exec_batch("CREATE TABLE bulk (id INTEGER PRIMARY KEY, n INTEGER, t TEXT, z TEXT)")
             .unwrap();
-            assert_eq!(
-                functions,
-                (
-                    "éclair straße".to_owned(),
-                    0,
-                    1,
-                    0,
-                    today.clone(),
-                    "blue's cafe".to_owned()
-                )
-            );
+        let rows: Vec<(i64, String, Option<String>)> = (0..2_000)
+            .map(|n| (n * 9_007_199_254, format!("row {n}"), None))
+            .collect();
+        database
+            .execute(
+                &format!(
+                    "INSERT INTO bulk (n, t, z) {}",
+                    crate::sql::json_rows(&["#0", "#1", "#2"], "?1")
+                ),
+                &params![crate::sql::json_array(&rows)],
+            )
+            .unwrap();
+        let stored: Vec<(i64, i64, String, Option<String>)> = database
+            .query("SELECT id, n, t, z FROM bulk ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(stored.len(), 2_000);
+        for (index, (id, n, t, z)) in stored.into_iter().enumerate() {
+            assert_eq!(id, index as i64 + 1);
+            assert_eq!((n, t, z), (rows[index].0, rows[index].1.clone(), None));
         }
     }
 
-    /// Writers from many tasks at once: each opens `BEGIN IMMEDIATE`, waits
-    /// for the others, and none fails with `SQLITE_BUSY`.
-    #[tokio::test]
-    async fn parallel_write_transactions_all_commit() {
-        let database = TempDatabase::new(8).await;
-        let pool = database.pool().clone();
+    /// Writers on many connections at once, as the server, the MCP stdio
+    /// process and `ledger-cli` are: each opens `BEGIN IMMEDIATE`, waits for
+    /// the others, and none fails with `SQLITE_BUSY`.
+    #[test]
+    fn parallel_write_transactions_all_commit() {
+        let file = TempDatabase::new();
         let now = chrono::Utc::now().naive_utc();
-        sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'u', 'h', $1)",
-        )
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES (1, 1, 'B', $1, $1)",
-        )
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let writers: Vec<_> = (0..32)
-            .map(|index| {
-                let pool = pool.clone();
-                tokio::spawn(async move {
-                    let mut transaction = crate::locks::begin_pool(&pool).await?;
-                    // A read, then a write that depends on it: the pattern
-                    // that fails with SQLITE_BUSY under a deferred BEGIN.
-                    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payees")
-                        .fetch_one(transaction.as_mut())
-                        .await?;
-                    sqlx::query(
-                        "INSERT INTO payees (book_id, name, created_at) VALUES (1, $1, $2)",
-                    )
-                    .bind(format!("Payee {index} after {count}"))
-                    .bind(now)
-                    .execute(transaction.as_mut())
-                    .await?;
-                    tokio::task::yield_now().await;
-                    transaction.commit().await?;
-                    Ok::<_, sqlx::Error>(())
+        file.database()
+            .exec_batch(
+                "INSERT INTO users (id, username, password_hash, created_at)
+                   VALUES (1, 'u', 'h', '2026-01-01 00:00:00');
+                 INSERT INTO books (id, user_id, name, created_at, updated_at)
+                   VALUES (1, 1, 'B', '2026-01-01 00:00:00', '2026-01-01 00:00:00');",
+            )
+            .unwrap();
+        let writers: Vec<_> = (0..8)
+            .map(|thread| {
+                let path = file.path().to_owned();
+                std::thread::spawn(move || {
+                    let database = Database::open(&path, false)?;
+                    for index in 0..4 {
+                        database.transaction(|tx| {
+                            // A read, then a write that depends on it: the
+                            // pattern that fails with SQLITE_BUSY under a
+                            // deferred BEGIN.
+                            let count: i64 = tx.query_row("SELECT COUNT(*) FROM payees", &[])?;
+                            std::thread::yield_now();
+                            tx.execute(
+                                "INSERT INTO payees (book_id, name, created_at) VALUES (1, ?1, ?2)",
+                                &params![format!("Payee {thread}.{index} after {count}"), now],
+                            )
+                        })?;
+                    }
+                    Ok::<_, Error>(())
                 })
             })
             .collect();
         for writer in writers {
-            writer.await.unwrap().unwrap();
+            writer.join().unwrap().unwrap();
         }
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payees")
-            .fetch_one(&pool)
-            .await
+        let database = file.database();
+        let count: i64 = database
+            .query_row("SELECT COUNT(*) FROM payees", &[])
             .unwrap();
         assert_eq!(count, 32);
-        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
-            .fetch_one(&pool)
-            .await
+        let violations: i64 = database
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", &[])
             .unwrap();
         assert_eq!(violations, 0);
     }

@@ -6,13 +6,15 @@ server must be PID 1 so /proc/1/status reports its RSS.
 """
 
 import argparse
+import base64
 import json
 import math
 import os
+import socket
 import subprocess
 import time
 from http.cookies import SimpleCookie
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, build_opener
 
 
@@ -41,22 +43,47 @@ def get(opener, url):
     return (time.perf_counter_ns() - start) / 1_000_000
 
 
-def open_sse(opener, url):
+def open_socket(url, cookie):
+    """Opens the book socket over plain HTTP and reads its `ready` message."""
     start = time.perf_counter_ns()
-    response = opener.open(Request(url, headers={"Accept": "text/event-stream"}), timeout=30)
+    parts = urlsplit(url)
+    if parts.scheme != "http":
+        raise RuntimeError(f"{url}: the benchmark opens sockets over plain HTTP only")
+    connection = socket.create_connection((parts.hostname, parts.port or 80), timeout=30)
+    reader = connection.makefile("rb")
     try:
-        if response.status != 200 or response.headers.get_content_type() != "text/event-stream":
-            raise RuntimeError(f"{url}: unexpected SSE response: {response.status}")
-        while True:
-            line = response.readline()
-            if not line:
-                raise RuntimeError("SSE closed before ready event")
-            if line == b"event: ready\n":
-                break
+        key = base64.b64encode(os.urandom(16)).decode()
+        connection.sendall((
+            f"GET {parts.path} HTTP/1.1\r\nHost: {parts.netloc}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+            f"Cookie: {cookie}\r\n\r\n"
+        ).encode())
+        status = reader.readline()
+        if b" 101 " not in status:
+            raise RuntimeError(f"{url}: unexpected socket response: {status!r}")
+        while reader.readline() not in (b"\r\n", b""):
+            pass
+        # The server's frames are not masked. `ready` is one short text frame.
+        first, second = reader.read(2)
+        length = second & 0x7F
+        if length == 126:
+            length = int.from_bytes(reader.read(2), "big")
+        elif length == 127:
+            length = int.from_bytes(reader.read(8), "big")
+        message = json.loads(reader.read(length))
+        if first & 0x0F != 1 or message.get("type") != "ready":
+            raise RuntimeError(f"{url}: the first message is not ready: {message!r}")
     except Exception:
-        response.close()
+        reader.close()
+        connection.close()
         raise
-    return (time.perf_counter_ns() - start) / 1_000_000, response
+    return (time.perf_counter_ns() - start) / 1_000_000, (reader, connection)
+
+
+def close_socket(stream):
+    reader, connection = stream
+    reader.close()
+    connection.close()
 
 
 def main():
@@ -67,11 +94,11 @@ def main():
     parser.add_argument("--account-id", type=int, required=True)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--sse-connections", type=int, default=10)
+    parser.add_argument("--socket-connections", type=int, default=10)
     parser.add_argument("--idle-seconds", type=int, default=30)
     args = parser.parse_args()
-    if min(args.samples, args.sse_connections) < 1 or min(args.warmup, args.idle_seconds) < 0:
-        parser.error("samples and sse-connections must be positive; warmup and idle-seconds cannot be negative")
+    if min(args.samples, args.socket_connections) < 1 or min(args.warmup, args.idle_seconds) < 0:
+        parser.error("samples and socket-connections must be positive; warmup and idle-seconds cannot be negative")
 
     opener = build_opener()
     credentials = json.dumps({
@@ -91,7 +118,8 @@ def main():
             raise RuntimeError("login did not set a session cookie")
         # Production sets Secure even on localhost HTTP. Python's cookie jar
         # rejects that cookie, unlike browsers' localhost exception.
-        opener.addheaders = [("Cookie", f"counterpoise_session={cookies['counterpoise_session'].value}")]
+        cookie = f"counterpoise_session={cookies['counterpoise_session'].value}"
+        opener.addheaders = [("Cookie", cookie)]
         response.read()
 
     base = f"{args.base_url}/api/b/{args.book_id}"
@@ -113,30 +141,30 @@ def main():
             "rss_kib": process_kib(args.container),
         }
 
-    sse_url = f"{base}/events"
+    socket_url = f"{base}/socket"
     for _ in range(args.warmup):
-        _, stream = open_sse(opener, sse_url)
-        stream.close()
+        _, stream = open_socket(socket_url, cookie)
+        close_socket(stream)
     values = []
     for _ in range(args.samples):
-        elapsed, stream = open_sse(opener, sse_url)
+        elapsed, stream = open_socket(socket_url, cookie)
         values.append(elapsed)
-        stream.close()
-    result["routes"]["sse_ready"] = {
+        close_socket(stream)
+    result["routes"]["socket_ready"] = {
         "p50_ms": round(percentile(values, 0.5), 2),
         "p95_ms": round(percentile(values, 0.95), 2),
         "rss_kib": process_kib(args.container),
     }
     streams = []
     try:
-        for _ in range(args.sse_connections):
-            _, stream = open_sse(opener, sse_url)
+        for _ in range(args.socket_connections):
+            _, stream = open_socket(socket_url, cookie)
             streams.append(stream)
         time.sleep(args.idle_seconds)
-        result["rss_kib"]["sse_idle"] = process_kib(args.container)
+        result["rss_kib"]["socket_idle"] = process_kib(args.container)
     finally:
         for stream in streams:
-            stream.close()
+            close_socket(stream)
     result["rss_kib"]["after"] = process_kib(args.container)
     result["rss_kib"]["peak"] = process_kib(args.container, "VmHWM")
     print(json.dumps(result, indent=2))

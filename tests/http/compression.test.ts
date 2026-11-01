@@ -4,9 +4,8 @@ import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 /**
  * Response compression (rust-api/server/src/compression.rs), sent to the real
- * binary. The unit tests in that file hold the rules. These cases prove that
- * `serve()` puts the layer around the routes, and that the real book change
- * stream goes out with no encoding.
+ * binary. The unit tests in that file hold the rules. This case proves that
+ * `serve()` puts the layer around the routes.
  *
  * `fetch` removes the encoding from the body, but it keeps the
  * `Content-Encoding` header, so the header tells what the server sent.
@@ -45,26 +44,6 @@ describe("response compression HTTP parity", () => {
       expect(response.headers.get("vary"), accept).toBe("accept-encoding");
       expect(response.headers.get("content-length"), accept).toBeNull();
       expect(await response.text(), accept).toBe(text);
-    }
-  });
-
-  it("never compresses the book change stream", async () => {
-    const response = await client.request("/api/b/1/events", {
-      headers: { "accept-encoding": "gzip, deflate, br, zstd" },
-    });
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toBe("text/event-stream");
-    expect(response.headers.get("content-encoding")).toBeNull();
-    const reader = response.body!.getReader();
-    try {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const chunk = await Promise.race([
-        reader.read(),
-        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("No SSE frame within 5 s")), 5000); }),
-      ]).finally(() => clearTimeout(timer));
-      expect(new TextDecoder().decode(chunk.value)).toBe("event: ready\ndata: {}\n\n");
-    } finally {
-      await reader.cancel();
     }
   });
 });

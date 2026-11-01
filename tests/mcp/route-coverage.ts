@@ -84,13 +84,17 @@ export const ROUTE_TOOLS: Record<string, string[]> = {
   "GET /b/[bookId]/sync/accounts/[id]/reconcile": ["get_reconcile_candidates"],
   "GET /b/[bookId]/sync/reconcile": ["get_reconcile_candidates"],
   "POST /b/[bookId]/sync/accounts/[id]/reconcile": ["reconcile_plaid_transaction"],
+  "GET /b/[bookId]/weekly-review": ["get_weekly_review"],
 };
 
 export const ROUTE_WAIVERS: Record<string, string> = {
   "GET /books/demo/datasets": "The create_demo_book schema lists the same dataset IDs, and a Rust test keeps them equal. The names and descriptions are for the books page.",
   "GET /b/[bookId]/reports/net-worth-history": "Dashboard chart series. No tool yet, decided 2026-10-02 when the route was added for the dashboard chart.",
   "GET /b/[bookId]/accounts/[id]/balance-history": "Register chart series of month-end points; get_account_balance_history gives the entries. Decided 2026-10-07.",
-  "GET /b/[bookId]/events": "Browser-only SSE invalidation transport authenticated by session cookie. MCP writes already trigger the same database notifications; stdio tools return finite results and do not subscribe to browser view invalidations.",
+  "GET /b/[bookId]/socket": "The live-update invalidation hints, for the web client and native clients. MCP writes already trigger the same hints; an MCP tool returns a finite result and does not subscribe to view invalidations.",
+  "GET /b/[bookId]/payees/[id]/entry-patterns": "Form helper for the manual entry fill; MCP clients write whole transactions. Decided 2026-10-12.",
+  "POST /b/[bookId]/entry-suggestion": "A TypeSafe call for the browser entry form; the MCP tools do not call TypeSafe. Decided 2026-10-12.",
+  "POST /b/[bookId]/entry-suggestion/outcome": "The browser's record of the user's choice in the entry form; not an MCP capability. Decided 2026-10-12.",
   "GET /b/[bookId]/settings/typesafe": "Web experiment controls; MCP does not participate in this opt-in UI pilot.",
   "PATCH /b/[bookId]/settings/typesafe": "Explicit human opt-in to external transaction processing; not delegated to MCP.",
   "DELETE /b/[bookId]/settings/typesafe": "Web-only experiment-data clearing with an explicit Settings confirmation.",
@@ -98,6 +102,13 @@ export const ROUTE_WAIVERS: Record<string, string> = {
   "PATCH /b/[bookId]/sync/accounts/[id]/reconcile/suggestion": "Records actual UI display; a machine call cannot establish human exposure.",
   "PUT /b/[bookId]/sync/accounts/[id]/reconcile/suggestion": "Explicit human suggestion confirmation; MCP already has deterministic reconciliation.",
   "GET /cron/typesafe-cleanup": "CRON_SECRET machine endpoint for experiment retention, not a user capability.",
+  "GET /b/[bookId]/settings/weekly-review": "Opt-in control of the weekly review; a person turns it on in book settings. Decided 2026-10-12.",
+  "PATCH /b/[bookId]/settings/weekly-review": "Explicit human opt-in to sending the book's week to Anthropic; not delegated to MCP.",
+  "DELETE /b/[bookId]/settings/weekly-review": "Web-only clearing of the reviews with an explicit Settings confirmation.",
+  "POST /b/[bookId]/weekly-review/run": "A paid external AI call; an AI client must not start it. Decided 2026-10-12.",
+  "POST /b/[bookId]/weekly-review/items/[id]/dismiss": "Dismissal is the user's judgment in the dashboard card.",
+  "POST /b/[bookId]/weekly-review/items/[id]/restore": "Undo of a dismissal in the dashboard card.",
+  "GET /cron/weekly-review": "CRON_SECRET machine endpoint for the scheduled job, not a user capability.",
   // Permanent — excluded by the 2026-08-23 parity design.
   "POST /auth/login": "Session auth. MCP authenticates with an API key.",
   "POST /auth/logout": "Session auth. MCP authenticates with an API key.",
@@ -118,6 +129,11 @@ export const ROUTE_WAIVERS: Record<string, string> = {
     "produce, so there is no legitimate way for an MCP caller to supply one — a tool that " +
     "accepted a caller-supplied credential here would be a way to write an arbitrary token into " +
     "the database.",
+  "POST /b/[bookId]/sync/tokens/[id]/accounts/refresh":
+    "Calls Plaid with the stored token and deletes the mappings of accounts that Plaid no " +
+    "longer reports, with their staged transactions. The Sync page runs it when the owner " +
+    "opens the mapping dialog. list_plaid_token_accounts reads only local data. Decided " +
+    "2026-10-30, when the refresh moved from a GET flag to this route.",
   "POST /b/[bookId]/sync/link-sessions":
     "Plaid Hosted Link. The owner signs in at the bank in a browser tab, so a machine caller " +
     "cannot finish the session. Decided 2026-10-09 when the route was added.",

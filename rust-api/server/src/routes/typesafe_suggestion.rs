@@ -9,9 +9,11 @@
 //! snapshot proves, at display and at confirmation, that nothing it read has
 //! changed.
 
+use crate::platform;
 use crate::typesafe::read_json_column;
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
+    book_scope::{BookAccess, Write},
     error::{ApiError, error, error_owned},
     routes::{
         payees::normalize_name,
@@ -36,12 +38,12 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{Days, Local, NaiveDateTime, TimeDelta};
-use ledger_db::engine::{DbConnection, DbExecutor, DbPool};
+use chrono::{Days, NaiveDateTime, TimeDelta};
+use ledger_db::Database;
 use ledger_db::locks::{FOR_SHARE, FOR_UPDATE};
-use ledger_db::sql::{self, MERCHANT_KEY};
+use ledger_db::sql::{in_integers, json, json_array, today_literal};
+use ledger_db::store::{self, Sql, Transaction, params};
 use serde_json::{Map, Value, json};
-use sqlx::FromRow;
 
 const LEASE: TimeDelta = TimeDelta::seconds(30);
 const RETRY: TimeDelta = TimeDelta::seconds(60);
@@ -62,8 +64,8 @@ enum Failure {
     Unavailable,
 }
 
-impl From<sqlx::Error> for Failure {
-    fn from(_: sqlx::Error) -> Self {
+impl From<store::Error> for Failure {
+    fn from(_: store::Error) -> Self {
         Self::Unavailable
     }
 }
@@ -112,25 +114,23 @@ fn stale(message: &'static str) -> Failure {
 }
 
 /// `lockTypeSafeBook`: the enabled flag and revision, under the row lock.
-async fn lock_book(connection: &mut DbConnection, book_id: i32) -> Result<(bool, i32)> {
-    let book: Option<(bool, i32)> = sqlx::query_as(&format!(
-        "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books
-         WHERE id = $1{FOR_UPDATE}"
-    ))
-    .bind(book_id)
-    .fetch_optional(&mut *connection)
-    .await?;
+fn lock_book(sql: &impl Sql, book_id: i32) -> Result<(bool, i32)> {
+    let book: Option<(bool, i32)> = sql.query_optional(
+        &format!(
+            "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books
+         WHERE id = ?1{FOR_UPDATE}"
+        ),
+        &params![book_id],
+    )?;
     book.ok_or(Failure::Request(StatusCode::NOT_FOUND, "Book not found"))
 }
 
 /// `getTypeSafeSettings`: enabled and revision, without a lock.
-async fn settings<'e, E: DbExecutor<'e>>(executor: E, book_id: i32) -> Result<(bool, i32)> {
-    let book: Option<(bool, i32)> = sqlx::query_as(
-        "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books WHERE id = $1",
-    )
-    .bind(book_id)
-    .fetch_optional(executor)
-    .await?;
+fn settings(sql: &impl Sql, book_id: i32) -> Result<(bool, i32)> {
+    let book: Option<(bool, i32)> = sql.query_optional(
+        "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books WHERE id = ?1",
+        &params![book_id],
+    )?;
     book.ok_or(Failure::Request(StatusCode::NOT_FOUND, "Book not found"))
 }
 
@@ -141,33 +141,29 @@ fn merchant_key(row: &crate::routes::reconcile::ReconRow) -> String {
 /// `snapshot`: everything the request reads, in the key order of the Node
 /// object literal, so that its fingerprint is the Node fingerprint. `None`
 /// means that no request applies.
-async fn snapshot(
-    connection: &mut DbConnection,
+fn snapshot(
+    sql: &impl Sql,
     book_id: i32,
     link_id: i64,
     reconciliation_id: i64,
 ) -> Result<Option<Value>> {
-    let (enabled, revision) = settings(&mut *connection, book_id).await?;
+    let (enabled, revision) = settings(sql, book_id)?;
     if !enabled || !is_configured() {
         return Ok(None);
     }
-    let link = reconcilable_link(&mut *connection, book_id, column(link_id)?).await?;
-    let token: Option<bool> = sqlx::query_scalar(
+    let link = reconcilable_link(sql, book_id, column(link_id)?)?;
+    let token: Option<bool> = sql.query_optional(
         "SELECT t.is_demo FROM plaid_accounts pa JOIN plaid_tokens t ON t.id = pa.token_id
-         WHERE pa.id = $1 AND pa.book_id = $2 AND t.book_id = $2",
-    )
-    .bind(link.link_id)
-    .bind(book_id)
-    .fetch_optional(&mut *connection)
-    .await?;
+         WHERE pa.id = ?1 AND pa.book_id = ?2 AND t.book_id = ?2",
+        &params![link.link_id, book_id],
+    )?;
     let row = load_row(
-        connection,
+        sql,
         link.link_id,
         column(reconciliation_id)?,
         book_id,
         false,
-    )
-    .await?
+    )?
     .ok_or(Failure::Request(
         StatusCode::NOT_FOUND,
         "Reconciliation row not found",
@@ -183,23 +179,18 @@ async fn snapshot(
     {
         return Ok(None);
     }
-    let currency: Option<String> = sqlx::query_scalar(
-        "SELECT iso_currency_code FROM plaid_transaction_reconciliation WHERE id = $1",
-    )
-    .bind(row.id)
-    .fetch_one(&mut *connection)
-    .await?;
-    let candidates = match_candidates(connection, &row, link.account_id).await?;
+    let currency: Option<String> = sql.query_row(
+        "SELECT iso_currency_code FROM plaid_transaction_reconciliation WHERE id = ?1",
+        &params![row.id],
+    )?;
+    let candidates = match_candidates(sql, &row, link.account_id)?;
     let key = merchant_key(&row);
-    let seen_before: Option<i32> = sqlx::query_scalar(&format!(
+    let seen_before: Option<i32> = sql.query_optional(
         "SELECT r.id FROM plaid_transaction_reconciliation r
-         WHERE r.book_id = $1 AND r.resolution_status = 'matched' AND {MERCHANT_KEY} = $2
-         LIMIT 1"
-    ))
-    .bind(book_id)
-    .bind(&key)
-    .fetch_optional(&mut *connection)
-    .await?;
+         WHERE r.book_id = ?1 AND r.resolution_status = 'matched' AND r.merchant_key = ?2
+         LIMIT 1",
+        &params![book_id, &key],
+    )?;
     let candidate_id = |candidate: &Value| {
         property(Some(candidate), "transactionId")
             .and_then(Value::as_i64)
@@ -210,19 +201,19 @@ async fn snapshot(
     let totals: Vec<(i32, i64)> = if candidates.is_empty() {
         Vec::new()
     } else {
-        sqlx::query_as(&format!(
-            "SELECT transaction_id, CAST(sum(amount) AS bigint) FROM transaction_splits
-             WHERE book_id = $1 AND account_id = $2 AND transaction_id {}
+        sql.query(
+            &format!(
+                "SELECT transaction_id, CAST(sum(amount) AS bigint) FROM transaction_splits
+             WHERE book_id = ?1 AND account_id = ?2 AND transaction_id {}
              GROUP BY transaction_id",
-            sql::in_integers("$3")
-        ))
-        .bind(book_id)
-        .bind(link.account_id)
-        .bind(sql::json_array(
-            &candidates.iter().map(candidate_id).collect::<Vec<_>>(),
-        ))
-        .fetch_all(&mut *connection)
-        .await?
+                in_integers("?3")
+            ),
+            &params![
+                book_id,
+                link.account_id,
+                json_array(&candidates.iter().map(candidate_id).collect::<Vec<_>>(),)
+            ],
+        )?
     };
     let expected = -i64::from(row.amount_cents);
     let eligible: Vec<&Value> = candidates
@@ -240,86 +231,71 @@ async fn snapshot(
     let counterparts: Vec<(i32, String, String)> = if eligible.is_empty() {
         Vec::new()
     } else {
-        sqlx::query_as(&format!(
-            "SELECT DISTINCT s.transaction_id, a.name, a.type
+        sql.query(
+            &format!(
+                "SELECT DISTINCT s.transaction_id, a.name, a.type
              FROM transaction_splits s
-             JOIN transactions t ON t.id = s.transaction_id AND t.book_id = $1
-             JOIN accounts a ON a.id = s.account_id AND a.book_id = $1
-             WHERE s.book_id = $1 AND s.transaction_id {}
+             JOIN transactions t ON t.id = s.transaction_id AND t.book_id = ?1
+             JOIN accounts a ON a.id = s.account_id AND a.book_id = ?1
+             WHERE s.book_id = ?1 AND s.transaction_id {}
                AND a.type IN ('income', 'expense')",
-            sql::in_integers("$2")
-        ))
-        .bind(book_id)
-        .bind(sql::json_array(
-            &eligible.iter().map(|c| candidate_id(c)).collect::<Vec<_>>(),
-        ))
-        .fetch_all(&mut *connection)
-        .await?
+                in_integers("?2")
+            ),
+            &params![
+                book_id,
+                json_array(&eligible.iter().map(|c| candidate_id(c)).collect::<Vec<_>>(),)
+            ],
+        )?
     };
-    let day: String = sqlx::query_scalar(concat!(
-        "SELECT ",
-        ledger_db::today!(),
-        " FROM books WHERE id = $1"
-    ))
-    .bind(book_id)
-    .fetch_one(&mut *connection)
-    .await?;
+    let day: String = sql.query_row(
+        &format!("SELECT {} FROM books WHERE id = ?1", today_literal()),
+        &params![book_id],
+    )?;
     // The payee that earlier resolved rows for this merchant used most.
-    let merchant_payee: Option<(i32, String)> = sqlx::query_as(&format!(
+    let merchant_payee: Option<(i32, String)> = sql.query_optional(
         "SELECT p.id, p.name FROM plaid_transaction_reconciliation r
          JOIN transactions t ON t.id = r.matched_transaction_id
          JOIN payees p ON p.id = t.payee_id
-         WHERE r.book_id = $1 AND t.book_id = $1
-           AND r.resolution_status IN ('matched', 'created') AND {MERCHANT_KEY} = $2
-         GROUP BY p.id, p.name ORDER BY count(*) DESC, p.id LIMIT 1"
-    ))
-    .bind(book_id)
-    .bind(&key)
-    .fetch_optional(&mut *connection)
-    .await?;
+         WHERE r.book_id = ?1 AND t.book_id = ?1
+           AND r.resolution_status IN ('matched', 'created') AND r.merchant_key = ?2
+         GROUP BY p.id, p.name ORDER BY count(*) DESC, p.id LIMIT 1",
+        &params![book_id, &key],
+    )?;
     let payee_categories: Vec<(String, i32)> = match &merchant_payee {
         None => Vec::new(),
-        Some((payee_id, _)) => {
-            sqlx::query_as(
-                "SELECT a.name, CAST(count(*) AS integer) FROM transaction_splits s
+        Some((payee_id, _)) => sql.query(
+            "SELECT a.name, CAST(count(*) AS integer) FROM transaction_splits s
                  JOIN transactions t ON t.id = s.transaction_id
                  JOIN accounts a ON a.id = s.account_id
-                 WHERE t.book_id = $1 AND t.payee_id = $2 AND a.type IN ('income', 'expense')
+                 WHERE t.book_id = ?1 AND t.payee_id = ?2 AND a.type IN ('income', 'expense')
                  GROUP BY a.id, a.name ORDER BY count(*) DESC, a.name LIMIT 3",
-            )
-            .bind(book_id)
-            .bind(payee_id)
-            .fetch_all(&mut *connection)
-            .await?
-        }
+            &params![book_id, payee_id],
+        )?,
     };
-    let payees: Vec<Payee> = sqlx::query_as::<_, (i32, String)>(
-        "SELECT id, name FROM payees WHERE book_id = $1 ORDER BY id",
-    )
-    .bind(book_id)
-    .fetch_all(&mut *connection)
-    .await?
-    .into_iter()
-    .map(|(id, name)| Payee { id, name })
-    .collect();
+    let payees: Vec<Payee> = sql
+        .query::<(i32, String)>(
+            "SELECT id, name FROM payees WHERE book_id = ?1 ORDER BY id",
+            &params![book_id],
+        )?
+        .into_iter()
+        .map(|(id, name)| Payee { id, name })
+        .collect();
     // Active income and expense accounts. Beyond 254, keep the ones with the
     // most splits in the last 365 days; a floating transaction counts as today.
-    let mut categories: Vec<(i32, String, String)> = sqlx::query_as(&format!(
-        "SELECT a.id, a.name, a.type FROM accounts a
+    let mut categories: Vec<(i32, String, String)> = sql.query(
+        &format!(
+            "SELECT a.id, a.name, a.type FROM accounts a
          LEFT JOIN transaction_splits s ON s.account_id = a.id
          LEFT JOIN transactions t ON t.id = s.transaction_id
-           AND {EFFECTIVE_DATE} >= $2
-         WHERE a.book_id = $1 AND a.is_active = true AND a.type IN ('income', 'expense')
+           AND {EFFECTIVE_DATE} >= ?2
+         WHERE a.book_id = ?1 AND a.is_active = true AND a.type IN ('income', 'expense')
          GROUP BY a.id, a.name, a.type ORDER BY count(t.id) DESC, a.name LIMIT 254"
-    ))
-    .bind(book_id)
-    .bind((Local::now().date_naive() - Days::new(365)).to_string())
-    .fetch_all(&mut *connection)
-    .await?;
+        ),
+        &params![book_id, (platform::today() - Days::new(365)).to_string()],
+    )?;
     // Code-unit order, not locale order, so that the fingerprint is stable.
     categories.sort_by(|a, b| js_cmp(&a.1, &b.1));
-    let baseline_category =
-        suggest_counter_account(connection, &row, link.account_id, book_id).await?;
+    let baseline_category = suggest_counter_account(sql, &row, link.account_id, book_id)?;
 
     let raw_merchant = row.merchant().to_owned();
     let merchant_payee = merchant_payee.map(|(id, name)| Payee { id, name });
@@ -389,7 +365,7 @@ async fn snapshot(
 
 /// An evaluation row. Its JSON columns are read as text, then put in jsonb
 /// key order by `read_json_column`, as the PostgreSQL release returned them.
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct StoredEvaluation {
     id: i32,
     reconciliation_id: i32,
@@ -491,7 +467,7 @@ fn status(status: &str, evaluation_id: Option<i32>) -> Value {
 /// A random UUID version 4, as `randomUUID()`.
 fn random_uuid() -> Result<String> {
     let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|_| Failure::Unavailable)?;
+    platform::random(&mut bytes).map_err(|_| Failure::Unavailable)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex = hex::encode(bytes);
@@ -512,28 +488,25 @@ enum Claim {
 
 /// The first transaction of `requestMatchSuggestion`: take the lease, or
 /// answer from what is stored.
-async fn claim(
-    connection: &mut DbConnection,
-    book_id: i32,
+fn claim(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     link_id: i64,
     reconciliation_id: i64,
 ) -> Result<Claim> {
-    let (enabled, _) = lock_book(connection, book_id).await?;
+    let book_id = access.book_id();
+    let (enabled, _) = lock_book(sql, book_id)?;
     if !enabled || !is_configured() {
         return Ok(Claim::Done(status("disabled", None)));
     }
-    let Some(input) = snapshot(connection, book_id, link_id, reconciliation_id).await? else {
+    let Some(input) = snapshot(sql, book_id, link_id, reconciliation_id)? else {
         return Ok(Claim::Done(status("skipped", None)));
     };
     let hash = fingerprint(&input);
     let asks = !build_questions(&input)?.is_empty();
-    let existing: Option<StoredEvaluation> = sqlx::query_as(&format!(
-        "SELECT {EVALUATION_COLUMNS} FROM typesafe_evaluations WHERE book_id = $1 AND fingerprint = $2"
-    ))
-    .bind(book_id)
-    .bind(&hash)
-    .fetch_optional(&mut *connection)
-    .await?;
+    let existing: Option<StoredEvaluation> = sql.query_optional(&format!(
+        "SELECT {EVALUATION_COLUMNS} FROM typesafe_evaluations WHERE book_id = ?1 AND fingerprint = ?2"
+    ), &params![book_id, &hash])?;
     let now = now_millis();
     if let Some(existing) = existing {
         match existing.status.as_str() {
@@ -545,48 +518,39 @@ async fn claim(
             _ => {}
         }
     }
-    let active: Option<i32> = sqlx::query_scalar(
+    let active: Option<i32> = sql.query_optional(
         "SELECT id FROM typesafe_evaluations
-         WHERE book_id = $1 AND status = 'pending' AND started_at > $2 LIMIT 1",
-    )
-    .bind(book_id)
-    .bind(now - LEASE)
-    .fetch_optional(&mut *connection)
-    .await?;
+         WHERE book_id = ?1 AND status = 'pending' AND started_at > ?2 LIMIT 1",
+        &params![book_id, now - LEASE],
+    )?;
     if active.is_some() {
         return Ok(Claim::Done(status("busy", None)));
     }
     if asks {
         let day = now.format("%Y-%m-%d").to_string();
-        let attempts: Option<i32> = sqlx::query_scalar(
-            "SELECT attempts FROM typesafe_quotas WHERE book_id = $1 AND day = $2",
-        )
-        .bind(book_id)
-        .bind(&day)
-        .fetch_optional(&mut *connection)
-        .await?;
+        let attempts: Option<i32> = sql.query_optional(
+            "SELECT attempts FROM typesafe_quotas WHERE book_id = ?1 AND day = ?2",
+            &params![book_id, &day],
+        )?;
         if attempts.unwrap_or(0) >= DAILY_ATTEMPTS {
             return Ok(Claim::Done(status("limited", None)));
         }
-        sqlx::query(
-            "INSERT INTO typesafe_quotas (book_id, day, attempts) VALUES ($1, $2, 1)
+        sql.execute(
+            "INSERT INTO typesafe_quotas (book_id, day, attempts) VALUES (?1, ?2, 1)
              ON CONFLICT (book_id, day) DO UPDATE SET attempts = typesafe_quotas.attempts + 1",
-        )
-        .bind(book_id)
-        .bind(&day)
-        .execute(&mut *connection)
-        .await?;
+            &params![book_id, &day],
+        )?;
     }
     let revision = property(Some(&input), "revision")
         .and_then(Value::as_i64)
         .unwrap_or_default();
-    let snapshot_json = sql::json("$6");
-    let record: StoredEvaluation = sqlx::query_as(&format!(
+    let snapshot_json = json("?6");
+    let record: StoredEvaluation = sql.query_row(&format!(
         "INSERT INTO typesafe_evaluations
            (book_id, link_id, reconciliation_id, revision, fingerprint, snapshot, attempt, status,
             started_at, completed_at, error_code, choice, probabilities, confidence, usage, answers,
             displayed_at, latency_ms)
-         VALUES ($1, $2, $3, $4, $5, {snapshot_json}, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, NULL,
+         VALUES (?1, ?2, ?3, ?4, ?5, {snapshot_json}, ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL,
                  NULL, NULL, NULL)
          ON CONFLICT (book_id, fingerprint) DO UPDATE SET
            book_id = excluded.book_id, link_id = excluded.link_id,
@@ -596,18 +560,7 @@ async fn claim(
            completed_at = NULL, error_code = NULL, choice = NULL, probabilities = NULL,
            confidence = NULL, usage = NULL, answers = NULL, displayed_at = NULL, latency_ms = NULL
          RETURNING {EVALUATION_COLUMNS}"
-    ))
-    .bind(book_id)
-    .bind(column(link_id)?)
-    .bind(column(reconciliation_id)?)
-    .bind(column(revision)?)
-    .bind(&hash)
-    .bind(js_stringify(&input))
-    .bind(random_uuid()?)
-    .bind(if asks { "pending" } else { "skipped" })
-    .bind(now)
-    .fetch_one(&mut *connection)
-    .await?;
+    ), &params![book_id, column(link_id)?, column(reconciliation_id)?, column(revision)?, &hash, js_stringify(&input), random_uuid()?, if asks { "pending" } else { "skipped" }, now])?;
     if !asks {
         return Ok(Claim::Done(status("skipped", Some(record.id))));
     }
@@ -615,42 +568,30 @@ async fn claim(
 }
 
 /// Runs `work` in one transaction: commit on success, roll back on failure.
-async fn in_transaction<T>(
-    pool: &DbPool,
-    work: impl AsyncFnOnce(&mut DbConnection) -> Result<T>,
+fn in_transaction<T>(
+    database: &Database,
+    work: impl FnOnce(&Transaction<'_>) -> Result<T>,
 ) -> Result<T> {
-    let mut transaction = ledger_db::locks::begin_pool(pool).await?;
-    let result = work(transaction.as_mut()).await;
-    match result {
-        Ok(value) => {
-            transaction.commit().await?;
-            Ok(value)
-        }
-        Err(failure) => {
-            let _ = transaction.rollback().await;
-            Err(failure)
-        }
-    }
+    database.transaction(work)
 }
 
 /// `requestMatchSuggestion`.
 async fn request_suggestion(
-    pool: &DbPool,
-    book_id: i32,
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     link_id: i64,
     reconciliation_id: i64,
 ) -> Result<Value> {
-    let record = match in_transaction(pool, async |connection| {
-        claim(connection, book_id, link_id, reconciliation_id).await
-    })
-    .await?
-    {
+    let book_id = access.book_id();
+    let record = match in_transaction(database, |sql| {
+        claim(sql, access, link_id, reconciliation_id)
+    })? {
         Claim::Done(result) => return Ok(result),
         Claim::Claimed(record) => record,
     };
     // Network happens outside every database transaction. Once sent, the
     // data cannot be recalled, even if the book turns the feature off.
-    let answer = match settings(pool, book_id).await {
+    let answer = match settings(database, book_id) {
         Ok((enabled, revision))
             if enabled && is_configured() && revision == record.row.revision =>
         {
@@ -665,22 +606,15 @@ async fn request_suggestion(
         Ok(_) => Err("stale"),
         Err(_) => Err("unavailable"),
     };
-    in_transaction(pool, async |connection| {
-        let (enabled, revision) = lock_book(connection, book_id).await?;
-        let current: Option<i32> = sqlx::query_scalar(
-            "SELECT id FROM typesafe_evaluations WHERE id = $1 AND attempt = $2 AND status = 'pending'",
-        )
-        .bind(record.row.id)
-        .bind(&record.row.attempt)
-        .fetch_optional(&mut *connection)
-        .await?;
+    in_transaction(database, |sql| {
+        let (enabled, revision) = lock_book(sql, book_id)?;
+        let current: Option<i32> = sql.query_optional("SELECT id FROM typesafe_evaluations WHERE id = ?1 AND attempt = ?2 AND status = 'pending'", &params![record.row.id, &record.row.attempt])?;
         if current.is_none() {
             return Ok(status("stale", None));
         }
         let fresh = if enabled && revision == record.row.revision && is_configured() {
             // A deleted or unmapped row invalidates the answer.
-            snapshot(connection, book_id, link_id, reconciliation_id)
-                .await
+            snapshot(sql, book_id, link_id, reconciliation_id)
                 .ok()
                 .flatten()
         } else {
@@ -717,40 +651,36 @@ async fn request_suggestion(
             .filter(|_| !is_stale)
             .map(|answers| js_stringify(&Value::Object(answers.clone())));
         // `usage: answer?.usage`: without an answer the column is not set.
-        let usage = answer.as_ref().ok().map(|evaluated| {
-            evaluated
-                .usage
-                .as_ref()
-                .map(js_stringify)
-        });
-        let (probabilities, confidence, answers, usage_json) = (
-            sql::json("$8"),
-            sql::json("$9"),
-            sql::json("$10"),
-            sql::json("$12"),
-        );
-        let updated: StoredEvaluation = sqlx::query_as(&format!(
-            "UPDATE typesafe_evaluations SET status = $3, completed_at = $4, latency_ms = $5,
-               error_code = $6, choice = $7, probabilities = {probabilities},
+        let usage = answer
+            .as_ref()
+            .ok()
+            .map(|evaluated| evaluated.usage.as_ref().map(js_stringify));
+        let (probabilities, confidence, answers, usage_json) =
+            (json("?8"), json("?9"), json("?10"), json("?12"));
+        let updated: StoredEvaluation = sql.query_row(
+            &format!(
+                "UPDATE typesafe_evaluations SET status = ?3, completed_at = ?4, latency_ms = ?5,
+               error_code = ?6, choice = ?7, probabilities = {probabilities},
                confidence = {confidence}, answers = {answers},
-               usage = CASE WHEN $11 THEN {usage_json} ELSE usage END
-             WHERE id = $1 AND attempt = $2
+               usage = CASE WHEN ?11 THEN {usage_json} ELSE usage END
+             WHERE id = ?1 AND attempt = ?2
              RETURNING {EVALUATION_COLUMNS}"
-        ))
-        .bind(record.row.id)
-        .bind(&record.row.attempt)
-        .bind(new_status)
-        .bind(now)
-        .bind(i32::try_from(latency).unwrap_or(i32::MAX))
-        .bind(error_code)
-        .bind(choice)
-        .bind(field("probabilities"))
-        .bind(field("confidence"))
-        .bind(stored_answers)
-        .bind(usage.is_some())
-        .bind(usage.flatten())
-        .fetch_one(&mut *connection)
-        .await?;
+            ),
+            &params![
+                record.row.id,
+                &record.row.attempt,
+                new_status,
+                now,
+                i32::try_from(latency).unwrap_or(i32::MAX),
+                error_code,
+                choice,
+                field("probabilities"),
+                field("confidence"),
+                stored_answers,
+                usage.is_some(),
+                usage.flatten()
+            ],
+        )?;
         if is_stale {
             Ok(status("stale", None))
         } else if answer.is_ok() {
@@ -759,38 +689,29 @@ async fn request_suggestion(
             Ok(status("unavailable", Some(record.row.id)))
         }
     })
-    .await
 }
 
 /// `validEvaluation`: a ready evaluation whose snapshot still has the same
 /// fingerprint. Anything else is stale.
-async fn valid_evaluation(
-    connection: &mut DbConnection,
+fn valid_evaluation(
+    sql: &impl Sql,
     book_id: i32,
     link_id: i64,
     evaluation_id: i64,
 ) -> Result<Evaluation> {
-    let record: Option<StoredEvaluation> = sqlx::query_as(&format!(
-        "SELECT {EVALUATION_COLUMNS} FROM typesafe_evaluations
-         WHERE id = $1 AND book_id = $2 AND link_id = $3 AND status = 'ready'"
-    ))
-    .bind(column(evaluation_id)?)
-    .bind(book_id)
-    .bind(column(link_id)?)
-    .fetch_optional(&mut *connection)
-    .await?;
+    let record: Option<StoredEvaluation> = sql.query_optional(
+        &format!(
+            "SELECT {EVALUATION_COLUMNS} FROM typesafe_evaluations
+         WHERE id = ?1 AND book_id = ?2 AND link_id = ?3 AND status = 'ready'"
+        ),
+        &params![column(evaluation_id)?, book_id, column(link_id)?],
+    )?;
     let Some(record) = record else {
         return Err(stale(STALE_REVIEW));
     };
-    let input = snapshot(
-        connection,
-        book_id,
-        link_id,
-        i64::from(record.reconciliation_id),
-    )
-    .await
-    .ok()
-    .flatten();
+    let input = snapshot(sql, book_id, link_id, i64::from(record.reconciliation_id))
+        .ok()
+        .flatten();
     if input.is_none_or(|input| fingerprint(&input) != record.fingerprint) {
         return Err(stale(STALE_REVIEW));
     }
@@ -798,46 +719,32 @@ async fn valid_evaluation(
 }
 
 /// `markSuggestionDisplayed`.
-async fn mark_displayed(
-    pool: &DbPool,
-    book_id: i32,
+fn mark_displayed(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     link_id: i64,
     evaluation_id: i64,
 ) -> Result<Value> {
-    in_transaction(pool, async |connection| {
-        lock_book(connection, book_id).await?;
-        let record = valid_evaluation(connection, book_id, link_id, evaluation_id).await?;
-        sqlx::query(
-            "UPDATE typesafe_evaluations SET displayed_at = coalesce(displayed_at, $2) WHERE id = $1",
-        )
-        .bind(record.row.id)
-        .bind(record.row.displayed_at.unwrap_or_else(now_millis))
-        .execute(&mut *connection)
-        .await?;
+    let book_id = access.book_id();
+    in_transaction(database, |sql| {
+        lock_book(sql, book_id)?;
+        let record = valid_evaluation(sql, book_id, link_id, evaluation_id)?;
+        sql.execute("UPDATE typesafe_evaluations SET displayed_at = coalesce(displayed_at, ?2) WHERE id = ?1", &params![record.row.id, record.row.displayed_at.unwrap_or_else(now_millis)])?;
         record.public()
     })
-    .await
 }
 
 /// `lockConfirmation`: locks what a confirmation reads until the resolver
 /// commits, in a fixed order.
-async fn lock_confirmation(
-    connection: &mut DbConnection,
-    link_id: i64,
-    record: &Evaluation,
-) -> Result<()> {
-    sqlx::query(&format!(
-        "SELECT id FROM plaid_accounts WHERE id = $1{FOR_UPDATE}"
-    ))
-    .bind(column(link_id)?)
-    .execute(&mut *connection)
-    .await?;
-    sqlx::query(&format!(
-        "SELECT id FROM plaid_transaction_reconciliation WHERE id = $1{FOR_UPDATE}"
-    ))
-    .bind(record.row.reconciliation_id)
-    .execute(&mut *connection)
-    .await?;
+fn lock_confirmation(sql: &impl Sql, link_id: i64, record: &Evaluation) -> Result<()> {
+    sql.query::<store::Row>(
+        &format!("SELECT id FROM plaid_accounts WHERE id = ?1{FOR_UPDATE}"),
+        &params![column(link_id)?],
+    )?;
+    sql.query::<store::Row>(
+        &format!("SELECT id FROM plaid_transaction_reconciliation WHERE id = ?1{FOR_UPDATE}"),
+        &params![record.row.reconciliation_id],
+    )?;
     let mut ids: Vec<i32> = match property(Some(&record.snapshot), "candidates") {
         Some(Value::Array(candidates)) => candidates
             .iter()
@@ -852,31 +759,31 @@ async fn lock_confirmation(
     };
     ids.sort_unstable();
     if !ids.is_empty() {
-        let payee_ids: Vec<Option<i32>> = sqlx::query_scalar(&format!(
-            "SELECT payee_id FROM transactions WHERE id {} ORDER BY id{FOR_UPDATE}",
-            sql::in_integers("$1")
-        ))
-        .bind(sql::json_array(&ids))
-        .fetch_all(&mut *connection)
-        .await?;
-        sqlx::query(&format!(
-            "SELECT id FROM transaction_splits WHERE transaction_id {} ORDER BY id{FOR_UPDATE}",
-            sql::in_integers("$1")
-        ))
-        .bind(sql::json_array(&ids))
-        .execute(&mut *connection)
-        .await?;
+        let payee_ids: Vec<Option<i32>> = sql.query(
+            &format!(
+                "SELECT payee_id FROM transactions WHERE id {} ORDER BY id{FOR_UPDATE}",
+                in_integers("?1")
+            ),
+            &params![json_array(&ids)],
+        )?;
+        sql.query::<store::Row>(
+            &format!(
+                "SELECT id FROM transaction_splits WHERE transaction_id {} ORDER BY id{FOR_UPDATE}",
+                in_integers("?1")
+            ),
+            &params![json_array(&ids)],
+        )?;
         let mut payee_ids: Vec<i32> = payee_ids.into_iter().flatten().collect();
         payee_ids.sort_unstable();
         payee_ids.dedup();
         if !payee_ids.is_empty() {
-            sqlx::query(&format!(
-                "SELECT id FROM payees WHERE id {} ORDER BY id{FOR_SHARE}",
-                sql::in_integers("$1")
-            ))
-            .bind(sql::json_array(&payee_ids))
-            .execute(&mut *connection)
-            .await?;
+            sql.query::<store::Row>(
+                &format!(
+                    "SELECT id FROM payees WHERE id {} ORDER BY id{FOR_SHARE}",
+                    in_integers("?1")
+                ),
+                &params![json_array(&payee_ids)],
+            )?;
         }
     }
     if let Some(proposal) = record.proposal()? {
@@ -887,16 +794,16 @@ async fn lock_confirmation(
                 .transpose()
         };
         if let Some(account_id) = id(["category", "accountId"])? {
-            sqlx::query(&format!("SELECT id FROM accounts WHERE id = $1{FOR_SHARE}"))
-                .bind(account_id)
-                .execute(&mut *connection)
-                .await?;
+            sql.query::<store::Row>(
+                &format!("SELECT id FROM accounts WHERE id = ?1{FOR_SHARE}"),
+                &params![account_id],
+            )?;
         }
         if let Some(payee_id) = id(["payee", "payeeId"])? {
-            sqlx::query(&format!("SELECT id FROM payees WHERE id = $1{FOR_SHARE}"))
-                .bind(payee_id)
-                .execute(&mut *connection)
-                .await?;
+            sql.query::<store::Row>(
+                &format!("SELECT id FROM payees WHERE id = ?1{FOR_SHARE}"),
+                &params![payee_id],
+            )?;
         }
     }
     Ok(())
@@ -911,39 +818,37 @@ enum Kind {
 /// `confirmMatchSuggestion` and `confirmCreateProposal`: the ordinary
 /// resolver runs in the same transaction as the checks. Returns the
 /// resolved item and the decision it applied.
-async fn confirm(
-    pool: &DbPool,
-    book_id: i32,
+fn confirm(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     link_id: i64,
     evaluation_id: i64,
     kind: Kind,
     shown_at: NaiveDateTime,
     actor: i32,
 ) -> Result<(Value, ReconcileInput)> {
-    let (link, row_id, input) = in_transaction(pool, async |connection| {
-        lock_book(connection, book_id).await?;
-        let record: Option<StoredEvaluation> = sqlx::query_as(&format!(
-            "SELECT {EVALUATION_COLUMNS} FROM typesafe_evaluations
-             WHERE id = $1 AND book_id = $2 AND link_id = $3"
-        ))
-        .bind(column(evaluation_id)?)
-        .bind(book_id)
-        .bind(column(link_id)?)
-        .fetch_optional(&mut *connection)
-        .await?;
+    let book_id = access.book_id();
+    let (link, row_id, input) = in_transaction(database, |sql| {
+        lock_book(sql, book_id)?;
+        let record: Option<StoredEvaluation> = sql.query_optional(
+            &format!(
+                "SELECT {EVALUATION_COLUMNS} FROM typesafe_evaluations
+             WHERE id = ?1 AND book_id = ?2 AND link_id = ?3"
+            ),
+            &params![column(evaluation_id)?, book_id, column(link_id)?],
+        )?;
         let record = Evaluation::read(record.ok_or(stale(
             "This TypeSafe suggestion is stale. Refresh and review again.",
         ))?)?;
-        lock_confirmation(connection, link_id, &record).await?;
-        let valid = valid_evaluation(connection, book_id, link_id, evaluation_id).await?;
+        lock_confirmation(sql, link_id, &record)?;
+        let valid = valid_evaluation(sql, book_id, link_id, evaluation_id)?;
         // A click proves that the suggestion was on screen, even when the
         // display report has not arrived yet.
         if valid.row.displayed_at.is_none() {
-            sqlx::query("UPDATE typesafe_evaluations SET displayed_at = $2 WHERE id = $1")
-                .bind(valid.row.id)
-                .bind(shown_at)
-                .execute(&mut *connection)
-                .await?;
+            sql.execute(
+                "UPDATE typesafe_evaluations SET displayed_at = ?2 WHERE id = ?1",
+                &params![valid.row.id, shown_at],
+            )?;
         }
         let reconciliation_id = f64::from(valid.row.reconciliation_id);
         let input = match kind {
@@ -976,18 +881,15 @@ async fn confirm(
                 }
             }
         };
-        let link = reconcilable_link(&mut *connection, book_id, column(link_id)?).await?;
-        let row_id = apply(connection, book_id, link, &input, actor, now_millis()).await?;
+        let link = reconcilable_link(sql, book_id, column(link_id)?)?;
+        let row_id = apply(sql, access, link, &input, actor, now_millis())?;
         Ok((link, row_id, input))
-    })
-    .await?;
-    let mut connection = pool.acquire().await?;
-    let row = load_row(&mut connection, link.link_id, row_id, book_id, false)
-        .await?
-        .ok_or(Failure::Reconcile(ReconcileError::NotFound(
-            "Updated row not found",
-        )))?;
-    let item = load_item(&mut connection, &row, link.account_id, book_id).await?;
+    })?;
+    let sql = database;
+    let row = load_row(sql, link.link_id, row_id, book_id, false)?.ok_or(Failure::Reconcile(
+        ReconcileError::NotFound("Updated row not found"),
+    ))?;
+    let item = load_item(sql, &row, link.account_id, book_id)?;
     Ok((item, input))
 }
 
@@ -1055,13 +957,14 @@ pub(crate) async fn request_route(
 ) -> std::result::Result<Json<Value>, ApiError> {
     let (book, link_id, object, body) =
         prepare(&state, &headers, &raw_book_id, &raw_link_id, &body).await?;
+    let access = book.write()?;
     let reconciliation_id = body
         .is_object()
         .then(|| positive_id(object.get("reconciliationId")))
         .flatten()
         .filter(|_| only_keys(&object, &["reconciliationId"]))
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid reconciliation ID"))?;
-    request_suggestion(&state.pool, book.book_id(), link_id, reconciliation_id)
+    request_suggestion(&state.database, &access, link_id, reconciliation_id)
         .await
         .map(Json)
         .map_err(Failure::into_api)
@@ -1075,14 +978,14 @@ pub(crate) async fn display_route(
 ) -> std::result::Result<Json<Value>, ApiError> {
     let (book, link_id, object, body) =
         prepare(&state, &headers, &raw_book_id, &raw_link_id, &body).await?;
+    let access = book.write()?;
     let evaluation_id = body
         .is_object()
         .then(|| positive_id(object.get("evaluationId")))
         .flatten()
         .filter(|_| only_keys(&object, &["evaluationId"]))
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid evaluation ID"))?;
-    mark_displayed(&state.pool, book.book_id(), link_id, evaluation_id)
-        .await
+    mark_displayed(&state.database, &access, link_id, evaluation_id)
         .map(Json)
         .map_err(Failure::into_api)
 }
@@ -1122,18 +1025,18 @@ pub(crate) async fn confirm_route(
     let started_at = now_millis();
     let (book, link_id, object, body) =
         prepare(&state, &headers, &raw_book_id, &raw_link_id, &body).await?;
+    let access = book.write()?;
     let (evaluation_id, active_review_ms, kind) = confirmation(&body, &object)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid evaluation ID"))?;
     let (item, mut input) = confirm(
-        &state.pool,
-        book.book_id(),
+        &state.database,
+        &access,
         link_id,
         evaluation_id,
         kind,
         started_at,
         book.user_id(),
     )
-    .await
     .map_err(Failure::into_api)?;
     // The decision names the transaction that the resolver linked.
     input.transaction_id = property(Some(&item), "matchedTransactionId")
@@ -1148,49 +1051,11 @@ pub(crate) async fn confirm_route(
     // Best-effort evidence after a committed ledger write; it never fails
     // the response.
     record_decision(
-        &state.pool,
-        book.book_id(),
+        &state.database,
+        &access,
         &input,
         &Observation::accepted(evaluation_id as f64, active_review_ms),
         started_at,
-    )
-    .await;
+    );
     Ok(Json(item))
-}
-
-#[cfg(test)]
-mod merchant_key_tests {
-    use super::MERCHANT_KEY;
-    use crate::routes::payees::normalize_name;
-
-    /// The SQL merchant key and the Rust merchant key must agree, or a
-    /// learned payee is not found again. The engine must keep this.
-    #[tokio::test]
-    async fn sql_merchant_key_equals_the_rust_key() {
-        let database = ledger_db::testing::TempDatabase::new(1).await;
-        let pool = database.pool().clone();
-        let cases: [(Option<&str>, &str); 8] = [
-            (Some("  Blue\u{2019}s   CAFE "), "ignored"),
-            (None, "\tCRÈME\n BRÛLÉE  Co"),
-            (Some("ÉCLAIR \u{2018}Bakery\u{2019}"), "x"),
-            (Some(""), "the name is not used"),
-            (Some("a`b\u{00B4}c\u{2032}d\u{201A}e\u{201B}"), "x"),
-            (None, "ÄÖÜ straße"),
-            (None, "ONE  two\r\nTHREE"),
-            (Some("  "), "x"),
-        ];
-        for (merchant, name) in cases {
-            let sql: String = sqlx::query_scalar(&format!(
-                "SELECT {MERCHANT_KEY} FROM (SELECT CAST($1 AS text) AS merchant_name,
-                 CAST($2 AS text) AS name) r"
-            ))
-            .bind(merchant)
-            .bind(name)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            let rust = normalize_name(merchant.unwrap_or(name)).to_lowercase();
-            assert_eq!(sql, rust, "merchant {merchant:?}, name {name:?}");
-        }
-    }
 }

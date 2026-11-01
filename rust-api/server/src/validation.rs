@@ -1,11 +1,12 @@
 use crate::error::{ApiError, error, error_owned};
+use crate::platform;
 use axum::{body::Bytes, http::StatusCode};
-use chrono::{Local, NaiveDate};
+use chrono::NaiveDate;
 /// Rust's `char::is_whitespace` differs from JavaScript at U+0085 and
 /// U+FEFF, so a stored payee name would differ from the one Node stores.
 pub(crate) use ledger_core::js::is_js_whitespace;
 use ledger_core::js::parse_int;
-use ledger_db::engine::DbPool;
+use ledger_db::store::{Sql, params};
 use serde::de::DeserializeOwned;
 use serde_json::{Number, Value};
 use std::collections::HashMap;
@@ -34,7 +35,7 @@ pub(crate) fn query_date_param(
 
 /// Bind one local calendar date for floating transactions in a request.
 pub(crate) fn local_today() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
+    platform::today().format("%Y-%m-%d").to_string()
 }
 
 /// JavaScript `parseInt(raw, 10)`.
@@ -575,8 +576,8 @@ pub(crate) fn pg_float8_to_int4(value: f64) -> Result<i32, String> {
 
 /// Reference checks always include book_id. Schema validation alone cannot
 /// distinguish a parent's ID in another book from a permitted parent.
-pub(crate) async fn require_account_parent(
-    pool: &DbPool,
+pub(crate) fn require_account_parent(
+    sql: &impl Sql,
     book_id: i32,
     parent_id: Option<i64>,
     failure_message: &'static str,
@@ -585,13 +586,12 @@ pub(crate) async fn require_account_parent(
         return Ok(());
     };
     let parent_id = database_integer(parent_id, failure_message)?;
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1 AND book_id = $2)")
-            .bind(parent_id)
-            .bind(book_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|cause| crate::error::internal_error(cause, failure_message))?;
+    let exists: bool = sql
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM accounts WHERE id = ?1 AND book_id = ?2)",
+            &params![parent_id, book_id],
+        )
+        .map_err(|cause| crate::error::internal_error(cause, failure_message))?;
     if exists {
         Ok(())
     } else {
@@ -940,23 +940,15 @@ mod tests {
 
     #[tokio::test]
     async fn account_parent_reference_is_scoped_to_the_book() {
-        let database = ledger_db::testing::TempDatabase::new(1).await;
-        let pool = database.pool().clone();
-        sqlx::query("CREATE TEMP TABLE accounts (id integer, book_id integer)")
-            .execute(&pool)
-            .await
+        let database = ledger_db::Database::open_in_memory().unwrap();
+        database
+            .exec_batch(
+                "CREATE TABLE accounts (id integer, book_id integer);
+                 INSERT INTO accounts VALUES (123, 8);",
+            )
             .unwrap();
-        sqlx::query("INSERT INTO accounts VALUES (123, 8)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(
-            require_account_parent(&pool, 8, Some(123), "failed")
-                .await
-                .is_ok()
-        );
-        let denied = require_account_parent(&pool, 7, Some(123), "failed")
-            .await
+        assert!(require_account_parent(&database, 8, Some(123), "failed").is_ok());
+        let denied = require_account_parent(&database, 7, Some(123), "failed")
             .unwrap_err()
             .into_response();
         assert_eq!(denied.status(), StatusCode::BAD_REQUEST);

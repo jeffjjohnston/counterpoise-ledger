@@ -16,7 +16,8 @@ use axum::{
 };
 use chrono::NaiveDate;
 use ledger_core::net_worth::point_dates;
-use ledger_db::{engine::DbPool, sql::EFFECTIVE_DATE};
+use ledger_db::sql::EFFECTIVE_DATE;
+use ledger_db::store::{self, Sql, params};
 use serde::Serialize;
 use serde_json::{json, to_value};
 
@@ -30,17 +31,15 @@ pub(crate) struct BookAccount {
 }
 
 /// The account `account_id` when it belongs to the book, else `None`.
-pub(crate) async fn find_book_account(
-    pool: &DbPool,
+pub(crate) fn find_book_account(
+    pool: &impl Sql,
     book_id: i32,
     account_id: i32,
-) -> Result<Option<BookAccount>, sqlx::Error> {
-    let row: Option<(i32, String, String)> =
-        sqlx::query_as("SELECT id, name, type FROM accounts WHERE book_id = $1 AND id = $2")
-            .bind(book_id)
-            .bind(account_id)
-            .fetch_optional(pool)
-            .await?;
+) -> Result<Option<BookAccount>, store::Error> {
+    let row: Option<(i32, String, String)> = pool.query_optional(
+        "SELECT id, name, type FROM accounts WHERE book_id = ?1 AND id = ?2",
+        &params![book_id, account_id],
+    )?;
     Ok(row.map(|(id, name, account_type)| BookAccount {
         id,
         name,
@@ -51,22 +50,20 @@ pub(crate) async fn find_book_account(
 /// The sum of the own splits of the account with an effective date before
 /// `date`. The splits of a child account are not included, as in the
 /// register.
-pub(crate) async fn balance_before(
-    pool: &DbPool,
+pub(crate) fn balance_before(
+    pool: &impl Sql,
     book_id: i32,
     account_id: i32,
     date: &str,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(&format!(
-        "SELECT CAST(COALESCE(SUM(s.amount), 0) AS INTEGER) FROM transaction_splits s
+) -> Result<i64, store::Error> {
+    pool.query_row(
+        &format!(
+            "SELECT CAST(COALESCE(SUM(s.amount), 0) AS INTEGER) FROM transaction_splits s
          JOIN transactions t ON s.transaction_id = t.id
-         WHERE s.book_id = $1 AND s.account_id = $2 AND {EFFECTIVE_DATE} < $3"
-    ))
-    .bind(book_id)
-    .bind(account_id)
-    .bind(date)
-    .fetch_one(pool)
-    .await
+         WHERE s.book_id = ?1 AND s.account_id = ?2 AND {EFFECTIVE_DATE} < ?3"
+        ),
+        &params![book_id, account_id, date],
+    )
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -99,11 +96,12 @@ pub(crate) async fn account_balance_history(
             "startDate must not be after endDate",
         ));
     }
-    let pool = &state.pool;
+    let pool = &*state.database;
     let book_id = book.book_id();
-    let db_error = |cause| internal_error(cause, FAILURE);
+    fn db_error(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
     let account = find_book_account(pool, book_id, account_id)
-        .await
         .map_err(db_error)?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Account not found"))?;
 
@@ -111,7 +109,6 @@ pub(crate) async fn account_balance_history(
     // first split. An account with no split, or one whose first split is after
     // the end, has no points.
     let first = first_split_date(pool, book_id, account.id)
-        .await
         .map_err(db_error)?
         .map(|first| match start_date {
             Some(start) if start > first => start,
@@ -121,12 +118,8 @@ pub(crate) async fn account_balance_history(
         return Ok(Json(json!({ "points": [] })));
     };
     let dates = point_dates(parse_date(&first)?, parse_date(&end_date)?);
-    let starting = balance_before(pool, book_id, account.id, &first)
-        .await
-        .map_err(db_error)?;
-    let days = day_totals(pool, book_id, account.id, &first, &end_date)
-        .await
-        .map_err(db_error)?;
+    let starting = balance_before(pool, book_id, account.id, &first).map_err(db_error)?;
+    let days = day_totals(pool, book_id, account.id, &first, &end_date).map_err(db_error)?;
     let points = balance_points(&dates, starting, &days);
     Ok(Json(
         json!({ "points": to_value(points).expect("points serialize") }),
@@ -139,46 +132,42 @@ fn parse_date(text: &str) -> Result<NaiveDate, ApiError> {
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))
 }
 
-async fn first_split_date(
-    pool: &DbPool,
+fn first_split_date(
+    pool: &impl Sql,
     book_id: i32,
     account_id: i32,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(&format!(
-        "SELECT MIN({EFFECTIVE_DATE}) FROM transaction_splits s
+) -> Result<Option<String>, store::Error> {
+    pool.query_row(
+        &format!(
+            "SELECT MIN({EFFECTIVE_DATE}) FROM transaction_splits s
          JOIN transactions t ON s.transaction_id = t.id
-         WHERE s.book_id = $1 AND s.account_id = $2"
-    ))
-    .bind(book_id)
-    .bind(account_id)
-    .fetch_one(pool)
-    .await
+         WHERE s.book_id = ?1 AND s.account_id = ?2"
+        ),
+        &params![book_id, account_id],
+    )
 }
 
 /// The split sum of the account on each effective date from `start` to
 /// `end`, ascending. A date without splits has no row.
-async fn day_totals(
-    pool: &DbPool,
+fn day_totals(
+    pool: &impl Sql,
     book_id: i32,
     account_id: i32,
     start: &str,
     end: &str,
-) -> Result<Vec<(String, i64)>, sqlx::Error> {
-    sqlx::query_as(&format!(
-        "SELECT {EFFECTIVE_DATE} AS day, CAST(SUM(s.amount) AS INTEGER)
+) -> Result<Vec<(String, i64)>, store::Error> {
+    pool.query(
+        &format!(
+            "SELECT {EFFECTIVE_DATE} AS day, CAST(SUM(s.amount) AS INTEGER)
          FROM transaction_splits s
          JOIN transactions t ON s.transaction_id = t.id
-         WHERE s.book_id = $1 AND s.account_id = $2
-           AND {EFFECTIVE_DATE} >= $3 AND {EFFECTIVE_DATE} <= $4
+         WHERE s.book_id = ?1 AND s.account_id = ?2
+           AND {EFFECTIVE_DATE} >= ?3 AND {EFFECTIVE_DATE} <= ?4
          GROUP BY day
          ORDER BY day"
-    ))
-    .bind(book_id)
-    .bind(account_id)
-    .bind(start)
-    .bind(end)
-    .fetch_all(pool)
-    .await
+        ),
+        &params![book_id, account_id, start, end],
+    )
 }
 
 /// The balance at each date: `starting` plus the day totals on or before it.

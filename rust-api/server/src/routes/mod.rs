@@ -1,9 +1,10 @@
+mod access_handoff;
 pub(crate) mod account_balance;
 pub(crate) mod accounts;
 pub(crate) mod auth;
 mod books;
 pub(crate) mod cron;
-mod events;
+mod entry_suggestion;
 pub(crate) mod investments;
 mod issue_reports;
 mod members;
@@ -18,13 +19,19 @@ pub(crate) mod reports;
 pub(crate) mod search;
 pub(crate) mod securities;
 pub(crate) mod security_prices;
+// The native socket. A Durable Object serves the path with its own API.
+#[cfg(feature = "native")]
+pub(crate) mod socket;
 pub(crate) mod sync;
 pub(crate) mod system;
 mod transaction_changes;
 pub(crate) mod transactions;
 pub(crate) mod typesafe;
 mod typesafe_suggestion;
+pub(crate) mod weekly_review;
 
+#[cfg(feature = "native")]
+use self::socket::book_socket;
 use self::{
     account_balance::account_balance_history,
     accounts::{create_account, delete_account, get_account, list_accounts, update_account},
@@ -38,7 +45,7 @@ use self::{
     cron::{
         plaid_sync as plaid_sync_cron, price_sync as price_sync_cron, recurring as recurring_cron,
     },
-    events::book_events,
+    entry_suggestion::{get_entry_patterns, record_entry_outcome, request_entry_suggestion},
     investments::{account_values, get_positions},
     issue_reports::{create_report, delete_report, list_reports, update_report},
     members::{add_member, change_member, list_members, remove_member},
@@ -63,8 +70,9 @@ use self::{
     },
     sync::{
         assigned_accounts, clear_sync_data, create_token, delete_token, list_token_accounts,
-        list_tokens, pending_count, pending_transactions, set_token_accounts, stale_unmatched,
-        transaction_plaid_link, unlink_transaction, update_token,
+        list_tokens, pending_count, pending_transactions, refresh_token_accounts,
+        set_token_accounts, stale_unmatched, transaction_plaid_link, unlink_transaction,
+        update_token,
     },
     system::{api_health, health, status, version},
     transaction_changes::list_transaction_changes,
@@ -74,6 +82,11 @@ use self::{
     },
     typesafe::{cleanup_route, clear_settings, get_settings, update_settings},
     typesafe_suggestion::{confirm_route, display_route, request_route},
+    weekly_review::{
+        clear_weekly_review_settings, dismiss_weekly_review_item, get_weekly_review,
+        get_weekly_review_settings, restore_weekly_review_item, run_weekly_review_now,
+        update_weekly_review_settings, weekly_review_cron,
+    },
 };
 use crate::state::AppState;
 use axum::{Router, routing::get};
@@ -98,7 +111,13 @@ pub(crate) fn routes() -> Router<AppState> {
             .route("/api/health", get(api_health))
             // Not in routes.json: that manifest lists the routes that had a
             // Next fallback, and MCP over HTTP and WebMCP never had one.
-            .route("/api/mcp", axum::routing::any(crate::mcp::http))
+            .route(crate::mcp::PATH, axum::routing::any(crate::mcp::http))
+            // Not in routes.json either: only a server behind Cloudflare Access
+            // answers it, and no browser page calls it.
+            .route(
+                "/api/auth/access-handoff",
+                get(access_handoff::access_handoff),
+            )
             .route(
                 "/api/b/{book_id}/webmcp",
                 get(crate::mcp::webmcp::list).post(crate::mcp::webmcp::call),
@@ -217,6 +236,44 @@ pub(crate) fn routes() -> Router<AppState> {
                 "/api/b/{book_id}/settings/typesafe",
                 axum::routing::delete(clear_settings),
             ),
+            ("GET", "/api/b/[bookId]/settings/weekly-review", "weeklyreview.settings") => router
+                .route(
+                    "/api/b/{book_id}/settings/weekly-review",
+                    get(get_weekly_review_settings),
+                ),
+            ("PATCH", "/api/b/[bookId]/settings/weekly-review", "weeklyreview.update") => router
+                .route(
+                    "/api/b/{book_id}/settings/weekly-review",
+                    axum::routing::patch(update_weekly_review_settings),
+                ),
+            ("DELETE", "/api/b/[bookId]/settings/weekly-review", "weeklyreview.clear") => router
+                .route(
+                    "/api/b/{book_id}/settings/weekly-review",
+                    axum::routing::delete(clear_weekly_review_settings),
+                ),
+            ("GET", "/api/b/[bookId]/weekly-review", "weeklyreview.get") => {
+                router.route("/api/b/{book_id}/weekly-review", get(get_weekly_review))
+            }
+            ("POST", "/api/b/[bookId]/weekly-review/run", "weeklyreview.run") => router.route(
+                "/api/b/{book_id}/weekly-review/run",
+                axum::routing::post(run_weekly_review_now),
+            ),
+            (
+                "POST",
+                "/api/b/[bookId]/weekly-review/items/[id]/dismiss",
+                "weeklyreview.dismiss",
+            ) => router.route(
+                "/api/b/{book_id}/weekly-review/items/{id}/dismiss",
+                axum::routing::post(dismiss_weekly_review_item),
+            ),
+            (
+                "POST",
+                "/api/b/[bookId]/weekly-review/items/[id]/restore",
+                "weeklyreview.restore",
+            ) => router.route(
+                "/api/b/{book_id}/weekly-review/items/{id}/restore",
+                axum::routing::post(restore_weekly_review_item),
+            ),
             ("GET", "/api/cron/typesafe-cleanup", "typesafe.cleanup") => {
                 router.route(&route.path, get(cleanup_route))
             }
@@ -229,9 +286,15 @@ pub(crate) fn routes() -> Router<AppState> {
             ("GET", "/api/cron/recurring", "cron.recurring") => {
                 router.route(&route.path, get(recurring_cron))
             }
-            ("GET", "/api/b/[bookId]/events", "events.stream") => {
-                router.route("/api/b/{book_id}/events", get(book_events))
+            ("GET", "/api/cron/weekly-review", "weeklyreview.cron") => {
+                router.route(&route.path, get(weekly_review_cron))
             }
+            #[cfg(feature = "native")]
+            ("GET", "/api/b/[bookId]/socket", "events.socket") => {
+                router.route("/api/b/{book_id}/socket", get(book_socket))
+            }
+            #[cfg(not(feature = "native"))]
+            ("GET", "/api/b/[bookId]/socket", "events.socket") => router,
             ("GET", "/api/b/[bookId]/sync/pending-count", "sync.pendingcount") => {
                 router.route("/api/b/{book_id}/sync/pending-count", get(pending_count))
             }
@@ -255,6 +318,14 @@ pub(crate) fn routes() -> Router<AppState> {
                     "/api/b/{book_id}/sync/tokens/{id}/accounts",
                     get(list_token_accounts),
                 ),
+            (
+                "POST",
+                "/api/b/[bookId]/sync/tokens/[id]/accounts/refresh",
+                "sync.refreshaccounts",
+            ) => router.route(
+                "/api/b/{book_id}/sync/tokens/{id}/accounts/refresh",
+                axum::routing::post(refresh_token_accounts),
+            ),
             ("PUT", "/api/b/[bookId]/sync/tokens/[id]/accounts", "sync.assignaccounts") => router
                 .route(
                     "/api/b/{book_id}/sync/tokens/{id}/accounts",
@@ -337,6 +408,23 @@ pub(crate) fn routes() -> Router<AppState> {
                     "/api/b/{book_id}/payees/{id}/last-account",
                     get(last_account),
                 ),
+            ("GET", "/api/b/[bookId]/payees/[id]/entry-patterns", "entrysuggestion.patterns") => {
+                router.route(
+                    "/api/b/{book_id}/payees/{id}/entry-patterns",
+                    get(get_entry_patterns),
+                )
+            }
+            ("POST", "/api/b/[bookId]/entry-suggestion", "entrysuggestion.request") => router
+                .route(
+                    "/api/b/{book_id}/entry-suggestion",
+                    axum::routing::post(request_entry_suggestion),
+                ),
+            ("POST", "/api/b/[bookId]/entry-suggestion/outcome", "entrysuggestion.outcome") => {
+                router.route(
+                    "/api/b/{book_id}/entry-suggestion/outcome",
+                    axum::routing::post(record_entry_outcome),
+                )
+            }
             ("GET", "/api/b/[bookId]/reports/data", "reports.data") => {
                 router.route("/api/b/{book_id}/reports/data", get(report_data))
             }

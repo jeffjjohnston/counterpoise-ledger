@@ -7,7 +7,7 @@ import { resetTestDatabase, setupTestDatabase } from "@/tests/helpers/db-utils";
 import { exec, insert } from "@/tests/helpers/sql";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import {
-  RUST_SERVER_BINARY, mcpTestTransport, stdioServerParameters,
+  RUST_SERVER_BINARY, stdioServerParameters,
 } from "@/tests/helpers/mcp-client";
 import manifest from "@/rust-api/server/mcp-tools.json";
 
@@ -19,7 +19,7 @@ const INITIALIZE = {
 };
 
 /** `counterpoise-rust-api mcp`: the key, revocation, and a clean stdout. */
-describe.skipIf(mcpTestTransport() !== "stdio")("Rust MCP over stdio", () => {
+describe("Rust MCP over stdio", () => {
   let key: string;
   let client: Client | undefined;
 

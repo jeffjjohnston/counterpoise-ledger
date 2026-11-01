@@ -27,10 +27,13 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-        let bind = env::var("RUST_BIND").unwrap_or_else(|_| "127.0.0.1:4000".to_string());
+        // A zone that is not one would put every "today" in another zone.
+        ledger_db::clock::resolve()?;
+        let bind =
+            ledger_db::env::var("RUST_BIND").unwrap_or_else(|_| "127.0.0.1:4000".to_string());
         let trust_proxy = trust_proxy(
-            env::var("TRUST_PROXY").ok().as_deref(),
-            env::var("APP_BIND").ok().as_deref(),
+            ledger_db::env::var("TRUST_PROXY").ok().as_deref(),
+            ledger_db::env::var("APP_BIND").ok().as_deref(),
             &bind,
         )?;
         Ok(Self {
@@ -38,7 +41,7 @@ impl Config {
                 .filter(|path| !path.is_empty())
                 .map_or_else(|| PathBuf::from("data/counterpoise.db"), PathBuf::from),
             bind,
-            enable_hsts: env::var("ENABLE_HSTS").is_ok_and(|value| value == "true"),
+            enable_hsts: ledger_db::env::var("ENABLE_HSTS").is_ok_and(|value| value == "true"),
             static_dir: env::var_os("COUNTERPOISE_STATIC_DIR")
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
@@ -52,7 +55,7 @@ impl Config {
     /// database file yet. Without this refusal it would start with an empty
     /// database, and the user could think that the data is lost.
     pub(crate) fn refuse_unconverted_install(&self) -> Result<(), String> {
-        let postgres = env::var("DATABASE_URL").is_ok_and(|url| !url.is_empty());
+        let postgres = ledger_db::env::var("DATABASE_URL").is_ok_and(|url| !url.is_empty());
         if postgres && !self.database_path.exists() {
             return Err(format!(
                 "DATABASE_URL is set, and there is no database at {}. This release \

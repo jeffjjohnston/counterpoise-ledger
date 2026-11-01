@@ -1,13 +1,13 @@
 //! Phase 1 (accounts and securities) and phase 1.5 (opening balances).
 
-use ledger_db::engine::DbConnection;
+use ledger_db::store::{self, Sql, Transaction, params};
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
 use ledger_core::formatters::to_date_string;
 
 use super::values::{Item, field, int, is_true, owned, text, timestamp_date};
-use super::{ImportContext, RowError, finish, row_error};
+use super::{ImportContext, RowError, row_error};
 
 /// A Moneydance account type as a Counterpoise type and subtype.
 enum Mapping {
@@ -88,12 +88,12 @@ fn initial_balance(item: &Item) -> Option<f64> {
     (balance != 0.0).then_some(balance)
 }
 
-pub async fn import_accounts(
-    connection: &mut DbConnection,
+pub fn import_accounts(
+    tx: &Transaction<'_>,
     context: &mut ImportContext,
     accounts: &[&Item],
     all_items: &[&Item],
-) -> Result<AccountStats, sqlx::Error> {
+) -> Result<AccountStats, store::Error> {
     context.heading("📁 Phase 1: Importing Accounts");
     let mut stats = AccountStats::default();
     let options = context.options;
@@ -152,21 +152,21 @@ pub async fn import_accounts(
             let is_active = !is_true(field(account, "is_inactive").as_deref());
             // The account and its cash child are two statements, as in the
             // TypeScript: a failed cash insert keeps the account and its mapping.
-            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-            let outcome = upsert_account(
-                &mut savepoint,
-                context.book_id,
-                context.now,
-                &NewAccount {
-                    name: &path,
-                    kind,
-                    subtype,
-                    parent_id: None,
-                    is_active,
-                },
-            )
-            .await;
-            let account_id = match finish(savepoint, outcome).await? {
+            let outcome = tx.savepoint(|sp| {
+                upsert_account(
+                    sp,
+                    context.book_id,
+                    context.now,
+                    &NewAccount {
+                        name: &path,
+                        kind,
+                        subtype,
+                        parent_id: None,
+                        is_active,
+                    },
+                )
+            })?;
+            let account_id = match outcome {
                 Ok(account_id) => account_id,
                 Err(message) => {
                     stats.errors += 1;
@@ -193,21 +193,21 @@ pub async fn import_accounts(
                 stats.imported += 1;
                 continue;
             }
-            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-            let outcome = upsert_account(
-                &mut savepoint,
-                context.book_id,
-                context.now,
-                &NewAccount {
-                    name: &format!("{path} - Cash"),
-                    kind: "asset",
-                    subtype: Some("cash"),
-                    parent_id: Some(account_id),
-                    is_active,
-                },
-            )
-            .await;
-            match finish(savepoint, outcome).await? {
+            let outcome = tx.savepoint(|sp| {
+                upsert_account(
+                    sp,
+                    context.book_id,
+                    context.now,
+                    &NewAccount {
+                        name: &format!("{path} - Cash"),
+                        kind: "asset",
+                        subtype: Some("cash"),
+                        parent_id: Some(account_id),
+                        is_active,
+                    },
+                )
+            })?;
+            match outcome {
                 Ok(cash_id) => {
                     context
                         .ids
@@ -236,23 +236,23 @@ pub async fn import_accounts(
             ) else {
                 continue;
             };
-            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-            let outcome = sqlx::query("UPDATE accounts SET parent_id = $1 WHERE id = $2")
-                .bind(parent)
-                .bind(child)
-                .execute(&mut *savepoint)
-                .await
+            let outcome = tx.savepoint(|sp| {
+                sp.execute(
+                    "UPDATE accounts SET parent_id = ?1 WHERE id = ?2",
+                    &params![parent, child],
+                )
                 .map(|_| ())
-                .map_err(row_error);
+                .map_err(row_error)
+            })?;
             let path = full_path(account, accounts);
-            match finish(savepoint, outcome).await? {
+            match outcome {
                 Ok(()) => context.verbose(format!("  ↳ {path} → parent set")),
                 Err(message) => eprintln!("  ✗ Error setting parent for {path}: {message}"),
             }
         }
     }
 
-    import_securities(connection, context, &mut stats, &securities, all_items).await?;
+    import_securities(tx, context, &mut stats, &securities, all_items)?;
 
     println!("\n📊 Account Import Summary:");
     println!("  Accounts imported: {}", stats.imported);
@@ -274,8 +274,8 @@ struct NewAccount<'a> {
 /// Inserts one account, or updates the row that an earlier import wrote. A
 /// re-import updates the type of a plain account and the parent of a cash
 /// child, as the TypeScript upserts do.
-async fn upsert_account(
-    connection: &mut DbConnection,
+fn upsert_account(
+    tx: &Transaction<'_>,
     book_id: i32,
     now: chrono::NaiveDateTime,
     account: &NewAccount<'_>,
@@ -285,35 +285,39 @@ async fn upsert_account(
     } else {
         "type = EXCLUDED.type, subtype = EXCLUDED.subtype, is_active = EXCLUDED.is_active"
     };
-    sqlx::query_scalar(&format!(
-        "INSERT INTO accounts
-           (book_id, name, type, subtype, parent_id, is_active, is_investment_cash, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-         ON CONFLICT (name, book_id) DO UPDATE SET {update}
-         RETURNING id"
-    ))
-    .bind(book_id)
-    .bind(account.name)
-    .bind(account.kind)
-    .bind(account.subtype)
-    .bind(account.parent_id)
-    .bind(account.is_active)
-    .bind(account.parent_id.is_some())
-    .bind(now)
-    .fetch_one(&mut *connection)
-    .await
+    tx.query_row(
+        &format!(
+            "INSERT INTO accounts
+               (book_id, name, type, subtype, parent_id, is_active, is_investment_cash, created_at,
+                updated_at, name_fold)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
+             ON CONFLICT (name, book_id) DO UPDATE SET {update}
+             RETURNING id"
+        ),
+        &params![
+            book_id,
+            account.name,
+            account.kind,
+            account.subtype,
+            account.parent_id,
+            account.is_active,
+            account.parent_id.is_some(),
+            now,
+            ledger_db::folds::fold(account.name)
+        ],
+    )
     .map_err(row_error)
 }
 
 /// Imports one `securities` row per underlying Moneydance security. Several
 /// security accounts can hold the same security.
-async fn import_securities(
-    connection: &mut DbConnection,
+fn import_securities(
+    tx: &Transaction<'_>,
     context: &mut ImportContext,
     stats: &mut AccountStats,
     securities: &[&Item],
     all_items: &[&Item],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), store::Error> {
     if securities.is_empty() {
         return Ok(());
     }
@@ -404,22 +408,25 @@ async fn import_securities(
             _ => "stock",
         };
         let symbol = ticker.clone().or_else(|| name.clone());
-        let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-        let outcome = sqlx::query_scalar::<_, i32>(
-            "INSERT INTO securities (book_id, name, symbol, security_type, created_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (name, symbol, book_id) DO UPDATE SET security_type = $4
-             RETURNING id",
-        )
-        .bind(context.book_id)
-        .bind(&name)
-        .bind(&symbol)
-        .bind(security_type)
-        .bind(context.now)
-        .fetch_one(&mut *savepoint)
-        .await
-        .map_err(row_error);
-        match finish(savepoint, outcome).await? {
+        let outcome = tx.savepoint(|sp| {
+            sp.query_row::<i32>(
+                "INSERT INTO securities
+                   (book_id, name, symbol, security_type, created_at, symbol_fold)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (name, symbol, book_id) DO UPDATE SET security_type = ?4
+                 RETURNING id",
+                &params![
+                    context.book_id,
+                    &name,
+                    &symbol,
+                    security_type,
+                    context.now,
+                    ledger_db::folds::fold_option(symbol.as_deref())
+                ],
+            )
+            .map_err(row_error)
+        })?;
+        match outcome {
             Ok(security_id) => {
                 for account in group {
                     if let Some(id) = text(account, "id") {
@@ -456,40 +463,37 @@ pub struct OpeningBalanceStats {
 }
 
 /// The "Imported Balance" expense account of this book, created when absent.
-async fn imported_balance_account(
-    connection: &mut DbConnection,
+fn imported_balance_account(
+    tx: &Transaction<'_>,
     context: &ImportContext,
-) -> Result<i32, sqlx::Error> {
-    let existing: Option<i32> = sqlx::query_scalar(
-        "SELECT id FROM accounts WHERE book_id = $1 AND name = 'Imported Balance'",
-    )
-    .bind(context.book_id)
-    .fetch_optional(&mut *connection)
-    .await?;
+) -> Result<i32, store::Error> {
+    let existing: Option<i32> = tx.query_optional(
+        "SELECT id FROM accounts WHERE book_id = ?1 AND name = 'Imported Balance'",
+        &params![context.book_id],
+    )?;
     if let Some(id) = existing {
         return Ok(id);
     }
-    sqlx::query_scalar(
+    tx.query_row(
         "INSERT INTO accounts
-           (book_id, name, type, subtype, parent_id, is_active, is_investment_cash, created_at, updated_at)
-         VALUES ($1, 'Imported Balance', 'expense', NULL, NULL, true, false, $2, $2)
+           (book_id, name, type, subtype, parent_id, is_active, is_investment_cash, created_at, updated_at,
+            name_fold)
+         VALUES (?1, 'Imported Balance', 'expense', NULL, NULL, true, false, ?2, ?2,
+           'imported balance')
          RETURNING id",
+        &params![context.book_id, context.now],
     )
-    .bind(context.book_id)
-    .bind(context.now)
-    .fetch_one(&mut *connection)
-    .await
 }
 
 /// One reconciled transaction per account with an initial balance, against
 /// the "Imported Balance" account. An investment account's balance goes to
 /// its cash child.
-pub async fn create_opening_balances(
-    connection: &mut DbConnection,
+pub fn create_opening_balances(
+    tx: &Transaction<'_>,
     context: &mut ImportContext,
     accounts: &[AccountWithBalance],
     today: NaiveDate,
-) -> Result<OpeningBalanceStats, sqlx::Error> {
+) -> Result<OpeningBalanceStats, store::Error> {
     context.heading("🏦 Phase 1.5: Creating Opening Balances");
     let mut stats = OpeningBalanceStats::default();
     if accounts.is_empty() {
@@ -525,7 +529,7 @@ pub async fn create_opening_balances(
         return Ok(stats);
     }
 
-    let offset_account = imported_balance_account(connection, context).await?;
+    let offset_account = imported_balance_account(tx, context)?;
     println!("Using Imported Balance account (ID: {offset_account})");
 
     for account in accounts {
@@ -543,10 +547,9 @@ pub async fn create_opening_balances(
                 account.name
             ));
         }
-        let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-        let outcome = async {
+        let outcome = tx.savepoint(|sp| {
             let transaction_id = super::insert_transaction(
-                &mut savepoint,
+                sp,
                 context.book_id,
                 context.now,
                 &super::NewTransaction {
@@ -556,10 +559,9 @@ pub async fn create_opening_balances(
                     payee_id: None,
                     is_reconciled: true,
                 },
-            )
-            .await?;
+            )?;
             super::insert_splits(
-                &mut savepoint,
+                sp,
                 context.book_id,
                 transaction_id,
                 &[
@@ -567,10 +569,8 @@ pub async fn create_opening_balances(
                     (offset_account, -account.initial_balance),
                 ],
             )
-            .await
-        }
-        .await;
-        match finish(savepoint, outcome).await? {
+        })?;
+        match outcome {
             Ok(()) => {
                 context.verbose(format!("  ✓ {text} on {date}"));
                 stats.created += 1;

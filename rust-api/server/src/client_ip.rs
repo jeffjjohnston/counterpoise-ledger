@@ -34,12 +34,12 @@
 
 use axum::{
     Router,
-    extract::{ConnectInfo, Request, State, connect_info::IntoMakeServiceWithConnectInfo},
+    extract::{Request, State},
     http::{HeaderMap, HeaderValue},
     middleware::{self, Next},
     response::Response,
 };
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr};
 
 /// The header that [`record`] writes. Its value is the rate-limit key of the
 /// client, not the client's address. An IPv6 address is cut to its /64 prefix.
@@ -160,12 +160,15 @@ pub(crate) async fn record(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let peer = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(address)| address.ip());
-    let client = resolve(trusted, request.headers(), peer);
-    let headers = request.headers_mut();
+    let peer = crate::platform::peer(&request);
+    rewrite(trusted, request.headers_mut(), peer);
+    next.run(request).await
+}
+
+/// What [`record`] does to a request's headers, for a request that does not
+/// pass through the router: a Durable Object's book socket.
+pub(crate) fn rewrite(trusted: bool, headers: &mut HeaderMap, peer: Option<IpAddr>) {
+    let client = resolve(trusted, headers, peer);
     headers.remove(CLIENT_IP_HEADER);
     if !trusted {
         for name in PROXY_HEADERS {
@@ -175,7 +178,6 @@ pub(crate) async fn record(
     if let Some(value) = client.and_then(|client| HeaderValue::from_str(&client).ok()) {
         headers.insert(CLIENT_IP_HEADER, value);
     }
-    next.run(request).await
 }
 
 /// The rate-limit key that [`record`] wrote, or `None` when it found none.
@@ -191,12 +193,9 @@ pub(crate) fn from_headers(headers: &HeaderMap) -> Option<&str> {
 
 /// The server's service: `app` behind [`record`], with the peer address in
 /// each request. `serve()` gives this to `axum::serve`.
-pub(crate) fn service(
-    app: Router,
-    trusted: bool,
-) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
-    app.layer(middleware::from_fn_with_state(trusted, record))
-        .into_make_service_with_connect_info::<SocketAddr>()
+#[cfg(feature = "native")]
+pub(crate) fn service(app: Router, trusted: bool) -> crate::platform::PeerService {
+    crate::platform::with_peer(app.layer(middleware::from_fn_with_state(trusted, record)))
 }
 
 #[cfg(test)]

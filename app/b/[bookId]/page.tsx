@@ -5,6 +5,7 @@ import { Link } from "@/lib/navigation";
 import { useBookId } from "@/hooks/useBookId";
 import { AccountCard } from "@/components/accounts/AccountCard";
 import { NetWorthCard } from "@/components/dashboard/NetWorthCard";
+import { WeeklyReviewCard } from "@/components/dashboard/WeeklyReviewCard";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { formatCurrency, formatDate, getAccountShortName, toDateString } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
@@ -18,6 +19,18 @@ interface AccountSummary {
   type: string;
   accounts: AccountWithBalance[];
   total: number;
+}
+
+// The register without accountId opens the favorite account and drops
+// highlight. Open the first asset or liability account of the transaction, the
+// rule of the weekly review card; else its first account.
+function registerHref(bookId: string, transaction: TransactionWithSplits): string {
+  const register = transaction.splits.find(
+    (split) => split.account.type === "asset" || split.account.type === "liability"
+  );
+  const accountId = (register ?? transaction.splits[0])?.account.id;
+  const account = accountId === undefined ? "" : `accountId=${accountId}&`;
+  return `/b/${bookId}/transactions?${account}highlight=${transaction.id}`;
 }
 
 export default function HomePage() {
@@ -161,6 +174,7 @@ export default function HomePage() {
             </p>
           </div>
         </div>
+        <WeeklyReviewCard bookId={bookId} />
         <NetWorthCard bookId={bookId} />
       </div>
 
@@ -242,7 +256,7 @@ export default function HomePage() {
               return (
                 <Link
                   key={transaction.id}
-                  href={`/b/${bookId}/transactions?highlight=${transaction.id}`}
+                  href={registerHref(bookId, transaction)}
                   className="px-3 md:px-6 py-3 md:py-4 flex items-center justify-between hover:bg-surface-tertiary transition-colors gap-3"
                 >
                   <div className="flex items-center gap-3 md:gap-4 min-w-0">

@@ -100,11 +100,39 @@ describe("IncomeStatementCharts", () => {
     expect(screen.getByRole("button", { name: "Show chart" })).toBeInTheDocument();
   });
 
-  it("hides the category chart on its own key", () => {
+  // Each card owns its button, so each chart must be in its card. A chart next to its card stays on Hide chart.
+  // With no expense rows, only the monthly card is there.
+  it("hides the monthly chart, keeps it hidden after a remount, and shows it with Show chart", async () => {
     vi.stubGlobal("fetch", respond(twoMonths));
-    render(<IncomeStatementCharts bookId="1" monthlyRange={null} expenseRows={rows} accounts={accounts} activeAccountIds={active} />);
+    const { unmount } = render(
+      <IncomeStatementCharts bookId="1" monthlyRange={{}} expenseRows={[]} accounts={accounts} activeAccountIds={active} />,
+    );
+    await screen.findByRole("img", { name: /^Income and expense by month/ });
     fireEvent.click(screen.getByRole("button", { name: "Hide chart" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    unmount();
+    render(<IncomeStatementCharts bookId="1" monthlyRange={{}} expenseRows={[]} accounts={accounts} activeAccountIds={active} />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show chart" }));
+    expect(await screen.findByRole("img", { name: /^Income and expense by month/ })).toBeInTheDocument();
+  });
+
+  // With a null range, only the category card is there.
+  it("hides the category chart on its own key, and keeps it hidden after a remount", () => {
+    vi.stubGlobal("fetch", respond(twoMonths));
+    const { unmount } = render(
+      <IncomeStatementCharts bookId="1" monthlyRange={null} expenseRows={rows} accounts={accounts} activeAccountIds={active} />,
+    );
+    expect(screen.getByRole("img", { name: /^Expense by category/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Hide chart" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
     expect(localStorage.getItem("counterpoise.expenseBreakdownChart.hidden")).toBe("true");
+    expect(localStorage.getItem("counterpoise.incomeByMonthChart.hidden")).toBeNull();
+    unmount();
+    render(<IncomeStatementCharts bookId="1" monthlyRange={null} expenseRows={rows} accounts={accounts} activeAccountIds={active} />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show chart" }));
+    expect(screen.getByRole("img", { name: /^Expense by category/ })).toBeInTheDocument();
   });
 
   it("gives one row per year in the table when the range has more than 24 months", async () => {

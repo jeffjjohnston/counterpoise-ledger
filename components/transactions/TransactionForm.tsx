@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo, useRef, useImperativeHandle, forwardRef } from "react";
+import { useState, useEffect, useCallback, useId, useMemo, useRef, useImperativeHandle, forwardRef } from "react";
 import { useBookId } from "@/hooks/useBookId";
-import { apiGet } from "@/lib/api-client";
+import { apiGet, apiPost } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -16,8 +16,10 @@ import {
   toDateString,
   resolveAmountOnBlur,
   getAccountShortName,
+  parseStrictCurrency,
 } from "@/lib/wasm-client";
 import { validateSplits } from "@/lib/wasm-client";
+import { prepareSaveChord } from "@/lib/save-chord";
 import type {
   AccountWithBalance,
   PlaidLinkData,
@@ -29,6 +31,10 @@ import { useInvestmentEntry } from "./useInvestmentEntry";
 import { InvestmentEntrySection } from "./InvestmentEntrySection";
 import { NewExpenseSubflow } from "./NewExpenseSubflow";
 import { TransactionAuthorship } from "./TransactionAuthorship";
+import { EntryPatternChip } from "./EntryPatternChip";
+import { useEntrySuggestion } from "@/hooks/useEntrySuggestion";
+import { fillFromPattern, outcomeOf, rangeHint, type PatternFill } from "@/lib/entry-patterns";
+import type { EntryPattern } from "@/lib/typesafe/types";
 import {
   buildSimpleEntry,
   buildSubmitPayload,
@@ -46,7 +52,8 @@ interface TransactionFormProps {
   editingTransaction?: TransactionWithSplits | null;
   plaidData?: PlaidLinkData | null;
   onPlaidUnlinked?: () => void;
-  onSubmit: (data: TransactionFormSubmitData) => void;
+  /** `true` when the save succeeded; the entry outcome is recorded only then. */
+  onSubmit: (data: TransactionFormSubmitData) => void | boolean | Promise<void | boolean>;
   onCancel?: () => void;
   onDelete?: () => void;
   onMakeRecurring?: (transactionId: number) => void;
@@ -56,6 +63,9 @@ interface TransactionFormProps {
   /** Show the transaction without edit controls. For a viewer. */
   readOnly?: boolean;
 }
+
+/** The wait after the last keystroke in the payee field before the payee search. */
+export const PAYEE_SEARCH_DELAY_MS = 150;
 
 export interface TransactionFormHandle {
   focus: () => void;
@@ -137,6 +147,28 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   const addButtonRef = useRef<HTMLButtonElement>(null);
   const journalAddButtonRef = useRef<HTMLButtonElement>(null);
   const autoFilledPayeeId = useRef<number | null>(null);
+  // The entry fill (guides/typesafe-experiment.md, "Entry suggestions"). The
+  // fill changes only the fields that the user has not set since the reset;
+  // a TypeSafe answer changes nothing after any edit since the last fill.
+  const accountsTouched = useRef(false);
+  const amountTouched = useRef(false);
+  const editedSinceFill = useRef(false);
+  // The amount in cents that the user typed in simple mode. It stays when a
+  // journal fill switches the mode, so a later fill keeps it too.
+  const typedCents = useRef<number | null>(null);
+  const chipShown = useRef(false);
+  // The fill that the form shows. It, not the hook's pick, names the chip's
+  // pattern and the source of the outcome: a dropped TypeSafe answer changes
+  // nothing in the form.
+  const [appliedFill, setAppliedFill] = useState<{
+    pattern: EntryPattern;
+    fill: PatternFill;
+    amountFilled: boolean;
+    picked: boolean;
+    index: number;
+    /** The automatic fill that the user saw first: history or TypeSafe. */
+    source: "history" | "typesafe";
+  } | null>(null);
 
   const compact = !fullLayout && !editingTransaction;
 
@@ -206,7 +238,36 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   // dropdown: when the user picks an account that displaces it on one side,
   // move it to the other side. Skipped while editing so existing transactions
   // can have their accounts changed freely.
+  const markAccountsTouched = () => {
+    accountsTouched.current = true;
+    editedSinceFill.current = true;
+  };
+  const markAmountTouched = () => {
+    amountTouched.current = true;
+    editedSinceFill.current = true;
+  };
+  const handleSplitsChange = (next: SplitInput[]) => {
+    markAccountsTouched();
+    markAmountTouched();
+    // The split amounts are now the user's; a typed simple amount no longer applies.
+    typedCents.current = null;
+    setSplits(next);
+  };
+  // The blur resolves an expression ("50+5" becomes "55.00"); the kept cents
+  // follow it.
+  const handleAmountBlur = () => {
+    const resolved = resolveAmountOnBlur(simpleAmount);
+    setSimpleAmount(resolved);
+    if (amountTouched.current) typedCents.current = parseStrictCurrency(resolved);
+  };
+  const handleAmountChange = (value: string) => {
+    markAmountTouched();
+    typedCents.current = parseStrictCurrency(value);
+    setSimpleAmount(value);
+  };
+
   const handleFromAccountChange = (id: number | null) => {
+    markAccountsTouched();
     setFromAccountId(id);
     if (editingTransaction) return;
     if (
@@ -219,6 +280,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   };
 
   const handleToAccountChange = (id: number | null) => {
+    markAccountsTouched();
     setToAccountId(id);
     if (editingTransaction) return;
     if (
@@ -287,6 +349,12 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     setFromAccountId(resolveSimpleAccountId(selectedAccountId));
     setToAccountId(null);
     autoFilledPayeeId.current = null;
+    accountsTouched.current = false;
+    amountTouched.current = false;
+    editedSinceFill.current = false;
+    chipShown.current = false;
+    typedCents.current = null;
+    setAppliedFill(null);
     const defaultAccount = accounts.find((a) => a.type === "expense") || accounts[0];
     setSplits([
       { accountId: defaultAccount?.id || 0, amount: 0 },
@@ -302,6 +370,9 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
 
   const handleModeChange = (nextMode: TransactionMode) => {
     if (isEditing) return;
+    // A mode change is the user's choice: a later fill must not undo it.
+    markAccountsTouched();
+    markAmountTouched();
     setMode(nextMode);
     if (nextMode === "journal") {
       setSplits([
@@ -376,7 +447,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     // already catches its own errors, so this cannot reject.
     const timeout = setTimeout(() => {
       void fetchSuggestions();
-    }, 150);
+    }, PAYEE_SEARCH_DELAY_MS);
 
     return () => {
       clearTimeout(timeout);
@@ -384,19 +455,266 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     };
   }, [bookId, payeeName]);
 
+  // The payee that the field names, by the server's rule
+  // (find_payee_by_name): the exact spelling, else the oldest payee whose name
+  // differs only by letter case. The save resolves the same payee.
+  const matchedPayee = useMemo(() => {
+    const trimmed = payeeName.trim();
+    if (!trimmed) return null;
+    const exact = payeeSuggestions.find((s) => s.name === trimmed);
+    if (exact) return exact;
+    const variants = payeeSuggestions.filter((s) => s.name.toLowerCase() === trimmed.toLowerCase());
+    return variants.reduce<(typeof variants)[number] | null>(
+      (oldest, s) => (oldest === null || s.id < oldest.id ? s : oldest),
+      null
+    );
+  }, [payeeName, payeeSuggestions]);
+  const matchedPayeeId = matchedPayee?.id ?? null;
+
+  const entryActive =
+    !editingTransaction &&
+    !readOnly &&
+    (mode === "simple" || mode === "journal") &&
+    resolvedSelectedAccountId !== null;
+  // The amount that the user typed before the payee, with its direction on
+  // the register's account: negative when money leaves it.
+  const typedAmount = useCallback(() => {
+    const cents = typedCents.current;
+    if (!amountTouched.current || cents === null) return null;
+    return mode === "simple" && toAccountId !== null && toAccountId === resolvedSelectedAccountId
+      ? cents
+      : -cents;
+  }, [mode, toAccountId, resolvedSelectedAccountId]);
+  const entryFill = useEntrySuggestion({
+    bookId,
+    accountId: resolvedSelectedAccountId,
+    payeeId: matchedPayeeId,
+    date,
+    typedAmount,
+    active: entryActive,
+  });
+
+  // A fill belongs to one payee. When the payee changes, the fields that the
+  // fill set and the user did not touch go back to the empty entry.
+  const appliedFillRef = useRef(appliedFill);
+  useEffect(() => {
+    appliedFillRef.current = appliedFill;
+  });
+  useEffect(() => {
+    const previous = appliedFillRef.current;
+    if (previous) {
+      if (!accountsTouched.current) {
+        if (previous.fill.mode === "journal") setMode("simple");
+        setFromAccountId(resolvedSelectedAccountId);
+        setToAccountId(null);
+      }
+      if (!amountTouched.current) setSimpleAmount("");
+    }
+    setAppliedFill(null);
+    chipShown.current = false;
+    // Only a change of the payee clears the fill.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matchedPayeeId]);
+
+  /**
+   * Fills the form from a pattern. `force` (a pick from the chip) sets every
+   * field; otherwise only the fields that the user has not set.
+   */
+  const applyFill = (
+    pattern: EntryPattern,
+    options: { force: boolean; picked: boolean; index: number; source: "history" | "typesafe" }
+  ) => {
+    if (resolvedSelectedAccountId === null) return;
+    const fill = fillFromPattern(pattern, resolvedSelectedAccountId);
+    const setAccounts = options.force || !accountsTouched.current;
+    // A pick keeps an amount that the user typed when the pattern has none.
+    const setAmount = options.force
+      ? pattern.stable || !amountTouched.current
+      : !amountTouched.current;
+    if (fill.mode === "simple" && mode === "simple") {
+      if (setAccounts) {
+        setFromAccountId(fill.fromAccountId);
+        setToAccountId(fill.toAccountId);
+      }
+      if (setAmount) setSimpleAmount(fill.amount);
+    } else {
+      // A journal fill sets the accounts. The amounts are the pattern's when
+      // they repeat; else this account's line gets the typed amount, or the
+      // total when it repeats, and the other lines stay empty.
+      if (!setAccounts) return;
+      const accountId = resolvedSelectedAccountId;
+      const net = pattern.splits
+        .filter((split) => split.accountId === accountId)
+        .reduce((sum, split) => sum + split.amount, 0);
+      // The amount that the user set: typed in simple mode, or the net of this
+      // account's lines edited in journal mode.
+      const edited =
+        mode === "journal"
+          ? Math.abs(splits.filter((split) => split.accountId === accountId).reduce((sum, split) => sum + split.amount, 0))
+          : 0;
+      const typed = !setAmount ? (typedCents.current ?? (edited > 0 ? edited : null)) : null;
+      const total =
+        setAmount && !pattern.stable && pattern.range.min === pattern.range.max ? pattern.range.max : null;
+      const own = typed ?? total;
+      // The amount goes on the first line of this account only, as one net
+      // amount; other lines of the account stay empty.
+      const firstOwn = pattern.splits.findIndex((split) => split.accountId === accountId);
+      setMode("journal");
+      setSplits(
+        pattern.splits.map((split, index) => {
+          if (setAmount && pattern.stable) return { accountId: split.accountId, amount: split.amount };
+          const mine = own !== null && index === firstOwn;
+          return { accountId: split.accountId, amount: mine ? (net <= 0 ? -own : own) : 0 };
+        })
+      );
+    }
+    editedSinceFill.current = false;
+    setAppliedFill({
+      pattern,
+      fill,
+      amountFilled: pattern.stable && setAmount,
+      picked: options.picked,
+      index: options.index,
+      source: options.source,
+    });
+  };
+
+  // The newest pattern at once; the TypeSafe pick when it arrives, only while
+  // the user has not edited the form since the last fill.
+  useEffect(() => {
+    if (!entryFill.patterns || !entryFill.pick) return;
+    const index = entryFill.patterns.findIndex((pattern) => pattern.key === entryFill.pick?.key);
+    if (index < 0) return;
+    if (entryFill.pick.source === "typesafe" && editedSinceFill.current) return;
+    if (appliedFill?.picked) return;
+    applyFill(entryFill.patterns[index], { force: false, picked: false, index, source: entryFill.pick.source });
+    // applyFill reads the current form state; the pick is the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entryFill.patterns, entryFill.pick]);
+
+  const chipVisible =
+    entryFill.patterns !== null &&
+    entryFill.patterns.length > 0 &&
+    entryFill.pick !== null &&
+    appliedFill !== null &&
+    resolvedSelectedAccountId !== null;
+  useEffect(() => {
+    if (chipVisible) chipShown.current = true;
+  }, [chipVisible]);
+
+  /**
+   * The record of what the user did with the fill, or null without one. It is
+   * built before a save resets the form, and sent after.
+   */
+  const entryOutcome = (outcome: string) => {
+    if (!entryFill.entryEnabled || !appliedFill) return null;
+    return {
+      evaluationId: entryFill.evaluationId,
+      outcome,
+      source: appliedFill.source,
+      chipVisible: chipShown.current,
+      pickedIndex: appliedFill.picked ? appliedFill.index : null,
+      transactionId: null,
+    };
+  };
+  /** Sends an outcome. It never blocks or undoes a save. */
+  const sendEntryOutcome = (body: ReturnType<typeof entryOutcome>) => {
+    if (!body) return;
+    apiPost(`/api/b/${bookId}/entry-suggestion/outcome`, body).catch(() => undefined);
+  };
+  const postEntryOutcome = (outcome: string) => sendEntryOutcome(entryOutcome(outcome));
+
+  // Closing the form with a fill and no save (the sheet's X, its backdrop,
+  // leaving the page) records `abandoned`, as Cancel does.
+  const abandonOnUnmount = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    abandonOnUnmount.current = appliedFill ? () => postEntryOutcome("abandoned") : null;
+  });
+  useEffect(() => () => abandonOnUnmount.current?.(), []);
+
+  const handleCancel = () => {
+    postEntryOutcome("abandoned");
+    abandonOnUnmount.current = null;
+    onCancel?.();
+  };
+
+  // The "usually $x–$y" hint of a pattern whose amount varies. In simple mode
+  // it sits directly below the empty Amount field it is about, and describes
+  // that field. Journal mode has no single amount field, so the hint stays
+  // beside the chip there. The chip leaves the range out: in simple mode it
+  // belongs under the Amount field only, and in journal mode the hint has it.
+  const amountHint =
+    chipVisible && appliedFill && mode === "simple" && simpleAmount === "" ? rangeHint(appliedFill.pattern) : null;
+  const journalHint =
+    chipVisible && appliedFill && mode === "journal" && appliedFill.fill.mode === "journal"
+      ? rangeHint(appliedFill.pattern)
+      : null;
+  // Unique per form: the register can mount the desktop and mobile forms at
+  // once. With fixed ids the second form's labels would name the first form's
+  // fields, and its Amount field would point at the first form's hint.
+  const fieldIdPrefix = useId();
+  const fieldId = (name: string) => `${fieldIdPrefix}-${name}`;
+  const amountHintId = fieldId("amount-hint");
+
+  const renderEntryChip = () => {
+    if (!chipVisible || !entryFill.patterns || !appliedFill || resolvedSelectedAccountId === null) return null;
+    return (
+      <EntryPatternChip
+        patterns={entryFill.patterns}
+        accounts={accounts}
+        accountId={resolvedSelectedAccountId}
+        chosen={appliedFill.pattern}
+        source={
+          appliedFill.picked
+            ? "your pick"
+            : appliedFill.source === "typesafe"
+              ? "TypeSafe"
+              : entryFill.unsure
+                ? "TypeSafe was not sure"
+                : "history"
+        }
+        hideAmount={mode === "simple" ? !appliedFill.pattern.stable : journalHint !== null}
+        onPick={(pattern, index) =>
+          pattern.key === appliedFill.pattern.key
+            ? // The pattern already shown: an acceptance, not another pick.
+              applyFill(pattern, {
+                force: true,
+                picked: appliedFill.picked,
+                index: appliedFill.index,
+                source: appliedFill.source,
+              })
+            : applyFill(pattern, { force: true, picked: true, index, source: appliedFill.source })
+        }
+      />
+    );
+  };
+
+  const entryChip = renderEntryChip();
+
+  const renderEntryHelp = () => {
+    if (!entryChip) return null;
+    return (
+      <div className="mt-1 flex flex-wrap items-start gap-x-3 gap-y-1">
+        {entryChip}
+        {journalHint && <span className="text-xs text-fg-tertiary">{journalHint}</span>}
+      </div>
+    );
+  };
+
   // Auto-fill To Account from last transaction for selected payee
+  // It runs when the entry fill has no history in this account, or cannot
+  // run (no register account).
   useEffect(() => {
     if (editingTransaction || mode !== "simple") return;
+    if (entryActive && (entryFill.patterns === null || entryFill.patterns.length > 0)) return;
 
-    const trimmed = payeeName.trim();
-    if (!trimmed) {
+    if (!payeeName.trim()) {
       autoFilledPayeeId.current = null;
       return;
     }
 
-    const matched = payeeSuggestions.find(
-      (s) => s.name.toLowerCase() === trimmed.toLowerCase()
-    );
+    // The exact spelling first, then a case variant (matchedPayee).
+    const matched = matchedPayee;
     if (!matched || autoFilledPayeeId.current === matched.id) return;
 
     const controller = new AbortController();
@@ -419,7 +737,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
       });
 
     return () => controller.abort();
-  }, [bookId, payeeName, payeeSuggestions, editingTransaction, mode]);
+  }, [bookId, payeeName, matchedPayee, editingTransaction, mode, entryActive, entryFill.patterns]);
 
   useEffect(() => {
     // Don't resolve account IDs when editing - preserve the original accounts even if inactive
@@ -434,12 +752,21 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     });
   }, [mode, resolveSimpleAccountId, editingTransaction]);
 
+  // From goes to the register's account when the mode or the account changes.
+  // An accounts refresh (a new resolveSimpleAccountId) keeps the user's From,
+  // for example a money-in fill.
+  const fromResetFor = useRef<string | null>(null);
   useEffect(() => {
-    if (mode !== "simple" || editingTransaction || selectedAccountId === null) return;
-    const resolvedSelectedId = resolveSimpleAccountId(selectedAccountId);
-    if (resolvedSelectedId !== null) {
-      setFromAccountId(resolvedSelectedId);
+    if (mode !== "simple" || editingTransaction || selectedAccountId === null) {
+      fromResetFor.current = null;
+      return;
     }
+    const resolvedSelectedId = resolveSimpleAccountId(selectedAccountId);
+    if (resolvedSelectedId === null) return;
+    const key = `${mode}|${selectedAccountId}`;
+    if (fromResetFor.current === key) return;
+    fromResetFor.current = key;
+    setFromAccountId(resolvedSelectedId);
   }, [mode, editingTransaction, selectedAccountId, resolveSimpleAccountId]);
 
   // Reset investment mode when navigating away from an investment account
@@ -456,6 +783,8 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
       // Check if the new account is now in the accounts list
       const accountExists = accounts.some((account) => account.id === investment.pendingNewAccountId);
       if (accountExists) {
+        // The user made this account: a later fill must not replace it.
+        markAccountsTouched();
         setToAccountId(investment.pendingNewAccountId);
         setPendingNewAccountId(null);
       }
@@ -543,7 +872,11 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     const changes = reconciledEditChanges(editingTransaction, date, entry.splits);
     if (changes.length > 0 && !confirm(reconciledEditPrompt(changes))) return;
 
-    onSubmit(
+    // Recorded only when the save handler reports success.
+    const outcome = appliedFill
+      ? entryOutcome(outcomeOf(appliedFill.fill, entry.splits, appliedFill.amountFilled, appliedFill.picked))
+      : null;
+    const saved = onSubmit(
       buildSubmitPayload(
         {
           date,
@@ -558,6 +891,19 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
         entry
       )
     );
+    // Made here, in the submit gesture, because browsers block audio that
+    // starts later on its own. It plays only when the save handler reports
+    // success.
+    const playChord = prepareSaveChord();
+    if (outcome || playChord) {
+      void Promise.resolve(saved)
+        .then((ok) => {
+          if (ok !== true) return;
+          if (outcome) sendEntryOutcome(outcome);
+          playChord?.();
+        })
+        .catch(() => undefined);
+    }
     if (!editingTransaction) {
       resetForm();
       // Focus the payee field for immediate next entry
@@ -594,6 +940,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           key={tab.id}
           type="button"
           onClick={() => handleModeChange(tab.id)}
+          aria-pressed={mode === tab.id}
           disabled={isEditing}
           className={`${
             isCompact ? "px-3 py-1.5 text-xs" : "px-4 py-2.5 text-sm"
@@ -678,7 +1025,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
             <DateInput
               label="Date"
               labelHidden
-              id="date"
+              id={fieldId("date")}
               size="compact"
               value={isFloating ? toDateString(new Date()) : date}
               onChange={setDate}
@@ -715,6 +1062,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
             <button
               type="button"
               onClick={() => {
+                markAccountsTouched();
                 setFromAccountId(toAccountId);
                 setToAccountId(fromAccountId);
               }}
@@ -744,17 +1092,16 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               type="text"
               label="Amount"
               labelHidden
-              id="amount"
+              id={fieldId("amount")}
               size="compact"
               value={simpleAmount}
-              onChange={(e) => setSimpleAmount(e.target.value)}
-              onBlur={() => {
-                setSimpleAmount(resolveAmountOnBlur(simpleAmount));
-              }}
+              onChange={(e) => handleAmountChange(e.target.value)}
+              onBlur={handleAmountBlur}
               onKeyDown={handleAmountKeyDown}
               placeholder="0.00"
               required
               selectOnFocus
+              aria-describedby={amountHint ? amountHintId : undefined}
             />
           </div>
           {/* Labelled, and sized like the primary action it is. This was a bare
@@ -779,6 +1126,16 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               Add
             </Button>
           </div>
+          {/* A second row of the same grid: the chip under Date and Payee, and
+              the range hint in the Amount column, directly below the field.
+              Both are in flow, so the hint wraps inside its column and pushes
+              what follows down rather than overlapping it. */}
+          {entryChip && <div className="col-span-3 self-start pl-4 pr-2 mt-1">{entryChip}</div>}
+          {amountHint && (
+            <p id={amountHintId} className="col-start-4 self-start pl-2 pr-2 mt-1 text-xs text-fg-tertiary">
+              {amountHint}
+            </p>
+          )}
         </div>
         {renderSelectedAccountWarning()}
         </>
@@ -791,7 +1148,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               <div className={isFloating ? "pointer-events-none" : ""} aria-disabled={isFloating || undefined} inert={isFloating || undefined}>
                 <DateInput
                   label="Date"
-                  id="date"
+                  id={fieldId("date")}
                   size="compact"
                   value={isFloating ? toDateString(new Date()) : date}
                   onChange={setDate}
@@ -810,9 +1167,10 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
                 allowClear={false}
               />
             </div>
+            {renderEntryHelp()}
             <SplitEditor
               splits={splits}
-              onChange={setSplits}
+              onChange={handleSplitsChange}
               accounts={accounts}
               onPendingChange={setHasPendingExpression}
               submitRef={journalAddButtonRef}
@@ -835,7 +1193,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               <div className={isFloating ? "pointer-events-none" : ""} aria-disabled={isFloating || undefined} inert={isFloating || undefined}>
                 <DateInput
                   label="Date"
-                  id="date"
+                  id={fieldId("date")}
                   size="compact"
                   value={isFloating ? toDateString(new Date()) : date}
                   onChange={setDate}
@@ -866,7 +1224,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
                 ref={descriptionRef}
                 type="text"
                 label="Description"
-                id="description"
+                id={fieldId("description")}
                 size="compact"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
@@ -876,7 +1234,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
                 <Input
                   type="text"
                   label="Check #"
-                  id="checkNumber"
+                  id={fieldId("checkNumber")}
                   size="compact"
                   value={checkNumber}
                   onChange={(e) => setCheckNumber(e.target.value)}
@@ -887,7 +1245,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
             </div>
             <Textarea
               label="Notes"
-              id="notes-compact"
+              id={fieldId("notes-compact")}
               size="compact"
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
@@ -970,7 +1328,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           <Input
             type="date"
             label="Date"
-            id="date"
+            id={fieldId("date")}
             value={isFloating ? toDateString(new Date()) : date}
             onChange={(e) => setDate(e.target.value)}
             required
@@ -1001,6 +1359,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           placeholder="e.g., Whole Foods"
           allowClear={false}
         />
+        {renderEntryHelp()}
       </div>
 
       <button
@@ -1029,7 +1388,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               ref={descriptionRef}
               type="text"
               label="Description"
-              id="description"
+              id={fieldId("description")}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="e.g., Grocery shopping"
@@ -1038,7 +1397,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               <Input
                 type="text"
                 label="Check Number (optional)"
-                id="checkNumber"
+                id={fieldId("checkNumber")}
                 value={checkNumber}
                 onChange={(e) => setCheckNumber(e.target.value)}
                 placeholder="e.g., 1234"
@@ -1049,7 +1408,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
 
           <Textarea
             label="Notes (optional)"
-            id="notes"
+            id={fieldId("notes")}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             placeholder="Add notes (markdown supported)"
@@ -1080,7 +1439,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           <div className="ml-6">
             <DateInput
               label="Cleared date"
-              id="clearedDate"
+              id={fieldId("clearedDate")}
               size="compact"
               value={date}
               onChange={setDate}
@@ -1106,6 +1465,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
             <button
               type="button"
               onClick={() => {
+                markAccountsTouched();
                 setFromAccountId(toAccountId);
                 setToAccountId(fromAccountId);
               }}
@@ -1131,16 +1491,20 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
             <Input
               type="text"
               label="Amount"
-              id="amount"
+              id={fieldId("amount")}
               value={simpleAmount}
-              onChange={(e) => setSimpleAmount(e.target.value)}
-              onBlur={() => {
-                setSimpleAmount(resolveAmountOnBlur(simpleAmount));
-              }}
+              onChange={(e) => handleAmountChange(e.target.value)}
+              onBlur={handleAmountBlur}
               placeholder="0.00"
               required
               selectOnFocus
+              aria-describedby={amountHint ? amountHintId : undefined}
             />
+            {amountHint && (
+              <p id={amountHintId} className="col-start-4 -mt-3 text-xs text-fg-tertiary">
+                {amountHint}
+              </p>
+            )}
           </div>
           {renderSelectedAccountWarning()}
           <button
@@ -1181,7 +1545,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           )}
           <SplitEditor
             splits={splits}
-            onChange={setSplits}
+            onChange={handleSplitsChange}
             accounts={accounts}
             onPendingChange={setHasPendingExpression}
           />
@@ -1225,7 +1589,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
             </div>
             <div className="flex gap-3">
               {onCancel && (
-                <Button type="button" variant="secondary" onClick={onCancel}>
+                <Button type="button" variant="secondary" onClick={handleCancel}>
                   Cancel
                 </Button>
               )}

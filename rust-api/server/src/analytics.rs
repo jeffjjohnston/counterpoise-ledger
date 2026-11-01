@@ -1,6 +1,10 @@
+use crate::platform;
 use reqwest::Client;
 use serde_json::{Value, json};
 use std::time::Duration;
+
+/// How long one capture may take.
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub(crate) struct PostHogCapture {
@@ -12,8 +16,8 @@ pub(crate) struct PostHogCapture {
 impl PostHogCapture {
     pub(crate) fn from_env() -> Self {
         Self::new(
-            std::env::var("NEXT_PUBLIC_POSTHOG_KEY").ok(),
-            std::env::var("NEXT_PUBLIC_POSTHOG_HOST").ok(),
+            ledger_db::env::var("NEXT_PUBLIC_POSTHOG_KEY").ok(),
+            ledger_db::env::var("NEXT_PUBLIC_POSTHOG_HOST").ok(),
         )
     }
 
@@ -22,10 +26,7 @@ impl PostHogCapture {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "https://us.i.posthog.com".to_owned());
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("HTTP client"),
+            client: platform::http_client(),
             key: key.filter(|value| !value.is_empty()),
             endpoint: format!("{}/batch/", host.trim_end_matches('/')),
         }
@@ -37,22 +38,26 @@ impl PostHogCapture {
         event: &str,
         properties: Option<Value>,
     ) -> Result<(), reqwest::Error> {
-        let Some(key) = &self.key else { return Ok(()) };
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .json(&json!({
-                "api_key": key,
-                "batch": [{
-                    "distinct_id": user_id.to_string(),
-                    "event": event,
-                    "properties": properties.unwrap_or_else(|| json!({})),
-                }],
-            }))
-            .send()
-            .await?;
-        response.error_for_status()?;
-        Ok(())
+        platform::outbound(async {
+            let Some(key) = &self.key else { return Ok(()) };
+            let response = self
+                .client
+                .post(&self.endpoint)
+                .timeout(TIMEOUT)
+                .json(&json!({
+                    "api_key": key,
+                    "batch": [{
+                        "distinct_id": user_id.to_string(),
+                        "event": event,
+                        "properties": properties.unwrap_or_else(|| json!({})),
+                    }],
+                }))
+                .send()
+                .await?;
+            response.error_for_status()?;
+            Ok(())
+        })
+        .await
     }
 
     /// Fire and forget. An analytics outage never changes an accounting
@@ -68,7 +73,7 @@ impl PostHogCapture {
             return;
         }
         let capture = self.clone();
-        tokio::spawn(async move {
+        platform::spawn_to_finish(async move {
             if let Err(cause) = capture.send_event(user_id, event, properties).await {
                 tracing::warn!(error = %cause, "PostHog capture failed");
             }

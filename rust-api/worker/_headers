@@ -1,0 +1,12 @@
+# The headers of the files that Cloudflare serves without the Worker
+# (wrangler.toml copies this file into the client build): the security
+# headers of rust-api/server/src/security.rs and the one-year cache of
+# static_pages.rs, as the native server sends them. A test in src/lib.rs
+# checks it. HSTS for these files comes from the zone.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: same-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Content-Security-Policy: frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'

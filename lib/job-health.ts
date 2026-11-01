@@ -8,7 +8,9 @@ export type JobName =
   | "recurring"
   | "plaid-sync"
   | "price-sync"
-  | "reindex";
+  | "reindex"
+  | "weekly-review"
+  | "issue-sync";
 
 export type JobState =
   | "ok"
@@ -94,6 +96,20 @@ export const JOB_SCHEDULES: Record<
     staleAfterMs: 35 * DAY,
     label: "Reindex",
     schedule: "Monthly, 1st 3am",
+  },
+  // Mondays 5am
+  "weekly-review": {
+    maxGapMs: 7 * DAY,
+    staleAfterMs: 8 * DAY,
+    label: "Weekly review",
+    schedule: "Mondays 5am",
+  },
+  // hourly at :30
+  "issue-sync": {
+    maxGapMs: 1 * HOUR,
+    staleAfterMs: 3 * HOUR,
+    label: "Issue sync",
+    schedule: "Hourly at :30",
   },
 };
 

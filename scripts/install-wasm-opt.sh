@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Select a pinned official arm64 archive for the current operating system and
-# verify it before using wasm-opt.
+# Select a pinned official archive for the current operating system and verify
+# it before using wasm-opt.
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64)
     asset=binaryen-version_131-arm64-macos.tar.gz
@@ -11,6 +11,10 @@ case "$(uname -s):$(uname -m)" in
   Linux:aarch64|Linux:arm64)
     asset=binaryen-version_131-aarch64-linux.tar.gz
     digest=ba991f677edd9a21d2bc96c0144bc8ac5b112d4d98a3eb266e075e22e557df2a
+    ;;
+  Linux:x86_64)
+    asset=binaryen-version_131-x86_64-linux.tar.gz
+    digest=b5bf1f0eaf17c63ee588ff7a5954dc8f6ce2c26989051c66f24dfe9ece3e46db
     ;;
   *)
     echo "No pinned Binaryen archive for $(uname -s) $(uname -m)" >&2

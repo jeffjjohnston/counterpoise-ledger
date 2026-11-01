@@ -2,6 +2,7 @@
 //! gate: each tool checks the key, and the owner-only tools check the role.
 
 use axum::http::Method;
+use ledger_db::store::{Sql, params};
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
 
@@ -12,15 +13,15 @@ use crate::mcp::call::{Caller, ToolResult, fail, integer, ok, thrown, without};
 /// Returns the book's name.
 async fn require_owner(caller: &Caller, user_id: i32, book_id: i64) -> ToolResult<String> {
     let row: Option<(String, String)> = match i32::try_from(book_id) {
-        Ok(book_id) => sqlx::query_as(
-            "SELECT b.name, bm.role FROM books b JOIN book_members bm ON bm.book_id = b.id
-             WHERE b.id = $1 AND bm.user_id = $2",
-        )
-        .bind(book_id)
-        .bind(user_id)
-        .fetch_optional(&caller.state().pool)
-        .await
-        .map_err(|cause| thrown(&cause.to_string()))?,
+        Ok(book_id) => caller
+            .state()
+            .database
+            .query_optional(
+                "SELECT b.name, bm.role FROM books b JOIN book_members bm ON bm.book_id = b.id
+                 WHERE b.id = ?1 AND bm.user_id = ?2",
+                &params![book_id, user_id],
+            )
+            .map_err(|cause| thrown(&cause.to_string()))?,
         Err(_) => None,
     };
     match row {

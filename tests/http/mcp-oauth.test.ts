@@ -259,6 +259,18 @@ describe("MCP OAuth", () => {
       expect(await elsewhere.json()).not.toHaveProperty("redirectTo");
     });
 
+    it("reads no client metadata document from an address that is not public", async () => {
+      // Both servers try the read: the refusal names the address, not a
+      // server that cannot read documents.
+      const response = await session.request(
+        `/api/oauth/consent?${authorizationQuery("https://127.0.0.1/client.json", pkce().challenge)}`
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: "The client metadata document could not be read: the host has an address that is not public",
+      });
+    });
+
     it("returns a request without PKCE or for another resource to the client with an error", async () => {
       const clientId = await registeredClient();
       const noPkce = await session.request(
@@ -399,7 +411,7 @@ describe("MCP OAuth", () => {
       expect((await mcp(access_token)).status).toBe(401);
     });
 
-    it("rotates the refresh token, and revokes the grant when a used one comes back later", async () => {
+    it("rotates the refresh token, and revokes the grant when a used one comes back at once", async () => {
       const { clientId, access_token, refresh_token } = await connect();
       const refresh = (value: string) =>
         token({ grant_type: "refresh_token", refresh_token: value, client_id: clientId });
@@ -408,15 +420,23 @@ describe("MCP OAuth", () => {
       const next = (await first.json()) as { access_token: string; refresh_token: string };
       expect(next.refresh_token).not.toBe(refresh_token);
       expect((await mcp(next.access_token)).status).toBe(200);
-      // Within the grace time, a retry gets invalid_grant and the grant stays.
-      expect((await refresh(refresh_token)).status).toBe(400);
-      expect((await mcp(next.access_token)).status).toBe(200);
-      // Later, the same reuse revokes the grant.
-      await exec("UPDATE oauth_tokens SET used_at = '2000-01-01 00:00:00' WHERE used_at IS NOT NULL");
+      // A reuse immediately after the first use revokes the grant: the token
+      // that a thief got from the first use stops too.
       expect((await refresh(refresh_token)).status).toBe(400);
       expect((await mcp(next.access_token)).status).toBe(401);
       expect((await mcp(access_token)).status).toBe(401);
       expect((await refresh(next.refresh_token)).status).toBe(400);
+    });
+
+    it("revokes the grant when two exchanges of one refresh token run at the same time", async () => {
+      const { clientId, refresh_token } = await connect();
+      const refresh = () => token({ grant_type: "refresh_token", refresh_token, client_id: clientId });
+      const answers = await Promise.all([refresh(), refresh()]);
+      expect(answers.map((answer) => answer.status).sort()).toEqual([200, 400]);
+      const winner = answers.find((answer) => answer.status === 200)!;
+      const next = (await winner.json()) as { access_token: string; refresh_token: string };
+      expect((await mcp(next.access_token)).status).toBe(401);
+      expect((await token({ grant_type: "refresh_token", refresh_token: next.refresh_token, client_id: clientId })).status).toBe(400);
     });
 
     it("keeps a used refresh token after it expires, so that its replay still revokes the grant", async () => {
@@ -525,9 +545,18 @@ describe("MCP OAuth", () => {
     const client = new Client({ name: "sdk", version: "1" });
     await client.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: provider }));
     const tools = await client.listTools();
-    expect(tools.tools.length).toBe(63);
+    expect(tools.tools.length).toBe(64);
     await client.close();
   });
+});
+
+describe("MCP OAuth with a COUNTERPOISE_PUBLIC_URL that is not an origin", () => {
+  beforeAll(async () => { await setupTestDatabase(); }, 120_000);
+
+  it("refuses to start", async () => {
+    await expect(startHttpTestServer({ COUNTERPOISE_PUBLIC_URL: "https://books.example/app" }))
+      .rejects.toThrow(/COUNTERPOISE_PUBLIC_URL must be the public origin/);
+  }, 120_000);
 });
 
 describe("MCP OAuth while COUNTERPOISE_PUBLIC_URL is not set", () => {

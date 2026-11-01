@@ -5,7 +5,7 @@ it carries the rules that apply everywhere and says when to come here.
 
 Counterpoise includes a Model Context Protocol (MCP) server that gives AI
 assistants read and write access to accounting data. The Rust server serves
-all 63 tools, over two transports: stdio (`counterpoise-rust-api mcp`) and
+all 64 tools, over two transports: stdio (`counterpoise-rust-api mcp`) and
 Streamable HTTP at `/api/mcp`. The browser gets a subset through WebMCP; see
 [WebMCP (Rust)](#webmcp-rust). The code is in `rust-api/server/src/mcp/`.
 
@@ -69,8 +69,13 @@ https://<host>/api/mcp`, then `/mcp` to sign in.
      `client_id` must be the URL, and it gives the name and redirect URIs.
      The fetch refuses a host with an address that is not public, connects
      only to the addresses it checked, follows no redirect, and stops after
-     5 seconds or 64 KiB. A document is kept for one hour, and a copy of up
-     to one day is used when a new read fails.
+     5 seconds or 64 KiB. On a Worker there is no DNS lookup to check:
+     `fetch` leaves from Cloudflare's network, which reaches only public
+     addresses, so only a host written as an address is checked. The
+     `global_fetch_strictly_public` flag in `wrangler.toml` sends a host in
+     the Worker's own zone the public way too, through Access. A document
+     is kept for one hour, and a copy of up to one day is used when a new
+     read fails.
    - **Dynamic Client Registration** (RFC 7591, `POST /api/oauth/register`).
      The specification marks it deprecated, but clients still use it. Each
      registration counts against a per-address limit, and a client with no
@@ -109,10 +114,12 @@ https://<host>/api/mcp`, then `/mcp` to sign in.
   the canonical resource, so a change of `COUNTERPOISE_PUBLIC_URL` stops the
   old tokens. A `resource` parameter that names another server gets
   `invalid_target`.
-- **Rotation:** each refresh gives a new refresh token. A used refresh token
-  sent again within 60 seconds gets `invalid_grant` only, so a retry after a
-  timeout does not disconnect the client. Later, a second use revokes the
-  grant. A second use of a code revokes its grant too.
+- **Rotation:** each refresh gives a new refresh token. A second use of a
+  refresh token revokes the grant, also immediately after the first use. A
+  bearer token cannot show if the second use is a retry or a thief who won
+  the rotation. A client that retries a
+  refresh after a timeout thus loses its connection, and the user connects
+  again. A second use of a code revokes its grant too.
 - **Storage:** codes and tokens are stored as SHA-256 digests only
   ([schema](schema.md)).
 - **Consent and grants accept the cookie only** (`cookie_session`): a key or
@@ -221,6 +228,23 @@ claude mcp add --transport http counterpoise https://<host>/api/mcp \
 With `COUNTERPOISE_PUBLIC_URL` set, leave out the header and sign in with
 OAuth instead; see [OAuth for custom connectors](#oauth-for-custom-connectors).
 
+## Worker MCP Client Configuration
+
+The Worker has no stdio transport and no container to exec into. Connect
+over HTTP to `https://<host>/api/mcp`. The Worker deploy sets
+`COUNTERPOISE_PUBLIC_URL`, so OAuth is on:
+
+- Claude Code: `claude mcp add --transport http -s user counterpoise https://<host>/api/mcp`,
+  then sign in through `/mcp`.
+- Claude Desktop and claude.ai: add a custom connector with that URL. Leave
+  the OAuth client fields empty.
+
+When Cloudflare Access is in front of the Worker, its policy must let
+through the paths that an MCP client calls without a browser: `/api/mcp`,
+the OAuth token endpoint and `/.well-known/`. The authorize page stays behind
+Access, and the user signs in there in the browser. The policy is managed
+outside this repository.
+
 ## Environment Variables
 
 | Variable | Purpose |
@@ -247,9 +271,13 @@ unit test fails when it differs from the manifest.
   and `Host` when not. The key is a
   bearer header, never a cookie, so this check is a second line of defense.
 - **HTTP is stateless:** no session IDs. Each request gets a new handler, and
-  the tools send no notifications.
-- **Protocol versions:** `initialize` agrees to `2025-11-25` at most. `rmcp`
-  also serves the stateless lifecycle of `2026-07-28`: `server/discover`, then
+  the tools send no notifications. The transport is in house
+  (`rust-api/server/src/mcp/http.rs`), because rmcp's needs tokio tasks and
+  timers that the Workers build lacks. It answers each request as rmcp 3.4.1
+  did in stateless JSON mode: the same status codes, header checks and
+  JSON-RPC errors. GET and DELETE get 405. stdio still runs on rmcp.
+- **Protocol versions:** `initialize` agrees to `2025-11-25` at most. The
+  server also serves the stateless lifecycle of `2026-07-28`: `server/discover`, then
   requests that carry the version in `_meta`, with no `initialize`. Claude Code
   uses that path. Version `2026-07-28` requires `ttlMs` and `cacheScope` on a
   list result (SEP-2549), so `list_tools` sets both; without them Claude Code
@@ -275,8 +303,8 @@ unit test fails when it differs from the manifest.
   (for example `delete_book` requires `confirmBookName`). When the difference
   is in the write itself, the tool calls a Rust function that the route shares,
   not the route: `create_payee` calls `create_exact()` in
-  `routes/payees.rs`, because the route returns a case variant that already
-  exists, and the tool creates a new payee. A read tool whose rows the route
+  `routes/payees.rs`, because the route returns a payee that already exists
+  (also a case variant), and the tool refuses it and names it. A read tool whose rows the route
   cannot give does the same: `GET /accounts` gives a tree that drops an
   account whose parent the filter leaves out, so `list_accounts` and
   `get_account_tree` call `accounts_with_balances()` in `routes/accounts.rs`.
@@ -349,27 +377,47 @@ unit test fails when it differs from the manifest.
   route, so the auto-match events reach PostHog, as the library sends them.
 - **Tests:** a tool suite connects through `connectMcpTestClient()` in
   `tests/helpers/mcp-client.ts`, which starts the Rust server. `npm run
-  test:mcp:http` runs the suites in `tests/mcp` over HTTP, and `npm run
-  test:mcp:stdio` runs them over stdio; CI runs both. They need the server
+  test:mcp:http` runs every suite in `tests/mcp` over HTTP. `npm run
+  test:mcp:stdio` runs only the suites that cross the stdio adapter (see the
+  table below); CI runs both. They need the server
   binary (`cargo build -p counterpoise-rust-api`), so a plain `npm test` leaves
   them out, as it leaves out `tests/http`. A new suite named
   `tests/mcp/mcp-*.test.ts` joins them. The Rust server
-  starts once for a suite, so a variable it reads (`STATUS_DIR`, the PostHog
-  settings) goes in the `env` option of `connectMcpTestClient()`, not in a
+  starts once for a suite, so a variable it reads (the PostHog settings, for
+  example) goes in the `env` option of `connectMcpTestClient()`, not in a
   later change to `process.env`. A suite that calls as another user uses
   `callAs()`, or `callToolAs()` for a plain-text error result. A suite that
   replaces an outside service uses a local HTTP fake, not `vi.mock`, because a
   mock does not reach the Rust process: `mcp-usage-tools.test.ts` fakes the
   PostHog Query API. `tests/mcp/rust-transport.test.ts` covers the HTTP gate.
+- **Transport coverage:** both transports reach the same dispatcher,
+  `call_tool` in `rust-api/server/src/mcp/mod.rs`. They differ in how a call
+  gets its credential (the bearer header of each HTTP request, or the
+  `COUNTERPOISE_API_KEY` of the stdio process) and in how a result goes back
+  (one HTTP response, or one line on stdout). So the detailed tool behavior
+  runs once, over HTTP, and each transport keeps the suites that cross its own
+  adapter. `vitest.config.ts` selects the files for each transport.
+
+  | Suite | HTTP | stdio | What it proves |
+  | --- | --- | --- | --- |
+  | `mcp-*-tools.test.ts`, `mcp-tools.test.ts`, `mcp-income-statement-parity.test.ts` | yes | no | Each tool's arguments, results, errors and book scoping |
+  | `manifest.test.ts` | yes | no | `tools/list` gives `mcp-tools.json` unchanged. Over stdio, `rust-stdio.test.ts` checks the tool names |
+  | `rust-transport.test.ts` | yes | no | The HTTP gate: bearer key, revoked key, no cookie, Origin, protocol versions |
+  | `rust-stdio.test.ts` | no | yes | The stdio key, a missing or unknown key, revocation without a restart, protocol-only stdout |
+  | `mcp-book-access.test.ts` | yes | yes | Owner, editor, viewer and non-member, through each user's own credential |
+  | `mcp-transports.test.ts` | yes | yes | One call of each result kind: a read, a write, a handler refusal, a schema refusal, an unknown tool |
+
+  A new tool suite runs over HTTP only. Add a case to `mcp-transports.test.ts`
+  only for a new kind of result or credential, not for a new tool.
 - **Stdio:** `counterpoise-rust-api mcp` serves the same registry over stdio.
   It reads `DATABASE_PATH`, `TZ` and `COUNTERPOISE_API_KEY`, and sends the key
   as the bearer header of each tool's route requests. A missing or unknown key
   does not stop the server; each tool answers with the auth error. Each call
   checks the key again, so a revoked key stops working without a restart.
   Stdout carries only the protocol, and the logs go to stderr (`rmcp` at
-  warn). `npm run test:mcp:stdio` runs the tool suites over it, with one
-  server process for each user; `tests/mcp/rust-stdio.test.ts` covers the key
-  and the clean stdout.
+  warn). `npm run test:mcp:stdio` runs the stdio suites of the table above,
+  with one server process for each user; `tests/mcp/rust-stdio.test.ts`
+  covers the key and the clean stdout.
 - **`analyze_usage`** has no route. `rust-api/server/src/posthog_query.rs` is
   the Rust copy of `lib/posthog-query.ts`.
 
@@ -469,7 +517,7 @@ open book. The Rust server serves its endpoint from the same registry as
 - `delete_issue_report` — Delete an issue report
 
 **System:**
-- `get_system_status` — Report the health of Counterpoise's background jobs (backup, backup pruning, recurring processing, bank sync, security price sync, the monthly database compaction named reindex)
+- `get_system_status` — Report the health of Counterpoise's background jobs (backup, pruning, recurring processing, bank sync, security price sync, weekly review, issue sync; the native server adds the monthly database compaction named reindex, and a Worker's backup is its daily export)
 
 **Analytics:**
 - `analyze_usage` — Query PostHog for the caller's own event summaries (requires PostHog env vars)
@@ -487,6 +535,9 @@ open book. The Rust server serves its endpoint from the same registry as
 - `unlink_plaid_transaction` — Remove a transaction's Plaid link. The bank transaction returns to the pending queue; the local transaction stops being reconciled
 - `get_reconcile_candidates` — The reconciliation queue for one linked bank account, or for all of them when no link is given: staged transactions awaiting a decision, each with up to five ranked candidate matches and a suggested counter account
 - `reconcile_plaid_transaction` — Resolve one staged bank transaction: match it to an existing transaction, match and rewrite that transaction's amount, create a new transaction from it, ignore it, keep what you already have, or unlink an already-resolved row (which also un-reconciles its transaction unless another bank row still matches it). Linking a row that is already linked is refused
+
+**Weekly review** (require `bookId`):
+- `get_weekly_review` — The newest weekly review of a book: its summary, the items that are not dismissed, whether the server is configured and the book opted in, a running review, and the newest failure. It cannot start a review: that is a paid AI call that the user starts in the app
 
 ## Changing a Tool
 

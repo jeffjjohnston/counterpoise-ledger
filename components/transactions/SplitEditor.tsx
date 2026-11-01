@@ -14,6 +14,7 @@ import { evaluateExpression } from "@/lib/wasm-client";
 import type { AccountWithBalance } from "@/types";
 import type { SplitInput } from "@/types";
 import { tabTo } from "@/components/transactions/tab-to";
+import { BalanceScale } from "@/components/transactions/BalanceScale";
 
 interface SplitEditorProps {
   splits: SplitInput[];
@@ -275,7 +276,7 @@ export function SplitEditor({ splits, onChange, accounts, onPendingChange, submi
           </span>
           <span
             className={cn(
-              "font-medium",
+              "font-medium inline-flex items-center gap-1.5 whitespace-nowrap",
               hasPendingExpression
                 ? "text-fg-tertiary"
                 : isBalanced
@@ -283,6 +284,7 @@ export function SplitEditor({ splits, onChange, accounts, onPendingChange, submi
                   : "text-fg-danger"
             )}
           >
+            <BalanceScale total={total} pending={hasPendingExpression} className="w-5 h-5 shrink-0" />
             {hasPendingExpression
               ? "Resolve amounts"
               : isBalanced

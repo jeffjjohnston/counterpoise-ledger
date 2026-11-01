@@ -7,7 +7,9 @@ use super::{
 };
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
+    book_scope::{BookAccess, Write},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
+    platform,
     state::AppState,
     validation::{
         first_query_values, js_number, js_string, parse_int_prefix, parse_json_body,
@@ -20,11 +22,11 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{Datelike, Local, Weekday};
+use chrono::{Datelike, Weekday};
 use ledger_core::collation::compare_names;
-use ledger_db::{engine::Db, sql};
+use ledger_db::sql;
+use ledger_db::store::{self, Sql, params};
 use serde_json::{Value, json};
-use sqlx::QueryBuilder;
 use std::collections::HashSet;
 
 const PRICE_DATE_REQUIRED: &str = "priceDate is required";
@@ -99,12 +101,6 @@ fn price_item(item: &Value) -> Option<PriceItem> {
     })
 }
 
-fn is_unique_violation(cause: &sqlx::Error) -> bool {
-    cause
-        .as_database_error()
-        .is_some_and(|database| database.is_unique_violation())
-}
-
 pub(crate) async fn price_history(
     State(state): State<AppState>,
     Path((raw_book_id, raw_id)): Path<(String, String)>,
@@ -114,9 +110,11 @@ pub(crate) async fn price_history(
     const FAILURE: &str = "Failed to fetch security price history";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
-    let failed = |cause| internal_error(cause, FAILURE);
+    fn failed(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
     let security_id = security_path_id(&raw_id, FAILURE)?;
-    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
+    find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
     let params = first_query_values(raw_query.as_deref());
     // The price chart asks for up to 5000 rows. The price list pages by 50.
     let limit = page_param(params.get("limit"), 1.0).map_or(50, |limit| limit.min(5000));
@@ -129,33 +127,32 @@ pub(crate) async fn price_history(
         return Err(bad_request("startDate must not be after endDate"));
     }
 
-    let prices: Vec<(String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT price_date, price_micros, source FROM security_prices
-         WHERE security_id = $1 AND book_id = $2
-           AND ($5 IS NULL OR price_date >= $5) AND ($6 IS NULL OR price_date <= $6)
-         ORDER BY price_date DESC LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)",
-    )
-    .bind(security_id)
-    .bind(book.book_id())
-    .bind(limit)
-    .bind(offset)
-    .bind(&start_date)
-    .bind(&end_date)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(failed)?;
-    let total: i32 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS integer) FROM security_prices
-         WHERE security_id = $1 AND book_id = $2
-           AND ($3 IS NULL OR price_date >= $3) AND ($4 IS NULL OR price_date <= $4)",
-    )
-    .bind(security_id)
-    .bind(book.book_id())
-    .bind(&start_date)
-    .bind(&end_date)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(failed)?;
+    let prices: Vec<(String, i64, Option<String>)> = state
+        .database
+        .query(
+            "SELECT price_date, price_micros, source FROM security_prices
+         WHERE security_id = ?1 AND book_id = ?2
+           AND (?5 IS NULL OR price_date >= ?5) AND (?6 IS NULL OR price_date <= ?6)
+         ORDER BY price_date DESC LIMIT COALESCE(?3, -1) OFFSET COALESCE(?4, 0)",
+            &params![
+                security_id,
+                book.book_id(),
+                limit,
+                offset,
+                &start_date,
+                &end_date
+            ],
+        )
+        .map_err(failed)?;
+    let total: i32 = state
+        .database
+        .query_row(
+            "SELECT CAST(COUNT(*) AS integer) FROM security_prices
+         WHERE security_id = ?1 AND book_id = ?2
+           AND (?3 IS NULL OR price_date >= ?3) AND (?4 IS NULL OR price_date <= ?4)",
+            &params![security_id, book.book_id(), &start_date, &end_date],
+        )
+        .map_err(failed)?;
     let has_more = offset + (prices.len() as i64) < i64::from(total);
     let prices: Vec<Value> = prices
         .into_iter()
@@ -181,7 +178,9 @@ pub(crate) async fn update_price(
     const FAILURE: &str = "Failed to update security price";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
-    let failed = |cause| internal_error(cause, FAILURE);
+    fn failed(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
     // Node checks the ID for NaN, then reads and validates the body. An ID
     // outside the int4 range fails later, at the database.
     let security_id =
@@ -189,32 +188,32 @@ pub(crate) async fn update_price(
     let input = validate_price_update(&parse_json_body(&body, FAILURE)?)?;
     let security_id = i32::try_from(security_id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
-    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
+    find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
 
-    let entry_exists = |date: String| {
-        sqlx::query_scalar::<_, bool>(
+    let entry_exists = |date: &str| {
+        state.database.query_row::<bool>(
             "SELECT EXISTS (SELECT 1 FROM security_prices
-               WHERE security_id = $1 AND price_date = $2)",
+               WHERE security_id = ?1 AND price_date = ?2)",
+            &params![security_id, date],
         )
-        .bind(security_id)
-        .bind(date)
-        .fetch_one(&state.pool)
     };
-    if !entry_exists(current_date.clone()).await.map_err(failed)? {
+    if !entry_exists(&current_date).map_err(failed)? {
         return Err(error(StatusCode::NOT_FOUND, "Price entry not found"));
     }
     if input.price_date == current_date {
-        sqlx::query(
-            "UPDATE security_prices SET price_micros = $1, source = $2
-             WHERE security_id = $3 AND price_date = $4",
-        )
-        .bind(input.price_micros)
-        .bind(&input.source)
-        .bind(security_id)
-        .bind(&current_date)
-        .execute(&state.pool)
-        .await
-        .map_err(failed)?;
+        state
+            .database
+            .execute(
+                "UPDATE security_prices SET price_micros = ?1, source = ?2
+             WHERE security_id = ?3 AND price_date = ?4",
+                &params![
+                    input.price_micros,
+                    &input.source,
+                    security_id,
+                    &current_date
+                ],
+            )
+            .map_err(failed)?;
         return Ok(Json(json!({ "success": true })));
     }
 
@@ -225,38 +224,32 @@ pub(crate) async fn update_price(
         )
     };
     // Checked before the transaction, so that the delete never runs.
-    if entry_exists(input.price_date.clone())
-        .await
-        .map_err(failed)?
-    {
+    if entry_exists(&input.price_date).map_err(failed)? {
         return Err(conflict());
     }
-    let moved: Result<(), sqlx::Error> = async {
-        let mut transaction = ledger_db::locks::begin_pool(&state.pool).await?;
-        sqlx::query("DELETE FROM security_prices WHERE security_id = $1 AND price_date = $2")
-            .bind(security_id)
-            .bind(&current_date)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query(
+    let moved = state.database.transaction(|tx| {
+        tx.execute(
+            "DELETE FROM security_prices WHERE security_id = ?1 AND price_date = ?2",
+            &params![security_id, &current_date],
+        )?;
+        tx.execute(
             "INSERT INTO security_prices (security_id, price_date, price_micros, source, book_id)
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(security_id)
-        .bind(&input.price_date)
-        .bind(input.price_micros)
-        .bind(&input.source)
-        .bind(book.book_id())
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await
-    }
-    .await;
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &params![
+                security_id,
+                &input.price_date,
+                input.price_micros,
+                &input.source,
+                book.book_id()
+            ],
+        )?;
+        Ok::<_, store::Error>(())
+    });
     match moved {
         Ok(()) => Ok(Json(json!({ "success": true }))),
         // A concurrent move onto the same date passes the check above and
         // collides here. The rollback restores the deleted row.
-        Err(cause) if is_unique_violation(&cause) => Err(conflict()),
+        Err(cause) if cause.is_unique_violation() => Err(conflict()),
         Err(cause) => Err(failed(cause)),
     }
 }
@@ -270,15 +263,15 @@ pub(crate) async fn delete_price(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let security_id = security_path_id(&raw_id, FAILURE)?;
-    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
-    let deleted =
-        sqlx::query("DELETE FROM security_prices WHERE security_id = $1 AND price_date = $2")
-            .bind(security_id)
-            .bind(&price_date)
-            .execute(&state.pool)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
-    if deleted.rows_affected() == 0 {
+    find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
+    let deleted = state
+        .database
+        .execute(
+            "DELETE FROM security_prices WHERE security_id = ?1 AND price_date = ?2",
+            &params![security_id, &price_date],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
+    if deleted == 0 {
         return Err(error(StatusCode::NOT_FOUND, "Price entry not found"));
     }
     Ok(Json(json!({ "success": true })))
@@ -286,7 +279,7 @@ pub(crate) async fn delete_price(
 
 /// `lastWeekdayOnOrBefore(new Date())` in the server time zone.
 fn last_weekday() -> String {
-    let mut date = Local::now().date_naive();
+    let mut date = platform::today();
     while matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
         date = date.pred_opt().expect("a date before today");
     }
@@ -303,39 +296,40 @@ pub(crate) async fn prices_due(
     const FAILURE: &str = "Failed to fetch securities needing prices";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
-    let failed = |cause| internal_error(cause, FAILURE);
+    fn failed(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
     // A fixed-price security is never prompted for, so it is not in this
     // population at all.
-    let manual: HashSet<i64> = sqlx::query_scalar::<_, i32>(
-        "SELECT id FROM securities
-         WHERE book_id = $1 AND fetch_prices = false AND fixed_price_micros IS NULL",
-    )
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
-    .map_err(failed)?
-    .into_iter()
-    .map(i64::from)
-    .collect();
+    let manual: HashSet<i64> = state
+        .database
+        .query::<i32>(
+            "SELECT id FROM securities
+         WHERE book_id = ?1 AND fetch_prices = false AND fixed_price_micros IS NULL",
+            &params![book.book_id()],
+        )
+        .map_err(failed)?
+        .into_iter()
+        .map(i64::from)
+        .collect();
     if manual.is_empty() {
         return Ok(Json(json!({ "dueDate": null, "securities": [] })));
     }
 
     // The newest price of a fetched security is the last market day. A book
     // with no fetched prices uses the last calendar weekday.
-    let newest: Option<String> = sqlx::query_scalar(
-        "SELECT max(p.price_date) FROM security_prices p
+    let newest: Option<String> = state
+        .database
+        .query_row(
+            "SELECT max(p.price_date) FROM security_prices p
          JOIN securities s ON p.security_id = s.id
-         WHERE s.book_id = $1 AND s.fetch_prices = true",
-    )
-    .bind(book.book_id())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(failed)?;
+         WHERE s.book_id = ?1 AND s.fetch_prices = true",
+            &params![book.book_id()],
+        )
+        .map_err(failed)?;
     let due_date = newest.unwrap_or_else(last_weekday);
 
-    let mut due: Vec<_> = positions(&state.pool, book.book_id(), None)
-        .await
+    let mut due: Vec<_> = positions(&*state.database, book.book_id(), None)
         .map_err(failed)?
         .into_iter()
         .filter(|position| {
@@ -426,7 +420,7 @@ pub(crate) enum SetPricesError {
     /// A security ID outside the int4 range. Node sends it to an integer
     /// column, and PostgreSQL refuses it.
     OutOfRange,
-    Database(sqlx::Error),
+    Database(store::Error),
 }
 
 /// The items that `set_prices` wrote, and the ones it skipped.
@@ -440,11 +434,12 @@ pub(crate) struct SetPrices {
 /// Upserts the valid items as manual prices in one transaction. It refuses the batch when no
 /// item is valid, or when a security is not in this book. The bulk route
 /// reports only the count; the MCP tool also reports what it skipped.
-pub(crate) async fn set_prices(
-    pool: &ledger_db::engine::DbPool,
-    book_id: i32,
+pub(crate) fn set_prices(
+    database: &ledger_db::Database,
+    access: &BookAccess<'_, Write>,
     items: &[Value],
 ) -> Result<SetPrices, SetPricesError> {
+    let book_id = access.book_id();
     let mut updates = Vec::new();
     let mut written = Vec::new();
     let mut discarded = Vec::new();
@@ -473,44 +468,42 @@ pub(crate) async fn set_prices(
         .map_err(|_| SetPricesError::OutOfRange)?;
     security_ids.sort_unstable();
     security_ids.dedup();
-    let owned: i32 = sqlx::query_scalar(&format!(
-        "SELECT CAST(COUNT(*) AS integer) FROM securities WHERE book_id = $1 AND id {in2}",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(book_id)
-    .bind(sql::json_array(&security_ids))
-    .fetch_one(pool)
-    .await
-    .map_err(SetPricesError::Database)?;
+    let owned: i32 = database
+        .query_row(
+            &format!(
+                "SELECT CAST(COUNT(*) AS integer) FROM securities WHERE book_id = ?1 AND id {in2}",
+                in2 = sql::in_integers("?2")
+            ),
+            &params![book_id, sql::json_array(&security_ids)],
+        )
+        .map_err(SetPricesError::Database)?;
     if owned as usize != security_ids.len() {
         return Err(SetPricesError::Invalid(
             "One or more securities do not belong to this book",
         ));
     }
 
-    let mut transaction = ledger_db::locks::begin_pool(pool)
-        .await
-        .map_err(SetPricesError::Database)?;
-    for update in &updates {
-        // The key is (security, date). The security belongs to this book,
-        // so a conflicting row does too.
-        sqlx::query(
-            "INSERT INTO security_prices (security_id, price_date, price_micros, source, book_id)
-             VALUES ($1, $2, $3, 'manual', $4)
-             ON CONFLICT (security_id, price_date)
-             DO UPDATE SET price_micros = EXCLUDED.price_micros",
-        )
-        .bind(update.security_id as i32)
-        .bind(&update.price_date)
-        .bind(update.price_micros)
-        .bind(book_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(SetPricesError::Database)?;
-    }
-    transaction
-        .commit()
-        .await
+    database
+        .transaction(|tx| {
+            for update in &updates {
+                // The key is (security, date). The security belongs to this
+                // book, so a conflicting row does too.
+                tx.execute(
+                    "INSERT INTO security_prices
+                       (security_id, price_date, price_micros, source, book_id)
+                     VALUES (?1, ?2, ?3, 'manual', ?4)
+                     ON CONFLICT (security_id, price_date)
+                     DO UPDATE SET price_micros = EXCLUDED.price_micros",
+                    &params![
+                        update.security_id as i32,
+                        &update.price_date,
+                        update.price_micros,
+                        book_id
+                    ],
+                )?;
+            }
+            Ok(())
+        })
         .map_err(SetPricesError::Database)?;
     Ok(SetPrices { written, discarded })
 }
@@ -524,15 +517,17 @@ pub(crate) async fn bulk_prices(
     const FAILURE: &str = "Failed to update security prices";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
-    let failed = |cause| internal_error(cause, FAILURE);
+    let access = book.write()?;
+    fn failed(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
     let body = parse_json_body(&body, FAILURE)?;
     let items = body
         .as_object()
         .and_then(|object| object.get("priceUpdates"))
         .and_then(Value::as_array)
         .ok_or_else(|| bad_request("priceUpdates must be an array"))?;
-    let written = set_prices(&state.pool, book.book_id(), items)
-        .await
+    let written = set_prices(&state.database, &access, items)
         .map_err(|cause| match cause {
             SetPricesError::Invalid(message) => bad_request(message),
             SetPricesError::OutOfRange => error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE),
@@ -588,14 +583,16 @@ pub(crate) async fn tiingo_prices(
     if not_found.is_empty() {
         return Ok(Json(result));
     }
-    let failed = |cause| internal_error(cause, FAILURE);
-    let fetching: Vec<(i32, String)> = sqlx::query_as(
-        "SELECT id, symbol FROM securities WHERE book_id = $1 AND fetch_prices = true",
-    )
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
-    .map_err(failed)?;
+    fn failed(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
+    let fetching: Vec<(i32, String)> = state
+        .database
+        .query(
+            "SELECT id, symbol FROM securities WHERE book_id = ?1 AND fetch_prices = true",
+            &params![book.book_id()],
+        )
+        .map_err(failed)?;
     let mut disabled_ids = Vec::new();
     let mut disabled_symbols = Vec::new();
     for symbol in not_found {
@@ -611,14 +608,16 @@ pub(crate) async fn tiingo_prices(
         }
     }
     if !disabled_ids.is_empty() {
-        let mut update =
-            QueryBuilder::<Db>::new("UPDATE securities SET fetch_prices = false WHERE id IN (");
-        let mut ids = update.separated(", ");
-        for id in &disabled_ids {
-            ids.push_bind(*id);
-        }
-        update.push(")");
-        update.build().execute(&state.pool).await.map_err(failed)?;
+        state
+            .database
+            .execute(
+                &format!(
+                    "UPDATE securities SET fetch_prices = false WHERE id {}",
+                    sql::in_integers("?1")
+                ),
+                &params![sql::json_array(&disabled_ids)],
+            )
+            .map_err(failed)?;
         result["fetchDisabled"] = json!(disabled_symbols);
     }
     Ok(Json(result))

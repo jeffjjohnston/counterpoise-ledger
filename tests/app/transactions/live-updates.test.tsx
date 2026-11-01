@@ -3,7 +3,7 @@ import { StrictMode, useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BookChangesProvider, useBookChanges } from "@/components/BookChangesProvider";
 import { useTransactionsPageData } from "@/app/b/[bookId]/transactions/useTransactionsPageData";
-import { FakeEventSource } from "@/tests/helpers/event-source";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 
 const notified = vi.fn();
 const scroll = vi.fn(); const toast = { error: vi.fn() }; const router = { replace: vi.fn() };
@@ -54,7 +54,7 @@ function Fixture() {
     }); }}>Load more</button>
   </>;
 }
-function source() { return FakeEventSource.instances[FakeEventSource.instances.length - 1]; }
+function source() { return FakeWebSocket.instances[FakeWebSocket.instances.length - 1]; }
 async function change(table = "transactions") {
   act(() => { source().emit("change", { tables: [table] }); });
   // Wait for the provider's bounded coalescing window, through a visible result
@@ -63,7 +63,7 @@ async function change(table = "transactions") {
 beforeEach(() => {
   unstableRenders = -1;
   version = 1; hold = undefined; failPath = undefined; toast.error.mockClear(); getCount = 0; requests.length = 0; scroll.mockClear(); notified.mockClear();
-  FakeEventSource.instances = []; vi.stubGlobal("EventSource", FakeEventSource);
+  FakeWebSocket.instances = []; vi.stubGlobal("WebSocket", FakeWebSocket);
   vi.stubGlobal("fetch", vi.fn(async (input: string) => {
     requests.push(input);
     const url = new URL(input, "http://localhost");

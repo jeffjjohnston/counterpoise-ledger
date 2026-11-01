@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "db", "server", "cli"]
+members = ["core", "db", "derive", "server", "cli", "worker"]
 default-members = ["server"]
 resolver = "3"
 
@@ -10,12 +10,32 @@ resolver = "3"
 [profile.dev]
 debug = "line-tables-only"
 
-# `debug = false` alone also makes Cargo strip the dependencies. On macOS the
-# stripped sqlx-macros proc-macro then does not load ("mis-aligned LINKEDIT
-# string pool"), so do not strip.
+# `debug = false` alone also makes Cargo strip the dependencies. On macOS a
+# stripped proc-macro then may not load ("mis-aligned LINKEDIT string pool",
+# seen with sqlx-macros), so do not strip.
 [profile.dev.package."*"]
 debug = false
 strip = "none"
+
+# Optimize the password hash in the dev profile. scrypt with N = 2^14 takes
+# about 0.7 s per hash unoptimized, and each login, failed or not, runs one.
+# The HTTP auth tests run dozens. These crates are small, so they compile in
+# seconds. Generic code from the other RustCrypto crates is compiled in the
+# crate that uses it, so scrypt and salsa20 carry most of the gain.
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.salsa20]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.release]
 opt-level = "s"
@@ -23,7 +43,7 @@ lto = true
 strip = true
 
 # Proc-macros and build scripts use this profile. rustc loads them while it
-# compiles, and on macOS a stripped sqlx-macros does not load ("mis-aligned
+# compiles, and on macOS a stripped proc-macro may not load ("mis-aligned
 # LINKEDIT string pool"), as in the dev profile above. They are not part of
 # the server binary, so the binary stays stripped.
 [profile.release.build-override]

@@ -2,12 +2,12 @@
 
 use chrono::NaiveDate;
 use ledger_core::{formatters::to_date_string, recurring::RecurrenceConfig};
-use ledger_db::engine::{Db, DbConnection};
+use ledger_db::store::{self, Sql, Transaction, params};
 
 use super::values::{
     Item, convert_date, field, int, int_or_zero, int4, integer_text, normalize_name, text,
 };
-use super::{ImportContext, RowError, finish, item_id, row_error};
+use super::{ImportContext, RowError, item_id, row_error};
 
 const MAX_AUTO_CREATE_DAYS: f64 = 30.0;
 const MAX_NEXT_DATE_ADVANCE_STEPS: usize = 10_000;
@@ -144,12 +144,12 @@ pub struct ReminderStats {
     pub errors: usize,
 }
 
-pub async fn import_reminders(
-    connection: &mut DbConnection,
+pub fn import_reminders(
+    tx: &Transaction<'_>,
     context: &mut ImportContext,
     reminders: &[&Item],
     today: NaiveDate,
-) -> Result<ReminderStats, sqlx::Error> {
+) -> Result<ReminderStats, store::Error> {
     context.heading("🔄 Phase 7: Importing Recurring Reminders");
     let mut stats = ReminderStats::default();
     println!("Found {} reminders", reminders.len());
@@ -217,7 +217,13 @@ pub async fn import_reminders(
                 .as_deref()
                 .map(normalize_name)
                 .filter(|name| !name.is_empty())
-                .and_then(|name| context.ids.payees.get(&name).copied());
+                .and_then(|name| {
+                    context
+                        .ids
+                        .payees
+                        .get(&super::transactions::payee_key(&name))
+                        .copied()
+                });
 
             let dates = convert_date(field(reminder, "sdt").as_deref()).and_then(|start| {
                 let ack = convert_date(field(reminder, "ackdt").as_deref())?;
@@ -237,7 +243,6 @@ pub async fn import_reminders(
             let outcome = match dates {
                 Err(message) => Err(message),
                 Ok((start, next)) => {
-                    let mut savepoint = ledger_db::locks::savepoint(connection).await?;
                     let rule = NewRule {
                         name: text(reminder, "desc").map(|name| name.into_owned()),
                         frequency: &frequency,
@@ -247,8 +252,7 @@ pub async fn import_reminders(
                         template_description: template.description.as_deref(),
                         payee_id,
                     };
-                    let outcome = insert_rule(&mut savepoint, context, &rule, &mapped).await;
-                    finish(savepoint, outcome).await?
+                    tx.savepoint(|sp| insert_rule(sp, context, &rule, &mapped))?
                 }
             };
             match outcome {
@@ -293,8 +297,8 @@ struct NewRule<'a> {
 
 /// Inserts the rule and its template splits together, so a failure cannot
 /// leave a rule with too few splits.
-async fn insert_rule(
-    connection: &mut DbConnection,
+fn insert_rule(
+    tx: &Transaction<'_>,
     context: &ImportContext,
     rule: &NewRule<'_>,
     splits: &[(i32, f64)],
@@ -303,45 +307,45 @@ async fn insert_rule(
         .frequency
         .day_of_month
         .map(|day| format!("[{}]", integer_text(day)));
-    let rule_id: i32 = sqlx::query_scalar(
-        "INSERT INTO recurring_rules
-           (book_id, name, frequency, interval, days_of_month, days_of_week, week_of_month, start_date,
-            next_date, auto_create_days_before, template_description, payee_id, is_active, created_at)
-         VALUES ($1, $2, $3, $4, $5, NULL, NULL, $6, $7, $8, $9, $10, true, $11)
-         RETURNING id",
-    )
-    .bind(context.book_id)
-    .bind(&rule.name)
-    .bind(rule.frequency.frequency)
-    .bind(int4(rule.frequency.interval)?)
-    .bind(days_of_month)
-    .bind(rule.start_date)
-    .bind(rule.next_date)
-    .bind(int4(rule.auto_create_days_before)?)
-    .bind(rule.template_description)
-    .bind(rule.payee_id)
-    .bind(context.now)
-    .fetch_one(&mut *connection)
-    .await
-    .map_err(row_error)?;
+    let interval = int4(rule.frequency.interval)?;
+    let auto_create_days_before = int4(rule.auto_create_days_before)?;
+    let rule_id: i32 = tx
+        .query_row(
+            "INSERT INTO recurring_rules
+               (book_id, name, frequency, interval, days_of_month, days_of_week, week_of_month,
+                start_date, next_date, auto_create_days_before, template_description, payee_id,
+                is_active, created_at, name_fold, template_description_fold)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8, ?9, ?10, true, ?11, ?12, ?13)
+             RETURNING id",
+            &params![
+                context.book_id,
+                &rule.name,
+                rule.frequency.frequency,
+                interval,
+                days_of_month,
+                rule.start_date,
+                rule.next_date,
+                auto_create_days_before,
+                rule.template_description,
+                rule.payee_id,
+                context.now,
+                ledger_db::folds::fold_option(rule.name.as_deref()),
+                ledger_db::folds::fold_option(rule.template_description)
+            ],
+        )
+        .map_err(row_error)?;
     let amounts = splits
         .iter()
         .map(|(account_id, amount)| Ok((*account_id, int4(*amount)?)))
         .collect::<Result<Vec<_>, RowError>>()?;
-    let mut insert: sqlx::QueryBuilder<Db> = sqlx::QueryBuilder::new(
-        "INSERT INTO recurring_template_splits (book_id, recurring_rule_id, account_id, amount) ",
-    );
-    insert.push_values(amounts, |mut row, (account_id, amount)| {
-        row.push_bind(context.book_id)
-            .push_bind(rule_id)
-            .push_bind(account_id)
-            .push_bind(amount);
-    });
-    insert
-        .build()
-        .execute(connection)
-        .await
-        .map_err(row_error)?;
+    tx.execute(
+        &format!(
+            "INSERT INTO recurring_template_splits (book_id, recurring_rule_id, account_id, amount) {}",
+            ledger_db::sql::json_rows(&["?1", "?2", "#0", "#1"], "?3")
+        ),
+        &params![context.book_id, rule_id, ledger_db::sql::json_array(&amounts)],
+    )
+    .map_err(row_error)?;
     Ok(())
 }
 

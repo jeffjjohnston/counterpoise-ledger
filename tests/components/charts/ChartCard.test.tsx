@@ -36,13 +36,30 @@ describe("ChartCard", () => {
     expect(screen.getByRole("button", { name: "Hide chart" })).toHaveClass("whitespace-nowrap");
   });
 
-  it("keeps the hidden state after a remount", () => {
+  it("takes less height while the chart is hidden", () => {
+    render(<ChartCard storageKey={KEY} title="Balance"><p>body</p></ChartCard>);
+    const card = screen.getByRole("heading", { name: "Balance" }).closest("section")!;
+    const header = screen.getByRole("heading", { name: "Balance" }).parentElement!;
+    expect(card).toHaveClass("py-4");
+    expect(header).toHaveClass("mb-2");
+    fireEvent.click(screen.getByRole("button", { name: "Hide chart" }));
+    expect(card).toHaveClass("py-2");
+    expect(card).not.toHaveClass("py-4");
+    expect(header).not.toHaveClass("mb-2");
+  });
+
+  it("keeps the hidden state after a remount, and the shown state too", () => {
     const { unmount } = render(<ChartCard storageKey={KEY}><p>body</p></ChartCard>);
     fireEvent.click(screen.getByRole("button", { name: "Hide chart" }));
     unmount();
-    render(<ChartCard storageKey={KEY}><p>body</p></ChartCard>);
+    const second = render(<ChartCard storageKey={KEY}><p>body</p></ChartCard>);
     expect(screen.queryByText("body")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Show chart" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show chart" }));
+    expect(screen.getByText("body")).toBeInTheDocument();
+    second.unmount();
+    render(<ChartCard storageKey={KEY}><p>body</p></ChartCard>);
+    expect(screen.getByText("body")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide chart" })).toBeInTheDocument();
   });
 
   it("works when the storage throws", () => {

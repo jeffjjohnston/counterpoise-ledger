@@ -2,6 +2,7 @@ use super::investments::{EFFECTIVE_DATE, MAX_SAFE_INTEGER, positions};
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
+    platform,
     state::AppState,
     validation::{
         expected, first_query_values, is_js_whitespace, local_today, parse_int_prefix,
@@ -14,13 +15,12 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{NaiveDateTime, SecondsFormat, Utc};
+use chrono::{NaiveDateTime, SecondsFormat};
 use ledger_core::{accounting::round_js, collation::compare_names, investments::fixed_price_row};
-use ledger_db::engine::{Db, DbPool};
 use ledger_db::sql;
+use ledger_db::store::{self, Builder, Sql, params};
 use serde::Serialize;
 use serde_json::{Map, Value, json, to_value};
-use sqlx::{FromRow, QueryBuilder};
 use std::collections::HashMap;
 
 const SECURITY_COLUMNS: &str =
@@ -29,7 +29,7 @@ const SECURITY_TYPES: [&str; 3] = ["etf", "mutual_fund", "stock"];
 const SECURITY_TYPE_MESSAGE: &str = "securityType must be one of: etf, mutual_fund, stock";
 const FIXED_PRICE_MESSAGE: &str = "fixedPriceMicros must be a positive whole number of micros";
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SecurityRecord {
     id: i32,
@@ -73,18 +73,14 @@ pub(super) fn security_path_id(raw: &str, failure: &'static str) -> Result<i32, 
     i32::try_from(id).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, failure))
 }
 
-pub(super) async fn find_security(
-    pool: &DbPool,
+pub(super) fn find_security(
+    pool: &impl Sql,
     book_id: i32,
     security_id: i32,
     failure: &'static str,
 ) -> Result<SecurityRecord, ApiError> {
     let query = format!("SELECT {SECURITY_COLUMNS} FROM securities WHERE id = $1 AND book_id = $2");
-    sqlx::query_as(&query)
-        .bind(security_id)
-        .bind(book_id)
-        .fetch_optional(pool)
-        .await
+    pool.query_optional(&query, &params![security_id, book_id])
         .map_err(|cause| internal_error(cause, failure))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Security not found"))
 }
@@ -225,25 +221,26 @@ fn validate_update(body: &Value) -> Result<SecurityUpdate, ApiError> {
 /// dividend `D` that withholds tax `W` gives `D - W`. A reinvested dividend
 /// that pays a fee `F` gives `D - F`, whether the cash goes through a cash
 /// leg or not, because the read does not look at the asset legs.
-pub(crate) async fn income_by_transaction(
-    pool: &DbPool,
+pub(crate) fn income_by_transaction(
+    pool: &impl Sql,
     transaction_ids: &[i32],
-) -> sqlx::Result<HashMap<i32, i64>> {
+) -> Result<HashMap<i32, i64>, store::Error> {
     if transaction_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    Ok(sqlx::query_as::<_, (i32, i64)>(&format!(
-        "SELECT s.transaction_id, CAST(-SUM(s.amount) AS bigint)
+    Ok(pool
+        .query::<(i32, i64)>(
+            &format!(
+                "SELECT s.transaction_id, CAST(-SUM(s.amount) AS bigint)
          FROM transaction_splits s JOIN accounts a ON a.id = s.account_id
          WHERE s.transaction_id {} AND a.type IN ('income', 'expense')
          GROUP BY s.transaction_id",
-        sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(transaction_ids))
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .collect())
+                sql::in_integers("?1")
+            ),
+            &params![sql::json_array(transaction_ids)],
+        )?
+        .into_iter()
+        .collect())
 }
 
 pub(crate) async fn list_securities(
@@ -254,35 +251,34 @@ pub(crate) async fn list_securities(
     const FAILURE: &str = "Failed to fetch securities";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
-    let failed = |cause| internal_error(cause, FAILURE);
-    let securities: Vec<(i32, String, String, String, bool, Option<i64>)> = sqlx::query_as(
-        "SELECT id, name, symbol, security_type, fetch_prices, fixed_price_micros
-         FROM securities WHERE book_id = $1 ORDER BY name, id",
-    )
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
-    .map_err(failed)?;
+    fn failed(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
+    let securities: Vec<(i32, String, String, String, bool, Option<i64>)> = state
+        .database
+        .query(
+            "SELECT id, name, symbol, security_type, fetch_prices, fixed_price_micros
+         FROM securities WHERE book_id = ?1 ORDER BY name, id",
+            &params![book.book_id()],
+        )
+        .map_err(failed)?;
     // Book-wide, so a holding in an inactive account counts.
-    let positions: HashMap<i64, _> = positions(&state.pool, book.book_id(), None)
-        .await
+    let positions: HashMap<i64, _> = positions(&*state.database, book.book_id(), None)
         .map_err(failed)?
         .into_iter()
         .map(|position| (position.security_id, position))
         .collect();
 
-    let income_splits: Vec<(i32, i32)> = sqlx::query_as(
-        "SELECT transaction_id, security_id FROM investment_splits
-         WHERE book_id = $1 AND action IN ('dividend', 'capGain')",
-    )
-    .bind(book.book_id())
-    .fetch_all(&state.pool)
-    .await
-    .map_err(failed)?;
-    let transaction_ids: Vec<i32> = income_splits.iter().map(|(id, _)| *id).collect();
-    let cash = income_by_transaction(&state.pool, &transaction_ids)
-        .await
+    let income_splits: Vec<(i32, i32)> = state
+        .database
+        .query(
+            "SELECT transaction_id, security_id FROM investment_splits
+         WHERE book_id = ?1 AND action IN ('dividend', 'capGain')",
+            &params![book.book_id()],
+        )
         .map_err(failed)?;
+    let transaction_ids: Vec<i32> = income_splits.iter().map(|(id, _)| *id).collect();
+    let cash = income_by_transaction(&*state.database, &transaction_ids).map_err(failed)?;
     let mut income: HashMap<i32, i64> = HashMap::new();
     for (transaction_id, security_id) in income_splits {
         *income.entry(security_id).or_default() += cash.get(&transaction_id).copied().unwrap_or(0);
@@ -323,14 +319,13 @@ pub(crate) async fn create_security(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let input = validate_create(&parse_json_body(&body, FAILURE)?)?;
-    let existing: Option<i32> = sqlx::query_scalar(
-        "SELECT id FROM securities WHERE book_id = $1 AND lower(symbol) = lower($2) LIMIT 1",
-    )
-    .bind(book.book_id())
-    .bind(&input.symbol)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+    let existing: Option<i32> = state
+        .database
+        .query_optional(
+            "SELECT id FROM securities WHERE book_id = ?1 AND symbol_fold = ?2 LIMIT 1",
+            &params![book.book_id(), ledger_db::folds::fold(&input.symbol)],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if let Some(existing) = existing {
         return Err(error_owned(
             StatusCode::CONFLICT,
@@ -348,19 +343,25 @@ pub(crate) async fn create_security(
     };
     let query = format!(
         "INSERT INTO securities
-           (book_id, name, symbol, security_type, fixed_price_micros, fetch_prices, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {SECURITY_COLUMNS}"
+           (book_id, name, symbol, security_type, fixed_price_micros, fetch_prices, created_at,
+            symbol_fold)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {SECURITY_COLUMNS}"
     );
-    let created: SecurityRecord = sqlx::query_as(&query)
-        .bind(book.book_id())
-        .bind(&input.name)
-        .bind(&input.symbol)
-        .bind(&input.security_type)
-        .bind(input.fixed_price_micros)
-        .bind(fetch_prices)
-        .bind(Utc::now().naive_utc())
-        .fetch_one(&state.pool)
-        .await
+    let created: SecurityRecord = state
+        .database
+        .query_row(
+            &query,
+            &params![
+                book.book_id(),
+                &input.name,
+                &input.symbol,
+                &input.security_type,
+                input.fixed_price_micros,
+                fetch_prices,
+                platform::timestamp(),
+                ledger_db::folds::fold(&input.symbol)
+            ],
+        )
         .map_err(|cause| internal_error(cause, FAILURE))?;
     Ok(Json(to_value(created).expect("security serializes")))
 }
@@ -374,27 +375,23 @@ pub(crate) async fn get_security(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let security_id = security_path_id(&raw_id, FAILURE)?;
-    let security = find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
+    let security = find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
     Ok(Json(to_value(security).expect("security serializes")))
 }
 
 /// The ID of another security in the book that has this symbol, compared
 /// without case. The route answers with a 409 that names this ID.
-pub(crate) async fn clashing_symbol(
-    pool: &DbPool,
+pub(crate) fn clashing_symbol(
+    pool: &impl Sql,
     book_id: i32,
     security_id: i32,
     symbol: &str,
-) -> Result<Option<i32>, sqlx::Error> {
-    sqlx::query_scalar(
+) -> Result<Option<i32>, store::Error> {
+    pool.query_optional(
         "SELECT id FROM securities
-         WHERE book_id = $1 AND id <> $2 AND lower(symbol) = lower($3) LIMIT 1",
+         WHERE book_id = ?1 AND id <> ?2 AND symbol_fold = ?3 LIMIT 1",
+        &params![book_id, security_id, ledger_db::folds::fold(symbol)],
     )
-    .bind(book_id)
-    .bind(security_id)
-    .bind(symbol)
-    .fetch_optional(pool)
-    .await
 }
 
 pub(crate) async fn update_security(
@@ -414,11 +411,10 @@ pub(crate) async fn update_security(
     let input = validate_update(&body)?;
     let security_id = i32::try_from(security_id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
-    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
+    find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
     if let Some(symbol) = &input.symbol {
         // A clash is a 409, as on create.
-        let clash = clashing_symbol(&state.pool, book.book_id(), security_id, symbol)
-            .await
+        let clash = clashing_symbol(&*state.database, book.book_id(), security_id, symbol)
             .map_err(|cause| internal_error(cause, FAILURE))?;
         if let Some(existing) = clash {
             return Err(error_owned(
@@ -427,28 +423,29 @@ pub(crate) async fn update_security(
             ));
         }
     }
-    let mut update = QueryBuilder::<Db>::new("UPDATE securities SET ");
-    let mut fields = update.separated(", ");
+    let mut fields: Vec<(&str, store::Value)> = Vec::new();
     if let Some(name) = &input.name {
-        fields.push("name = ").push_bind_unseparated(name);
+        fields.push(("name", name.into()));
     }
     if let Some(symbol) = &input.symbol {
-        fields.push("symbol = ").push_bind_unseparated(symbol);
+        fields.push(("symbol", symbol.into()));
+        fields.push(("symbol_fold", ledger_db::folds::fold(symbol).into()));
     }
     if let Some(security_type) = &input.security_type {
-        fields
-            .push("security_type = ")
-            .push_bind_unseparated(security_type);
+        fields.push(("security_type", security_type.into()));
     }
     if let Some(fetch_prices) = input.fetch_prices {
-        fields
-            .push("fetch_prices = ")
-            .push_bind_unseparated(fetch_prices);
+        fields.push(("fetch_prices", fetch_prices.into()));
     }
     if let Some(fixed_price_micros) = input.fixed_price_micros {
-        fields
-            .push("fixed_price_micros = ")
-            .push_bind_unseparated(fixed_price_micros);
+        fields.push(("fixed_price_micros", fixed_price_micros.into()));
+    }
+    let mut update = Builder::new("UPDATE securities SET ");
+    for (index, (column, value)) in fields.into_iter().enumerate() {
+        if index > 0 {
+            update.push(", ");
+        }
+        update.push(column).push(" = ").push_bind(value);
     }
     update
         .push(" WHERE id = ")
@@ -457,9 +454,7 @@ pub(crate) async fn update_security(
         .push_bind(book.book_id())
         .push(format!(" RETURNING {SECURITY_COLUMNS}"));
     let updated: SecurityRecord = update
-        .build_query_as()
-        .fetch_optional(&state.pool)
-        .await
+        .query_optional(&*state.database)
         .map_err(|cause| internal_error(cause, FAILURE))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Security not found"))?;
     Ok(Json(to_value(updated).expect("security serializes")))
@@ -476,33 +471,33 @@ pub(crate) async fn delete_security(
     let security_id = security_path_id(&raw_id, FAILURE)?;
     // Splits, lots, and prices cascade from a security, so a delete would
     // erase its investment history and leave the transactions in place.
-    let splits: i32 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS integer) FROM investment_splits
-         WHERE security_id = $1 AND book_id = $2",
-    )
-    .bind(security_id)
-    .bind(book.book_id())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+    let splits: i32 = state
+        .database
+        .query_row(
+            "SELECT CAST(COUNT(*) AS integer) FROM investment_splits
+         WHERE security_id = ?1 AND book_id = ?2",
+            &params![security_id, book.book_id()],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if splits > 0 {
         return Err(bad_request(
             "Cannot delete security with investment transactions",
         ));
     }
-    let deleted = sqlx::query("DELETE FROM securities WHERE id = $1 AND book_id = $2")
-        .bind(security_id)
-        .bind(book.book_id())
-        .execute(&state.pool)
-        .await
+    let deleted = state
+        .database
+        .execute(
+            "DELETE FROM securities WHERE id = ?1 AND book_id = ?2",
+            &params![security_id, book.book_id()],
+        )
         .map_err(|cause| internal_error(cause, FAILURE))?;
-    if deleted.rows_affected() == 0 {
+    if deleted == 0 {
         return Err(error(StatusCode::NOT_FOUND, "Security not found"));
     }
     Ok(Json(json!({ "success": true })))
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct SecuritySplitRecord {
     id: i32,
     transaction_id: i32,
@@ -586,41 +581,39 @@ pub(crate) async fn security_detail(
     const FAILURE: &str = "Failed to fetch security detail";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
-    let failed = |cause| internal_error(cause, FAILURE);
+    fn failed(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
     let security_id = security_path_id(&raw_id, FAILURE)?;
-    let security = find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
-    let latest: Option<(i64, String)> = sqlx::query_as(
-        "SELECT price_micros, price_date FROM security_prices
-         WHERE security_id = $1 AND book_id = $2 ORDER BY price_date DESC LIMIT 1",
-    )
-    .bind(security_id)
-    .bind(book.book_id())
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(failed)?;
+    let security = find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
+    let latest: Option<(i64, String)> = state
+        .database
+        .query_optional(
+            "SELECT price_micros, price_date FROM security_prices
+         WHERE security_id = ?1 AND book_id = ?2 ORDER BY price_date DESC LIMIT 1",
+            &params![security_id, book.book_id()],
+        )
+        .map_err(failed)?;
     let query = format!(
         "{} ORDER BY {EFFECTIVE_DATE} ASC, s.id ASC",
         security_split_query()
     );
-    let splits: Vec<SecuritySplitRecord> = sqlx::query_as(&query)
-        .bind(security_id)
-        .bind(book.book_id())
-        .fetch_all(&state.pool)
-        .await
+    let splits: Vec<SecuritySplitRecord> = state
+        .database
+        .query(&query, &params![security_id, book.book_id()])
         .map_err(failed)?;
-    let basis: HashMap<i32, i32> = sqlx::query_as(
-        "SELECT account_id, CAST(COALESCE(SUM(remaining_basis_cents), 0) AS integer)
+    let basis: HashMap<i32, i32> = state
+        .database
+        .query(
+            "SELECT account_id, CAST(COALESCE(SUM(remaining_basis_cents), 0) AS integer)
          FROM investment_lots
-         WHERE book_id = $1 AND security_id = $2 AND remaining_shares_micros > 0
+         WHERE book_id = ?1 AND security_id = ?2 AND remaining_shares_micros > 0
          GROUP BY account_id",
-    )
-    .bind(book.book_id())
-    .bind(security_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(failed)?
-    .into_iter()
-    .collect();
+            &params![book.book_id(), security_id],
+        )
+        .map_err(failed)?
+        .into_iter()
+        .collect();
 
     // A fixed price replaces every recorded price.
     let latest = match security.fixed_price_micros {
@@ -718,7 +711,7 @@ pub(crate) async fn security_detail(
     })))
 }
 
-#[derive(FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LotRow {
     lot_id: i32,
@@ -738,19 +731,18 @@ pub(crate) async fn security_lots(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let security_id = security_path_id(&raw_id, FAILURE)?;
-    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
-    let rows: Vec<LotRow> = sqlx::query_as(
-        "SELECT l.id AS lot_id, l.account_id, a.name AS account_name, l.acquired_date,
+    find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
+    let rows: Vec<LotRow> = state
+        .database
+        .query(
+            "SELECT l.id AS lot_id, l.account_id, a.name AS account_name, l.acquired_date,
                 l.remaining_shares_micros AS shares_micros, l.remaining_basis_cents AS basis_cents
          FROM investment_lots l JOIN accounts a ON a.id = l.account_id
-         WHERE l.book_id = $1 AND l.security_id = $2 AND l.remaining_shares_micros > 0
+         WHERE l.book_id = ?1 AND l.security_id = ?2 AND l.remaining_shares_micros > 0
          ORDER BY l.acquired_date ASC, l.id ASC",
-    )
-    .bind(book.book_id())
-    .bind(security_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+            &params![book.book_id(), security_id],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     Ok(Json(to_value(rows).expect("lots serialize")))
 }
 
@@ -775,9 +767,11 @@ pub(crate) async fn security_splits(
     const FAILURE: &str = "Failed to fetch security splits";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
-    let failed = |cause| internal_error(cause, FAILURE);
+    fn failed(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
     let security_id = security_path_id(&raw_id, FAILURE)?;
-    find_security(&state.pool, book.book_id(), security_id, FAILURE).await?;
+    find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
     let params = first_query_values(raw_query.as_deref());
     let limit = page_param(params.get("limit"), 1.0).map_or(50, |limit| limit.min(200));
     let offset = page_param(params.get("offset"), 0.0).unwrap_or(0);
@@ -786,23 +780,18 @@ pub(crate) async fn security_splits(
         "{} ORDER BY {EFFECTIVE_DATE} DESC, s.id DESC LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)",
         security_split_query()
     );
-    let splits: Vec<SecuritySplitRecord> = sqlx::query_as(&query)
-        .bind(security_id)
-        .bind(book.book_id())
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&state.pool)
-        .await
+    let splits: Vec<SecuritySplitRecord> = state
+        .database
+        .query(&query, &params![security_id, book.book_id(), limit, offset])
         .map_err(failed)?;
-    let total: i32 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS integer) FROM investment_splits
-         WHERE security_id = $1 AND book_id = $2",
-    )
-    .bind(security_id)
-    .bind(book.book_id())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(failed)?;
+    let total: i32 = state
+        .database
+        .query_row(
+            "SELECT CAST(COUNT(*) AS integer) FROM investment_splits
+         WHERE security_id = ?1 AND book_id = ?2",
+            &params![security_id, book.book_id()],
+        )
+        .map_err(failed)?;
 
     let is_income =
         |split: &SecuritySplitRecord| matches!(split.action.as_str(), "dividend" | "capGain");
@@ -811,9 +800,7 @@ pub(crate) async fn security_splits(
         .filter(|split| is_income(split))
         .map(|split| split.transaction_id)
         .collect();
-    let cash = income_by_transaction(&state.pool, &income_ids)
-        .await
-        .map_err(failed)?;
+    let cash = income_by_transaction(&*state.database, &income_ids).map_err(failed)?;
     let has_more = offset + (splits.len() as i64) < i64::from(total);
     let rows: Vec<Value> = splits
         .iter()

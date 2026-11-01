@@ -4,7 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { generateApiKey, hashApiKey } from "../helpers/api-keys";
 import { resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
 import { insert } from "../helpers/sql";
-import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { onWorker, sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 
@@ -171,7 +171,9 @@ describe("security layers HTTP parity", () => {
       expect(response.status).toBe(400);
     });
 
-    it("allows a POST whose Origin names the host that a reverse proxy forwards", async () => {
+    // The Worker has no reverse proxy in front of it, so it never trusts
+    // X-Forwarded-Host.
+    it.skipIf(onWorker)("allows a POST whose Origin names the host that a reverse proxy forwards", async () => {
       const allowed = await withSession("/api/b/1/transactions", {
         method: "POST",
         headers: { origin: "https://books.example", "x-forwarded-host": "books.example", "content-type": "application/json" },
@@ -181,6 +183,15 @@ describe("security layers HTTP parity", () => {
       const refused = await withSession("/api/b/1/transactions", {
         method: "POST",
         headers: { origin: EVIL, "x-forwarded-host": "books.example" },
+      });
+      expect(refused.status).toBe(403);
+    });
+
+    it.runIf(onWorker)("refuses a POST whose Origin names only a forwarded host", async () => {
+      const refused = await withSession("/api/b/1/transactions", {
+        method: "POST",
+        headers: { origin: "https://books.example", "x-forwarded-host": "books.example", "content-type": "application/json" },
+        body: "{}",
       });
       expect(refused.status).toBe(403);
     });

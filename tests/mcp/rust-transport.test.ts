@@ -5,9 +5,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { generateApiKey, getKeyPrefix, hashApiKey } from "@/tests/helpers/api-keys";
 import { resetTestDatabase, setupTestDatabase } from "@/tests/helpers/db-utils";
 import { exec, insert } from "@/tests/helpers/sql";
-import { startHttpTestServer } from "@/tests/helpers/http-parity";
+import { onWorker, startHttpTestServer } from "@/tests/helpers/http-parity";
 import { callMcpTool } from "@/tests/helpers/mcp";
-import { mcpTestTransport } from "@/tests/helpers/mcp-client";
 
 const INITIALIZE = {
   jsonrpc: "2.0",
@@ -17,7 +16,7 @@ const INITIALIZE = {
 };
 
 /** The HTTP gate of the Rust `/api/mcp`: the key, the cookie, and Origin. */
-describe.skipIf(mcpTestTransport() !== "http")("Rust MCP transport", () => {
+describe("Rust MCP transport", () => {
   let baseUrl: string;
   let stop: () => Promise<void>;
   let key: string;
@@ -129,9 +128,11 @@ describe.skipIf(mcpTestTransport() !== "http")("Rust MCP transport", () => {
     expect((await post({ authorization: `Bearer ${key}`, origin: `http://${host}` })).status).toBe(200);
   });
 
+  // The Worker has no reverse proxy in front of it, so it never trusts
+  // X-Forwarded-Host.
   it("compares Origin with X-Forwarded-Host, which the Next rewrite sets", async () => {
     const forwarded = { authorization: `Bearer ${key}`, "x-forwarded-host": "books.example" };
-    expect((await post({ ...forwarded, origin: "https://books.example" })).status).toBe(200);
+    expect((await post({ ...forwarded, origin: "https://books.example" })).status).toBe(onWorker ? 403 : 200);
     expect((await post({ ...forwarded, origin: "https://evil.example" })).status).toBe(403);
   });
 

@@ -38,8 +38,7 @@ fn formatted_balance(cents: i64) -> String {
 async fn rows(caller: &Caller, book_id: i64, query: &AccountQuery) -> ToolResult<Vec<Value>> {
     // The book gate has accepted the ID, so it is in the int4 range.
     let book_id = i32::try_from(book_id).map_err(|cause| thrown(&cause.to_string()))?;
-    accounts_with_balances(&caller.state().pool, book_id, query)
-        .await
+    accounts_with_balances(&caller.state().database, book_id, query)
         .map_err(|cause| thrown(&cause.to_string()).into())
 }
 

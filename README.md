@@ -62,6 +62,11 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 - **Reconciliation** - Match imported transactions with existing records
 - **Auto-Matching** - Learned payee-based matching runs automatically after each sync
 
+### Weekly Review (optional, AI)
+- **Dashboard card** - Each Monday, Claude reviews the past week of a book: a short summary, items to check (possible duplicates, missed payments, unusual amounts) and insights (price changes, new regular payments, spending changes)
+- **Opt-in per book** - Off until an editor or owner turns it on in the book settings, and only when the server has `ANTHROPIC_API_KEY`
+- **Data sent to Anthropic** - The transactions of the week with their memos and account names, monthly totals of the 13 months before, and the recurring rules. Email addresses and long digit runs are replaced. The review never changes the book. See [guides/weekly-review.md](guides/weekly-review.md)
+
 ### Financial Reporting
 - **Dashboard** - Net worth, assets, liabilities, income, expenses
 - **Balance Sheet** - Real-time snapshot of financial position
@@ -87,7 +92,7 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 ## Tech Stack
 
 - **Web client**: React with React Router, built by Vite into static files
-- **API server**: Rust (Axum and SQLx). It serves the API, the MCP server and the client build, and runs the scheduled jobs and the backups
+- **API server**: Rust (Axum and rusqlite). It serves the API, the MCP server and the client build, and runs the scheduled jobs and the backups
 - **Language**: TypeScript in the browser, Rust on the server. The browser runs the shared Rust domain code as WASM
 - **Styling**: Tailwind CSS
 - **Database**: SQLite, one file
@@ -200,7 +205,7 @@ uid 1000 (`counterpoise`). It uses two volumes:
 | Volume | Mounted at | Holds |
 | --- | --- | --- |
 | `counterpoise_data` (external) | `/data` | `counterpoise.db`, its `-wal` and `-shm` files, and its lock files |
-| `${COUNTERPOISE_BACKUPS_DIR:-./backups}` | `/backups` | The hourly snapshots and the job status records (`status/`). It must be writable by uid 1000 |
+| `${COUNTERPOISE_BACKUPS_DIR:-./backups}` | `/backups` | The hourly snapshots. It must be writable by uid 1000 |
 
 > **An install that ran an earlier release on PostgreSQL** must convert its
 > data once before this release can start. Follow
@@ -231,6 +236,7 @@ TRUST_PROXY=true|false
 PLAID_CLIENT_ID=...
 PLAID_SECRET=...
 PLAID_ENV=sandbox|production
+PLAID_TOKEN_KEY=...  # openssl rand -base64 32; encrypts the stored access tokens
 
 # Optional — Tiingo security prices
 TIINGO_API_KEY=...
@@ -401,13 +407,15 @@ tell that the original request was HTTPS, and without
 value that the client wrote:
 
 ```nginx
-# Deliver live book updates immediately instead of buffering the stream.
-location ~ ^/api/b/[0-9]+/events$ {
+# Pass the upgrade of the live-update socket. The server pings every 25 seconds.
+location ~ ^/api/b/[0-9]+/socket$ {
     proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
     proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_buffering off;
     proxy_read_timeout 60s;
 }
 
@@ -598,8 +606,8 @@ and a look at the books tells you that.
 
 ### Monitoring
 
-The server records the outcome of every scheduled job in `backups/status/`,
-and `/api/system/status` reads those records. The app surfaces stale or
+The server records the outcome of every scheduled job in its database (the
+table `job_runs`), and `/api/system/status` reads those records. The app surfaces stale or
 unverified jobs in the navbar — silently, until something needs attention.
 
 That design assumes **you use the app**. It detects a broken backup job while
@@ -615,7 +623,7 @@ still reports when the whole host is down.
 ## Scheduler
 
 The server runs every scheduled job itself, in the time zone that `TZ` sets
-(`COUNTERPOISE_SCHEDULER=on`, set in the image; `rust-api/server/src/scheduler.rs`).
+(`COUNTERPOISE_SCHEDULER=on`, set in the image; `rust-api/server/src/scheduler/mod.rs`).
 There is no scheduler container.
 
 | Job | Schedule | Description |
@@ -641,6 +649,20 @@ curl -H "authorization: Bearer ${CRON_SECRET}" http://localhost:3000/api/cron/re
 Bank sync is optional, and off until `PLAID_CLIENT_ID` and `PLAID_SECRET` are
 set — `isPlaidConfigured()` is false without them, so sync fails closed rather
 than reaching a live institution.
+
+The server stores each bank's access token encrypted, with the key in
+`PLAID_TOKEN_KEY` (generate it with `openssl rand -base64 32`). Without the key
+it stores no new token, so a bank cannot be connected. Keep the key somewhere
+safe beside your backups: the tokens in a backup do not open without it, and
+each bank would have to be connected again.
+
+**Upgrading an install that already has bank connections:** set
+`PLAID_TOKEN_KEY` before you start the new release. On its first start the
+server encrypts the existing tokens. Until the key is set it keeps them in
+plaintext and logs a warning. Once tokens are encrypted, the server refuses to
+start without the key that encrypted them. To rotate the key, move the old one
+to `PLAID_TOKEN_KEY_PREVIOUS`, set the new one, and restart; then remove the old
+one.
 
 ### 1. Get API credentials
 

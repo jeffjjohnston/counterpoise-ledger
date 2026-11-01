@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { ConsentForm, type ConsentDetails } from "@/app/oauth/consent/ConsentForm";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { ConsentForm, STALLED_AFTER_MS, type ConsentDetails } from "@/app/oauth/consent/ConsentForm";
 
 const QUERY = "response_type=code&client_id=cpc_1&state=s";
 
@@ -28,6 +28,7 @@ function stubFetch(details: () => Response, decision: () => Response = () => jso
 
 describe("ConsentForm", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -67,6 +68,33 @@ describe("ConsentForm", () => {
     await waitFor(() => expect(leave).toHaveBeenCalledWith("https://claude.ai/cb?code=x"));
     const [, init] = fetchMock.mock.calls.find(([, init]) => init?.method === "POST")!;
     expect(JSON.parse(String(init?.body))).toEqual({ query: QUERY, approve: true });
+  });
+
+  // The redirect does not always replace the page: macOS can give an https
+  // redirect URI to a desktop app, and a browser can drop a navigation to a
+  // loopback listener. The page then says it is done, and offers a link
+  // instead of navigating a second time on its own.
+  it("says the window can close when the browser stays after the redirect", async () => {
+    stubFetch(() => json(200, DETAILS));
+    const leave = vi.fn();
+    render(<ConsentForm query={QUERY} leave={leave} />);
+    const approve = await screen.findByRole("button", { name: "Approve" });
+    vi.useFakeTimers();
+    fireEvent.click(approve);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(leave).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Returning to the app...")).toBeInTheDocument();
+    expect(screen.queryByTestId("consent-done")).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STALLED_AFTER_MS);
+    });
+    expect(screen.queryByText("Returning to the app...")).toBeNull();
+    expect(screen.getByText("You can close this window.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "claude.ai" })).toHaveAttribute("href", "https://claude.ai/cb?code=x");
+    expect(leave).toHaveBeenCalledTimes(1);
   });
 
   it("sends a denial", async () => {

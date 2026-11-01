@@ -128,8 +128,7 @@ pub(super) async fn realized_gains(
             i32::try_from(id).map_err(|_| Box::new(thrown("value out of range for type integer")))
         })
         .transpose()?;
-    let result = report(&caller.state().pool, book, &filters, account_id)
-        .await
+    let result = report(&*caller.state().database, book, &filters, account_id)
         .map_err(|cause| thrown(&cause.to_string()))?;
     let disposals: Vec<Value> = result["rows"]
         .as_array()

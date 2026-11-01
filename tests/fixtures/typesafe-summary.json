@@ -3,7 +3,8 @@
     "Hand-worked TypeSafe report cases. tests/lib/typesafe-report.test.ts gives them to summarizeTypeSafe in lib/typesafe/report.ts, and the tests of rust-api/server/src/typesafe.rs give them to summarize. Both must give the expected counts.",
     "Each evaluation names one of the snapshots below. A field that an evaluation or a decision does not give is null (false for the two decision flags). A time is UTC.",
     "The expected counts are in the order in which the summary first adds each key; the tests compare the JSON text, so the order and a NaN count (written as null) must also agree.",
-    "A case with \"error\": true has a snapshot that the summary cannot read: TypeScript throws a TypeError and Rust returns an error."
+    "A case with \"error\": true has a snapshot that the summary cannot read: TypeScript throws a TypeError and Rust returns an error.",
+    "entryCases are given to summarizeEntries and summarize_entries; their expected counts are in key order too."
   ],
   "snapshots": {
     "familiar": {
@@ -490,6 +491,39 @@
       ],
       "decisions": [],
       "error": true
+    }
+  ],
+  "entryCases": [
+    {
+      "name": "a ready pick that agrees, a none, an error, and three outcomes",
+      "evaluations": [
+        { "status": "ready", "choice": "10:in", "baselineKey": "10:in", "latencyMs": 400, "errorCode": null },
+        { "status": "ready", "choice": null, "baselineKey": "10:in", "latencyMs": 300, "errorCode": null },
+        { "status": "ready", "choice": "11:in", "baselineKey": "10:in", "latencyMs": null, "errorCode": null },
+        { "status": "error", "choice": null, "baselineKey": "10:in", "latencyMs": 5000, "errorCode": "timeout" },
+        { "status": "skipped", "choice": null, "baselineKey": "10:in", "latencyMs": null, "errorCode": null }
+      ],
+      "outcomes": [
+        { "outcome": "kept", "source": "typesafe", "chipVisible": true },
+        { "outcome": "changed_amount", "source": "history", "chipVisible": false },
+        { "outcome": "kept", "source": "typesafe", "chipVisible": true }
+      ],
+      "expected": {
+        "entry_evaluations": 5,
+        "entry_status_ready": 3,
+        "entry_choice": 2,
+        "entry_agrees_with_baseline": 1,
+        "entry_latency_samples": 3,
+        "entry_latency_total_ms": 5700,
+        "entry_none": 1,
+        "entry_differs_from_baseline": 1,
+        "entry_status_error": 1,
+        "entry_error_timeout": 1,
+        "entry_status_skipped": 1,
+        "entry_outcome_typesafe_kept": 2,
+        "entry_chip_visible": 2,
+        "entry_outcome_history_changed_amount": 1
+      }
     }
   ]
 }

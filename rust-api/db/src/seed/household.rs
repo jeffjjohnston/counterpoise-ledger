@@ -14,82 +14,71 @@ use super::window::{Window, date, format_date};
 use super::{
     Positions, SeedResult, Seeder, buy_allocation, gross_cents, insert_payees, js_round, split,
 };
+use crate::store::Sql;
 
 /// Writes the household rows into the book of `seeder`.
-pub(super) async fn seed(seeder: &mut Seeder<'_>, window: Window) -> SeedResult<()> {
-    let accounts = create_accounts(seeder).await?;
+pub(super) fn seed(seeder: &mut Seeder<'_, impl Sql>, window: Window) -> SeedResult<()> {
+    let accounts = create_accounts(seeder)?;
 
     let vti = Security::new(
-        seeder
-            .security("Vanguard Total Stock Market ETF", "VTI")
-            .await?,
+        seeder.security("Vanguard Total Stock Market ETF", "VTI")?,
         "VTI",
         &VTI_PRICES,
         window,
     );
     let vxus = Security::new(
-        seeder
-            .security("Vanguard Total International Stock ETF", "VXUS")
-            .await?,
+        seeder.security("Vanguard Total International Stock ETF", "VXUS")?,
         "VXUS",
         &VXUS_PRICES,
         window,
     );
     let bnd = Security::new(
-        seeder
-            .security("Vanguard Total Bond Market ETF", "BND")
-            .await?,
+        seeder.security("Vanguard Total Bond Market ETF", "BND")?,
         "BND",
         &BND_PRICES,
         window,
     );
     let agg = Security::new(
-        seeder
-            .security("iShares Core US Aggregate Bond ETF", "AGG")
-            .await?,
+        seeder.security("iShares Core US Aggregate Bond ETF", "AGG")?,
         "AGG",
         &AGG_PRICES,
         window,
     );
     (seeder.log)("  Created securities");
 
-    seed_prices(seeder, &[vti, vxus, bnd, agg], window).await?;
+    seed_prices(seeder, &[vti, vxus, bnd, agg], window)?;
     (seeder.log)("  Created security price history");
 
-    let payees = insert_payees(seeder, &PAYEES).await?;
+    let payees = insert_payees(seeder, &PAYEES)?;
     (seeder.log)("  Created payees");
     let payee = |name: &str| payees.get(name).copied();
 
     (seeder.log)("  Creating opening balances...");
     let a = &accounts;
     let opening_date = format_date(window.opening_date());
-    seeder
-        .transaction(
-            &opening_date,
-            "Opening Balance - Checking",
-            None,
-            &[
-                split(a.checking, 1_500_000),
-                split(a.opening_balances, -1_500_000),
-            ],
-        )
-        .await?;
-    seeder
-        .transaction(
-            &opening_date,
-            "Opening Balance - Auto Loan",
-            None,
-            &[
-                split(a.auto_loan, -2_500_000),
-                split(a.opening_balances, 2_500_000),
-            ],
-        )
-        .await?;
+    seeder.transaction(
+        &opening_date,
+        "Opening Balance - Checking",
+        None,
+        &[
+            split(a.checking, 1_500_000),
+            split(a.opening_balances, -1_500_000),
+        ],
+    )?;
+    seeder.transaction(
+        &opening_date,
+        "Opening Balance - Auto Loan",
+        None,
+        &[
+            split(a.auto_loan, -2_500_000),
+            split(a.opening_balances, 2_500_000),
+        ],
+    )?;
 
     (seeder.log)("  Generating transactions...");
     let mut positions = Positions::default();
     let next_paycheck =
-        seed_paychecks(seeder, a, &payee, &mut positions, [vti, vxus, bnd], window).await?;
+        seed_paychecks(seeder, a, &payee, &mut positions, [vti, vxus, bnd], window)?;
     (seeder.log)("    Paychecks & 401(k) purchases done");
     seed_months(
         seeder,
@@ -98,17 +87,15 @@ pub(super) async fn seed(seeder: &mut Seeder<'_>, window: Window) -> SeedResult<
         &mut positions,
         [vti, vxus, bnd, agg],
         window,
-    )
-    .await?;
+    )?;
 
-    seed_plaid(seeder, &plaid_demo(&accounts), window.today).await?;
+    seed_plaid(seeder, &plaid_demo(&accounts), window.today)?;
     write_rules(
         seeder,
         rules(&accounts, next_paycheck),
         &payees,
         window.today,
-    )
-    .await?;
+    )?;
     Ok(())
 }
 
@@ -342,133 +329,105 @@ struct Accounts {
     opening_balances: i32,
 }
 
-async fn create_accounts(seeder: &mut Seeder<'_>) -> SeedResult<Accounts> {
+fn create_accounts(seeder: &mut Seeder<'_, impl Sql>) -> SeedResult<Accounts> {
     let asset = "asset";
-    let checking = seeder
-        .account("Joint Checking", asset, Some("bank"), None, true, None)
-        .await?;
-    let brokerage = seeder
-        .account(
-            "Joint Brokerage",
-            asset,
-            Some("investment"),
-            None,
-            true,
-            None,
-        )
-        .await?;
-    let brokerage_cash = seeder
-        .account(
-            "Joint Brokerage Cash",
-            asset,
-            Some("cash"),
-            Some(brokerage),
-            false,
-            None,
-        )
-        .await?;
-    let sarah_401k = seeder
-        .account("Sarah 401(k)", asset, Some("investment"), None, false, None)
-        .await?;
-    let sarah_401k_cash = seeder
-        .account(
-            "Sarah 401(k) Cash",
-            asset,
-            Some("cash"),
-            Some(sarah_401k),
-            false,
-            None,
-        )
-        .await?;
-    let michael_401k = seeder
-        .account(
-            "Michael 401(k)",
-            asset,
-            Some("investment"),
-            None,
-            false,
-            None,
-        )
-        .await?;
-    let michael_401k_cash = seeder
-        .account(
-            "Michael 401(k) Cash",
-            asset,
-            Some("cash"),
-            Some(michael_401k),
-            false,
-            None,
-        )
-        .await?;
-    let sarah_ira = seeder
-        .account("Sarah IRA", asset, Some("investment"), None, false, None)
-        .await?;
-    let sarah_ira_cash = seeder
-        .account(
-            "Sarah IRA Cash",
-            asset,
-            Some("cash"),
-            Some(sarah_ira),
-            false,
-            None,
-        )
-        .await?;
-    let michael_ira = seeder
-        .account("Michael IRA", asset, Some("investment"), None, false, None)
-        .await?;
-    let michael_ira_cash = seeder
-        .account(
-            "Michael IRA Cash",
-            asset,
-            Some("cash"),
-            Some(michael_ira),
-            false,
-            None,
-        )
-        .await?;
+    let checking = seeder.account("Joint Checking", asset, Some("bank"), None, true, None)?;
+    let brokerage = seeder.account(
+        "Joint Brokerage",
+        asset,
+        Some("investment"),
+        None,
+        true,
+        None,
+    )?;
+    let brokerage_cash = seeder.account(
+        "Joint Brokerage Cash",
+        asset,
+        Some("cash"),
+        Some(brokerage),
+        false,
+        None,
+    )?;
+    let sarah_401k =
+        seeder.account("Sarah 401(k)", asset, Some("investment"), None, false, None)?;
+    let sarah_401k_cash = seeder.account(
+        "Sarah 401(k) Cash",
+        asset,
+        Some("cash"),
+        Some(sarah_401k),
+        false,
+        None,
+    )?;
+    let michael_401k = seeder.account(
+        "Michael 401(k)",
+        asset,
+        Some("investment"),
+        None,
+        false,
+        None,
+    )?;
+    let michael_401k_cash = seeder.account(
+        "Michael 401(k) Cash",
+        asset,
+        Some("cash"),
+        Some(michael_401k),
+        false,
+        None,
+    )?;
+    let sarah_ira = seeder.account("Sarah IRA", asset, Some("investment"), None, false, None)?;
+    let sarah_ira_cash = seeder.account(
+        "Sarah IRA Cash",
+        asset,
+        Some("cash"),
+        Some(sarah_ira),
+        false,
+        None,
+    )?;
+    let michael_ira =
+        seeder.account("Michael IRA", asset, Some("investment"), None, false, None)?;
+    let michael_ira_cash = seeder.account(
+        "Michael IRA Cash",
+        asset,
+        Some("cash"),
+        Some(michael_ira),
+        false,
+        None,
+    )?;
     (seeder.log)("  Created asset accounts");
 
     let liability = "liability";
-    let chase_sapphire = seeder
-        .account(
-            "Chase Sapphire",
-            liability,
-            Some("credit_card"),
-            None,
-            true,
-            None,
-        )
-        .await?;
-    let amex_blue = seeder
-        .account(
-            "Amex Blue Cash",
-            liability,
-            Some("credit_card"),
-            None,
-            false,
-            None,
-        )
-        .await?;
-    let citi_double = seeder
-        .account(
-            "Citi Double Cash",
-            liability,
-            Some("credit_card"),
-            None,
-            false,
-            None,
-        )
-        .await?;
-    let auto_loan = seeder
-        .account(
-            "Honda Auto Loan",
-            liability,
-            Some("loan"),
-            None,
-            false,
-            None,
-        )
-        .await?;
+    let chase_sapphire = seeder.account(
+        "Chase Sapphire",
+        liability,
+        Some("credit_card"),
+        None,
+        true,
+        None,
+    )?;
+    let amex_blue = seeder.account(
+        "Amex Blue Cash",
+        liability,
+        Some("credit_card"),
+        None,
+        false,
+        None,
+    )?;
+    let citi_double = seeder.account(
+        "Citi Double Cash",
+        liability,
+        Some("credit_card"),
+        None,
+        false,
+        None,
+    )?;
+    let auto_loan = seeder.account(
+        "Honda Auto Loan",
+        liability,
+        Some("loan"),
+        None,
+        false,
+        None,
+    )?;
     (seeder.log)("  Created liability accounts");
 
     // Icons go on the top-level categories. A child keeps a null icon, which
@@ -478,314 +437,227 @@ async fn create_accounts(seeder: &mut Seeder<'_>) -> SeedResult<Accounts> {
     // that an unconfigured category shows. No two top-level categories have
     // the same icon.
     let income = "income";
-    let salary = seeder
-        .account("Salary", income, None, None, false, Some("\u{1f4b0}"))
-        .await?;
-    let investment_income = seeder
-        .account(
-            "Investment Income",
-            income,
-            None,
-            None,
-            false,
-            Some("\u{1f4c8}"),
-        )
-        .await?;
-    let sarah_salary = seeder
-        .account("Salary:Sarah", income, None, Some(salary), false, None)
-        .await?;
-    let michael_salary = seeder
-        .account("Salary:Michael", income, None, Some(salary), false, None)
-        .await?;
-    let dividend_income = seeder
-        .account(
-            "Investment Income:Dividends",
-            income,
-            None,
-            Some(investment_income),
-            false,
-            None,
-        )
-        .await?;
-    seeder
-        .account(
-            "Investment Income:Capital Gains",
-            income,
-            None,
-            Some(investment_income),
-            false,
-            None,
-        )
-        .await?;
-    seeder
-        .account(
-            "Interest Income",
-            income,
-            None,
-            None,
-            false,
-            Some("\u{1f3e6}"),
-        )
-        .await?;
+    let salary = seeder.account("Salary", income, None, None, false, Some("\u{1f4b0}"))?;
+    let investment_income = seeder.account(
+        "Investment Income",
+        income,
+        None,
+        None,
+        false,
+        Some("\u{1f4c8}"),
+    )?;
+    let sarah_salary = seeder.account("Salary:Sarah", income, None, Some(salary), false, None)?;
+    let michael_salary =
+        seeder.account("Salary:Michael", income, None, Some(salary), false, None)?;
+    let dividend_income = seeder.account(
+        "Investment Income:Dividends",
+        income,
+        None,
+        Some(investment_income),
+        false,
+        None,
+    )?;
+    seeder.account(
+        "Investment Income:Capital Gains",
+        income,
+        None,
+        Some(investment_income),
+        false,
+        None,
+    )?;
+    seeder.account(
+        "Interest Income",
+        income,
+        None,
+        None,
+        false,
+        Some("\u{1f3e6}"),
+    )?;
     (seeder.log)("  Created income accounts");
 
     let expense = "expense";
-    let taxes = seeder
-        .account(
-            "Taxes",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1f3db}\u{fe0f}"),
-        )
-        .await?;
-    let insurance = seeder
-        .account(
-            "Insurance",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1f6e1}\u{fe0f}"),
-        )
-        .await?;
-    let housing = seeder
-        .account("Housing", expense, None, None, false, Some("\u{1f3e0}"))
-        .await?;
-    let auto = seeder
-        .account("Auto", expense, None, None, false, Some("\u{1f697}"))
-        .await?;
-    let food = seeder
-        .account("Food", expense, None, None, false, Some("\u{1f354}"))
-        .await?;
-    let shopping = seeder
-        .account(
-            "Shopping",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1f6cd}\u{fe0f}"),
-        )
-        .await?;
-    let personal = seeder
-        .account("Personal", expense, None, None, false, Some("\u{1f9f4}"))
-        .await?;
-    let interest = seeder
-        .account("Interest", expense, None, None, false, Some("\u{1f4b3}"))
-        .await?;
+    let taxes = seeder.account(
+        "Taxes",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1f3db}\u{fe0f}"),
+    )?;
+    let insurance = seeder.account(
+        "Insurance",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1f6e1}\u{fe0f}"),
+    )?;
+    let housing = seeder.account("Housing", expense, None, None, false, Some("\u{1f3e0}"))?;
+    let auto = seeder.account("Auto", expense, None, None, false, Some("\u{1f697}"))?;
+    let food = seeder.account("Food", expense, None, None, false, Some("\u{1f354}"))?;
+    let shopping = seeder.account(
+        "Shopping",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1f6cd}\u{fe0f}"),
+    )?;
+    let personal = seeder.account("Personal", expense, None, None, false, Some("\u{1f9f4}"))?;
+    let interest = seeder.account("Interest", expense, None, None, false, Some("\u{1f4b3}"))?;
     let child = |parent: i32| Some(parent);
-    let tax_federal = seeder
-        .account("Taxes:Federal", expense, None, child(taxes), false, None)
-        .await?;
-    let tax_nj = seeder
-        .account("Taxes:NJ State", expense, None, child(taxes), false, None)
-        .await?;
-    let tax_ss = seeder
-        .account(
-            "Taxes:Social Security",
-            expense,
-            None,
-            child(taxes),
-            false,
-            None,
-        )
-        .await?;
-    let tax_medicare = seeder
-        .account("Taxes:Medicare", expense, None, child(taxes), false, None)
-        .await?;
-    let ins_health = seeder
-        .account(
-            "Insurance:Health",
-            expense,
-            None,
-            child(insurance),
-            false,
-            None,
-        )
-        .await?;
-    let ins_dental = seeder
-        .account(
-            "Insurance:Dental",
-            expense,
-            None,
-            child(insurance),
-            false,
-            None,
-        )
-        .await?;
-    let ins_car = seeder
-        .account(
-            "Insurance:Car",
-            expense,
-            None,
-            child(insurance),
-            false,
-            None,
-        )
-        .await?;
-    let housing_rent = seeder
-        .account("Housing:Rent", expense, None, child(housing), false, None)
-        .await?;
-    let housing_electric = seeder
-        .account(
-            "Housing:Electric",
-            expense,
-            None,
-            child(housing),
-            false,
-            None,
-        )
-        .await?;
-    let housing_gas = seeder
-        .account("Housing:Gas", expense, None, child(housing), false, None)
-        .await?;
-    let housing_water = seeder
-        .account("Housing:Water", expense, None, child(housing), false, None)
-        .await?;
-    let housing_internet = seeder
-        .account(
-            "Housing:Internet",
-            expense,
-            None,
-            child(housing),
-            false,
-            Some("\u{1f310}"),
-        )
-        .await?;
-    let housing_phone = seeder
-        .account("Housing:Phone", expense, None, child(housing), false, None)
-        .await?;
-    let auto_fuel = seeder
-        .account("Auto:Fuel", expense, None, child(auto), false, None)
-        .await?;
-    let auto_maintenance = seeder
-        .account("Auto:Maintenance", expense, None, child(auto), false, None)
-        .await?;
-    let food_groceries = seeder
-        .account("Food:Groceries", expense, None, child(food), false, None)
-        .await?;
-    let food_dining = seeder
-        .account("Food:Dining", expense, None, child(food), false, None)
-        .await?;
-    let food_coffee = seeder
-        .account(
-            "Food:Coffee",
-            expense,
-            None,
-            child(food),
-            false,
-            Some("\u{2615}"),
-        )
-        .await?;
-    let entertainment = seeder
-        .account(
-            "Entertainment",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1f3ac}"),
-        )
-        .await?;
-    let shop_clothing = seeder
-        .account(
-            "Shopping:Clothing",
-            expense,
-            None,
-            child(shopping),
-            false,
-            None,
-        )
-        .await?;
-    let shop_household = seeder
-        .account(
-            "Shopping:Household",
-            expense,
-            None,
-            child(shopping),
-            false,
-            None,
-        )
-        .await?;
-    let shop_electronics = seeder
-        .account(
-            "Shopping:Electronics",
-            expense,
-            None,
-            child(shopping),
-            false,
-            None,
-        )
-        .await?;
-    let medical = seeder
-        .account("Medical", expense, None, None, false, Some("\u{1f3e5}"))
-        .await?;
-    let personal_gym = seeder
-        .account(
-            "Personal:Gym",
-            expense,
-            None,
-            child(personal),
-            false,
-            Some("\u{1f3cb}\u{fe0f}"),
-        )
-        .await?;
-    let personal_haircuts = seeder
-        .account(
-            "Personal:Haircuts",
-            expense,
-            None,
-            child(personal),
-            false,
-            None,
-        )
-        .await?;
-    let travel = seeder
-        .account(
-            "Travel",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{2708}\u{fe0f}"),
-        )
-        .await?;
-    let gifts = seeder
-        .account("Gifts", expense, None, None, false, Some("\u{1f381}"))
-        .await?;
-    seeder
-        .account("Investment Fees", expense, None, None, false, None)
-        .await?;
-    let misc_expense = seeder
-        .account("Miscellaneous", expense, None, None, false, None)
-        .await?;
-    let interest_car_loan = seeder
-        .account(
-            "Interest:Car Loan",
-            expense,
-            None,
-            child(interest),
-            false,
-            None,
-        )
-        .await?;
-    let streaming = seeder
-        .account(
-            "Entertainment:Streaming",
-            expense,
-            None,
-            child(entertainment),
-            false,
-            Some("\u{1f4fa}"),
-        )
-        .await?;
+    let tax_federal = seeder.account("Taxes:Federal", expense, None, child(taxes), false, None)?;
+    let tax_nj = seeder.account("Taxes:NJ State", expense, None, child(taxes), false, None)?;
+    let tax_ss = seeder.account(
+        "Taxes:Social Security",
+        expense,
+        None,
+        child(taxes),
+        false,
+        None,
+    )?;
+    let tax_medicare =
+        seeder.account("Taxes:Medicare", expense, None, child(taxes), false, None)?;
+    let ins_health = seeder.account(
+        "Insurance:Health",
+        expense,
+        None,
+        child(insurance),
+        false,
+        None,
+    )?;
+    let ins_dental = seeder.account(
+        "Insurance:Dental",
+        expense,
+        None,
+        child(insurance),
+        false,
+        None,
+    )?;
+    let ins_car = seeder.account(
+        "Insurance:Car",
+        expense,
+        None,
+        child(insurance),
+        false,
+        None,
+    )?;
+    let housing_rent =
+        seeder.account("Housing:Rent", expense, None, child(housing), false, None)?;
+    let housing_electric = seeder.account(
+        "Housing:Electric",
+        expense,
+        None,
+        child(housing),
+        false,
+        None,
+    )?;
+    let housing_gas = seeder.account("Housing:Gas", expense, None, child(housing), false, None)?;
+    let housing_water =
+        seeder.account("Housing:Water", expense, None, child(housing), false, None)?;
+    let housing_internet = seeder.account(
+        "Housing:Internet",
+        expense,
+        None,
+        child(housing),
+        false,
+        Some("\u{1f310}"),
+    )?;
+    let housing_phone =
+        seeder.account("Housing:Phone", expense, None, child(housing), false, None)?;
+    let auto_fuel = seeder.account("Auto:Fuel", expense, None, child(auto), false, None)?;
+    let auto_maintenance =
+        seeder.account("Auto:Maintenance", expense, None, child(auto), false, None)?;
+    let food_groceries =
+        seeder.account("Food:Groceries", expense, None, child(food), false, None)?;
+    let food_dining = seeder.account("Food:Dining", expense, None, child(food), false, None)?;
+    let food_coffee = seeder.account(
+        "Food:Coffee",
+        expense,
+        None,
+        child(food),
+        false,
+        Some("\u{2615}"),
+    )?;
+    let entertainment = seeder.account(
+        "Entertainment",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1f3ac}"),
+    )?;
+    let shop_clothing = seeder.account(
+        "Shopping:Clothing",
+        expense,
+        None,
+        child(shopping),
+        false,
+        None,
+    )?;
+    let shop_household = seeder.account(
+        "Shopping:Household",
+        expense,
+        None,
+        child(shopping),
+        false,
+        None,
+    )?;
+    let shop_electronics = seeder.account(
+        "Shopping:Electronics",
+        expense,
+        None,
+        child(shopping),
+        false,
+        None,
+    )?;
+    let medical = seeder.account("Medical", expense, None, None, false, Some("\u{1f3e5}"))?;
+    let personal_gym = seeder.account(
+        "Personal:Gym",
+        expense,
+        None,
+        child(personal),
+        false,
+        Some("\u{1f3cb}\u{fe0f}"),
+    )?;
+    let personal_haircuts = seeder.account(
+        "Personal:Haircuts",
+        expense,
+        None,
+        child(personal),
+        false,
+        None,
+    )?;
+    let travel = seeder.account(
+        "Travel",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{2708}\u{fe0f}"),
+    )?;
+    let gifts = seeder.account("Gifts", expense, None, None, false, Some("\u{1f381}"))?;
+    seeder.account("Investment Fees", expense, None, None, false, None)?;
+    let misc_expense = seeder.account("Miscellaneous", expense, None, None, false, None)?;
+    let interest_car_loan = seeder.account(
+        "Interest:Car Loan",
+        expense,
+        None,
+        child(interest),
+        false,
+        None,
+    )?;
+    let streaming = seeder.account(
+        "Entertainment:Streaming",
+        expense,
+        None,
+        child(entertainment),
+        false,
+        Some("\u{1f4fa}"),
+    )?;
     (seeder.log)("  Created expense accounts");
 
-    let opening_balances = seeder
-        .account("Opening Balances", "equity", None, None, false, None)
-        .await?;
+    let opening_balances = seeder.account("Opening Balances", "equity", None, None, false, None)?;
     (seeder.log)("  Created equity account");
 
     Ok(Accounts {
@@ -856,8 +728,8 @@ const DENTAL_INSURANCE: i64 = 3_500;
 /// Biweekly paychecks for both earners from the first Friday of the window,
 /// and each 401(k) purchase on the day after. Returns the next pay date after
 /// `today`, for the paycheck rule.
-async fn seed_paychecks(
-    seeder: &mut Seeder<'_>,
+fn seed_paychecks(
+    seeder: &mut Seeder<'_, impl Sql>,
     a: &Accounts,
     payee: &(dyn Fn(&str) -> Option<i32> + Sync),
     positions: &mut Positions,
@@ -946,9 +818,7 @@ async fn seed_paychecks(
             if contribution > 0 {
                 splits.push(split(plan_cash, contribution));
             }
-            seeder
-                .transaction(&date_text, description, payee(payee_name), &splits)
-                .await?;
+            seeder.transaction(&date_text, description, payee(payee_name), &splits)?;
 
             if contribution > 0 && buy_on <= window.today {
                 buy_allocation(
@@ -961,8 +831,7 @@ async fn seed_paychecks(
                     contribution,
                     &allocation,
                     label,
-                )
-                .await?;
+                )?;
             }
         }
 
@@ -1086,8 +955,8 @@ fn charge_templates(a: &Accounts) -> Vec<ChargeTemplate> {
 /// each later amount depends on it. A draw happens whether or not its row is
 /// written, so a row after `today` does not move the draws of the rows
 /// before it.
-async fn seed_months(
-    seeder: &mut Seeder<'_>,
+fn seed_months(
+    seeder: &mut Seeder<'_, impl Sql>,
     a: &Accounts,
     payee: &(dyn Fn(&str) -> Option<i32> + Sync),
     positions: &mut Positions,
@@ -1110,14 +979,12 @@ async fn seed_months(
         let on = |day: i64| window.on(year, month1, day as u32).map(format_date);
 
         if let Some(day) = on(1) {
-            seeder
-                .transaction(
-                    &day,
-                    "Rent Payment",
-                    payee("Greenwood Apartments"),
-                    &[split(a.housing_rent, 250_000), split(a.checking, -250_000)],
-                )
-                .await?;
+            seeder.transaction(
+                &day,
+                "Rent Payment",
+                payee("Greenwood Apartments"),
+                &[split(a.housing_rent, 250_000), split(a.checking, -250_000)],
+            )?;
         }
 
         // Electric: higher in summer and winter.
@@ -1131,17 +998,15 @@ async fn seed_months(
         let noise = seeder.rand.int(-1500, 1500) as f64;
         let electric = js_round(12_000.0 * season + noise) as i64;
         if let Some(day) = on(5) {
-            seeder
-                .transaction(
-                    &day,
-                    "Electric Bill",
-                    payee("PSE&G"),
-                    &[
-                        split(a.housing_electric, electric),
-                        split(a.checking, -electric),
-                    ],
-                )
-                .await?;
+            seeder.transaction(
+                &day,
+                "Electric Bill",
+                payee("PSE&G"),
+                &[
+                    split(a.housing_electric, electric),
+                    split(a.checking, -electric),
+                ],
+            )?;
         }
 
         // Gas: winter heating, and only the water heater in summer.
@@ -1155,55 +1020,45 @@ async fn seed_months(
         let noise = seeder.rand.int(-1000, 1000) as f64;
         let gas = js_round(7_500.0 * season + noise) as i64;
         if let Some(day) = on(7) {
-            seeder
-                .transaction(
-                    &day,
-                    "Gas Bill",
-                    payee("PSE&G"),
-                    &[split(a.housing_gas, gas), split(a.checking, -gas)],
-                )
-                .await?;
+            seeder.transaction(
+                &day,
+                "Gas Bill",
+                payee("PSE&G"),
+                &[split(a.housing_gas, gas), split(a.checking, -gas)],
+            )?;
         }
 
         let water = 6_500 + seeder.rand.int(-500, 500);
         if let Some(day) = on(10) {
-            seeder
-                .transaction(
-                    &day,
-                    "Water Bill",
-                    payee("New Jersey American Water"),
-                    &[split(a.housing_water, water), split(a.checking, -water)],
-                )
-                .await?;
+            seeder.transaction(
+                &day,
+                "Water Bill",
+                payee("New Jersey American Water"),
+                &[split(a.housing_water, water), split(a.checking, -water)],
+            )?;
         }
 
         if let Some(day) = on(12) {
-            seeder
-                .transaction(
-                    &day,
-                    "Internet",
-                    payee("Optimum Internet"),
-                    &[split(a.housing_internet, 9_000), split(a.checking, -9_000)],
-                )
-                .await?;
-            seeder
-                .transaction(
-                    &day,
-                    "Phone Bill",
-                    payee("T-Mobile"),
-                    &[split(a.housing_phone, 14_000), split(a.checking, -14_000)],
-                )
-                .await?;
+            seeder.transaction(
+                &day,
+                "Internet",
+                payee("Optimum Internet"),
+                &[split(a.housing_internet, 9_000), split(a.checking, -9_000)],
+            )?;
+            seeder.transaction(
+                &day,
+                "Phone Bill",
+                payee("T-Mobile"),
+                &[split(a.housing_phone, 14_000), split(a.checking, -14_000)],
+            )?;
         }
         if let Some(day) = on(15) {
-            seeder
-                .transaction(
-                    &day,
-                    "Car Insurance",
-                    payee("Geico"),
-                    &[split(a.ins_car, 18_500), split(a.checking, -18_500)],
-                )
-                .await?;
+            seeder.transaction(
+                &day,
+                "Car Insurance",
+                payee("Geico"),
+                &[split(a.ins_car, 18_500), split(a.checking, -18_500)],
+            )?;
         }
 
         if car_loan_remaining > 0 {
@@ -1211,44 +1066,38 @@ async fn seed_months(
             let principal = (car_loan_payment - interest).min(car_loan_remaining);
             if let Some(day) = on(18) {
                 car_loan_remaining -= principal;
-                seeder
-                    .transaction(
-                        &day,
-                        "Auto Loan Payment",
-                        payee("Honda Financial Services"),
-                        &[
-                            split(a.auto_loan, principal),
-                            split(a.interest_car_loan, interest),
-                            split(a.checking, -(principal + interest)),
-                        ],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Auto Loan Payment",
+                    payee("Honda Financial Services"),
+                    &[
+                        split(a.auto_loan, principal),
+                        split(a.interest_car_loan, interest),
+                        split(a.checking, -(principal + interest)),
+                    ],
+                )?;
             }
         }
 
         if let Some(day) = on(20) {
             for (name, amount) in [("Netflix", 1_599), ("Spotify", 999), ("Hulu", 799)] {
-                seeder
-                    .transaction(
-                        &day,
-                        name,
-                        payee(name),
-                        &[split(a.streaming, amount), split(a.amex_blue, -amount)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    name,
+                    payee(name),
+                    &[split(a.streaming, amount), split(a.amex_blue, -amount)],
+                )?;
                 *card_balances.entry(a.amex_blue).or_default() += amount;
             }
         }
 
         if let Some(day) = on(1) {
-            seeder
-                .transaction(
-                    &day,
-                    "Equinox Membership",
-                    payee("Equinox Gym"),
-                    &[split(a.personal_gym, 18_000), split(a.checking, -18_000)],
-                )
-                .await?;
+            seeder.transaction(
+                &day,
+                "Equinox Membership",
+                payee("Equinox Gym"),
+                &[split(a.personal_gym, 18_000), split(a.checking, -18_000)],
+            )?;
         }
 
         let charges = seeder.rand.int(15, 25);
@@ -1258,17 +1107,15 @@ async fn seed_months(
             let amount = seeder.rand.int(template.min, template.max);
             let day = seeder.rand.int(2, 28);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        payee_name,
-                        payee(payee_name),
-                        &[
-                            split(template.account, amount),
-                            split(template.card, -amount),
-                        ],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    payee_name,
+                    payee(payee_name),
+                    &[
+                        split(template.account, amount),
+                        split(template.card, -amount),
+                    ],
+                )?;
                 *card_balances.entry(template.card).or_default() += amount;
             }
         }
@@ -1277,14 +1124,12 @@ async fn seed_months(
             let amount = seeder.rand.int(5_000, 25_000);
             let day = seeder.rand.int(5, 25);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        "Doctor Visit",
-                        payee("Summit Medical Group"),
-                        &[split(a.medical, amount), split(a.citi_double, -amount)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Doctor Visit",
+                    payee("Summit Medical Group"),
+                    &[split(a.medical, amount), split(a.citi_double, -amount)],
+                )?;
                 *card_balances.entry(a.citi_double).or_default() += amount;
             }
         }
@@ -1294,17 +1139,15 @@ async fn seed_months(
             let shop = *seeder.rand.pick(&["Mavis Discount Tire", "Jiffy Lube"]);
             let day = seeder.rand.int(5, 25);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        shop,
-                        payee(shop),
-                        &[
-                            split(a.auto_maintenance, amount),
-                            split(a.checking, -amount),
-                        ],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    shop,
+                    payee(shop),
+                    &[
+                        split(a.auto_maintenance, amount),
+                        split(a.checking, -amount),
+                    ],
+                )?;
             }
         }
 
@@ -1312,17 +1155,15 @@ async fn seed_months(
             let amount = seeder.rand.int(10_000, 80_000);
             let day = seeder.rand.int(5, 25);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        "Best Buy",
-                        payee("Best Buy"),
-                        &[
-                            split(a.shop_electronics, amount),
-                            split(a.chase_sapphire, -amount),
-                        ],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Best Buy",
+                    payee("Best Buy"),
+                    &[
+                        split(a.shop_electronics, amount),
+                        split(a.chase_sapphire, -amount),
+                    ],
+                )?;
                 *card_balances.entry(a.chase_sapphire).or_default() += amount;
             }
         }
@@ -1334,28 +1175,24 @@ async fn seed_months(
             let hotel = seeder.rand.int(40_000, 120_000);
             let day = seeder.rand.int(5, 15);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        "Flights",
-                        payee("Delta Airlines"),
-                        &[split(a.travel, airfare), split(a.chase_sapphire, -airfare)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Flights",
+                    payee("Delta Airlines"),
+                    &[split(a.travel, airfare), split(a.chase_sapphire, -airfare)],
+                )?;
                 *card_balances.entry(a.chase_sapphire).or_default() += airfare;
             }
 
             let lodging = *seeder.rand.pick(&["Marriott Hotels", "Airbnb"]);
             let day = seeder.rand.int(16, 25);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        lodging,
-                        payee(lodging),
-                        &[split(a.travel, hotel), split(a.chase_sapphire, -hotel)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    lodging,
+                    payee(lodging),
+                    &[split(a.travel, hotel), split(a.chase_sapphire, -hotel)],
+                )?;
                 *card_balances.entry(a.chase_sapphire).or_default() += hotel;
             }
         }
@@ -1364,14 +1201,12 @@ async fn seed_months(
             let amount = seeder.rand.int(5_000, 30_000);
             let day = seeder.rand.int(5, 25);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        "Gift Purchase",
-                        payee("Amazon"),
-                        &[split(a.gifts, amount), split(a.chase_sapphire, -amount)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Gift Purchase",
+                    payee("Amazon"),
+                    &[split(a.gifts, amount), split(a.chase_sapphire, -amount)],
+                )?;
                 *card_balances.entry(a.chase_sapphire).or_default() += amount;
             }
         }
@@ -1387,14 +1222,12 @@ async fn seed_months(
                 } else {
                     "Citi"
                 };
-                seeder
-                    .transaction(
-                        &day,
-                        "Credit Card Payment",
-                        payee(bank),
-                        &[split(*card, *balance), split(a.checking, -*balance)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Credit Card Payment",
+                    payee(bank),
+                    &[split(*card, *balance), split(a.checking, -*balance)],
+                )?;
                 *balance = 0;
             }
         }
@@ -1427,17 +1260,15 @@ async fn seed_months(
                         let amount = js_round(value as f64 * quarterly_yield) as i64;
                         if amount > 0 {
                             let description = format!("{} Dividend - {label}", security.symbol);
-                            seeder
-                                .dividend(
-                                    &date_text,
-                                    account,
-                                    cash,
-                                    a.dividend_income,
-                                    security.id,
-                                    amount,
-                                    &description,
-                                )
-                                .await?;
+                            seeder.dividend(
+                                &date_text,
+                                account,
+                                cash,
+                                a.dividend_income,
+                                security.id,
+                                amount,
+                                &description,
+                            )?;
                         }
                     }
                 }
@@ -1453,14 +1284,12 @@ async fn seed_months(
                 (a.sarah_ira, a.sarah_ira_cash, "Sarah", "Sarah IRA"),
                 (a.michael_ira, a.michael_ira_cash, "Michael", "Michael IRA"),
             ] {
-                seeder
-                    .transaction(
-                        &day,
-                        &format!("IRA Contribution - {person}"),
-                        payee("Main Street Bank"),
-                        &[split(ira_cash, limit), split(a.checking, -limit)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    &format!("IRA Contribution - {person}"),
+                    payee("Main Street Bank"),
+                    &[split(ira_cash, limit), split(a.checking, -limit)],
+                )?;
                 if let Some(buy_day) = on(16) {
                     buy_allocation(
                         seeder,
@@ -1472,8 +1301,7 @@ async fn seed_months(
                         limit,
                         &[(vti, 0.4), (vxus, 0.2), (bnd, 0.0)],
                         label,
-                    )
-                    .await?;
+                    )?;
                 }
             }
         }
@@ -1481,14 +1309,12 @@ async fn seed_months(
         if quarter_end {
             let amount = seeder.rand.int(200_000, 500_000);
             if let Some(day) = on(10) {
-                seeder
-                    .transaction(
-                        &day,
-                        "Transfer to Brokerage",
-                        payee("Main Street Bank"),
-                        &[split(a.brokerage_cash, amount), split(a.checking, -amount)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Transfer to Brokerage",
+                    payee("Main Street Bank"),
+                    &[split(a.brokerage_cash, amount), split(a.checking, -amount)],
+                )?;
                 if let Some(buy_day) = on(11) {
                     buy_allocation(
                         seeder,
@@ -1500,8 +1326,7 @@ async fn seed_months(
                         amount,
                         &[(vti, 0.4), (vxus, 0.15), (bnd, 0.25), (agg, 0.0)],
                         "Brokerage",
-                    )
-                    .await?;
+                    )?;
                 }
 
                 // The year-end rebalance sells about a fifth of the VTI in
@@ -1517,17 +1342,15 @@ async fn seed_months(
                         && let Some(sale_day) = on(18)
                     {
                         let price = vti.price_micros(month_date)?;
-                        seeder
-                            .sell(
-                                &sale_day,
-                                a.brokerage,
-                                a.brokerage_cash,
-                                vti.id,
-                                trim,
-                                price,
-                                "Sell VTI - Rebalance",
-                            )
-                            .await?;
+                        seeder.sell(
+                            &sale_day,
+                            a.brokerage,
+                            a.brokerage_cash,
+                            vti.id,
+                            trim,
+                            price,
+                            "Sell VTI - Rebalance",
+                        )?;
                         positions.add(a.brokerage, vti.id, -trim);
                     }
                 }
@@ -1539,14 +1362,12 @@ async fn seed_months(
             let amount = seeder.rand.int(1_500, 10_000);
             let day = seeder.rand.int(5, 25);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        app,
-                        payee(app),
-                        &[split(a.misc_expense, amount), split(a.checking, -amount)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    app,
+                    payee(app),
+                    &[split(a.misc_expense, amount), split(a.checking, -amount)],
+                )?;
             }
         }
 
@@ -1554,28 +1375,24 @@ async fn seed_months(
             let amount = seeder.rand.int(15_000, 25_000);
             let day = seeder.rand.int(10, 20);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        "Dental Cleaning",
-                        payee("Dr. Patel DDS"),
-                        &[split(a.medical, amount), split(a.checking, -amount)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Dental Cleaning",
+                    payee("Dr. Patel DDS"),
+                    &[split(a.medical, amount), split(a.checking, -amount)],
+                )?;
             }
         }
 
         if month % 2 == 1 {
             let day = seeder.rand.int(10, 25);
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &day,
-                        "Haircut",
-                        payee("Supercuts"),
-                        &[split(a.personal_haircuts, 3_500), split(a.checking, -3_500)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &day,
+                    "Haircut",
+                    payee("Supercuts"),
+                    &[split(a.personal_haircuts, 3_500), split(a.checking, -3_500)],
+                )?;
             }
         }
     }

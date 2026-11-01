@@ -234,8 +234,8 @@ export default function SyncTokensPage() {
     setPlaidAccounts([]);
 
     try {
-      const payload = await apiGet<PlaidAccountAssignment[]>(
-        `/api/b/${bookId}/sync/tokens/${token.id}/accounts?refresh=true`
+      const payload = await apiPost<PlaidAccountAssignment[]>(
+        `/api/b/${bookId}/sync/tokens/${token.id}/accounts/refresh`
       );
       setPlaidAccounts(Array.isArray(payload) ? payload : []);
     } catch (fetchError) {

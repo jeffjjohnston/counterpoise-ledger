@@ -1,6 +1,8 @@
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
+    book_scope::{BookAccess, Write},
     error::{ApiError, ApiResult, error, internal_error},
+    platform,
     state::AppState,
     validation::{
         first_query_values, local_today, parse_int_prefix_number, parse_js_number, parse_json_body,
@@ -13,12 +15,12 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{NaiveDateTime, SecondsFormat, Utc};
-use ledger_db::engine::DbPool;
+use chrono::{NaiveDateTime, SecondsFormat};
+use ledger_db::{Sql, store::params};
 use serde::Serialize;
 use serde_json::{Value, json, to_value};
 
-#[derive(sqlx::FromRow, Serialize)]
+#[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PayeeListRow {
     id: i32,
@@ -27,7 +29,7 @@ struct PayeeListRow {
     transaction_count: i32,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct PayeeSummaryRow {
     id: i32,
     name: String,
@@ -38,14 +40,6 @@ struct PayeeSummaryRow {
 /// `normalizePayeeName()`. It does not change case: "IKEA" and "Ikea" are
 /// two payees.
 pub(crate) use ledger_core::names::normalize_payee_name as normalize_name;
-
-fn search_pattern(input: &str) -> String {
-    input
-        .to_lowercase()
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
 
 fn parse_limit(input: Option<&str>) -> Option<i64> {
     let value = parse_js_number(input?)?;
@@ -69,32 +63,29 @@ pub(crate) async fn list_payees(
     .await?;
     let params = first_query_values(raw_query.as_deref());
     let search = normalize_name(params.get("search").map_or("", String::as_str));
-    let pattern = search_pattern(&search);
+    let pattern = ledger_db::folds::fold(&search);
     let limit = parse_limit(params.get("limit").map(String::as_str));
     // Bind the same local calendar date used by the Node date helpers.
     let today = local_today();
-    let rows: Vec<PayeeListRow> = sqlx::query_as(
-        "SELECT p.id, p.name,
-                MAX(CASE WHEN t.is_floating THEN $3 ELSE t.date END) AS last_transaction_date,
+    let rows: Vec<PayeeListRow> = state
+        .database
+        .query(
+            "SELECT p.id, p.name,
+                MAX(CASE WHEN t.is_floating THEN ?3 ELSE t.date END) AS last_transaction_date,
                 CAST(COUNT(t.id) AS integer) AS transaction_count
          FROM payees p
          LEFT JOIN transactions t ON t.payee_id = p.id
-         WHERE p.book_id = $1 AND ($2 = '' OR lower(p.name) LIKE '%' || $2 || '%')
+         WHERE p.book_id = ?1 AND (?2 = '' OR instr(p.name_fold, ?2) > 0)
          GROUP BY p.id
-         ORDER BY CASE WHEN $2 = '' THEN 0
-                       WHEN lower(p.name) LIKE $2 || '%' THEN 0
-                       WHEN lower(p.name) LIKE '% ' || $2 || '%' THEN 1
+         ORDER BY CASE WHEN ?2 = '' THEN 0
+                       WHEN instr(p.name_fold, ?2) = 1 THEN 0
+                       WHEN instr(p.name_fold, ' ' || ?2) > 0 THEN 1
                        ELSE 2 END,
                   p.name
-         LIMIT COALESCE($4, -1)",
-    )
-    .bind(book.book_id())
-    .bind(pattern)
-    .bind(today)
-    .bind(limit)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, "Failed to fetch payees"))?;
+         LIMIT COALESCE(?4, -1)",
+            &params![book.book_id(), pattern, today, limit],
+        )
+        .map_err(|cause| internal_error(cause, "Failed to fetch payees"))?;
     Ok(Json(to_value(rows).expect("payee rows serialize")))
 }
 
@@ -112,17 +103,16 @@ pub(crate) async fn get_payee(
     )
     .await?;
     let id = payee_path_id(&raw_id, "Failed to fetch payee")?;
-    let row: Option<PayeeSummaryRow> = sqlx::query_as(
-        "SELECT p.id, p.name, p.created_at, CAST(COUNT(t.id) AS integer) AS transaction_count
+    let row: Option<PayeeSummaryRow> = state
+        .database
+        .query_optional(
+            "SELECT p.id, p.name, p.created_at, CAST(COUNT(t.id) AS integer) AS transaction_count
          FROM payees p LEFT JOIN transactions t ON t.payee_id = p.id
-         WHERE p.book_id = $1 AND p.id = $2
+         WHERE p.book_id = ?1 AND p.id = ?2
          GROUP BY p.id",
-    )
-    .bind(book.book_id())
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, "Failed to fetch payee"))?;
+            &params![book.book_id(), id],
+        )
+        .map_err(|cause| internal_error(cause, "Failed to fetch payee"))?;
     let row = row.ok_or_else(|| error(StatusCode::NOT_FOUND, "Payee not found"))?;
     Ok(Json(json!({
         "id": row.id,
@@ -132,7 +122,7 @@ pub(crate) async fn get_payee(
     })))
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct PayeeRow {
     id: i32,
     book_id: i32,
@@ -168,68 +158,72 @@ pub(crate) async fn create_payee(
     const FAILURE: &str = "Failed to create payee";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let body = parse_json_body(&body, FAILURE)?;
     let name = normalize_name(validate_payee_create(&body)?);
 
     // The form's "new payee" field treats a case variant as the same payee
-    // and returns the stored row. Node lowercases the name in JavaScript and
-    // compares it with PostgreSQL lower(); keep both halves of that rule.
-    let existing: Option<PayeeRow> = sqlx::query_as(
-        "SELECT id, book_id, name, created_at FROM payees
-         WHERE book_id = $1 AND lower(name) = $2 LIMIT 1",
-    )
-    .bind(book.book_id())
-    .bind(name.to_lowercase())
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+    // and returns the stored row: the folded name matches `name_fold`.
+    // The exact spelling first, then the oldest: see `find_payee_by_name`.
+    let existing: Option<PayeeRow> = state
+        .database
+        .query_optional(
+            "SELECT id, book_id, name, created_at FROM payees
+         WHERE book_id = ?1 AND name_fold = ?2
+         ORDER BY name = ?3 DESC, id LIMIT 1",
+            &params![book.book_id(), ledger_db::folds::fold(&name), &name],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if let Some(row) = existing {
         return Ok(Json(payee_json(row)));
     }
 
-    // createPayee() refuses an exact repeat. The lookup above can miss one
-    // only when PostgreSQL lower() and JavaScript toLowerCase() disagree, and
-    // Node then returns its 500 message.
-    match create_exact(&state.pool, book.book_id(), &name)
-        .await
+    // A concurrent request can create the payee after the lookup above; the
+    // create then returns it, as the lookup would have.
+    match create_exact(&state.database, &access, &name)
         .map_err(|cause| internal_error(cause, FAILURE))?
     {
-        Some(payee) => Ok(Json(payee)),
-        None => Err(error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE)),
+        Ok(payee) | Err(payee) => Ok(Json(payee)),
     }
 }
 
 /// `createPayee()` of `lib/payees.ts`, for a name that `normalize_name` has
-/// already normalized. Inserts the payee and returns it, or returns `None`
-/// when the book already has a payee with exactly this name. A case variant
-/// is a different name, so "Ikea" after "IKEA" inserts a new row.
+/// already normalized. Inserts the payee and returns it, or returns
+/// `Err(existing payee)` when the book already has the payee: a name matches
+/// without letter case, so "Ikea" after "IKEA" is the existing payee. One
+/// write transaction holds the check and the insert, so two concurrent calls
+/// with case variants make one payee.
 ///
-/// The route calls this after its case-insensitive lookup. The MCP tool
-/// `create_payee` calls it without that lookup.
-pub(crate) async fn create_exact(
-    pool: &DbPool,
-    book_id: i32,
+/// `POST /payees` returns the existing payee; the MCP tool `create_payee`
+/// reports it as an error.
+pub(crate) fn create_exact(
+    database: &ledger_db::Database,
+    access: &BookAccess<'_, Write>,
     name: &str,
-) -> sqlx::Result<Option<Value>> {
-    let exact: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM payees WHERE book_id = $1 AND name = $2)")
-            .bind(book_id)
-            .bind(name)
-            .fetch_one(pool)
-            .await?;
-    if exact {
-        return Ok(None);
-    }
-    let row: PayeeRow = sqlx::query_as(
-        "INSERT INTO payees (name, book_id, created_at) VALUES ($1, $2, $3)
-         RETURNING id, book_id, name, created_at",
-    )
-    .bind(name)
-    .bind(book_id)
-    .bind(Utc::now().naive_utc())
-    .fetch_one(pool)
-    .await?;
-    Ok(Some(payee_json(row)))
+) -> Result<Result<Value, Value>, ledger_db::store::Error> {
+    let book_id = access.book_id();
+    database.transaction(|tx| {
+        let existing: Option<PayeeRow> = tx.query_optional(
+            "SELECT id, book_id, name, created_at FROM payees
+             WHERE book_id = ?1 AND name_fold = ?2
+             ORDER BY name = ?3 DESC, id LIMIT 1",
+            &params![book_id, ledger_db::folds::fold(name), name],
+        )?;
+        if let Some(existing) = existing {
+            return Ok(Err(payee_json(existing)));
+        }
+        let row: PayeeRow = tx.query_row(
+            "INSERT INTO payees (name, book_id, created_at, name_fold) VALUES (?1, ?2, ?3, ?4)
+             RETURNING id, book_id, name, created_at",
+            &params![
+                name,
+                book_id,
+                platform::timestamp(),
+                ledger_db::folds::fold(name)
+            ],
+        )?;
+        Ok(Ok(payee_json(row)))
+    })
 }
 
 pub(crate) async fn delete_payee(
@@ -241,33 +235,35 @@ pub(crate) async fn delete_payee(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let payee_id = payee_path_id(&raw_id, FAILURE)?;
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM payees WHERE id = $1 AND book_id = $2)")
-            .bind(payee_id)
-            .bind(book.book_id())
-            .fetch_one(&state.pool)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
+    let exists: bool = state
+        .database
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM payees WHERE id = ?1 AND book_id = ?2)",
+            &params![payee_id, book.book_id()],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if !exists {
         return Err(error(StatusCode::NOT_FOUND, "Payee not found"));
     }
-    let used: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM transactions WHERE payee_id = $1)")
-            .bind(payee_id)
-            .fetch_one(&state.pool)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
+    let used: bool = state
+        .database
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM transactions WHERE payee_id = ?1)",
+            &params![payee_id],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if used {
         return Err(error(
             StatusCode::CONFLICT,
             "Cannot delete a payee that has associated transactions",
         ));
     }
-    sqlx::query("DELETE FROM payees WHERE id = $1 AND book_id = $2")
-        .bind(payee_id)
-        .bind(book.book_id())
-        .execute(&state.pool)
-        .await
+    state
+        .database
+        .execute(
+            "DELETE FROM payees WHERE id = ?1 AND book_id = ?2",
+            &params![payee_id, book.book_id()],
+        )
         .map_err(|cause| internal_error(cause, FAILURE))?;
     Ok(Json(json!({ "success": true })))
 }
@@ -297,11 +293,10 @@ pub(crate) async fn last_account(
         )
     })?;
     let today = local_today();
-    let account_id: Option<i32> = sqlx::query_scalar(
-        "WITH latest AS (
+    let account_id: Option<i32> = state.database.query_optional("WITH latest AS (
            SELECT id FROM transactions
-           WHERE book_id = $1 AND payee_id = $2
-           ORDER BY CASE WHEN is_floating THEN $3 ELSE date END DESC, id DESC
+           WHERE book_id = ?1 AND payee_id = ?2
+           ORDER BY CASE WHEN is_floating THEN ?3 ELSE date END DESC, id DESC
            LIMIT 1
          ), largest AS (
            SELECT MAX(s.amount) AS amount FROM transaction_splits s JOIN latest t ON t.id = s.transaction_id
@@ -314,34 +309,27 @@ pub(crate) async fn last_account(
            FROM transaction_splits s JOIN transactions t ON t.id = s.transaction_id
            JOIN candidates c ON c.account_id = s.account_id
            WHERE (SELECT COUNT(*) FROM candidates) > 1
-             AND t.book_id = $1 AND t.payee_id = $2 AND s.amount > 0
+             AND t.book_id = ?1 AND t.payee_id = ?2 AND s.amount > 0
            GROUP BY s.account_id
          )
          SELECT c.account_id FROM candidates c LEFT JOIN usage u ON u.account_id = c.account_id
-         ORDER BY COALESCE(u.frequency, 0) DESC, c.account_id ASC LIMIT 1",
-    )
-    .bind(book.book_id())
-    .bind(id)
-    .bind(today)
-    .fetch_optional(&state.pool)
-    .await
+         ORDER BY COALESCE(u.frequency, 0) DESC, c.account_id ASC LIMIT 1",&params![book.book_id(), id, today])
     .map_err(|cause| internal_error(cause, "Failed to fetch last account"))?;
     Ok(Json(json!({ "accountId": account_id })))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_name, parse_limit, search_pattern};
+    use super::{normalize_name, parse_limit};
 
     #[test]
-    fn payee_search_normalizes_and_escapes_literal_patterns() {
+    fn payee_search_normalizes_names_and_limits() {
         assert_eq!(normalize_name("  Bob’s   Shop "), "Bob's Shop");
         assert_eq!(
             normalize_name("\u{feff}IKEA\u{a0}\u{a0}Store"),
             "IKEA Store"
         );
         assert_eq!(normalize_name("\u{85}IKEA"), "\u{85}IKEA");
-        assert_eq!(search_pattern("a%_\\b"), "a\\%\\_\\\\b");
         assert_eq!(parse_limit(Some("2")), Some(2));
         assert_eq!(parse_limit(Some("1e2")), Some(100));
         assert_eq!(parse_limit(Some("bad")), None);

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { TransactionForm } from "@/components/transactions/TransactionForm";
 import { ToastProvider } from "@/components/ui/ToastProvider";
 import type { AccountWithBalance } from "@/types";
@@ -754,4 +754,96 @@ describe("TransactionForm simple mode", () => {
     }
   });
 
+  it("gives each mounted form its own field ids", async () => {
+    // The register mounts the desktop and the mobile form at once. With fixed
+    // ids, the mobile form's labels named the desktop form's fields.
+    renderWithToast(
+      <>
+        <div data-testid="desktop">
+          <TransactionForm accounts={mockAccounts} selectedAccountId={3} onSubmit={vi.fn()} />
+        </div>
+        <div data-testid="mobile">
+          <TransactionForm accounts={mockAccounts} selectedAccountId={3} onSubmit={vi.fn()} fullLayout />
+        </div>
+      </>
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    fireEvent.click(within(screen.getByTestId("desktop")).getByLabelText("Show details"));
+    fireEvent.click(within(screen.getByTestId("mobile")).getByRole("button", { name: /^Description, notes/ }));
+
+    const fields = {
+      desktop: ["Date", "Amount", "Description", "Check #", "Notes"],
+      mobile: ["Date", "Amount", "Description", "Check Number (optional)", "Notes (optional)"],
+    };
+    for (const [form, names] of Object.entries(fields)) {
+      const wrapper = within(screen.getByTestId(form));
+      for (const name of names) {
+        // getByLabelText follows the label's for attribute, so a label whose id
+        // also belongs to the other form finds a field outside this wrapper.
+        expect(wrapper.getByLabelText(name)).toBeInTheDocument();
+      }
+    }
+    const ids = [...document.querySelectorAll("[id]")].map((el) => el.id);
+    expect(ids.filter((id, i) => ids.indexOf(id) !== i)).toEqual([]);
+  });
+
+  it("fills To from the payee with the exact spelling when case variants exist", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string" ? input : input instanceof Request ? input.url : input.toString();
+      if (url.includes("/payees/1/last-account")) {
+        return Promise.resolve({ ok: true, json: async () => ({ accountId: 5 }) });
+      }
+      if (url.includes("/payees/2/last-account")) {
+        return Promise.resolve({ ok: true, json: async () => ({ accountId: 4 }) });
+      }
+      if (url.includes("/entry-patterns")) {
+        return Promise.resolve({ ok: true, json: async () => ({ patterns: [] }) });
+      }
+      if (url.startsWith("/api/b/1/payees")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => [{ id: 1, name: "IKEA" }, { id: 2, name: "Ikea" }],
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => [] });
+    });
+
+    renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={3} onSubmit={vi.fn()} />
+    );
+    fireEvent.change(screen.getByLabelText("Payee"), { target: { value: "Ikea" } });
+    await waitFor(() => expect(screen.getByLabelText("To Account")).toHaveValue("Groceries"));
+  });
+
+  it("fills To from the oldest case variant when no spelling is exact", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string" ? input : input instanceof Request ? input.url : input.toString();
+      if (url.includes("/payees/1/last-account")) {
+        return Promise.resolve({ ok: true, json: async () => ({ accountId: 4 }) });
+      }
+      if (url.includes("/payees/2/last-account")) {
+        return Promise.resolve({ ok: true, json: async () => ({ accountId: 5 }) });
+      }
+      if (url.includes("/entry-patterns")) {
+        return Promise.resolve({ ok: true, json: async () => ({ patterns: [] }) });
+      }
+      if (url.startsWith("/api/b/1/payees")) {
+        // Sorted by name, so the newer payee comes first.
+        return Promise.resolve({
+          ok: true,
+          json: async () => [{ id: 2, name: "IKEA" }, { id: 1, name: "Ikea" }],
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => [] });
+    });
+
+    renderWithToast(
+      <TransactionForm accounts={mockAccounts} selectedAccountId={3} onSubmit={vi.fn()} />
+    );
+    fireEvent.change(screen.getByLabelText("Payee"), { target: { value: "ikea" } });
+    await waitFor(() => expect(screen.getByLabelText("To Account")).toHaveValue("Groceries"));
+  });
 });

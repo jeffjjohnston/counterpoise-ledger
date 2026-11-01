@@ -14,8 +14,11 @@ import { ReportIssueModal } from "@/components/ReportIssueModal";
 import { PriceEntryPill } from "@/components/layout/PriceEntryPill";
 import { JobHealthIndicator } from "@/components/layout/JobHealthIndicator";
 import { TypeSafeSettings } from "@/components/settings/TypeSafeSettings";
+import { WeeklyReviewSettings } from "@/components/settings/WeeklyReviewSettings";
+import { SaveChordSettings } from "@/components/settings/SaveChordSettings";
+import { OPEN_BOOK_SETTINGS_EVENT } from "@/lib/weekly-review";
 import { BookMembersSettings } from "@/components/settings/BookMembersSettings";
-import { useBookChanges } from "@/components/BookChangesProvider";
+import { useBookChanges, useBookChangesLive } from "@/components/BookChangesProvider";
 import { useBookRole } from "@/components/BookRoleProvider";
 import { BOOK_SESSION_ENDED_EVENT, SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
 import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
@@ -39,6 +42,13 @@ export function BookNavbar() {
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [showAccountModal, setShowAccountModal] = useState(false);
+
+  // The dashboard card opens the book settings with this event.
+  useEffect(() => {
+    const open = () => setShowAccountModal(true);
+    window.addEventListener(OPEN_BOOK_SETTINGS_EVENT, open);
+    return () => window.removeEventListener(OPEN_BOOK_SETTINGS_EVENT, open);
+  }, []);
   const [showReportModal, setShowReportModal] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [upcomingDays, setUpcomingDays] = useState(30);
@@ -106,6 +116,9 @@ export function BookNavbar() {
     return pathname.startsWith(href);
   };
 
+  // The active link is marked for assistive technology too, not only by its color.
+  const currentPage = (item: NavItem | string) => (isActive(item) ? "page" : undefined);
+
   const handleLogout = async () => {
     try {
       await apiPost("/api/auth/logout");
@@ -126,6 +139,7 @@ export function BookNavbar() {
   };
 
   const requestBadgeRefresh = useRef<() => void>(() => {});
+  const live = useBookChangesLive();
   useBookChanges((change) => {
     if (change.type === "reset" || change.tables.some((table) =>
       table === "plaid_accounts" || table === "plaid_transaction_reconciliation")) {
@@ -137,6 +151,9 @@ export function BookNavbar() {
     let active = true;
     let running = false;
     let dirty = false;
+    // The last read failed: the next poll runs even while the socket is open,
+    // since no hint follows a failed read.
+    let failed = false;
     const controller = new AbortController();
     const refresh = async () => {
       dirty = true;
@@ -148,13 +165,22 @@ export function BookNavbar() {
           try {
             const data = await apiGet<{ count: number }>(`/api/b/${bookId}/sync/pending-count`, { signal: controller.signal });
             if (active) setSyncPendingCount(data.count ?? 0);
-          } catch { /* Retain the last badge value; polling/focus can recover. */ }
+            failed = false;
+          } catch {
+            // Retain the last badge value; the next poll or focus recovers.
+            failed = true;
+          }
         }
       } finally { running = false; }
     };
     requestBadgeRefresh.current = () => { void refresh(); };
     void refresh();
-    const interval = setInterval(() => { void refresh(); }, 60_000);
+    // The count reads only plaid_accounts and plaid_transaction_reconciliation,
+    // whose changes the book socket sends (above), also those of the scheduled
+    // sync. Each poll wakes the server's Durable Object, and it starts again
+    // after a short idle time, so the poll waits while the socket is open,
+    // unless the last read failed.
+    const interval = setInterval(() => { if (!live() || failed) void refresh(); }, 60_000);
     const handler = () => { void refresh(); };
     window.addEventListener(SYNC_QUEUE_CHANGED_EVENT, handler);
     return () => {
@@ -164,7 +190,7 @@ export function BookNavbar() {
       requestBadgeRefresh.current = () => {};
       window.removeEventListener(SYNC_QUEUE_CHANGED_EVENT, handler);
     };
-  }, [bookId]);
+  }, [bookId, live]);
 
   // Close mobile menu on route change
   useEffect(() => {
@@ -209,15 +235,18 @@ export function BookNavbar() {
           drawers use 3.5rem and 4rem as the navbar height. */}
       <nav className="h-14 lg:h-16 bg-surface border-b border-border">
         <div className="h-full px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-full">
-            <div className="flex items-center">
+          <div className="flex items-center justify-between gap-2 h-full">
+            {/* The left group shrinks and the right cluster does not. When the
+                row is too narrow, the book name truncates. It does not slide
+                under the desktop links. */}
+            <div className="flex items-center min-w-0">
               <Link href="/" className="flex items-center gap-2 shrink-0">
                 <img src={logoSrc} alt="" className="w-7 h-7 lg:w-8 lg:h-8" />
                 <span className="text-lg lg:text-xl font-bold text-fg hidden sm:inline" title={`Counterpoise v${process.env.NEXT_PUBLIC_APP_VERSION}`}>Counterpoise</span>
               </Link>
 
               {/* Book switcher */}
-              <div className="relative ml-2 sm:ml-4" ref={bookMenuRef}>
+              <div className="relative flex min-w-0 ml-2 sm:ml-4" ref={bookMenuRef}>
                 <button
                   onClick={() => {
                     setShowBookMenu(!showBookMenu);
@@ -227,7 +256,7 @@ export function BookNavbar() {
                   aria-label="Open book menu"
                   aria-haspopup="true"
                   aria-expanded={showBookMenu}
-                  className="flex items-center gap-1 px-2 sm:px-3 py-1.5 text-sm font-medium text-fg-secondary bg-surface-tertiary rounded-md hover:bg-surface-tertiary/80 transition-colors max-w-[8rem] sm:max-w-[10rem]"
+                  className="flex items-center gap-1 min-w-0 px-2 sm:px-3 py-1.5 text-sm font-medium text-fg-secondary bg-surface-tertiary rounded-md hover:bg-surface-tertiary/80 transition-colors max-w-[8rem] sm:max-w-[10rem]"
                 >
                   <span className="truncate">{currentBook?.name || "Loading..."}</span>
                   {/* While the role loads, write controls stay hidden, but
@@ -240,7 +269,7 @@ export function BookNavbar() {
                   </svg>
                 </button>
                 {showBookMenu && (
-                  <div className="absolute left-0 mt-1 w-56 bg-surface-elevated border border-border rounded-lg shadow-lg z-50">
+                  <div className="absolute top-full left-0 mt-1 w-56 bg-surface-elevated border border-border rounded-lg shadow-lg z-50">
                     {books.map((book) => {
                       const isCurrentBook = book.id === parseInt(bookId);
                       return (
@@ -280,7 +309,7 @@ export function BookNavbar() {
             </div>
 
             {/* Right cluster: price pill + breakpoint-specific controls */}
-            <div className="flex items-center gap-2 self-stretch">
+            <div className="flex items-center gap-2 self-stretch shrink-0">
               {canWrite && <PriceEntryPill bookId={bookId} />}
               <JobHealthIndicator />
 
@@ -291,6 +320,7 @@ export function BookNavbar() {
                   <Link
                     key={item.href}
                     href={item.href}
+                    aria-current={currentPage(item)}
                     className={cn(
                       "self-stretch flex items-center px-3 text-sm font-medium transition-colors border-b-2",
                       isActive(item)
@@ -335,6 +365,7 @@ export function BookNavbar() {
                         <Link
                           key={item.href}
                           href={item.href}
+                          aria-current={currentPage(item)}
                           className={cn(
                             "block px-4 py-2 text-sm",
                             isActive(item)
@@ -352,6 +383,7 @@ export function BookNavbar() {
                           <Link
                             key={item.href}
                             href={item.href}
+                            aria-current={currentPage(item)}
                             className={cn(
                               "block px-4 py-2 text-sm",
                               isActive(item)
@@ -371,6 +403,7 @@ export function BookNavbar() {
                 {/* Search */}
                 <Link
                   href={`${prefix}/search`}
+                  aria-current={currentPage(`${prefix}/search`)}
                   className={cn(
                     "self-stretch flex items-center px-3 transition-colors border-b-2",
                     isActive(`${prefix}/search`)
@@ -484,6 +517,7 @@ export function BookNavbar() {
                 <Link
                   key={item.href}
                   href={item.href}
+                  aria-current={currentPage(item)}
                   className={cn(
                     "block px-6 py-3 text-sm font-medium transition-colors",
                     isActive(item)
@@ -545,6 +579,8 @@ export function BookNavbar() {
             />
           </section>
 
+          {showAccountModal && <SaveChordSettings />}
+
           {isOwner && (
             <section className="pt-4 border-t border-border">
               <Input
@@ -575,6 +611,8 @@ export function BookNavbar() {
           )}
 
           {showAccountModal && currentBook && canWrite && <TypeSafeSettings key={bookId} bookId={bookId} bookName={currentBook.name} />}
+
+          {showAccountModal && currentBook && canWrite && <WeeklyReviewSettings key={`wr-${bookId}`} bookId={bookId} bookName={currentBook.name} />}
 
           {showAccountModal && <BookMembersSettings bookId={bookId} />}
 

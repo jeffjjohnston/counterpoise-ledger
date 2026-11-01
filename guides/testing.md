@@ -40,7 +40,7 @@ changes that weaken existing guarantees.
 | Change | Primary evidence |
 | --- | --- |
 | Accounting, FIFO, recurrence, rounding | Pure tests with independently calculated results, boundary cases, and conservation properties |
-| Persistence, ownership, rollback, locking | A real SQLite database (with the app's registered SQL functions) through the relevant production path |
+| Persistence, ownership, rollback, locking | A real SQLite database (with a Durable Object's limits) through the relevant production path |
 | HTTP or MCP adapter | Auth, schema wiring, serialization, error mapping, and surface-specific behavior |
 | Interactive UI | User actions and observable results; browser checks for layout and navigation |
 | Release, publishing, migration | Execute the real script or artifact against disposable fixtures, including refusal and partial failure |
@@ -57,8 +57,9 @@ blocked database operation, release holders in `finally`, and never use a fixed
 sleep to assume an interleaving happened.
 
 A test that calls a helper on a pooled connection does not cover the
-reserved-connection path. Anything reachable from Rust's `with_session_lock`
-needs a test through the lock.
+reserved-connection path. Anything reachable from a run that holds a lease
+(`rust-api/server/src/leases.rs`), such as the Plaid sync, needs a test
+through the lease.
 
 UI tests query accessible roles and labels, interact, and check the result.
 An edit must survive reload or reopening; an unchanged row remaining visible
@@ -85,6 +86,23 @@ measurements in one place rather than testing repeated prose for agreement.
   --manifest-path rust-api/Cargo.toml`. CI runs it. The suite ran
   against the Node server too until the Next API handlers were retired, so
   its snapshots and expected bodies are the ones both servers gave.
+  - `COUNTERPOISE_HTTP_SERVER=worker` runs the HTTP suite, and the MCP
+    suite with `COUNTERPOISE_MCP_TRANSPORT=http`, against the Worker under
+    `wrangler dev` instead: `npm run test:http:worker` and
+    `npm run test:mcp:worker`. Build it first with `npm run worker:build`
+    (`npm run worker:build`, which needs `worker-build`).
+    CI runs both suites on both targets: the native server in the
+    `rust-workspace` job and the Worker in the `worker` job. Each server gets its own wrangler config, with the
+    settings as variables, and a `--persist-to` directory whose object file
+    is the worker's test database, so the database helpers write the rows the
+    object reads. `onWorker` from `tests/helpers/http-parity.ts` gives a test
+    the Worker's expectation where the targets differ, and
+    `vitest.config.ts` leaves out the suites that do not apply there, each
+    with its reason. Both targets are production (see
+    [architecture.md](architecture.md#deployment-targets)). A change to the
+    database code, the jobs, the sockets, the start or `platform.rs` can pass
+    on one target and fail on the other. Run the suites on both targets
+    before you say such a change is done.
   - `tests/http/rebuild-lots.test.ts` runs `ledger-cli rebuild-lots` on
     seeded, imported and edge-case books, and checks that it rewrites every
     lot and allocation unchanged. It also checks the backfill guard and that
@@ -102,17 +120,23 @@ measurements in one place rather than testing repeated prose for agreement.
     generator change, run `cargo test --manifest-path rust-api/Cargo.toml -p
     ledger-db seed -- --nocapture`, copy the printed `actual hash`, and paste
     it into the constant. Do this only for an intended change.
-- `npm run test:mcp:http` and `npm run test:mcp:stdio` run the MCP suites in
-  `tests/mcp` against the Rust server, over each transport. They need the
-  server binary too. See [mcp-server.md](mcp-server.md).
+- `npm run test:mcp:http` runs every MCP suite in `tests/mcp` against the Rust
+  server over HTTP. `npm run test:mcp:stdio` runs the suites that cross the
+  stdio adapter. They need the server binary too. See the transport coverage
+  table in [mcp-server.md](mcp-server.md).
+- The dev profile builds `scrypt` and its hash crates with `opt-level = 3`
+  (`rust-api/Cargo.toml`). Unoptimized, one password hash takes about 0.7 s,
+  and each login runs one, so the HTTP auth suite took about 46 s on a
+  development machine; it now takes about 3 s. The hash parameters do not
+  change, only the code that computes them.
 - Some HTTP suites compare full response bodies with snapshots in
   `tests/http/__snapshots__/`. After a deliberate change to one of these
   responses, check the new body by hand, delete the affected snapshot and run
   the suite to write it again. Run with `CI=1` to make a missing snapshot fail
   instead of being written.
 - `npm run test:e2e` builds and starts its own server on `.e2e/counterpoise.db`. It refuses an occupied port
-  rather than silently testing another checkout's server. As in production,
-  there is one server: `playwright.config.ts` runs `npx vite build`, then the
+  rather than silently testing another checkout's server. As on the Docker
+  target, there is one server: `playwright.config.ts` runs `npx vite build`, then the
   Rust server with `RUST_BIND=127.0.0.1:3001` and `COUNTERPOISE_STATIC_DIR=build`.
   The Rust server serves the client build and the API on `http://127.0.0.1:3001`.
   `tests/e2e/static-client.spec.ts` checks the static client: a deep link
@@ -122,8 +146,9 @@ measurements in one place rather than testing repeated prose for agreement.
   and `cargo test --workspace --manifest-path rust-api/Cargo.toml`. The Rust
   tests need no database server: `ledger_db::testing::TempDatabase` makes a
   migrated SQLite file in the temporary directory for each test. One test
-  asserts the pragmas and the registered SQL functions on every pooled
-  connection.
+  asserts the pragmas, and that no SQL function is registered, on every
+  pooled connection. Every connection has a Durable Object's limits, so a
+  statement with more than 100 bound parameters fails in any test.
 - With Homebrew's `rust` and `rust-wasm`, build the browser target using the
   configuration supplied by `rust-wasm`. That configuration links with
   `wasm-ld`, which Homebrew's `lld` formula supplies (`brew install lld`).
@@ -140,11 +165,11 @@ measurements in one place rather than testing repeated prose for agreement.
   `cargo build --target wasm32-unknown-unknown` command cannot find `core`.
   CI installs the target through `rustup` and uses the plain command there.
 - `npm run build`, `npm run dev`, and the npm test commands compile
-  `ledger-core` with its `wasm` feature, run `wasm-bindgen` 0.2.128 and
+  `ledger-core` with its `wasm` feature, run `wasm-bindgen` 0.2.129 and
   `wasm-opt`, then generate `lib/wasm/generated/` before using it. The
   generated files are ignored: Homebrew and rustup produce different bytes,
   and committing either build would make the other toolchain dirty the tree.
-  Install the CLI with `cargo install wasm-bindgen-cli --version 0.2.128
+  Install the CLI with `cargo install wasm-bindgen-cli --version 0.2.129
   --locked` and Binaryen with `brew install binaryen`. If the CLI is outside
   `PATH`, set `WASM_BINDGEN` to its binary path. The build script checks the
   active `rustc` sysroot before selecting the Homebrew `rust-wasm` config and
@@ -233,7 +258,7 @@ test run.
 `tests/helpers/sql.ts` runs raw SQL on the worker's file with Node's built-in
 `node:sqlite` (`rows`, `scalar`, `script`, `insert`). Use it for fixtures and
 for checks of stored rows. `node:sqlite` does not register the app's SQL
-functions, so do not use `lower()`, `LIKE` or `cp_today()` in a test query
+functions, so do not use `lower()` or `LIKE` in a test query
 where the answer depends on them.
 
 E2E uses `.e2e/counterpoise.db`. The server creates and migrates it when it

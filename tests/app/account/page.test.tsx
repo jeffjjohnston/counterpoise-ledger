@@ -55,6 +55,7 @@ describe("AccountPage", () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith("/api/auth/password", {
         method: "PUT",
+        redirect: "manual",
         // apiFetch normalizes headers through the Headers constructor (see
         // lib/api-client.ts) rather than a plain object, so it can accept
         // any HeadersInit shape from a caller without silently dropping it.

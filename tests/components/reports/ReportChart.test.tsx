@@ -51,13 +51,17 @@ describe("ReportChart", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  // The card owns the button, so the chart must be in the card. A chart next to the card stays on Hide chart.
   it("hides the chart and keeps the choice", () => {
     const { unmount } = render(<ReportChart groups={groups} dimensions={["month"]} />);
+    expect(screen.getByRole("img", { name: /^Totals by month/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Hide chart" }));
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
     unmount();
     render(<ReportChart groups={groups} dimensions={["month"]} />);
-    expect(screen.getByRole("button", { name: "Show chart" })).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show chart" }));
+    expect(screen.getByRole("img", { name: /^Totals by month/ })).toBeInTheDocument();
   });
 
   it("works when storage is not available", () => {

@@ -16,16 +16,19 @@ The schema is the SQL in `rust-api/db/migrations/`. See
 [database-management.md](database-management.md) for the type rules.
 
 A timestamp column is `TEXT` that holds a **UTC wall-clock value**
-(`YYYY-MM-DD HH:MM:SS[.fff]`). The Rust code always binds it: use
-`Utc::now().naive_utc()` for new rows and updates. When you read one in Rust,
+(`YYYY-MM-DD HH:MM:SS[.fff]`). The Rust code always binds it: the server
+uses `platform::timestamp()` (`rust-api/server/src/platform.rs`) for new rows
+and updates. When you read one in Rust,
 `.and_utc()` is correct only because the stored value is already UTC. No
 column has a SQL default for a timestamp. Do not write one from SQL
 (`CURRENT_TIMESTAMP`, `datetime('now')`) either: bind the value from Rust, as
 every write path does.
 
-A calendar date is `TEXT` `YYYY-MM-DD` in the app's local day. In SQL, use
-`cp_today()` (the `today!()` macro in `ledger_db::sql`), which gives today in
-`TZ`. SQLite's own `CURRENT_DATE` and `date('now')` give the UTC date, which
+A calendar date is `TEXT` `YYYY-MM-DD` in the app's local day. Today is
+`ledger_db::clock::today()`, in the app's zone: `APP_TZ`, else `TZ`, else the
+system's zone, else `America/New_York`. Bind it, or put it in with
+`ledger_db::sql::today_literal()` or `EFFECTIVE_DATE`; no SQL function gives
+it. SQLite's own `CURRENT_DATE` and `date('now')` give the UTC date, which
 is a different day for some hours of each day. A wrong date moves a floating
 transaction, a recurring rule or a cleanup cutoff by one day. The `books`
 insert trigger also copies `books.created_at` into the creator's
@@ -65,11 +68,11 @@ single-column reference between two book tables needs a trigger of the same
 kind. The lot tables and the TypeSafe records have none: only the server
 writes their references.
 
-- **books**: `userId` is the user who created the book. It is not the access
+- **books**: `weeklyReviewEnabled` and `weeklyReviewRevision` are the opt-in of the weekly review and its revision ([weekly-review.md](weekly-review.md)). `userId` is the user who created the book. It is not the access
   list. `book_members` decides who can open the book and at what role.
-  `typesafeReconciliationEnabled` defaults to false; `typesafeRevision`
-  invalidates in-flight and cached experiment results across settings
-  changes. The dedicated Settings API is the only opt-in surface.
+  `typesafeReconciliationEnabled` and `typesafeEntryEnabled` default to
+  false; `typesafeRevision`, which both share, invalidates in-flight and
+  cached experiment results across settings changes. The dedicated Settings API is the only opt-in surface.
 
 - **book_members**: This table is the only source of book access. It has
   these columns:
@@ -105,12 +108,35 @@ writes their references.
   (`match`, `payee`, `category`); `choice`/`probabilities`/`confidence` keep
   the match answer only. `typesafeDecisions.proposalPayeeKept` and
   `proposalCategoryKept` are set only for a create after a visible proposal.
+- **typesafeEntryEvaluations / typesafeEntryOutcomes**: the records of the
+  entry suggestions ([TypeSafe experiment](typesafe-experiment.md)). One
+  evaluation per book and fingerprint; `baselineKey` is the newest pattern.
+  `accountId`, `payeeId` and `typesafeEntryOutcomes.transactionId` have no
+  foreign key, so a record never blocks a delete. `typesafeEntryOutcomes.evaluationId`
+  is set to null when its evaluation is deleted: the cleanup counts and
+  deletes old evaluations and old outcomes apart.
 - **accounts**: Chart of accounts with hierarchical structure (parent-child)
   - Types: `asset`, `liability`, `equity`, `income`, `expense`
   - Subtypes: `bank`, `credit_card`, `loan`, `investment`, `cash`, `other`
   - Special field: `isInvestmentCash` for auto-created investment cash accounts
   - `icon` (nullable): one emoji grapheme. **`null` means "inherit from the parent account" — never "no icon".** Resolved at render time by `resolveAccountIcon()`/`resolveAccountIconSource()`; only `income`/`expense` accounts show a picker or resolve an icon for display
 
+- **payees**: `name` keeps the case that was first typed, but a name matches
+  without letter case: `payees_name_book_unique` refuses an exact repeat, and
+  `payees_book_name_nocase` (migration 0009, `name COLLATE NOCASE`) refuses an
+  ASCII case variant in the same book. A lookup compares `name_fold`. See
+  [patterns-and-gotchas.md](patterns-and-gotchas.md).
+- **Folded columns** (migration 0012): `transactions.description_fold`,
+  `notes_fold` and `check_number_fold`, `payees.name_fold`,
+  `accounts.name_fold`, `securities.symbol_fold`, and
+  `recurring_rules.name_fold` and `template_description_fold`. Each holds
+  `ledger_core::names::fold()` (Unicode lowercase) of its column, or NULL when
+  the column is NULL. **Every insert and update of the column writes its fold
+  in the same statement.** A lookup or search reads the fold, never `lower()`
+  of the column. They are derived state: see
+  [database-management.md](database-management.md#folded-columns).
+  `plaid_transaction_reconciliation.merchant_key` (migration 0013) is derived
+  the same way, from `merchant_name` and `name`.
 - **transactions**: Main transaction records with date, description, payee
   - Links to `payees` (optional) and `recurringRules` (optional)
   - `createdBy` / `updatedBy` (nullable, FK `users.id`, ON DELETE SET NULL):
@@ -182,16 +208,31 @@ writes their references.
   - `oauthCodes` / `oauthTokens`: `codeHash` / `tokenHash` are SHA-256 hex digests, never the secret. `usedAt` marks the one exchange of a code or a refresh token; a later use revokes the grant. `oauthTokens.kind` is `access` or `refresh`
 
 - **issueReports**: In-app issue reports (meta table — scoped to `userId`, not `bookId`)
-  - Fields: `userId`, `description`, `type` (`bug`/`improvement`/`other`), `page`, `status` (`new`/`resolved`/`wontfix`)
+  - Fields: `userId`, `description`, `type` (`bug`/`improvement`/`other`), `page`, `status` (`new`/`resolved`/`wontfix`), `githubIssueNumber` (nullable)
   - Written by `ReportIssueModal`; read when triaging reports
+  - `githubIssueNumber` is set only by the `issue-sync` job: the issue it opened in the configured GitHub repo. The HTTP and MCP routes do not return it. See [issue-sync.md](issue-sync.md)
 
 - **plaidTokens** / **plaidAccounts** / **plaidTransactionReconciliation**: Plaid bank sync integration
-  - `plaidTokens`: Stores Plaid access tokens and `syncCursor` for incremental transaction sync
+  - `plaidTokens`: Stores Plaid access tokens and `syncCursor` for incremental transaction sync. `access_token` is ciphertext whenever `access_token_key` (the sealing key's ID) is set; read and write it only through `Plaid::open_token()` and `Plaid::seal_token()` (see "Access tokens at rest" in [plaid-sync.md](plaid-sync.md))
   - `plaidAccounts`: Links Plaid accounts to Counterpoise accounts (`counterpoiseAccountId`)
   - `plaidTransactionReconciliation`: Staged Plaid transactions awaiting reconciliation
     - `resolutionStatus`: `pending`, `matched`, `created`, `ignored`
     - `reviewReason`: `plaid_modified` or `plaid_removed` (flags items needing human review)
     - `matchedTransactionId`: FK to local transaction when matched (manually or auto-matched)
+  - `weeklyReviews` (migration 0007): one run of the weekly review
+    ([weekly-review.md](weekly-review.md)). `source` is `schedule` or `manual`
+    (not `trigger`, an SQL keyword). `status` is `running`, `complete` or
+    `failed`; a partial unique index allows one `running` review per book.
+    `revision` is the book's `weeklyReviewRevision` at the start: a different
+    value at the save discards the result. `model` is the model that answered
+    (a fallback can change it).
+  - `weeklyReviewItems`: the items of a review, in the model's order
+    (`position`). `transactionIds` is a JSON array that the server checked
+    against the book. `recurringRuleId` has no foreign key, so a deleted rule
+    does not delete the record. `fingerprint` is kind, category and the
+    sorted IDs: a dismissed fingerprint keeps the same item out of later
+    reviews. Only the server writes these two tables, so they have no
+    cross-book triggers.
   - `plaidLinkSessions` (migration 0005): one Plaid Hosted Link session of the
     Sync page. `tokenId` is null for a new connection and names the connection
     in update mode; `resultTokenId` is the connection that the session made or
@@ -200,3 +241,25 @@ writes their references.
     exchanges the result), `complete`, `expired` or `failed`. `expiresAt` is
     at most four hours after `createdAt`. The table never holds an access
     token. See [plaid-sync.md](plaid-sync.md#connect-and-reconnect-hosted-link)
+- **jobLeases** / **jobRuns** (migration 0014): the state of the scheduled
+  jobs, which an older release kept in files beside the database
+  (`ledger_db::jobs`). Neither has a `bookId`.
+  - `jobLeases`: one row per held lease, by `name` (`job:<job>` or
+    `plaid-sync:<token id>`). `holder` is the run that holds it. `expiresAt`
+    moves forward while the run renews it; a lease past `expiresAt` is free,
+    so a crashed run holds it up for at most a minute. Take one only with
+    `jobs::acquire()`, whose one statement is the whole race.
+  - `jobRuns`: the last run of each job that records status, by `job`.
+    `lastOkAt` is null for a failed run. `notConfigured` marks a run that
+    had no secret and did nothing; `/api/system/status` does not count it as
+    a success.
+- **rateLimits** (migration 0016): the failure counters and lockouts of
+  `rust-api/server/src/rate_limit.rs`, which an older release kept in
+  memory. No `bookId`. One row per (`scope`, `bucket`): the scope is
+  `login`, `apikey` and so on, and the bucket is `user:<lowercased name>` or
+  `ip:<rate-limit key>` (for an API key, the address and the key's prefix).
+  `lockedUntil` past now means locked. `expiresAt` is the later of the
+  window's end (`windowStarted` + 15 minutes) and `lockedUntil`; a row past
+  it holds nothing, and the limiter deletes it every 512 failures and in
+  the daily prune job. The row holds the address only as the limiter's key:
+  do not read it as the address of a client.

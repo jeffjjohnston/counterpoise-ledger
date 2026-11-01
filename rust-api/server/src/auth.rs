@@ -1,17 +1,19 @@
 use crate::{
     api_key_cache::{ApiKeyPrincipal, KeyDigest},
-    client_ip,
+    client_ip, platform,
     rate_limit::{Keys, Scope},
     state::AppState,
 };
 use axum::http::{HeaderMap, header};
-use chrono::Utc;
+use ledger_db::{
+    Sql,
+    store::{self, params},
+};
 use percent_encoding::percent_decode_str;
 use scrypt::{Params, scrypt};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 use subtle::ConstantTimeEq;
 
 pub(crate) fn cookie_token(headers: &HeaderMap) -> Option<String> {
@@ -61,7 +63,7 @@ pub(crate) async fn run_scrypt(
         .acquire_owned()
         .await
         .expect("scrypt semaphore remains open");
-    tokio::task::spawn_blocking(move || {
+    platform::blocking(move || {
         let _permit = permit;
         let params = Params::new(14, 8, 1, length).map_err(|_| ())?;
         let mut derived = vec![0; length];
@@ -82,7 +84,7 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && words.next().is_none()).then_some(token)
 }
 
-fn valid_key_shape(key: &str) -> bool {
+pub(crate) fn valid_key_shape(key: &str) -> bool {
     key.len() == 52
         && key.starts_with("cpk_")
         && key[4..]
@@ -110,17 +112,12 @@ async fn stamp_if_due(state: &AppState, digest: KeyDigest, key_id: i32) {
     if !state.api_keys.stamp_due(digest) {
         return;
     }
-    let now = Utc::now().naive_utc();
-    if let Err(cause) = sqlx::query(
-        "UPDATE api_keys SET last_used_at = $2
-         WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $3)",
-    )
-    .bind(key_id)
-    .bind(now)
-    .bind(now - chrono::Duration::minutes(5))
-    .execute(&state.pool)
-    .await
-    {
+    let now = platform::timestamp();
+    if let Err(cause) = state.database.execute(
+        "UPDATE api_keys SET last_used_at = ?2
+         WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?3)",
+        &params![key_id, now, now - chrono::Duration::minutes(5)],
+    ) {
         tracing::error!(error = %cause, "Could not stamp API key lastUsedAt");
     }
 }
@@ -129,16 +126,15 @@ async fn resolve_api_key(
     state: &AppState,
     key: &str,
     digest: KeyDigest,
-) -> Result<Option<ApiKeyPrincipal>, sqlx::Error> {
-    if let Some(principal) = state.api_keys.verified(digest, &state.pool).await? {
+) -> Result<Option<ApiKeyPrincipal>, store::Error> {
+    if let Some(principal) = state.api_keys.verified(digest, &*state.database)? {
         stamp_if_due(state, digest, principal.key_id).await;
         return Ok(Some(principal));
     }
-    let candidates: Vec<(i32, i32, String)> =
-        sqlx::query_as("SELECT id, user_id, key_hash FROM api_keys WHERE key_prefix = $1")
-            .bind(&key[..8])
-            .fetch_all(&state.pool)
-            .await?;
+    let candidates: Vec<(i32, i32, String)> = state.database.query(
+        "SELECT id, user_id, key_hash FROM api_keys WHERE key_prefix = ?1",
+        &params![&key[..8]],
+    )?;
     for (key_id, user_id, hash) in candidates {
         // Node's scrypt is asynchronous. Keep its Rust equivalent off Tokio's
         // request workers and bound concurrent checks for known prefixes.
@@ -161,7 +157,7 @@ async fn resolve_api_key(
 pub(crate) async fn principal(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<Option<i32>, sqlx::Error> {
+) -> Result<Option<i32>, store::Error> {
     principal_with(state, headers, crate::mcp::in_oauth_tool_call()).await
 }
 
@@ -176,16 +172,13 @@ pub(crate) async fn principal_with(
     state: &AppState,
     headers: &HeaderMap,
     accept_oauth: bool,
-) -> Result<Option<i32>, sqlx::Error> {
+) -> Result<Option<i32>, store::Error> {
     if let Some(token) = cookie_token(headers) {
         let digest = token_hash(&token);
-        let user_id: Option<i32> = sqlx::query_scalar(
-            "SELECT user_id FROM sessions WHERE token_hash = $1 AND expires_at > $2",
-        )
-        .bind(digest)
-        .bind(Utc::now().naive_utc())
-        .fetch_optional(&state.pool)
-        .await?;
+        let user_id: Option<i32> = state.database.query_optional(
+            "SELECT user_id FROM sessions WHERE token_hash = ?1 AND expires_at > ?2",
+            &params![digest, platform::timestamp()],
+        )?;
         if user_id.is_some() {
             return Ok(user_id);
         }
@@ -208,7 +201,7 @@ pub(crate) async fn principal_with(
     };
     if state
         .rate_limits
-        .check(Scope::ApiKey, &keys, Instant::now())
+        .check(Scope::ApiKey, &keys, platform::timestamp())
         .is_some()
     {
         return Ok(None);
@@ -223,14 +216,14 @@ pub(crate) async fn principal_with(
             Some(_) => state.rate_limits.clear_ip(Scope::ApiKey, &keys),
             None => state
                 .rate_limits
-                .failure(Scope::ApiKey, &keys, Instant::now()),
+                .failure(Scope::ApiKey, &keys, platform::timestamp()),
         }
         return Ok(user_id);
     }
     if !valid_key_shape(key) {
         state
             .rate_limits
-            .failure(Scope::ApiKey, &keys, Instant::now());
+            .failure(Scope::ApiKey, &keys, platform::timestamp());
         return Ok(None);
     }
     let digest: KeyDigest = Sha256::digest(key.as_bytes()).into();
@@ -248,7 +241,7 @@ pub(crate) async fn principal_with(
         None => {
             state
                 .rate_limits
-                .failure(Scope::ApiKey, &keys, Instant::now());
+                .failure(Scope::ApiKey, &keys, platform::timestamp());
             Ok(None)
         }
     }
@@ -292,10 +285,15 @@ mod tests {
 
     #[tokio::test]
     async fn verified_key_is_coalesced_cached_and_checked_for_revocation() {
-        let database = ledger_db::testing::TempDatabase::new(1).await;
-        let pool = database.pool().clone();
-        sqlx::query("CREATE TEMP TABLE api_keys (id integer, user_id integer, key_hash text, key_prefix text, last_used_at timestamp)")
-            .execute(&pool).await.unwrap();
+        let state = AppState::in_memory();
+        let database = &state.database;
+        database
+            .execute(
+                "INSERT INTO users (id, username, password_hash, created_at)
+                 VALUES (7, 'cache-test', 'unused', '2026-10-21 00:00:00')",
+                &[],
+            )
+            .unwrap();
         let key = format!("cpk_{}", "a".repeat(48));
         let salt = "cache-test-salt";
         let mut derived = [0_u8; 32];
@@ -307,19 +305,13 @@ mod tests {
         )
         .unwrap();
         let hash = format!("{salt}:{}", hex::encode(derived));
-        sqlx::query(
-            "INSERT INTO api_keys (id, user_id, key_hash, key_prefix) VALUES (11, 7, $1, $2)",
-        )
-        .bind(hash)
-        .bind(&key[..8])
-        .execute(&pool)
-        .await
-        .unwrap();
-        let mut state = AppState::with_pool(
-            pool.clone(),
-            crate::book_changes::BookChangeHub::new(pool.clone()),
-        );
-        state.pool = pool.clone();
+        database
+            .execute(
+                "INSERT INTO api_keys (id, user_id, name, key_hash, key_prefix, created_at)
+                 VALUES (11, 7, 'cache test', ?1, ?2, '2026-10-21 00:00:00')",
+                &params![hash, &key[..8]],
+            )
+            .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -338,23 +330,18 @@ mod tests {
         assert_eq!(b.unwrap(), Some(7));
         assert_eq!(c.unwrap(), Some(7));
         assert_eq!(state.api_keys.scrypt_runs.load(Ordering::SeqCst), 1);
-        let first_stamp: chrono::NaiveDateTime =
-            sqlx::query_scalar("SELECT last_used_at FROM api_keys WHERE id = 11")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let first_stamp: chrono::NaiveDateTime = database
+            .query_row("SELECT last_used_at FROM api_keys WHERE id = 11", &[])
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert_eq!(principal(&state, &headers).await.unwrap(), Some(7));
         assert_eq!(state.api_keys.scrypt_runs.load(Ordering::SeqCst), 1);
-        let cached_stamp: chrono::NaiveDateTime =
-            sqlx::query_scalar("SELECT last_used_at FROM api_keys WHERE id = 11")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let cached_stamp: chrono::NaiveDateTime = database
+            .query_row("SELECT last_used_at FROM api_keys WHERE id = 11", &[])
+            .unwrap();
         assert_eq!(cached_stamp, first_stamp);
-        sqlx::query("DELETE FROM api_keys WHERE id = 11")
-            .execute(&pool)
-            .await
+        database
+            .execute("DELETE FROM api_keys WHERE id = 11", &[])
             .unwrap();
         assert_eq!(principal(&state, &headers).await.unwrap(), None);
     }

@@ -1951,6 +1951,59 @@ describe("TransactionList", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows a go-to payee action in the context menu and calls navigation callback", () => {
+    const onNavigateToPayee = vi.fn();
+    const transactions: TransactionWithSplits[] = [
+      {
+        ...baseTransaction,
+        id: 15,
+        bookId: 1,
+        splits: [],
+        investmentSplits: [],
+        payeeId: 7,
+        payee: { id: 7, bookId: 1, name: "Corner Store", createdAt: new Date() },
+      },
+    ];
+
+    render(
+      <TransactionList
+        transactions={transactions}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        onNavigateToPayee={onNavigateToPayee}
+      />
+    );
+
+    fireEvent.contextMenu(screen.getAllByText("Corner Store")[0]);
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Go to payee Corner Store" })
+    );
+
+    expect(onNavigateToPayee).toHaveBeenCalledWith(7);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("offers no go-to payee action for a transaction without a payee", () => {
+    render(
+      <TransactionList
+        transactions={[{ ...baseTransaction, id: 16, bookId: 1, splits: [], investmentSplits: [] }]}
+        accounts={mockAccounts}
+        selectedAccountId={1}
+        onEdit={vi.fn()}
+        onNavigateToPayee={vi.fn()}
+        onToggleReconciled={vi.fn()}
+      />
+    );
+
+    fireEvent.contextMenu(screen.getAllByText("Unassigned")[0]);
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("menuitem", { name: /Go to payee/ })
+    ).not.toBeInTheDocument();
+  });
+
   it("renders skeleton rows when isLoading is true", () => {
     render(
       <TransactionList
@@ -3503,7 +3556,7 @@ describe("date-state row emphasis", () => {
     }
   });
 
-  // Report #42: a floating row whose stored date is in the future also showed
+  // A floating row whose stored date is in the future also showed
   // the Scheduled pill. Its effective date is today, so it is not scheduled.
   const FLOATING_FUTURE = dateStateRow(9104, "Floating rent", "2999-01-01", {
     isFloating: true,

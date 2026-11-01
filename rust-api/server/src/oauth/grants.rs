@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{NaiveDateTime, SecondsFormat};
+use ledger_db::{Sql, store::params};
 use serde_json::{Value, json};
 
 fn iso(value: NaiveDateTime) -> String {
@@ -24,7 +25,7 @@ fn host_of(url: &str) -> Option<String> {
         .and_then(|url| url.host_str().map(str::to_owned))
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct GrantRow {
     id: i32,
     client_name: String,
@@ -45,17 +46,15 @@ pub(super) async fn list(State(state): State<AppState>, headers: HeaderMap) -> R
     // The list works while OAuth is off, so that a user can still revoke
     // the grants from before.
     sweep(&state).await;
-    let rows: Result<Vec<GrantRow>, _> = sqlx::query_as(
+    let rows: Result<Vec<GrantRow>, _> = state.database.query(
         "SELECT g.id, oc.client_name, oc.client_id, oc.metadata_document, g.redirect_uri,
                 g.created_at, g.last_used_at
          FROM oauth_grants g JOIN oauth_clients oc ON oc.id = g.client_id
-         WHERE g.user_id = $1
+         WHERE g.user_id = ?1
            AND EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.grant_id = g.id)
          ORDER BY g.created_at DESC, g.id DESC",
-    )
-    .bind(user_id)
-    .fetch_all(&state.pool)
-    .await;
+        &params![user_id],
+    );
     match rows {
         Ok(rows) => no_store(
             Json(Value::Array(
@@ -101,14 +100,10 @@ pub(super) async fn remove(
     let Ok(id) = id.parse::<i32>() else {
         return error(StatusCode::BAD_REQUEST, "Invalid connection ID").into_response();
     };
-    match sqlx::query_scalar::<_, i32>(
-        "DELETE FROM oauth_grants WHERE id = $1 AND user_id = $2 RETURNING id",
-    )
-    .bind(id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await
-    {
+    match state.database.query_optional::<i32>(
+        "DELETE FROM oauth_grants WHERE id = ?1 AND user_id = ?2 RETURNING id",
+        &params![id, user_id],
+    ) {
         Ok(Some(_)) => Json(json!({ "success": true })).into_response(),
         Ok(None) => error(StatusCode::NOT_FOUND, "Connection not found").into_response(),
         Err(cause) => {

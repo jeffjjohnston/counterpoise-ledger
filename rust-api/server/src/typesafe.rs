@@ -1,8 +1,10 @@
 //! The TypeSafe experiment records. These records are evidence only: they never change the
 //! ledger, and a failure to save one never fails the request.
 
+use crate::platform;
 use crate::validation::js_number_string;
 use crate::{
+    book_scope::{BookAccess, Write},
     routes::{
         payees::normalize_name,
         reconcile::{Action, ReconcileInput},
@@ -11,73 +13,87 @@ use crate::{
     validation::{is_js_whitespace, js_number, js_truthy},
 };
 use chrono::{DateTime, NaiveDateTime, TimeDelta};
-use ledger_db::engine::{Db, DbPool};
+use ledger_db::Database;
 use ledger_db::locks::FOR_UPDATE;
 use ledger_db::sql;
+use ledger_db::store::{self, Sql, Transaction, params};
 use serde_json::{Value, json};
-use sqlx::FromRow;
 use std::collections::HashSet;
 
 /// `recordTypeSafeUnlink`: after an unlink from the transaction banner, an
 /// `unlink` decision for each evaluation that an earlier `match` decision on
 /// this transaction came from. The book row is locked, as for every
 /// TypeSafe record, so a settings change cannot interleave.
-pub(crate) async fn record_unlink(pool: &DbPool, book_id: i32, transaction_id: i32) {
+pub(crate) fn record_unlink(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
+    transaction_id: i32,
+) {
+    let book_id = access.book_id();
     // The MCP tools record no TypeSafe decision, so a route that runs for a
     // tool records none.
     if crate::mcp::in_tool_call() {
         return;
     }
-    let result: Result<(), sqlx::Error> = async {
-        let mut transaction = ledger_db::locks::begin_pool(pool).await?;
-        let enabled: bool = sqlx::query_scalar(&format!(
-            "SELECT typesafe_reconciliation_enabled FROM books WHERE id = $1{FOR_UPDATE}"
-        ))
-        .bind(book_id)
-        .fetch_one(transaction.as_mut())
-        .await?;
+    let result = database.transaction(|tx| {
+        let enabled: bool = tx.query_row(
+            &format!("SELECT typesafe_reconciliation_enabled FROM books WHERE id = ?1{FOR_UPDATE}"),
+            &params![book_id],
+        )?;
         if enabled {
-            let prior: Vec<(i32, Option<i32>)> = sqlx::query_as(
+            let prior: Vec<(i32, Option<i32>)> = tx.query(
                 "SELECT reconciliation_id, evaluation_id FROM typesafe_decisions
-                 WHERE book_id = $1 AND transaction_id = $2 AND action = 'match'
+                 WHERE book_id = ?1 AND transaction_id = ?2 AND action = 'match'
                  ORDER BY id",
-            )
-            .bind(book_id)
-            .bind(transaction_id)
-            .fetch_all(transaction.as_mut())
-            .await?;
+                &params![book_id, transaction_id],
+            )?;
             let mut seen = HashSet::new();
             for (reconciliation_id, evaluation_id) in prior {
                 let Some(evaluation_id) = evaluation_id.filter(|id| seen.insert(*id)) else {
                     continue;
                 };
-                sqlx::query(
+                tx.execute(
                     "INSERT INTO typesafe_decisions
                        (book_id, reconciliation_id, evaluation_id, action, transaction_id,
                         decided_at)
-                     VALUES ($1, $2, $3, 'unlink', $4, $5)",
-                )
-                .bind(book_id)
-                .bind(reconciliation_id)
-                .bind(evaluation_id)
-                .bind(transaction_id)
-                .bind(chrono::Utc::now().naive_utc())
-                .execute(transaction.as_mut())
-                .await?;
+                     VALUES (?1, ?2, ?3, 'unlink', ?4, ?5)",
+                    &params![
+                        book_id,
+                        reconciliation_id,
+                        evaluation_id,
+                        transaction_id,
+                        platform::timestamp()
+                    ],
+                )?;
             }
         }
-        transaction.commit().await
-    }
-    .await;
+        Ok::<_, store::Error>(())
+    });
     if let Err(cause) = result {
         tracing::error!(error = %cause, "TypeSafe unlink observation could not be saved");
     }
 }
 
+/// A failed record or cleanup: its message, from a database error or from a
+/// check of this module.
+struct Failure(String);
+
+impl From<store::Error> for Failure {
+    fn from(cause: store::Error) -> Self {
+        Self(cause.to_string())
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self(message)
+    }
+}
+
 /// `isTypeSafeConfigured`, read on each call as Node reads it.
 pub(crate) fn is_configured() -> bool {
-    std::env::var("TYPESAFE_ENABLED").is_ok_and(|value| value == "true")
-        && std::env::var("TYPESAFE_API_KEY")
+    ledger_db::env::var("TYPESAFE_ENABLED").is_ok_and(|value| value == "true")
+        && ledger_db::env::var("TYPESAFE_API_KEY")
             .is_ok_and(|key| !key.trim_matches(is_js_whitespace).is_empty())
 }
 
@@ -214,7 +230,7 @@ pub(crate) fn proposal<'a>(
     Ok(payee.zip(category))
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct EvaluationRow {
     id: i32,
     started_at: NaiveDateTime,
@@ -235,43 +251,32 @@ fn millis(value: NaiveDateTime) -> NaiveDateTime {
 /// `recordTypeSafeDecision`: after a committed decision, the evidence of what
 /// the suggestion showed. It never changes the response; a failure is
 /// logged.
-pub(crate) async fn record_decision(
-    pool: &DbPool,
-    book_id: i32,
+pub(crate) fn record_decision(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     input: &ReconcileInput,
     observation: &Observation,
     action_started_at: NaiveDateTime,
 ) {
+    let book_id = access.book_id();
     // As in `record_unlink`: a route that runs for an MCP tool records none.
     if crate::mcp::in_tool_call() {
         return;
     }
-    let result: Result<(), String> = async {
-        let failed = |cause: sqlx::Error| cause.to_string();
-        let mut transaction = ledger_db::locks::begin_pool(pool).await.map_err(failed)?;
-        let (enabled, revision): (bool, i32) = sqlx::query_as(&format!(
-            "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books
-             WHERE id = $1{FOR_UPDATE}"
-        ))
-        .bind(book_id)
-        .fetch_one(transaction.as_mut())
-        .await
-        .map_err(failed)?;
+    let result = database.transaction(|tx| {
+        let (enabled, revision): (bool, i32) = tx.query_row(
+            &format!(
+                "SELECT typesafe_reconciliation_enabled, typesafe_revision FROM books
+                 WHERE id = ?1{FOR_UPDATE}"
+            ),
+            &params![book_id],
+        )?;
         if enabled && is_configured() {
-            record_in(
-                &mut transaction,
-                book_id,
-                revision,
-                input,
-                observation,
-                action_started_at,
-            )
-            .await?;
+            record_in(tx, access, revision, input, observation, action_started_at)?;
         }
-        transaction.commit().await.map_err(failed)
-    }
-    .await;
-    if let Err(cause) = result {
+        Ok::<_, Failure>(())
+    });
+    if let Err(Failure(cause)) = result {
         tracing::error!(error = %cause, "TypeSafe decision observation could not be saved");
     }
 }
@@ -284,32 +289,26 @@ fn integer_column(value: f64) -> Result<i32, String> {
         .ok_or_else(|| format!("{value} is not an integer column value"))
 }
 
-async fn record_in(
-    transaction: &mut sqlx::Transaction<'_, Db>,
-    book_id: i32,
+fn record_in(
+    tx: &Transaction<'_>,
+    access: &BookAccess<'_, Write>,
     revision: i32,
     input: &ReconcileInput,
     observation: &Observation,
     action_started_at: NaiveDateTime,
-) -> Result<(), String> {
-    let failed = |cause: sqlx::Error| cause.to_string();
+) -> Result<(), Failure> {
+    let book_id = access.book_id();
     let reconciliation_id = integer_column(input.reconciliation_id)?;
     let evaluation_filter = observation.evaluation_id.map(integer_column).transpose()?;
-    let record: Option<EvaluationRow> = sqlx::query_as(
+    let record: Option<EvaluationRow> = tx.query_optional(
         "SELECT id, started_at, status, completed_at, displayed_at,
                 CAST(snapshot AS TEXT) AS snapshot, CAST(answers AS TEXT) AS answers
          FROM typesafe_evaluations
-         WHERE book_id = $1 AND reconciliation_id = $2 AND revision = $3
-           AND ($4 IS NULL OR id = $4)
+         WHERE book_id = ?1 AND reconciliation_id = ?2 AND revision = ?3
+           AND (?4 IS NULL OR id = ?4)
          ORDER BY started_at DESC LIMIT 1",
-    )
-    .bind(book_id)
-    .bind(reconciliation_id)
-    .bind(revision)
-    .bind(evaluation_filter)
-    .fetch_optional(transaction.as_mut())
-    .await
-    .map_err(failed)?;
+        &params![book_id, reconciliation_id, revision, evaluation_filter],
+    )?;
     let Some(record) = record else {
         return Ok(());
     };
@@ -363,27 +362,26 @@ async fn record_in(
         .active_review_ms
         .map(integer_column)
         .transpose()?;
-    sqlx::query(
+    tx.execute(
         "INSERT INTO typesafe_decisions
            (book_id, reconciliation_id, evaluation_id, action, transaction_id, suggestion_visible,
             accepted_suggestion, proposal_payee_kept, proposal_category_kept, active_review_ms,
             decided_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-    )
-    .bind(book_id)
-    .bind(reconciliation_id)
-    .bind(record.id)
-    .bind(input.action.name())
-    .bind(transaction_id)
-    .bind(visible)
-    .bind(visible && observation.accepted_suggestion == Some(true))
-    .bind(creating.then_some(payee_kept))
-    .bind(creating.then_some(category_kept))
-    .bind(active_review_ms)
-    .bind(now_millis())
-    .execute(transaction.as_mut())
-    .await
-    .map_err(failed)?;
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        &params![
+            book_id,
+            reconciliation_id,
+            record.id,
+            input.action.name(),
+            transaction_id,
+            visible,
+            visible && observation.accepted_suggestion == Some(true),
+            creating.then_some(payee_kept),
+            creating.then_some(category_kept),
+            active_review_ms,
+            now_millis()
+        ],
+    )?;
     Ok(())
 }
 
@@ -471,7 +469,7 @@ pub(crate) struct SummaryEvaluation {
 }
 
 /// An evaluation row with its jsonb columns as text.
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct StoredEvaluation {
     id: i32,
     status: String,
@@ -525,7 +523,7 @@ impl StoredEvaluation {
     }
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 pub(crate) struct SummaryDecision {
     pub(crate) evaluation_id: Option<i32>,
     pub(crate) action: String,
@@ -839,6 +837,62 @@ fn token_count(value: Option<&Value>) -> f64 {
     }
 }
 
+/// An entry evaluation as the summary reads it.
+pub(crate) struct EntryEvaluation {
+    pub(crate) status: String,
+    pub(crate) choice: Option<String>,
+    pub(crate) baseline_key: String,
+    pub(crate) latency_ms: Option<i32>,
+    pub(crate) error_code: Option<String>,
+}
+
+/// An entry outcome as the summary reads it.
+pub(crate) struct EntryOutcome {
+    pub(crate) outcome: String,
+    pub(crate) source: String,
+    pub(crate) chip_visible: bool,
+}
+
+/// The counts of entry evaluations and entry outcomes. `summarizeEntries` in
+/// lib/typesafe/report.ts counts the same keys in the same order.
+pub(crate) fn summarize_entries(
+    evaluations: &[EntryEvaluation],
+    outcomes: &[EntryOutcome],
+) -> Counts {
+    let mut counts = Counts::default();
+    for row in evaluations {
+        counts.count("entry_evaluations");
+        counts.count(&format!("entry_status_{}", row.status));
+        if let Some(code) = &row.error_code {
+            counts.count(&format!("entry_error_{code}"));
+        }
+        if row.status == "ready" {
+            match &row.choice {
+                None => counts.count("entry_none"),
+                Some(choice) => {
+                    counts.count("entry_choice");
+                    counts.count(if *choice == row.baseline_key {
+                        "entry_agrees_with_baseline"
+                    } else {
+                        "entry_differs_from_baseline"
+                    });
+                }
+            }
+        }
+        if let Some(latency) = row.latency_ms {
+            counts.count("entry_latency_samples");
+            counts.add("entry_latency_total_ms", f64::from(latency));
+        }
+    }
+    for row in outcomes {
+        counts.count(&format!("entry_outcome_{}_{}", row.source, row.outcome));
+        if row.chip_visible {
+            counts.count("entry_chip_visible");
+        }
+    }
+    counts
+}
+
 const RETENTION_DAYS: i64 = 30;
 pub(crate) const CLEANUP_BATCH: i64 = 1000;
 
@@ -846,22 +900,32 @@ pub(crate) const CLEANUP_BATCH: i64 = 1000;
 /// added to the book's archived counts and deleted with their decisions,
 /// book by book under the book-row lock. Quotas of earlier days are deleted.
 /// Returns the number of evaluations deleted.
-pub(crate) async fn cleanup(pool: &DbPool, now: NaiveDateTime) -> Result<i64, String> {
-    let failed = |cause: sqlx::Error| cause.to_string();
+pub(crate) fn cleanup(database: &Database, now: NaiveDateTime) -> Result<i64, String> {
+    cleanup_batch(database, now).map_err(|Failure(message)| message)
+}
+
+fn cleanup_batch(database: &Database, now: NaiveDateTime) -> Result<i64, Failure> {
     let cutoff = now - TimeDelta::days(RETENTION_DAYS);
-    let batch: Vec<(i32, i32)> = sqlx::query_as(
-        "SELECT id, book_id FROM typesafe_evaluations WHERE started_at < $1
-         ORDER BY id LIMIT COALESCE($2, -1)",
-    )
-    .bind(cutoff)
-    .bind(CLEANUP_BATCH)
-    .fetch_all(pool)
-    .await
-    .map_err(failed)?;
+    let batch: Vec<(i32, i32)> = database.query(
+        "SELECT id, book_id FROM typesafe_evaluations WHERE started_at < ?1
+         ORDER BY id LIMIT COALESCE(?2, -1)",
+        &params![cutoff, CLEANUP_BATCH],
+    )?;
     let mut books: Vec<i32> = Vec::new();
     for (_, book_id) in &batch {
         if !books.contains(book_id) {
             books.push(*book_id);
+        }
+    }
+    // The books with expired entry records, which the batch above may miss.
+    let entry_books: Vec<i32> = database.query(
+        "SELECT book_id FROM typesafe_entry_evaluations WHERE started_at < ?1
+         UNION SELECT book_id FROM typesafe_entry_outcomes WHERE decided_at < ?1",
+        &params![cutoff],
+    )?;
+    for book_id in entry_books {
+        if !books.contains(&book_id) {
+            books.push(book_id);
         }
     }
     let mut deleted = 0;
@@ -871,50 +935,83 @@ pub(crate) async fn cleanup(pool: &DbPool, now: NaiveDateTime) -> Result<i64, St
             .filter(|(_, book)| *book == book_id)
             .map(|(id, _)| *id)
             .collect();
-        deleted += archive_book(pool, book_id, &ids, cutoff).await?;
+        // A scheduled job has no user. The queries above chose the book.
+        let access = BookAccess::for_system_job(book_id);
+        if !ids.is_empty() {
+            deleted += database.transaction(|tx| archive_book(tx, &access, &ids, cutoff))?;
+        }
+        deleted += database.transaction(|tx| archive_entries(tx, &access, cutoff))?;
     }
     // Quotas carry no transaction data. Today's quota stays across clear-data.
     let cutoff_day = cutoff.format("%Y-%m-%d").to_string();
-    sqlx::query("DELETE FROM typesafe_quotas WHERE day < $1")
-        .bind(cutoff_day)
-        .execute(pool)
-        .await
-        .map_err(failed)?;
+    database.execute(
+        "DELETE FROM typesafe_quotas WHERE day < ?1",
+        &params![cutoff_day],
+    )?;
     Ok(deleted)
 }
 
-async fn archive_book(
-    pool: &DbPool,
-    book_id: i32,
+/// Locks the book row, so a settings change cannot interleave.
+fn lock_book(tx: &Transaction<'_>, book_id: i32) -> Result<(), Failure> {
+    let locked: Option<i32> = tx.query_optional(
+        &format!("SELECT id FROM books WHERE id = ?1{FOR_UPDATE}"),
+        &params![book_id],
+    )?;
+    match locked {
+        Some(_) => Ok(()),
+        None => Err(Failure("Book not found".to_owned())),
+    }
+}
+
+/// The archived counts of the book, in the order that jsonb gave, as the
+/// stored counts were read before.
+fn archived_counts(tx: &Transaction<'_>, book_id: i32) -> Result<Counts, Failure> {
+    let archived: Option<String> = tx.query_optional(
+        "SELECT CAST(counts AS TEXT) FROM typesafe_aggregates WHERE book_id = ?1",
+        &params![book_id],
+    )?;
+    Ok(match archived {
+        Some(text) => Counts::parse(
+            &read_json_column(&text)
+                .map_err(|cause| cause.to_string())?
+                .to_string(),
+        )?,
+        None => Counts::default(),
+    })
+}
+
+fn store_counts(tx: &Transaction<'_>, book_id: i32, counts: &Counts) -> Result<(), Failure> {
+    tx.execute(
+        &format!(
+            "INSERT INTO typesafe_aggregates (book_id, counts) VALUES (?1, {})
+             ON CONFLICT (book_id) DO UPDATE SET counts = excluded.counts",
+            sql::json("?2")
+        ),
+        &params![book_id, counts.to_json()],
+    )?;
+    Ok(())
+}
+
+fn archive_book(
+    tx: &Transaction<'_>,
+    access: &BookAccess<'_, Write>,
     ids: &[i32],
     cutoff: NaiveDateTime,
-) -> Result<i64, String> {
-    let failed = |cause: sqlx::Error| cause.to_string();
-    let mut transaction = ledger_db::locks::begin_pool(pool).await.map_err(failed)?;
-    let locked: Option<i32> =
-        sqlx::query_scalar(&format!("SELECT id FROM books WHERE id = $1{FOR_UPDATE}"))
-            .bind(book_id)
-            .fetch_optional(transaction.as_mut())
-            .await
-            .map_err(failed)?;
-    if locked.is_none() {
-        return Err("Book not found".to_owned());
-    }
-    let rows: Vec<StoredEvaluation> = sqlx::query_as(&format!(
-        "SELECT id, status, CAST(snapshot AS TEXT) AS snapshot, choice,
-                CAST(usage AS TEXT) AS usage, CAST(answers AS TEXT) AS answers, displayed_at,
-                latency_ms
-         FROM typesafe_evaluations
-         WHERE book_id = $1 AND id {} AND started_at < $3
-         ORDER BY id",
-        sql::in_integers("$2")
-    ))
-    .bind(book_id)
-    .bind(sql::json_array(ids))
-    .bind(cutoff)
-    .fetch_all(transaction.as_mut())
-    .await
-    .map_err(failed)?;
+) -> Result<i64, Failure> {
+    let book_id = access.book_id();
+    lock_book(tx, book_id)?;
+    let rows: Vec<StoredEvaluation> = tx.query(
+        &format!(
+            "SELECT id, status, CAST(snapshot AS TEXT) AS snapshot, choice,
+                    CAST(usage AS TEXT) AS usage, CAST(answers AS TEXT) AS answers,
+                    displayed_at, latency_ms
+             FROM typesafe_evaluations
+             WHERE book_id = ?1 AND id {} AND started_at < ?3
+             ORDER BY id",
+            sql::in_integers("?2")
+        ),
+        &params![book_id, sql::json_array(ids), cutoff],
+    )?;
     if rows.is_empty() {
         return Ok(0);
     }
@@ -923,53 +1020,102 @@ async fn archive_book(
         .map(StoredEvaluation::parse)
         .collect::<Result<Vec<_>, _>>()?;
     let ids: Vec<i32> = rows.iter().map(|row| row.id).collect();
-    let decisions: Vec<SummaryDecision> = sqlx::query_as(&format!(
-        "SELECT evaluation_id, action, transaction_id, suggestion_visible, accepted_suggestion,
-                proposal_payee_kept, proposal_category_kept, active_review_ms, decided_at
-         FROM typesafe_decisions WHERE evaluation_id {} ORDER BY id",
-        sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(&ids))
-    .fetch_all(transaction.as_mut())
-    .await
-    .map_err(failed)?;
-    let archived: Option<String> = sqlx::query_scalar(
-        "SELECT CAST(counts AS TEXT) FROM typesafe_aggregates WHERE book_id = $1",
-    )
-    .bind(book_id)
-    .fetch_optional(transaction.as_mut())
-    .await
-    .map_err(failed)?;
-    let mut counts = match archived {
-        // In the order that jsonb gave, as the stored counts were read before.
-        Some(text) => Counts::parse(
-            &read_json_column(&text)
-                .map_err(|cause| cause.to_string())?
-                .to_string(),
-        )?,
-        None => Counts::default(),
-    };
+    let decisions: Vec<SummaryDecision> = tx.query(
+        &format!(
+            "SELECT evaluation_id, action, transaction_id, suggestion_visible,
+                    accepted_suggestion, proposal_payee_kept, proposal_category_kept,
+                    active_review_ms, decided_at
+             FROM typesafe_decisions WHERE evaluation_id {} ORDER BY id",
+            sql::in_integers("?1")
+        ),
+        &params![sql::json_array(&ids)],
+    )?;
+    let mut counts = archived_counts(tx, book_id)?;
     counts.merge(&summarize(&rows, &decisions)?);
-    sqlx::query(&format!(
-        "INSERT INTO typesafe_aggregates (book_id, counts) VALUES ($1, {})
-         ON CONFLICT (book_id) DO UPDATE SET counts = excluded.counts",
-        sql::json("$2")
-    ))
-    .bind(book_id)
-    .bind(counts.to_json())
-    .execute(transaction.as_mut())
-    .await
-    .map_err(failed)?;
-    sqlx::query(&format!(
-        "DELETE FROM typesafe_evaluations WHERE id {}",
-        sql::in_integers("$1")
-    ))
-    .bind(sql::json_array(&ids))
-    .execute(transaction.as_mut())
-    .await
-    .map_err(failed)?;
-    transaction.commit().await.map_err(failed)?;
+    store_counts(tx, book_id, &counts)?;
+    tx.execute(
+        &format!(
+            "DELETE FROM typesafe_evaluations WHERE id {}",
+            sql::in_integers("?1")
+        ),
+        &params![sql::json_array(&ids)],
+    )?;
     Ok(ids.len() as i64)
+}
+
+/// An entry evaluation row: ID, status, choice, baseline key, latency,
+/// error code.
+type EntryRow = (
+    i64,
+    String,
+    Option<String>,
+    String,
+    Option<i32>,
+    Option<String>,
+);
+
+/// One bounded batch of the expired entry records of one book: their counts
+/// go into the archived counts, then they are deleted. An outcome is counted
+/// apart from its evaluation, so a newer outcome stays (its evaluation ID
+/// becomes null). Returns the number of evaluations deleted.
+fn archive_entries(
+    tx: &Transaction<'_>,
+    access: &BookAccess<'_, Write>,
+    cutoff: NaiveDateTime,
+) -> Result<i64, Failure> {
+    let book_id = access.book_id();
+    lock_book(tx, book_id)?;
+    let evaluations: Vec<EntryRow> = tx.query(
+        "SELECT id, status, choice, baseline_key, latency_ms, error_code
+         FROM typesafe_entry_evaluations
+         WHERE book_id = ?1 AND started_at < ?2 ORDER BY id LIMIT ?3",
+        &params![book_id, cutoff, CLEANUP_BATCH],
+    )?;
+    let outcomes: Vec<(i64, String, String, bool)> = tx.query(
+        "SELECT id, outcome, source, chip_visible FROM typesafe_entry_outcomes
+         WHERE book_id = ?1 AND decided_at < ?2 ORDER BY id LIMIT ?3",
+        &params![book_id, cutoff, CLEANUP_BATCH],
+    )?;
+    if evaluations.is_empty() && outcomes.is_empty() {
+        return Ok(0);
+    }
+    let evaluation_ids: Vec<i64> = evaluations.iter().map(|row| row.0).collect();
+    let outcome_ids: Vec<i64> = outcomes.iter().map(|row| row.0).collect();
+    let summary = summarize_entries(
+        &evaluations
+            .into_iter()
+            .map(
+                |(_, status, choice, baseline_key, latency_ms, error_code)| EntryEvaluation {
+                    status,
+                    choice,
+                    baseline_key,
+                    latency_ms,
+                    error_code,
+                },
+            )
+            .collect::<Vec<_>>(),
+        &outcomes
+            .into_iter()
+            .map(|(_, outcome, source, chip_visible)| EntryOutcome {
+                outcome,
+                source,
+                chip_visible,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut counts = archived_counts(tx, book_id)?;
+    counts.merge(&summary);
+    store_counts(tx, book_id, &counts)?;
+    for (table, ids) in [
+        ("typesafe_entry_outcomes", &outcome_ids),
+        ("typesafe_entry_evaluations", &evaluation_ids),
+    ] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE id {}", sql::in_integers("?1")),
+            &params![sql::json_array(ids)],
+        )?;
+    }
+    Ok(evaluation_ids.len() as i64)
 }
 
 #[cfg(test)]
@@ -1210,6 +1356,76 @@ mod tests {
                     "{name}: expected {}, got {actual:?}",
                     expected.unwrap_or_else(|| "an error".to_owned())
                 )),
+            }
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct EntryCaseEvaluation {
+            status: String,
+            choice: Option<String>,
+            baseline_key: String,
+            latency_ms: Option<i32>,
+            error_code: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct EntryCaseOutcome {
+            outcome: String,
+            source: String,
+            chip_visible: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct EntryCase {
+            name: String,
+            evaluations: Vec<EntryCaseEvaluation>,
+            outcomes: Vec<EntryCaseOutcome>,
+            expected: Value,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct EntryFixture {
+            entry_cases: Vec<EntryCase>,
+        }
+
+        #[test]
+        fn entry_cases_give_the_hand_worked_counts() {
+            let fixture: EntryFixture = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/typesafe-summary.json"
+            )))
+            .expect("the fixture must be valid");
+            assert!(!fixture.entry_cases.is_empty());
+            for case in fixture.entry_cases {
+                let evaluations: Vec<EntryEvaluation> = case
+                    .evaluations
+                    .into_iter()
+                    .map(|row| EntryEvaluation {
+                        status: row.status,
+                        choice: row.choice,
+                        baseline_key: row.baseline_key,
+                        latency_ms: row.latency_ms,
+                        error_code: row.error_code,
+                    })
+                    .collect();
+                let outcomes: Vec<EntryOutcome> = case
+                    .outcomes
+                    .into_iter()
+                    .map(|row| EntryOutcome {
+                        outcome: row.outcome,
+                        source: row.source,
+                        chip_visible: row.chip_visible,
+                    })
+                    .collect();
+                assert_eq!(
+                    summarize_entries(&evaluations, &outcomes).to_json(),
+                    case.expected.to_string(),
+                    "{}",
+                    case.name
+                );
             }
         }
 

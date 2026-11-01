@@ -6,7 +6,7 @@ coverage/
 out/
 build/
 dist/
-rust-api/target/
+rust-api/target
 lib/wasm/generated/
 data/
 *.db
@@ -48,3 +48,6 @@ worktrees/
 .claude/worktrees/
 __pycache__/
 *.pyc
+.issue-fix/
+.issue-fix-codex/
+.issue-fix-address/

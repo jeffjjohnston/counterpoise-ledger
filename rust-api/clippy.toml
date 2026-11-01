@@ -1,6 +1,6 @@
-# Every transaction opens through ledger_db::locks, so that the engine
-# decides how a write transaction starts.
+# Every transaction opens through `ledger_db::Database`, so that the engine
+# decides how a write transaction starts (`BEGIN IMMEDIATE`).
 disallowed-methods = [
-  { path = "sqlx::Connection::begin", reason = "use ledger_db::locks::begin or savepoint" },
-  { path = "sqlx::Pool::begin", reason = "use ledger_db::locks::begin_pool" },
+  { path = "rusqlite::Connection::transaction", reason = "use ledger_db::Database::transaction (BEGIN IMMEDIATE)" },
+  { path = "rusqlite::Connection::unchecked_transaction", reason = "use ledger_db::Database::transaction (BEGIN IMMEDIATE)" },
 ]

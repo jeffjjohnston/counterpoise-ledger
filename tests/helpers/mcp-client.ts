@@ -44,6 +44,8 @@ export function stdioServerParameters(
       DATABASE_PATH: workerDatabasePath(),
       DATABASE_URL: "",
       NODE_ENV: "production",
+      // As in startHttpTestServer: the server's zone follows TZ.
+      APP_TZ: env.TZ ?? process.env.TZ ?? "",
       ...(key === undefined ? {} : { COUNTERPOISE_API_KEY: key }),
       ...env,
     },

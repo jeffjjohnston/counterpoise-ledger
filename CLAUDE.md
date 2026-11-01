@@ -8,19 +8,28 @@ everywhere, and the warnings you must read before you act. Everything else is in
 touch. The guides carry the reasons, and a rule without its reason is the rule
 that gets undone.
 
-This checkout is for development only. Production runs from a separate checkout
-on `main`. The default path is `~/counterpoise-production`. The variable
-`COUNTERPOISE_BUILD_DIR` can name another directory. The gitignored
-`.env.deploy.local` can also set it. The production checkout is the directory
-that `COUNTERPOISE_BUILD_DIR` names. On the owner's machine, `.env.deploy.local`
-in the dev checkout sets it. The production checkout has its own
-`.env.production.local` and `backups/`. Development needs no
-Docker: the Rust server keeps its SQLite file in `data/`. `docker-compose.yml`
-is production-only.
+This checkout is for development only. Development needs no Docker and no
+Cloudflare account: the Rust server keeps its SQLite file in `data/`.
+
+Production has two targets. `COUNTERPOISE_DEPLOY_TARGET` selects the target
+that a release deploys to. Set it in the environment or in the gitignored
+`.env.deploy.local`. See
+[guides/architecture.md](guides/architecture.md#deployment-targets).
+
+- `worker`: the Cloudflare Worker in `rust-api/worker/`. One Durable Object
+  holds the database. The owner's production runs on this target. When a
+  release PR merges into `main`, GitHub Actions publishes the tag and deploys
+  it. No local checkout or container takes part.
+- `docker` (the default): one image, one container and one process, from
+  `docker-compose.yml` in a separate checkout on `main`. The default path is
+  `~/counterpoise-production`. `COUNTERPOISE_BUILD_DIR` (in the environment or
+  in `.env.deploy.local`) can name another directory. That checkout has its
+  own `.env.production.local` and `backups/`. An install on its own machine uses
+  this target. `docker-compose.yml` is for this target only.
 
 ## Project Overview
 
-Counterpoise is a multi-book personal finance accounting application with true double-entry bookkeeping and investment tracking. The UI is a React and React Router client that Vite builds into static files (`client/`, pages in `app/`). A Rust server (axum and sqlx, in `rust-api/`) serves every `/api` route, the MCP server and, in production, the client build; the browser runs its shared domain code as WASM. One SQLite file holds all data (`DATABASE_PATH`). The server applies the numbered SQL migrations in `rust-api/db/migrations/` at startup, and runs the scheduled jobs and the backups itself. Production is one image, one container and one process. The app supports user authentication, shared books, and a Moneydance import tool (`ledger-cli import-moneydance`).
+Counterpoise is a multi-book personal finance accounting application with true double-entry bookkeeping and investment tracking. The UI is a React and React Router client that Vite builds into static files (`client/`, pages in `app/`). A Rust server (axum and rusqlite, in `rust-api/`) serves every `/api` route, the MCP server and, on the Docker target, the client build; the browser runs its shared domain code as WASM. One SQLite database holds all data: a file (`DATABASE_PATH`) on the Docker target, the Durable Object's own storage on the Worker. The server applies the numbered SQL migrations in `rust-api/db/migrations/` at startup, and runs the scheduled jobs and the backups itself. The Docker target is one image, one container and one process. The Worker runs the same router inside its Durable Object, and the object's alarm runs the jobs. The app supports user authentication, shared books, and a Moneydance import tool (`ledger-cli import-moneydance`).
 
 ## Guides
 
@@ -35,7 +44,7 @@ Counterpoise is a multi-book personal finance accounting application with true d
 | [guides/securities-and-prices.md](guides/securities-and-prices.md) | Change price fetching, fixed-price securities, or the price entry pill |
 | [guides/recurring-transactions.md](guides/recurring-transactions.md) | Change recurring rules, their processing, or business-day shifts |
 | [guides/plaid-sync.md](guides/plaid-sync.md) | Change bank sync, auto-match, or reconciliation |
-| [guides/mcp-server.md](guides/mcp-server.md) | Add or change an MCP tool, or connect an MCP client. Lists all 63 tools |
+| [guides/mcp-server.md](guides/mcp-server.md) | Add or change an MCP tool, or connect an MCP client. Lists all 64 tools |
 | [guides/components-and-ui.md](guides/components-and-ui.md) | Build or change UI |
 | [guides/testing.md](guides/testing.md) | Write a test, or claim that work is done |
 | [guides/database-management.md](guides/database-management.md) | Change the schema, add a migration, or touch the production database |
@@ -47,6 +56,8 @@ Counterpoise is a multi-book personal finance accounting application with true d
 | [guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md) | Upgrade an install from PostgreSQL, or restore a snapshot |
 | [guides/debugging.md](guides/debugging.md) | Debug a query, an unbalanced transaction, or a wrong position |
 | [guides/typesafe-experiment.md](guides/typesafe-experiment.md) | Change TypeSafe suggestions, their settings, the data sent, or retention |
+| [guides/weekly-review.md](guides/weekly-review.md) | Change the weekly review, the data it sends to Claude, or its schedule |
+| [guides/issue-sync.md](guides/issue-sync.md) | Change the issue sync to GitHub, its settings, the data it posts, or the workflow that fixes and merges its issues |
 
 ## Skills
 
@@ -85,19 +96,20 @@ npm run db:seed -- --book-id 2  # Seed into existing book (replaces book data on
 # The seed dates end today (the app's TZ). --today pins them; --today 2025-12-31 gives the old 2023-2025 household rows
 npm run db:rebuild-lots  # Regenerate investment lots from splits (guarded; --force to override)
 npm run db:list-books    # List the books and their IDs
-sqlite3 data/counterpoise.db  # Open the dev database. The shell lacks the app's SQL functions: see guides/database-management.md
+# ledger-cli dump <file> / ledger-cli load <file>: the portable JSON dump (guides/database-management.md#dump-and-load)
+sqlite3 data/counterpoise.db  # Open the dev database. The app registers no SQL function, so the shell runs the same SQL: see guides/database-management.md
 
 # MCP (the Rust server; needs COUNTERPOISE_API_KEY)
 npm run mcp:dev          # Start the MCP server over stdio (cargo run ... -- mcp)
 npm run test:mcp:http    # Run the MCP tool suites over HTTP (needs the Rust server binary)
 npm run test:mcp:stdio   # Run the MCP tool suites over stdio
 
-# MCP (Docker — production)
+# MCP over stdio on the Docker target (the Worker has MCP over HTTP only, at /api/mcp)
 docker exec -i -e COUNTERPOISE_API_KEY=cpk_... counterpoise-rust-api-1 counterpoise-rust-api mcp
 
 # Release & Deploy — read guides/release-and-deploy.md first
 ./scripts/release.sh [patch|minor|major] [--skip-checks] [--no-pr]  # In a RELEASE CHECKOUT: bump, name and push release/vX.Y.Z, open PR to main
-./scripts/deploy.sh --ref <commit> [--yes]                          # Publish tag vX.Y.Z once at that commit, rebuild Docker
+./scripts/deploy.sh --ref <commit> [--yes]                          # Publish tag vX.Y.Z once at that commit, then rebuild Docker or wait for the Worker deploy
 ```
 
 ### Running Individual Tests
@@ -160,7 +172,7 @@ same day: see [guides/testing.md](guides/testing.md).
 
 5. **Floating Transactions**:
    - `isFloating` boolean on transactions — effective date auto-advances to today
-   - In SQL that filters, sorts or aggregates by date, use the effective date: `CASE WHEN t.is_floating THEN cp_today() ELSE t.date END` (`EFFECTIVE_DATE` in `rust-api/db/src/sql.rs`; the route modules and `rust-api/db/src/lots.rs` use it). `cp_today()` is today in the app's `TZ`; do not use SQLite's `CURRENT_DATE`, which is the UTC date
+   - In SQL that filters, sorts or aggregates by date, use the effective date: `CASE WHEN t.is_floating THEN '<today>' ELSE t.date END` (`EFFECTIVE_DATE` in `rust-api/db/src/sql.rs`, which prints today's date as a literal each time a statement is built; the route modules and `rust-api/db/src/lots.rs` use it). Today comes from `ledger_db::clock::today()`, in the app's zone (`APP_TZ`, else `TZ`); do not use SQLite's `CURRENT_DATE`, which is the UTC date, and do not call a clock in SQL
    - Use `getEffectiveDate()` from `lib/wasm-client.ts` in client-side code for display and sorting
    - When reconciling a floating transaction: set `isFloating=false`, update `date` to cleared date, set `isReconciled=true`
    - Stored `date` field retains the original entry date while floating; it's overwritten with the cleared date on reconciliation
@@ -174,10 +186,19 @@ the incident that produced it.
 - **Merge release PRs with a merge commit, never a squash.** This preserves
   release ancestry when reconciling `dev` with `main` →
   [guides/release-and-deploy.md](guides/release-and-deploy.md)
+- **The Worker deploy never attaches a custom domain.** Do not pass
+  `--domain` or add `routes` to `wrangler.toml`; the domains are managed
+  outside this repository →
+  [guides/release-and-deploy.md](guides/release-and-deploy.md)
+- **A wrangler command without `--env staging` acts on the production
+  Worker.** A `secret put`, a `secret delete` or a `rollback` takes effect at
+  once. Run each wrangler command through `scripts/wrangler.sh` from
+  `rust-api/worker/` →
+  [guides/release-and-deploy.md](guides/release-and-deploy.md)
 - **Every schema change is a new numbered file in `rust-api/db/migrations/`.**
   Never edit a migration that has run, and never change a database with direct
-  DDL. sqlx records each migration's checksum in `_sqlx_migrations`, and the
-  server refuses to start when a file no longer matches →
+  DDL. The runner records each migration's checksum in `schema_migrations`,
+  and the server refuses to start when a file no longer matches →
   [guides/database-management.md](guides/database-management.md)
 - **Lots and allocations are derived state.** `rebuild_lots()` in
   `rust-api/db/src/lots.rs` is the only runtime inserter. The transaction write
@@ -190,8 +211,10 @@ the incident that produced it.
   The validator is what stops a client setting `bookId` or `id`. An id that
   references another row must also be proved to belong to this book →
   [guides/api-route-patterns.md](guides/api-route-patterns.md)
-- **Payee `normalize_name()` does not lowercase.** "IKEA" and "Ikea" are
-  deliberately distinct payees → [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md)
+- **A payee name matches without letter case.** `normalize_name()` keeps the
+  case that was typed, but "IKEA" and "Ikea" are one payee: every lookup and
+  create treats a case variant as the existing payee →
+  [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md)
 - **The mobile/desktop breakpoint is declared in two places** — Tailwind `lg:`
   classes and `MOBILE_BREAKPOINT`. They must move together →
   [guides/components-and-ui.md](guides/components-and-ui.md)
@@ -205,7 +228,8 @@ the incident that produced it.
   for a read-only tool. A static test fails on a mismatch →
   [guides/api-route-patterns.md](guides/api-route-patterns.md)
 - **Timestamps are UTC text; calendar dates are local.** A timestamp column
-  holds UTC wall-clock text that Rust binds; the app's SQL never makes one. `cp_today()`
-  gives today in the app's `TZ`, and SQLite's own `CURRENT_DATE` and
+  holds UTC wall-clock text that Rust binds; the app's SQL never makes one.
+  `ledger_db::clock::today()` gives today in the app's zone (`APP_TZ`, else
+  `TZ`), and SQLite's own `CURRENT_DATE` and
   `datetime('now')` give UTC. Use the right one, and test under a non-UTC
   `TZ` → [guides/schema.md](guides/schema.md#timezones-and-timestamp-columns)

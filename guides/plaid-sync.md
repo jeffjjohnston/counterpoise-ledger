@@ -122,7 +122,7 @@ Rules that are easy to get wrong:
   the same guarded `UPDATE` (`status = 'pending' OR (status = 'completing'
   AND updated_at < $stale_before)`). A fresh claim answers the stored state,
   with no Plaid call. The request that holds a claim makes one Plaid call,
-  the exchange (at most 120 seconds, the client timeout), so 10 minutes is
+  the exchange (at most 120 seconds, the request timeout), so 10 minutes is
   more than four times the longest live claim. If the server exited after
   the exchange, the public token is used: the new exchange fails, the claim
   goes back, and the session stays `pending` until it expires. The user then
@@ -137,7 +137,8 @@ Rules that are easy to get wrong:
   and updates accounts, and deletes none. A delete of a `plaid_accounts` row
   cascades to its staged bank transactions, and a user who deselects an
   account in update mode must not lose that history. **Map accounts** still
-  refreshes with `prune: true`, as before.
+  refreshes with `prune: true`, through
+  `POST sync/tokens/[id]/accounts/refresh`.
 - **No response contains an access token, a public token or a link token**,
   and no log line names one. The HTTP test checks the response text for each
   token.
@@ -168,7 +169,7 @@ in-app flow is the default.
 
 ## Sync Trigger Points
 - **Manual**: POST `/api/b/[bookId]/sync/tokens/[id]/sync` — syncs a single token on demand. Sync is always per token: there is **no** per-account sync route. `DELETE` on that same path clears the token's staged sync data. The only route under `sync/accounts/[id]/` is `reconcile`
-- **Scheduled**: the server syncs all tokens with linked accounts every 6 hours (12am, 6am, 12pm, 6pm, in `TZ`; `rust-api/server/src/scheduler.rs`). GET `/api/cron/plaid-sync` runs the same job now and requires the `CRON_SECRET` bearer token. **Tokens with `isDemo = true` are excluded**, and `sync_token()` refuses them outright. The seed gives a demo book a Plaid connection with a synthetic access token so the Sync page has something to show; it is linked to a liability account exactly like a real connection, so nothing but that column tells them apart. Without the exclusion, every demo book makes a guaranteed-failing call to Plaid every six hours and writes the rejection to `lastError`, which the Sync page renders as "Last sync failed". The guard in `sync_locked()` runs *before* the step that writes `lastError` for that reason: a demo connection must not be recorded as a broken one.
+- **Scheduled**: the server syncs all tokens with linked accounts every 6 hours (12am, 6am, 12pm, 6pm, in `TZ`; `rust-api/server/src/scheduler/mod.rs`). The scheduled run syncs three tokens per step, in ID order, and keeps the last ID in its slot's cursor (`job_slots`), so one step fits in a Workers alarm. GET `/api/cron/plaid-sync` runs the same job now, every token in one call, and requires the `CRON_SECRET` bearer token. **Tokens with `isDemo = true` are excluded**, and `sync_token()` refuses them outright. The seed gives a demo book a Plaid connection with a synthetic access token so the Sync page has something to show; it is linked to a liability account exactly like a real connection, so nothing but that column tells them apart. Without the exclusion, every demo book makes a guaranteed-failing call to Plaid every six hours and writes the rejection to `lastError`, which the Sync page renders as "Last sync failed". The guard in `sync_locked()` runs *before* the step that writes `lastError` for that reason: a demo connection must not be recorded as a broken one.
 
 ## Auto-Match Algorithm (`auto_match()` in `rust-api/server/src/routes/plaid_sync.rs`)
 Auto-match runs automatically after every sync (both manual and cron). It uses a learned payee map built from previously human-matched reconciliation rows:
@@ -195,7 +196,7 @@ Auto-match runs automatically after every sync (both manual and cron). It uses a
 
 `rust-api/server/src/routes/reconcile.rs` owns the two queue reads and the six decisions. The route `sync/accounts/[id]/reconcile` serves them, and the two MCP tools send their requests through that route. Seven things about it are easy to get wrong:
 
-- **It does not take a session lock**, unlike `sync_token()`. It changes one staged row by id inside one database transaction, and that transaction is the whole concurrency story. The transaction opens with `BEGIN IMMEDIATE` (`ledger_db::locks::begin`), which holds the write lock of the database file before `apply()` reads the staged row (`load_row()`). Without that lock, two resolves of one row that run at the same time (two tabs, or the ordinary route and a TypeSafe confirmation) both read it as pending, both insert a transaction, and the second UPDATE overwrites the link, so the first transaction is left orphaned. With the lock, the second resolve waits, reads the row as linked, and the already-linked guard refuses it. Do not open this transaction with a plain `BEGIN`: a deferred transaction reads without the lock.
+- **It does not take a session lock**, unlike `sync_token()`. It changes one staged row by id inside one database transaction, and that transaction is the whole concurrency story. The transaction opens with `BEGIN IMMEDIATE` (`Database::transaction`), which holds the write lock of the database file before `apply()` reads the staged row (`load_row()`). Without that lock, two resolves of one row that run at the same time (two tabs, or the ordinary route and a TypeSafe confirmation) both read it as pending, both insert a transaction, and the second UPDATE overwrites the link, so the first transaction is left orphaned. With the lock, the second resolve waits, reads the row as linked, and the already-linked guard refuses it. Do not open this transaction with a plain `BEGIN`: a deferred transaction reads without the lock.
 - **The route checks the action's required field before it loads the row.** `validate_reconcile()` runs on the body first, so the route reports `"transactionId is required for match"` (400) ahead of `"Reconciliation row not found"` (404). `apply()` expects a validated decision: it does not check the field again. The TypeSafe confirmation builds its decision itself, from a stored candidate or proposal, so it must give the id that the action needs.
 - **A bank row that is already linked cannot be linked again** — `match`, `match_update_amount` and `create` all refuse when `matchedTransactionId` is set and `reviewReason` is null. Without it a repeated `create` inserts a second transaction and repoints the link at it, orphaning the first (still marked reconciled, attached to nothing, and invisible to the `stale-unmatched` read, which filters `isReconciled = false`). The `reviewReason` half is load-bearing: the queue is "pending OR flagged for review", `ReconciliationModal` renders those buttons for anything in it, so a row Plaid has since modified is both already-linked and legitimately re-linkable. What stays closed is what the UI cannot reach — `load_row()` matches on id, link and book but not queue membership, so MCP can address a fully-resolved row long after it left the queue.
 - **`unlink` un-reconciles its transaction, but only when nothing else matches it.** Per-link uniqueness is enforced per link, so one transaction can be matched on two links at once — that is how a transfer reconciles against both sides — and an unconditional clear would make a correctly-reconciled transfer a false positive in the health check.
@@ -244,10 +245,42 @@ manual confirmation, evaluation, and retention.
 | `PLAID_SECRET` | Plaid API secret |
 | `PLAID_ENV` | Plaid environment — `sandbox` or `production`. Any other value is rejected |
 | `PLAID_API_URL` | Replaces the origin of the selected environment. The HTTP tests set it to a local mock, so that no test calls Plaid. Leave it unset in a deployment |
+| `PLAID_TOKEN_KEY` | Encrypts the stored access tokens: 32 bytes in base64 (`openssl rand -base64 32`). Required to store a token. See "Access tokens at rest" |
+| `PLAID_TOKEN_KEY_PREVIOUS` | Only while rotating: the old keys, comma-separated |
 | `CRON_SECRET` | Shared secret for cron endpoint auth (also used by recurring cron) |
 
+## Access tokens at rest
+
+`plaid_tokens.access_token` is a live grant to a bank's data, so the database
+holds only its ciphertext. `rust-api/server/src/plaid_token_keys.rs` has the
+cipher (XChaCha20-Poly1305, pure Rust, so it also builds for wasm32), and
+`Plaid::seal_token()` and `Plaid::open_token()` are the only way in and out.
+
+- **Read a token through `open_token()`, with both columns.** The text means
+  nothing without `access_token_key`, the ID of the key that sealed it (eight
+  hex digits of a SHA-256 over the key, never the key). A null key ID means the
+  text is plaintext: a row from before migration 0011, or a seeded demo
+  connection. A query that selects `access_token` alone gets ciphertext.
+- **Write a token through `seal_token()`.** Without `PLAID_TOKEN_KEY` it fails
+  with a message that names the variable, which the routes answer as a 500
+  configuration fault. A link session for a new Item is refused up front for
+  the same reason, so no Item is made at Plaid that the server could not keep.
+  A reconnect (update mode) writes no token, so it works without a key. If the
+  seal fails after the public-token exchange, the Item is removed at Plaid.
+- **The startup step** (`prepare()`, after the migrations) refuses a file whose
+  rows name a key that neither `PLAID_TOKEN_KEY` nor `PLAID_TOKEN_KEY_PREVIOUS`
+  holds. With a key set, it then seals every plaintext row and every row under a
+  previous key with the current key, in one transaction. Without a key it
+  changes nothing and logs a warning for each start while real connections are
+  plaintext. The stdio MCP process runs only the refusal (`check()`).
+- **Backups and dumps carry the ciphertext.** Restoring one needs the key that
+  sealed it. A tool that copies production into a development database must
+  overwrite every token and clear its key ID, so the copy needs no production
+  key.
+- **Never log a key or a token.** The messages name the variable or the key ID.
+
 ## Key Functions
-- `sync_token(state, book_id, token_id)` in `routes/plaid_sync.rs` — Main sync entry point, returns `SyncResult` with counts of added/modified/removed/auto-matched. Serialized per token by `ledger_db::locks::with_session_lock()` (a file lock under `<database>.locks/`), so the scheduled job, the MCP process and a manual click cannot fetch the same Plaid pages twice; the loser gets a 409 refusal rather than waiting. The whole sync therefore runs on one reserved connection
+- `sync_token(state, book_id, token_id)` in `routes/plaid_sync.rs` — Main sync entry point, returns `SyncResult` with counts of added/modified/removed/auto-matched. Serialized per token by a lease (`leases::plaid_sync(token_id)`, a row of `job_leases`), so the scheduled job, the MCP process and a manual click cannot fetch the same Plaid pages twice; the loser gets a 409 refusal rather than waiting. The whole sync therefore runs on one reserved connection
 - `SyncError` — `Refused` carries an HTTP status (404 token not found, 400 invalid config, 409 sync already running); `Failed` carries any other failure
 - `auto_match(connection, analytics, book_id, link_ids)` — Builds the learned payee map from historical matches, then returns the count of successful auto-matches
 - `Plaid::is_configured()` in `plaid.rs` — Checks if all three Plaid env vars are set

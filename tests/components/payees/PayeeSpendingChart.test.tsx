@@ -138,6 +138,20 @@ describe("PayeeSpendingChart", () => {
     expect(await screen.findByText("Could not load spending by month.")).toBeInTheDocument();
   });
 
+  // The card owns the button, so the chart must be in the card. A chart next to the card stays on Hide chart.
+  it("hides the chart with Hide chart, keeps it hidden after a remount, and shows it with Show chart", async () => {
+    vi.stubGlobal("fetch", respond(body));
+    const { unmount } = render(<PayeeSpendingChart bookId="1" payeeId={7} />);
+    await screen.findByRole("img", { name: /^Totals by month/ });
+    fireEvent.click(screen.getByRole("button", { name: "Hide chart" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    unmount();
+    render(<PayeeSpendingChart bookId="1" payeeId={7} />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show chart" }));
+    expect(await screen.findByRole("img", { name: /^Totals by month/ })).toBeInTheDocument();
+  });
+
   it("sends no request while the chart is hidden, and one when it is shown", async () => {
     localStorage.setItem("counterpoise.payeeSpendingChart.hidden", "true");
     const fetchMock = respond(body);

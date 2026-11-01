@@ -52,17 +52,12 @@ export function StaleSyncBanner({
     // load already catches its own errors (best-effort banner); it cannot
     // reject.
     void load();
-    // A sync can match transactions while the page sits open, so re-check
-    // when the user returns to the tab
-    const recheck = () => {
-      if (document.visibilityState === "visible") void load();
-    };
-    window.addEventListener("focus", recheck);
-    document.addEventListener("visibilitychange", recheck);
+    // A sync can match transactions while the page sits open. The page
+    // changes refreshKey after each refresh of its data, and it refreshes on
+    // each change of the book and each return to the tab, so the banner has
+    // no listener of its own: one would load it a second time.
     return () => {
       cancelled = true;
-      window.removeEventListener("focus", recheck);
-      document.removeEventListener("visibilitychange", recheck);
     };
   }, [bookId, refreshKey]); // refreshKey exists only to retrigger the check
 

@@ -74,6 +74,13 @@ fn required(value: bool) -> Required {
     }
 }
 
+fn ok_response(schema: S) -> Response {
+    ResponseBuilder::new()
+        .description("OK")
+        .content(JSON, json_content(schema))
+        .build()
+}
+
 fn operation(op: &Operation) -> utoipa::openapi::path::Operation {
     let mut builder = OperationBuilder::new()
         .operation_id(Some(op.operation_id))
@@ -118,23 +125,25 @@ fn operation(op: &Operation) -> utoipa::openapi::path::Operation {
                 .build(),
         ));
     }
-    let ok = match op.response {
-        [one] => reference(one),
+    builder = match op.response {
+        // A WebSocket: a request that passes answers 101 with no body.
+        [] => builder.response(
+            "101",
+            ResponseBuilder::new()
+                .description(
+                    "Switching Protocols. The WebSocket opens, and the server sends JSON text messages.",
+                )
+                .build(),
+        ),
+        [one] => builder.response("200", ok_response(reference(one))),
         many => {
             let mut one_of = OneOfBuilder::new();
             for name in many {
                 one_of = one_of.item(reference(name));
             }
-            RefOr::T(Schema::OneOf(one_of.build()))
+            builder.response("200", ok_response(RefOr::T(Schema::OneOf(one_of.build()))))
         }
     };
-    builder = builder.response(
-        "200",
-        ResponseBuilder::new()
-            .description("OK")
-            .content(JSON, json_content(ok))
-            .build(),
-    );
     for (status, description) in op.errors {
         builder = builder.response(status.to_string(), error_response(description));
     }

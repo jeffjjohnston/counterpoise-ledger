@@ -43,11 +43,12 @@ describe("text semantics HTTP parity", () => {
   const names = (rows: { name: string }[]) => rows.map((row) => row.name);
 
   it("lists payees in UTF-8 byte order", async () => {
-    for (const name of ["zebra", "Éclair", "apple", "Banana", "Zebra", "A Z", "AB", "eggs"]) {
+    // No two names differ only by ASCII case: the book refuses that (payee case index).
+    for (const name of ["zebra", "Éclair", "apple", "Banana", "Zebu", "A Z", "AB", "eggs"]) {
       await createPayee({ name });
     }
     expect(names(await ok("/api/b/1/payees"))).toEqual(
-      ["A Z", "AB", "Banana", "Zebra", "apple", "eggs", "zebra", "Éclair"],
+      ["A Z", "AB", "Banana", "Zebu", "apple", "eggs", "zebra", "Éclair"],
     );
   });
 

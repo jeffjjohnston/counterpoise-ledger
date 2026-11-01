@@ -11,11 +11,15 @@
 //!
 //! Before the check, the copy gets a floor marker in its transaction change
 //! log (see [`mark_sync_floor`]). The live database does not get it.
+//!
+//! Once a day, the backup also writes a portable dump
+//! (`counterpoise-<UTC time>.json`, [`crate::dump`]), so that the format
+//! that moves the data to a Durable Object is tested on real data first.
 
-use crate::engine::DbPool;
-use sqlx::{
-    ConnectOptions, Connection,
-    sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqliteSynchronous},
+use crate::{
+    Database,
+    store::{Sql, params},
+    sync_floor,
 };
 use std::{
     path::{Path, PathBuf},
@@ -36,12 +40,8 @@ pub struct Snapshot {
     pub problem: Option<String>,
 }
 
-/// The `book_id` of a floor marker in `transaction_changes`. No book has
-/// this ID. A delta cursor below the newest marker is from before a restore.
-pub const SYNC_FLOOR_BOOK_ID: i32 = 0;
-/// The distance from the newest `seq` of a copy to its floor marker. The live
-/// database must log fewer changes than this before the copy is restored.
-const SYNC_FLOOR_GAP: i64 = 1 << 32;
+/// The suffix of a dump ([`daily_dump`]).
+const DUMP: &str = ".json";
 
 /// The suffix of a copy that SQLite still writes or that is not checked yet.
 const PARTIAL: &str = ".partial";
@@ -49,10 +49,15 @@ const PARTIAL: &str = ".partial";
 /// inspection; the prune does not delete it.
 const BAD: &str = ".bad";
 
-/// Writes a backup of the database of `pool` into `dir`, then checks it.
+/// Writes a backup of the file of `database` into `dir`, then checks it.
 /// The file name gives the time in UTC, so that a clock change cannot give
 /// two snapshots the same name (guides/upgrade-to-sqlite.md tells the reader).
-pub async fn snapshot(pool: &DbPool, dir: &Path) -> Result<Snapshot, String> {
+///
+/// The copy runs on a connection of its own, so `database` stays free for
+/// the requests while it runs. It takes seconds on a large file: an async
+/// caller runs it on a blocking thread.
+pub fn snapshot(database: &Database, dir: &Path) -> Result<Snapshot, String> {
+    let live = own_connection(database)?;
     std::fs::create_dir_all(dir)
         .map_err(|cause| format!("cannot create {}: {cause}", dir.display()))?;
     let name = format!("{PREFIX}{}.db", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
@@ -67,59 +72,112 @@ pub async fn snapshot(pool: &DbPool, dir: &Path) -> Result<Snapshot, String> {
         .to_str()
         .ok_or_else(|| format!("{} is not UTF-8", partial.display()))?
         .to_owned();
-    if let Err(cause) = sqlx::query("VACUUM INTO $1")
-        .bind(&target)
-        .execute(pool)
-        .await
-    {
+    let copied = live.execute("VACUUM INTO ?1", &params![target]);
+    drop(live);
+    if let Err(cause) = copied {
         let _ = std::fs::remove_file(&partial);
         return Err(format!("VACUUM INTO failed: {cause}"));
     }
-    if let Err(cause) = mark_sync_floor(&partial).await {
+    if let Err(cause) = mark_sync_floor(&partial) {
         let _ = std::fs::remove_file(&partial);
         return Err(cause);
     }
-    finish(&partial, &path).await
+    finish(&partial, &path)
+}
+
+/// Writes a dump of `database` into `dir` when `dir` has none from today
+/// (UTC) yet. Returns the dump's path and size, or `None` when one exists.
+/// The dump reads one snapshot on a connection of its own, as [`snapshot`]
+/// does.
+pub fn daily_dump(database: &Database, dir: &Path) -> Result<Option<(PathBuf, u64)>, String> {
+    let now = chrono::Utc::now();
+    let today = format!("{PREFIX}{}-", now.format("%Y%m%d"));
+    let entries = std::fs::read_dir(dir)
+        .map_err(|cause| format!("cannot read {}: {cause}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|cause| format!("cannot read {}: {cause}", dir.display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&today) && name.ends_with(DUMP) && is_backup_name(&name) {
+            return Ok(None);
+        }
+    }
+    let path = dir.join(format!("{PREFIX}{}{DUMP}", now.format("%Y%m%d-%H%M%S")));
+    let bytes = write_dump(database, &path)?;
+    Ok(Some((path, bytes)))
+}
+
+/// Writes a dump of `database` at `path`, which must not exist, and returns
+/// its size. The file appears complete or not at all.
+pub fn write_dump(database: &Database, path: &Path) -> Result<u64, String> {
+    let live = own_connection(database)?;
+    let text = live
+        .read_transaction(|tx| crate::dump::dump_json(tx))
+        .map_err(|cause| format!("the dump failed: {cause}"))?;
+    drop(live);
+    // Each writer has its own partial file, made new, so two dumps to the
+    // same name never write into one file. The process id and a counter
+    // tell the writers apart.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let partial = crate::database::sidecar(
+        path,
+        &format!(
+            ".{}-{}{PARTIAL}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+    );
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(&text)?;
+            file.sync_all()
+        });
+    if let Err(cause) = written {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("cannot write {}: {cause}", partial.display()));
+    }
+    if let Err(cause) = crate::database::publish_file(&partial, path) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(cause);
+    }
+    Ok(text.len() as u64)
+}
+
+/// A second connection on the file of `database`.
+fn own_connection(database: &Database) -> Result<Database, String> {
+    let path = database
+        .path()
+        .ok_or("a database in memory has no file to copy")?;
+    Database::open(path, false).map_err(|cause| format!("cannot open {}: {cause}", path.display()))
 }
 
 /// Adds a floor marker to the transaction change log of the copy at `path`,
-/// [`SYNC_FLOOR_GAP`] above its newest `seq`. The next change after a restore
+/// [`sync_floor::GAP`] above its newest `seq`. The next change after a restore
 /// of the copy gets a `seq` above the marker. Every cursor that a native
 /// client got from the live database is below the marker, so the delta route
 /// answers 410 and the client downloads the book again. Without the marker,
 /// the restored log gives again `seq` values that a client already has, and
 /// the client does not see the changes that the restore removed.
-async fn mark_sync_floor(path: &Path) -> Result<(), String> {
-    let fail =
-        |cause: sqlx::Error| format!("cannot mark the sync floor of {}: {cause}", path.display());
-    let mut connection: SqliteConnection = SqliteConnectOptions::new()
-        .filename(path)
-        .journal_mode(SqliteJournalMode::Delete)
-        .synchronous(SqliteSynchronous::Full)
-        .connect()
-        .await
-        .map_err(fail)?;
-    let result = sqlx::query(
-        "INSERT INTO transaction_changes (seq, book_id, transaction_id)
-         SELECT coalesce(max(seq), 0) + $1, $2, 0 FROM transaction_changes",
-    )
-    .bind(SYNC_FLOOR_GAP)
-    .bind(SYNC_FLOOR_BOOK_ID)
-    .execute(&mut connection)
-    .await;
-    let closed = connection.close().await;
-    result.map_err(fail)?;
-    closed.map_err(fail)
+fn mark_sync_floor(path: &Path) -> Result<(), String> {
+    let fail = |cause: crate::store::Error| {
+        format!("cannot mark the sync floor of {}: {cause}", path.display())
+    };
+    let copy = Database::open_copy(path, false).map_err(fail)?;
+    sync_floor::insert(&copy).map_err(fail)
 }
 
 /// Checks the copy at `partial`, syncs it, and gives it the name `path` when
 /// the check passes, else `<path>.bad`. It never replaces a file.
-async fn finish(partial: &Path, path: &Path) -> Result<Snapshot, String> {
+fn finish(partial: &Path, path: &Path) -> Result<Snapshot, String> {
     let bytes = std::fs::metadata(partial)
         .map_err(|cause| format!("cannot read {}: {cause}", partial.display()))?
         .len();
     // A copy that cannot be opened is not verified either.
-    let problem = check(partial).await.unwrap_or_else(Some);
+    let problem = check(partial).unwrap_or_else(Some);
     let path = match problem {
         None => path.to_path_buf(),
         Some(_) => crate::database::sidecar(path, BAD),
@@ -135,18 +193,12 @@ async fn finish(partial: &Path, path: &Path) -> Result<Snapshot, String> {
 
 /// `PRAGMA integrity_check` on the file at `path`, opened read-only. `None`
 /// when the check says `ok`, else its first message.
-pub async fn check(path: &Path) -> Result<Option<String>, String> {
-    let mut connection: SqliteConnection = SqliteConnectOptions::new()
-        .filename(path)
-        .read_only(true)
-        .connect()
-        .await
+pub fn check(path: &Path) -> Result<Option<String>, String> {
+    let copy = Database::open_copy(path, true)
         .map_err(|cause| format!("cannot open {}: {cause}", path.display()))?;
-    let messages: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
-        .fetch_all(&mut connection)
-        .await
+    let messages: Vec<String> = copy
+        .query("PRAGMA integrity_check", &[])
         .map_err(|cause| format!("integrity_check failed: {cause}"))?;
-    let _ = connection.close().await;
     Ok(match messages.as_slice() {
         [ok] if ok == "ok" => None,
         [] => Some("integrity_check returned nothing".to_owned()),
@@ -154,7 +206,8 @@ pub async fn check(path: &Path) -> Result<Option<String>, String> {
     })
 }
 
-/// `counterpoise-YYYYMMDD-HHMMSS.db`, the name of a checked snapshot, or
+/// `counterpoise-YYYYMMDD-HHMMSS.db`, the name of a checked snapshot,
+/// `counterpoise-YYYYMMDD-HHMMSS.json`, the name of a daily dump, or
 /// `counterpoise-YYYYMMDD-HHMMSS.dump`, the name of a dump of the PostgreSQL
 /// scheduler. No other name: not a `.partial` or `.bad` copy, and not the
 /// safety dump of the upgrade (`counterpoise-pre-sqlite-<time>.dump`), which
@@ -162,6 +215,7 @@ pub async fn check(path: &Path) -> Result<Option<String>, String> {
 fn is_backup_name(name: &str) -> bool {
     let Some(stamp) = name.strip_prefix(PREFIX).and_then(|rest| {
         rest.strip_suffix(".db")
+            .or_else(|| rest.strip_suffix(DUMP))
             .or_else(|| rest.strip_suffix(".dump"))
     }) else {
         return false;
@@ -211,22 +265,19 @@ pub fn prune(dir: &Path, days: u64) -> Result<usize, String> {
 
 /// `PRAGMA optimize`: lets SQLite refresh the statistics that the query
 /// planner uses. Cheap when nothing is due.
-pub async fn optimize(pool: &DbPool) -> Result<(), String> {
-    sqlx::query("PRAGMA optimize")
-        .execute(pool)
-        .await
-        .map(|_| ())
+pub fn optimize(database: &Database) -> Result<(), String> {
+    database
+        .exec_batch("PRAGMA optimize")
         .map_err(|cause| format!("PRAGMA optimize failed: {cause}"))
 }
 
 /// `VACUUM`: rebuilds the file, frees unused pages and defragments the
 /// indexes. It replaces the monthly REINDEX of PostgreSQL. It needs the
-/// write lock for its whole run, so writers wait.
-pub async fn vacuum(pool: &DbPool) -> Result<(), String> {
-    sqlx::query("VACUUM")
-        .execute(pool)
-        .await
-        .map(|_| ())
+/// write lock for its whole run, so writers wait. It runs on a connection of
+/// its own, so reads go on; an async caller runs it on a blocking thread.
+pub fn vacuum(database: &Database) -> Result<(), String> {
+    own_connection(database)?
+        .exec_batch("VACUUM")
         .map_err(|cause| format!("VACUUM failed: {cause}"))
 }
 
@@ -235,20 +286,20 @@ mod tests {
     use super::*;
     use crate::testing::TempDatabase;
 
-    #[tokio::test]
-    async fn a_backup_is_a_checked_copy_of_the_rows() {
-        let database = TempDatabase::new(2).await;
+    #[test]
+    fn a_backup_is_a_checked_copy_of_the_rows() {
+        let temp = TempDatabase::new();
+        let database = temp.database();
         let now = chrono::Utc::now().naive_utc();
-        sqlx::query(
-            "INSERT INTO users (username, password_hash, created_at) VALUES ('u', 'h', $1)",
-        )
-        .bind(now)
-        .execute(database.pool())
-        .await
-        .unwrap();
+        database
+            .execute(
+                "INSERT INTO users (username, password_hash, created_at) VALUES ('u', 'h', ?1)",
+                &params![now],
+            )
+            .unwrap();
         let dir = std::env::temp_dir().join(format!("counterpoise-backups-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let snapshot = snapshot(database.pool(), &dir).await.unwrap();
+        let snapshot = snapshot(database, &dir).unwrap();
         assert!(snapshot.verified, "{:?}", snapshot.problem);
         assert!(snapshot.bytes > 0);
         // Only the checked copy is left, with its normal name.
@@ -259,40 +310,33 @@ mod tests {
         assert_eq!(names.len(), 1, "{names:?}");
         assert!(is_backup_name(&names[0]), "{names:?}");
         assert_eq!(dir.join(&names[0]), snapshot.path);
-        let copy = crate::connect(&snapshot.path, false).unwrap();
-        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-            .fetch_one(&copy)
-            .await
-            .unwrap();
+        let copy = Database::open(&snapshot.path, false).unwrap();
+        let users: i64 = copy.query_row("SELECT COUNT(*) FROM users", &[]).unwrap();
         assert_eq!(users, 1);
         // The copy has a floor marker above the newest seq of the live log,
         // and the live log has no new marker.
         let newest = "SELECT max(seq) FROM transaction_changes";
         let markers = "SELECT count(*) FROM transaction_changes WHERE book_id = 0";
-        let live: i64 = sqlx::query_scalar(newest)
-            .fetch_one(database.pool())
-            .await
+        let live: i64 = database.query_row(newest, &[]).unwrap();
+        let floor: i64 = copy
+            .query_row(
+                "SELECT max(seq) FROM transaction_changes WHERE book_id = 0",
+                &[],
+            )
             .unwrap();
-        let floor: i64 =
-            sqlx::query_scalar("SELECT max(seq) FROM transaction_changes WHERE book_id = 0")
-                .fetch_one(&copy)
-                .await
-                .unwrap();
-        assert_eq!(floor, live + SYNC_FLOOR_GAP);
-        let copy_markers: i64 = sqlx::query_scalar(markers).fetch_one(&copy).await.unwrap();
-        let live_markers: i64 = sqlx::query_scalar(markers)
-            .fetch_one(database.pool())
-            .await
-            .unwrap();
+        assert_eq!(floor, live + sync_floor::GAP);
+        let copy_markers: i64 = copy.query_row(markers, &[]).unwrap();
+        let live_markers: i64 = database.query_row(markers, &[]).unwrap();
         assert_eq!((copy_markers, live_markers), (2, 1));
         // The next change after a restore is above the marker.
-        sqlx::query("INSERT INTO transaction_changes (book_id, transaction_id) VALUES (1, 1)")
-            .execute(&copy)
-            .await
-            .unwrap();
-        let next: i64 = sqlx::query_scalar(newest).fetch_one(&copy).await.unwrap();
+        copy.execute(
+            "INSERT INTO transaction_changes (book_id, transaction_id) VALUES (1, 1)",
+            &[],
+        )
+        .unwrap();
+        let next: i64 = copy.query_row(newest, &[]).unwrap();
         assert_eq!(next, floor + 1);
-        copy.close().await;
+        drop(copy);
 
         // A copy with a damaged page fails the check.
         let mut bytes = std::fs::read(&snapshot.path).unwrap();
@@ -302,22 +346,19 @@ mod tests {
         }
         let damaged = dir.join("damaged.db");
         std::fs::write(&damaged, &bytes).unwrap();
-        assert!(
-            check(&damaged)
-                .await
-                .map_or(true, |problem| problem.is_some())
-        );
+        assert!(check(&damaged).map_or(true, |problem| problem.is_some()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A copy that fails its check never gets the normal name: it becomes
     /// `.bad`, and the snapshot says that it is not verified.
-    #[tokio::test]
-    async fn a_copy_that_fails_its_check_is_named_bad() {
-        let database = TempDatabase::new(1).await;
+    #[test]
+    fn a_copy_that_fails_its_check_is_named_bad() {
+        let temp = TempDatabase::new();
+        let database = temp.database();
         let dir = std::env::temp_dir().join(format!("counterpoise-bad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let good = snapshot(database.pool(), &dir).await.unwrap();
+        let good = snapshot(database, &dir).unwrap();
         let mut bytes = std::fs::read(&good.path).unwrap();
         std::fs::remove_file(&good.path).unwrap();
         let page = 4096;
@@ -327,7 +368,7 @@ mod tests {
         let path = dir.join("counterpoise-20250101-000000.db");
         let partial = dir.join("counterpoise-20250101-000000.db.partial");
         std::fs::write(&partial, &bytes).unwrap();
-        let bad = finish(&partial, &path).await.unwrap();
+        let bad = finish(&partial, &path).unwrap();
         assert!(!bad.verified);
         assert!(bad.problem.is_some());
         assert_eq!(bad.path, dir.join("counterpoise-20250101-000000.db.bad"));
@@ -336,11 +377,62 @@ mod tests {
         assert!(!partial.exists());
 
         // A good copy never replaces a file with its name.
-        let good = snapshot(database.pool(), &dir).await.unwrap();
+        let good = snapshot(database, &dir).unwrap();
         std::fs::copy(&good.path, &partial).unwrap();
         std::fs::write(&path, b"keep").unwrap();
-        assert!(finish(&partial, &path).await.is_err());
+        assert!(finish(&partial, &path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_database_in_memory_has_no_snapshot() {
+        let database = Database::open_in_memory().unwrap();
+        assert!(snapshot(&database, &std::env::temp_dir()).is_err());
+    }
+
+    #[test]
+    fn the_daily_dump_is_written_once_a_day() {
+        let temp = TempDatabase::new();
+        let dir = std::env::temp_dir().join(format!("counterpoise-dumps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A dump of another day does not count.
+        std::fs::write(dir.join("counterpoise-20250101-000000.json"), b"{}").unwrap();
+        let (path, bytes) = daily_dump(temp.database(), &dir).unwrap().unwrap();
+        assert!(is_backup_name(&path.file_name().unwrap().to_string_lossy()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.len() as u64, bytes);
+        let dump: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(dump["format"], crate::dump::FORMAT);
+        assert!(daily_dump(temp.database(), &dir).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two dumps to one name: one publishes a whole file, the other fails,
+    /// and neither leaves a partial file behind.
+    #[test]
+    fn concurrent_dumps_to_one_name_never_share_a_file() {
+        let temp = TempDatabase::new();
+        let dir = std::env::temp_dir().join(format!("counterpoise-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counterpoise-20260101-000000.json");
+        let results: Vec<Result<u64, String>> = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| write_dump(temp.database(), &path)))
+                .collect();
+            writers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let dump: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(dump["format"], crate::dump::FORMAT);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["counterpoise-20260101-000000.json"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -353,7 +445,9 @@ mod tests {
         for (name, time) in [
             ("counterpoise-20250101-000000.db", Some(old)),
             ("counterpoise-20250101-000000.dump", Some(old)),
+            ("counterpoise-20250101-000000.json", Some(old)),
             ("counterpoise-20260101-000000.db", None),
+            ("counterpoise-20260101-000000.json", None),
             ("pre-sqlite-upgrade.dump", Some(old)),
             // The safety dump of the v1.50.0 upgrade script, by its real name.
             ("counterpoise-pre-sqlite-20250101-000000.dump", Some(old)),
@@ -372,7 +466,7 @@ mod tests {
                     .unwrap();
             }
         }
-        assert_eq!(prune(&dir, 30).unwrap(), 2);
+        assert_eq!(prune(&dir, 30).unwrap(), 3);
         let mut left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -384,6 +478,7 @@ mod tests {
                 "counterpoise-20250101-000000.db.bad",
                 "counterpoise-20250101-000000.db.partial",
                 "counterpoise-20260101-000000.db",
+                "counterpoise-20260101-000000.json",
                 "counterpoise-pre-sqlite-20250101-000000.dump",
                 "notes.txt",
                 "pre-sqlite-upgrade.dump"

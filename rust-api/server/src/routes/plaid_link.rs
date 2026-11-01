@@ -16,8 +16,11 @@
 
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
+    book_scope::{BookAccess, Owner},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
     plaid::{LinkOutcome, is_configuration_error, is_definitive_error},
+    plaid_token_keys::{MISSING_KEY, Sealed, key_failure},
+    platform,
     routes::sync::{
         DUPLICATE_ITEM, TOKEN_NOT_FOUND, bad_request, database_id, finite_path_id, iso_timestamp,
         refresh_accounts,
@@ -33,9 +36,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::{DateTime, NaiveDateTime, TimeDelta};
-use ledger_db::engine::DbConnection;
+use ledger_db::{
+    Sql,
+    store::{self, params},
+};
 use serde_json::{Value, json};
-use sqlx::FromRow;
 
 /// A session expires four hours after it starts, or when its link token
 /// expires, if that is earlier.
@@ -79,9 +84,9 @@ const SESSION_QUERY: &str = "
     FROM plaid_link_sessions s
     LEFT JOIN plaid_tokens t
            ON t.id = COALESCE(s.result_token_id, s.token_id) AND t.book_id = s.book_id
-    WHERE s.id = $1 AND s.book_id = $2";
+    WHERE s.id = ?1 AND s.book_id = ?2";
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct SessionRow {
     id: i32,
     token_id: Option<i32>,
@@ -123,11 +128,9 @@ async fn load_session(
     session_id: i32,
     failure_message: &'static str,
 ) -> Result<SessionRow, ApiError> {
-    sqlx::query_as(SESSION_QUERY)
-        .bind(session_id)
-        .bind(book_id)
-        .fetch_optional(&state.pool)
-        .await
+    state
+        .database
+        .query_optional(SESSION_QUERY, &params![session_id, book_id])
         .map_err(|cause| internal_error(cause, failure_message))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, SESSION_NOT_FOUND))
 }
@@ -203,20 +206,16 @@ async fn open_session_ids(
     failure_message: &'static str,
 ) -> Result<Vec<i32>, ApiError> {
     let now = now_millis();
-    sqlx::query_scalar(
-        "SELECT id FROM plaid_link_sessions
-         WHERE book_id = $1 AND token_id IS $2 AND status IN ('pending', 'completing')
-           AND ($5 OR expires_at > $3 OR (status = 'completing' AND updated_at >= $4))
+    state
+        .database
+        .query(
+            "SELECT id FROM plaid_link_sessions
+         WHERE book_id = ?1 AND token_id IS ?2 AND status IN ('pending', 'completing')
+           AND (?5 OR expires_at > ?3 OR (status = 'completing' AND updated_at >= ?4))
          ORDER BY id DESC",
-    )
-    .bind(book_id)
-    .bind(token_id)
-    .bind(now)
-    .bind(now - CLAIM_LEASE)
-    .bind(include_expired)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, failure_message))
+            &params![book_id, token_id, now, now - CLAIM_LEASE, include_expired],
+        )
+        .map_err(|cause| internal_error(cause, failure_message))
 }
 
 /// Starts a Hosted Link session, or continues one.
@@ -239,6 +238,7 @@ pub(crate) async fn create_link_session(
     const FAILURE: &str = "Failed to start the bank connection";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Owner, FAILURE).await?;
+    let access = book.owner()?;
     let body = parse_json_body(&body, FAILURE)?;
     let LinkBody { token_id, restart } = validate_link_body(&body)?;
     let token_id = match token_id {
@@ -251,21 +251,39 @@ pub(crate) async fn create_link_session(
     let access_token = match token_id {
         None => None,
         Some(token_id) => {
-            let token: Option<(String, bool)> = sqlx::query_as(
-                "SELECT access_token, is_demo FROM plaid_tokens WHERE id = $1 AND book_id = $2",
-            )
-            .bind(token_id)
-            .bind(book.book_id())
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
+            let token: Option<(String, Option<String>, bool)> = state
+                .database
+                .query_optional(
+                    "SELECT access_token, access_token_key, is_demo FROM plaid_tokens
+                 WHERE id = ?1 AND book_id = ?2",
+                    &params![token_id, book.book_id()],
+                )
+                .map_err(|cause| internal_error(cause, FAILURE))?;
             match token {
                 None => return Err(error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND)),
-                Some((_, true)) => return Err(bad_request(DEMO_TOKEN)),
-                Some((access_token, false)) => Some(access_token),
+                Some((_, _, true)) => return Err(bad_request(DEMO_TOKEN)),
+                Some((stored, key_id, false)) => Some(
+                    state
+                        .plaid
+                        .open_token(&stored, key_id.as_deref())
+                        .map_err(key_failure)?,
+                ),
             }
         }
     };
+
+    // A new Item's access token could not be stored, so no session starts.
+    // Update mode keeps the stored token and writes none.
+    if token_id.is_none()
+        && state
+            .plaid
+            .token_keys()
+            .map_err(key_failure)?
+            .current_id()
+            .is_none()
+    {
+        return Err(key_failure(MISSING_KEY.to_owned()));
+    }
 
     // The user can have finished an open session at Plaid. A failure here
     // does not stop the request: the session stays as it is, and the log
@@ -281,7 +299,7 @@ pub(crate) async fn create_link_session(
         let Ok(session) = load_session(&state, book.book_id(), session_id, FAILURE).await else {
             continue;
         };
-        if let Err(cause) = advance_session(&state, book.book_id(), &session, FAILURE).await {
+        if let Err(cause) = advance_session(&state, &access, &session, FAILURE).await {
             tracing::warn!(
                 session_id,
                 error = %cause.message(),
@@ -341,78 +359,69 @@ pub(crate) async fn create_link_session(
     {
         expires_at = expires_at.min(expiration);
     }
-    let database = |cause| internal_error(cause, FAILURE);
-    sqlx::query("DELETE FROM plaid_link_sessions WHERE expires_at < $1")
-        .bind(now - SESSION_RETENTION)
-        .execute(&state.pool)
-        .await
+    fn database(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
+    state
+        .database
+        .execute(
+            "DELETE FROM plaid_link_sessions WHERE expires_at < ?1",
+            &params![now - SESSION_RETENTION],
+        )
         .map_err(database)?;
     // The checks above ran without the write lock, so another request can
     // have started a session for this connection since then (two tabs that
     // start at the same time). Thus this transaction, which holds the write
     // lock, looks at the open sessions again before it inserts.
-    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
-        .await
+    let session_id = state
+        .database
+        .transaction(|tx| {
+            // A restart stops the pending sessions and the stale claims. It
+            // does not stop a live claim: that request exchanges a result
+            // that the user finished at Plaid, and it completes the session.
+            // The open sessions stop only after Plaid gave the new one, so a
+            // failed start leaves them open.
+            if restart {
+                tx.execute(
+                    "UPDATE plaid_link_sessions SET status = 'expired', updated_at = ?3
+                     WHERE book_id = ?1 AND token_id IS ?2
+                       AND (status = 'pending' OR (status = 'completing' AND updated_at < ?4))",
+                    &params![book.book_id(), token_id, now, now - CLAIM_LEASE],
+                )?;
+            }
+            // Without `restart`, an open session is continued. After a
+            // restart, the only open session can be a live claim, and the
+            // route answers it: the client polls it and sees the saved
+            // connection. In both cases the route inserts nothing. The new
+            // link token is not used, and it expires at Plaid.
+            let open: Option<i32> = tx.query_optional(
+                "SELECT id FROM plaid_link_sessions
+                 WHERE book_id = ?1 AND token_id IS ?2 AND status IN ('pending', 'completing')
+                   AND (expires_at > ?3 OR (status = 'completing' AND updated_at >= ?4))
+                 ORDER BY id DESC LIMIT 1",
+                &params![book.book_id(), token_id, now, now - CLAIM_LEASE],
+            )?;
+            if let Some(session_id) = open {
+                return Ok(session_id);
+            }
+            tx.query_row::<i32>(
+                "INSERT INTO plaid_link_sessions
+                   (book_id, user_id, token_id, link_token, hosted_link_url, status, expires_at,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7)
+                 RETURNING id",
+                &params![
+                    book.book_id(),
+                    book.user_id(),
+                    token_id,
+                    &link.link_token,
+                    &link.hosted_link_url,
+                    expires_at,
+                    now
+                ],
+            )
+        })
         .map_err(database)?;
-    // A restart stops the pending sessions and the stale claims. It does not
-    // stop a live claim: that request exchanges a result that the user
-    // finished at Plaid, and it completes the session. The open sessions stop
-    // only after Plaid gave the new one, so a failed start leaves them open.
-    if restart {
-        sqlx::query(
-            "UPDATE plaid_link_sessions SET status = 'expired', updated_at = $3
-             WHERE book_id = $1 AND token_id IS $2
-               AND (status = 'pending' OR (status = 'completing' AND updated_at < $4))",
-        )
-        .bind(book.book_id())
-        .bind(token_id)
-        .bind(now)
-        .bind(now - CLAIM_LEASE)
-        .execute(transaction.as_mut())
-        .await
-        .map_err(database)?;
-    }
-    // Without `restart`, an open session is continued. After a restart, the
-    // only open session can be a live claim, and the route answers it: the
-    // client polls it and sees the saved connection. In both cases the route
-    // inserts nothing. The new link token is not used, and it expires at
-    // Plaid.
-    let open: Option<i32> = sqlx::query_scalar(
-        "SELECT id FROM plaid_link_sessions
-         WHERE book_id = $1 AND token_id IS $2 AND status IN ('pending', 'completing')
-           AND (expires_at > $3 OR (status = 'completing' AND updated_at >= $4))
-         ORDER BY id DESC LIMIT 1",
-    )
-    .bind(book.book_id())
-    .bind(token_id)
-    .bind(now)
-    .bind(now - CLAIM_LEASE)
-    .fetch_optional(transaction.as_mut())
-    .await
-    .map_err(database)?;
-    if let Some(session_id) = open {
-        transaction.commit().await.map_err(database)?;
-        let session = load_session(&state, book.book_id(), session_id, FAILURE).await?;
-        return Ok(Json(session_body(&session)));
-    }
-    let session_id: i32 = sqlx::query_scalar(
-        "INSERT INTO plaid_link_sessions
-           (book_id, user_id, token_id, link_token, hosted_link_url, status, expires_at,
-            created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $7)
-         RETURNING id",
-    )
-    .bind(book.book_id())
-    .bind(book.user_id())
-    .bind(token_id)
-    .bind(&link.link_token)
-    .bind(&link.hosted_link_url)
-    .bind(expires_at)
-    .bind(now)
-    .fetch_one(transaction.as_mut())
-    .await
-    .map_err(database)?;
-    transaction.commit().await.map_err(database)?;
     let session = load_session(&state, book.book_id(), session_id, FAILURE).await?;
     Ok(Json(session_body(&session)))
 }
@@ -428,12 +437,13 @@ pub(crate) async fn check_link_session(
     const FAILURE: &str = "Failed to check the bank connection";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Owner, FAILURE).await?;
+    let access = book.owner()?;
     let session_id = database_id(finite_path_id(&raw_id, INVALID_SESSION_ID)?, FAILURE)?;
     let session = load_session(&state, book.book_id(), session_id, FAILURE).await?;
     if !session.is_open() {
         return Ok(Json(session_body(&session)));
     }
-    advance_session(&state, book.book_id(), &session, FAILURE).await?;
+    advance_session(&state, &access, &session, FAILURE).await?;
     let session = load_session(&state, book.book_id(), session_id, FAILURE).await?;
     Ok(Json(session_body(&session)))
 }
@@ -463,7 +473,7 @@ pub(crate) async fn check_link_session(
 /// when the claim still holds (`save_new_item`).
 async fn advance_session(
     state: &AppState,
-    book_id: i32,
+    access: &BookAccess<'_, Owner>,
     session: &SessionRow,
     failure_message: &'static str,
 ) -> Result<(), ApiError> {
@@ -475,18 +485,16 @@ async fn advance_session(
     let stale_before = now - CLAIM_LEASE;
     let expired = session.expires_at <= now;
     let expire = || async {
-        sqlx::query(
-            "UPDATE plaid_link_sessions SET status = 'expired', updated_at = $2
-             WHERE id = $1
-               AND (status = 'pending' OR (status = 'completing' AND updated_at < $3))",
-        )
-        .bind(session_id)
-        .bind(now)
-        .bind(stale_before)
-        .execute(&state.pool)
-        .await
-        .map(|_| ())
-        .map_err(|cause| internal_error(cause, failure_message))
+        state
+            .database
+            .execute(
+                "UPDATE plaid_link_sessions SET status = 'expired', updated_at = ?2
+             WHERE id = ?1
+               AND (status = 'pending' OR (status = 'completing' AND updated_at < ?3))",
+                &params![session_id, now, stale_before],
+            )
+            .map(|_| ())
+            .map_err(|cause| internal_error(cause, failure_message))
     };
     // Another request holds the claim and completes the session.
     if session.status == "completing" && session.updated_at >= stale_before {
@@ -523,18 +531,16 @@ async fn advance_session(
     // loses the claim answers the state that the winner wrote. One statement
     // takes a stale claim again, so two requests that both see it stale
     // cannot both win.
-    let claimed: Option<i32> = sqlx::query_scalar(
-        "UPDATE plaid_link_sessions SET status = 'completing', updated_at = $2
-         WHERE id = $1
-           AND (status = 'pending' OR (status = 'completing' AND updated_at < $3))
+    let claimed: Option<i32> = state
+        .database
+        .query_optional(
+            "UPDATE plaid_link_sessions SET status = 'completing', updated_at = ?2
+         WHERE id = ?1
+           AND (status = 'pending' OR (status = 'completing' AND updated_at < ?3))
          RETURNING id",
-    )
-    .bind(session_id)
-    .bind(now)
-    .bind(stale_before)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, failure_message))?;
+            &params![session_id, now, stale_before],
+        )
+        .map_err(|cause| internal_error(cause, failure_message))?;
     if claimed.is_none() {
         return Ok(());
     }
@@ -542,7 +548,7 @@ async fn advance_session(
         (None, Some((public_token, institution))) => {
             complete_new_item(
                 state,
-                book_id,
+                access,
                 session_id,
                 &public_token,
                 institution,
@@ -550,37 +556,29 @@ async fn advance_session(
             )
             .await
         }
-        (Some(token_id), _) => complete_update(state, book_id, session_id, token_id).await,
+        (Some(token_id), _) => complete_update(state, access, session_id, token_id).await,
         (None, None) => unreachable!("a new item has a public token"),
     }
 }
 
 /// Gives the claim back, so that a later check tries again.
 async fn release_claim(state: &AppState, session_id: i32) {
-    if let Err(cause) = sqlx::query(
-        "UPDATE plaid_link_sessions SET status = 'pending', updated_at = $2
-         WHERE id = $1 AND status = 'completing'",
-    )
-    .bind(session_id)
-    .bind(now_millis())
-    .execute(&state.pool)
-    .await
-    {
+    if let Err(cause) = state.database.execute(
+        "UPDATE plaid_link_sessions SET status = 'pending', updated_at = ?2
+         WHERE id = ?1 AND status = 'completing'",
+        &params![session_id, now_millis()],
+    ) {
         tracing::error!(error = %cause, session_id, "Could not release a Plaid link session");
     }
 }
 
 /// Expires a claimed session whose result cannot be saved any more.
 async fn expire_claim(state: &AppState, session_id: i32) {
-    if let Err(cause) = sqlx::query(
-        "UPDATE plaid_link_sessions SET status = 'expired', updated_at = $2
-         WHERE id = $1 AND status = 'completing'",
-    )
-    .bind(session_id)
-    .bind(now_millis())
-    .execute(&state.pool)
-    .await
-    {
+    if let Err(cause) = state.database.execute(
+        "UPDATE plaid_link_sessions SET status = 'expired', updated_at = ?2
+         WHERE id = ?1 AND status = 'completing'",
+        &params![session_id, now_millis()],
+    ) {
         tracing::error!(error = %cause, session_id, "Could not expire a Plaid link session");
     }
 }
@@ -589,16 +587,11 @@ async fn expire_claim(state: &AppState, session_id: i32) {
 /// exchanged again, so the session stops. Only a claim changes: a session
 /// that a restart expired stays expired.
 async fn fail_session(state: &AppState, session_id: i32, message: &str) {
-    if let Err(cause) = sqlx::query(
-        "UPDATE plaid_link_sessions SET status = 'failed', error = $2, updated_at = $3
-         WHERE id = $1 AND status = 'completing'",
-    )
-    .bind(session_id)
-    .bind(message)
-    .bind(now_millis())
-    .execute(&state.pool)
-    .await
-    {
+    if let Err(cause) = state.database.execute(
+        "UPDATE plaid_link_sessions SET status = 'failed', error = ?2, updated_at = ?3
+         WHERE id = ?1 AND status = 'completing'",
+        &params![session_id, message, now_millis()],
+    ) {
         tracing::error!(error = %cause, session_id, "Could not record a failed Plaid link session");
     }
 }
@@ -611,7 +604,7 @@ async fn fail_session(state: &AppState, session_id: i32, message: &str) {
 /// expires the session: its public token does not become valid again.
 async fn complete_new_item(
     state: &AppState,
-    book_id: i32,
+    access: &BookAccess<'_, Owner>,
     session_id: i32,
     public_token: &str,
     institution: Option<String>,
@@ -630,6 +623,18 @@ async fn complete_new_item(
         }
     };
     let institution = institution.unwrap_or_else(|| UNNAMED_INSTITUTION.to_owned());
+    // Only the ciphertext is stored. A token that cannot be sealed is not
+    // kept, so its Item ends at Plaid too, as for a failed save below.
+    let sealed = match state.plaid.seal_token(&access_token) {
+        Ok(sealed) => sealed,
+        Err(message) => {
+            if let Err(removal) = state.plaid.remove_item(&access_token).await {
+                tracing::error!(error = %removal, session_id, "Could not remove the Plaid Item of an unsaved connection");
+            }
+            fail_session(state, session_id, SAVE_FAILED).await;
+            return Err(key_failure(message));
+        }
+    };
 
     // From here, the public token is used: this access token is the only
     // one. A database failure (for example a lock that another writer holds
@@ -637,19 +642,11 @@ async fn complete_new_item(
     // transaction, so a failed try writes nothing.
     let mut attempt = 1;
     let saved = loop {
-        let result = save_new_item(
-            state,
-            book_id,
-            session_id,
-            &institution,
-            &item_id,
-            &access_token,
-        )
-        .await;
+        let result = save_new_item(state, access, session_id, &institution, &item_id, &sealed);
         match result {
             Err(cause) if attempt < SAVE_ATTEMPTS => {
                 tracing::warn!(error = %cause, session_id, attempt, "Could not save a Plaid connection; trying again");
-                tokio::time::sleep(SAVE_RETRY_DELAY).await;
+                platform::sleep(SAVE_RETRY_DELAY).await;
                 attempt += 1;
             }
             result => break result,
@@ -666,11 +663,10 @@ async fn complete_new_item(
             // An Item that a book of this installation has stored (Item IDs
             // are unique across it) is a duplicate: it must stay at Plaid,
             // because that connection uses it.
-            let stored: Result<bool, sqlx::Error> =
-                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE item_id = $1)")
-                    .bind(&item_id)
-                    .fetch_one(&state.pool)
-                    .await;
+            let stored: Result<bool, ledger_db::store::Error> = state.database.query_row(
+                "SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE item_id = ?1)",
+                &params![&item_id],
+            );
             match stored {
                 Ok(true) => {
                     fail_session(state, session_id, DUPLICATE_ITEM).await;
@@ -695,7 +691,7 @@ async fn complete_new_item(
     };
     // The connection is saved. The owner can load the accounts again from
     // the connections page, so a failure here does not fail the session.
-    if let Err(message) = refresh_accounts(state, book_id, token_id, &access_token, false).await {
+    if let Err(message) = refresh_accounts(state, access, token_id, &access_token, false).await {
         tracing::error!(error = %message, session_id, "Plaid account load after a new connection failed");
     }
     Ok(())
@@ -715,63 +711,57 @@ async fn complete_new_item(
 /// have to sign in to the bank again. To write `complete` over the other
 /// state would undo a decision of the other request. With this choice the
 /// bank data stays, and each session state comes from one request.
-async fn save_new_item(
+fn save_new_item(
     state: &AppState,
-    book_id: i32,
+    access: &BookAccess<'_, Owner>,
     session_id: i32,
     institution: &str,
     item_id: &str,
-    access_token: &str,
-) -> Result<Option<i32>, sqlx::Error> {
+    access_token: &Sealed,
+) -> Result<Option<i32>, store::Error> {
+    let book_id = access.book_id();
     let now = now_millis();
-    let mut transaction = ledger_db::locks::begin_pool(&state.pool).await?;
-    let duplicate: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE book_id = $1 AND item_id = $2)",
-    )
-    .bind(book_id)
-    .bind(item_id)
-    .fetch_one(transaction.as_mut())
-    .await?;
-    if duplicate {
-        return Ok(None);
-    }
-    let token_id: i32 = sqlx::query_scalar(
-        "INSERT INTO plaid_tokens
-           (financial_institution, item_id, access_token, book_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $5) RETURNING id",
-    )
-    .bind(institution)
-    .bind(item_id)
-    .bind(access_token)
-    .bind(book_id)
-    .bind(now)
-    .fetch_one(transaction.as_mut())
-    .await?;
-    complete_claimed_session(transaction.as_mut(), session_id, token_id, now).await?;
-    transaction.commit().await?;
-    Ok(Some(token_id))
+    state.database.transaction(|tx| {
+        let duplicate: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE book_id = ?1 AND item_id = ?2)",
+            &params![book_id, item_id],
+        )?;
+        if duplicate {
+            return Ok(None);
+        }
+        let token_id: i32 = tx.query_row(
+            "INSERT INTO plaid_tokens
+               (financial_institution, item_id, access_token, access_token_key, book_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) RETURNING id",
+            &params![
+                institution,
+                item_id,
+                &access_token.text,
+                &access_token.key_id,
+                book_id,
+                now
+            ],
+        )?;
+        complete_claimed_session(tx, session_id, token_id, now)?;
+        Ok(Some(token_id))
+    })
 }
 
 /// Makes a claimed session `complete`, inside the transaction that writes its
 /// connection. When the session is no longer `completing`, it changes
 /// nothing and logs it; `save_new_item` gives the reason.
-async fn complete_claimed_session(
-    connection: &mut DbConnection,
+fn complete_claimed_session(
+    tx: &impl Sql,
     session_id: i32,
     token_id: i32,
     now: NaiveDateTime,
-) -> Result<(), sqlx::Error> {
-    let completed = sqlx::query(
+) -> Result<(), store::Error> {
+    let completed = tx.execute(
         "UPDATE plaid_link_sessions
-         SET status = 'complete', result_token_id = $2, completed_at = $3, updated_at = $3
-         WHERE id = $1 AND status = 'completing'",
-    )
-    .bind(session_id)
-    .bind(token_id)
-    .bind(now)
-    .execute(connection)
-    .await?
-    .rows_affected();
+         SET status = 'complete', result_token_id = ?2, completed_at = ?3, updated_at = ?3
+         WHERE id = ?1 AND status = 'completing'",
+        &params![session_id, token_id, now],
+    )?;
     if completed == 0 {
         tracing::warn!(
             session_id,
@@ -790,28 +780,22 @@ async fn complete_claimed_session(
 /// not true any more.
 async fn complete_update(
     state: &AppState,
-    book_id: i32,
+    access: &BookAccess<'_, Owner>,
     session_id: i32,
     token_id: i32,
 ) -> Result<(), ApiError> {
+    let book_id = access.book_id();
     const FAILURE: &str = "Failed to check the bank connection";
     let now = now_millis();
-    let written: Result<Option<String>, sqlx::Error> = async {
-        let mut transaction = ledger_db::locks::begin_pool(&state.pool).await?;
-        let access_token: Option<String> = sqlx::query_scalar(
-            "UPDATE plaid_tokens SET last_error = NULL, updated_at = $3
-             WHERE id = $1 AND book_id = $2 RETURNING access_token",
-        )
-        .bind(token_id)
-        .bind(book_id)
-        .bind(now)
-        .fetch_optional(transaction.as_mut())
-        .await?;
-        complete_claimed_session(transaction.as_mut(), session_id, token_id, now).await?;
-        transaction.commit().await?;
-        Ok(access_token)
-    }
-    .await;
+    let written = state.database.transaction(|tx| {
+        let access_token: Option<(String, Option<String>)> = tx.query_optional(
+            "UPDATE plaid_tokens SET last_error = NULL, updated_at = ?3
+             WHERE id = ?1 AND book_id = ?2 RETURNING access_token, access_token_key",
+            &params![token_id, book_id, now],
+        )?;
+        complete_claimed_session(tx, session_id, token_id, now)?;
+        Ok::<_, store::Error>(access_token)
+    });
     let access_token = match written {
         Ok(access_token) => access_token,
         Err(cause) => {
@@ -820,9 +804,14 @@ async fn complete_update(
         }
     };
     // The session cascades with its connection, so the row is there.
-    if let Some(access_token) = access_token
-        && let Err(message) = refresh_accounts(state, book_id, token_id, &access_token, false).await
-    {
+    let Some((stored, key_id)) = access_token else {
+        return Ok(());
+    };
+    let refreshed = match state.plaid.open_token(&stored, key_id.as_deref()) {
+        Ok(access_token) => refresh_accounts(state, access, token_id, &access_token, false).await,
+        Err(message) => Err(message),
+    };
+    if let Err(message) = refreshed {
         tracing::error!(error = %message, session_id, "Plaid account load after a reconnect failed");
     }
     Ok(())

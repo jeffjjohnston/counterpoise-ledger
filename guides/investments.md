@@ -136,13 +136,13 @@ pair from its splits sidesteps that question entirely.
 The rows that the rebuild inserts are computed from its read of the pair's
 splits, so the read must be protected too. Two concurrent rebuilds of the same
 pair must not each read a stale view and then both write from it. The
-protection is the write transaction: every caller passes a connection inside
-a transaction that `ledger_db::locks::begin` opened with `BEGIN IMMEDIATE`.
-That transaction holds the write lock of the database file from its first
+protection is the write transaction: every caller runs the rebuild inside a
+transaction that opened with `BEGIN IMMEDIATE`, a `Database::transaction`
+of the synchronous API. That
+transaction holds the write lock of the database file from its first
 statement until it commits, so no other writer runs between the read and the
-inserts. The rebuild still calls `lock_transaction(LotPair)` first; on SQLite
-that call adds nothing. A caller that runs the rebuild outside such a
-transaction gets no protection across its statements.
+inserts. A caller that runs the rebuild outside such a transaction gets no
+protection across its statements.
 
 The lot backfill (`backfill_lots()`, run by the server at startup after the
 migrations, and by `ledger-cli rebuild-lots`, guarded — see the Critical Files
@@ -188,11 +188,15 @@ from the rebuild alone.
 ### The lot rebuild
 
 `rust-api/db/src/lots.rs` holds `rebuild_lots()`, `rebuild_lots_for_pairs()`,
-`find_all_lot_pairs()`, `collect_affected_pairs()`, and `backfill_lots()`.
+`find_all_lot_pairs()`, `collect_affected_pairs()`, `backfill_lots()` and
+`rebuild_lots_step()`. The last is the backfill in steps, for a Durable
+Object, whose events have a time limit: the scheduler's lot-rebuild job
+keeps where the next step starts in its slot's cursor, because the guard
+(`lots_missing()`) reads a half-done rebuild as done.
 The rules above apply to each: the caller passes a connection inside a
 `BEGIN IMMEDIATE` transaction, and the backfill is one transaction for every
-book. The rebuild evaluates the effective date with `cp_today()`, which is
-today in the app's `TZ`.
+book. The rebuild evaluates the effective date with `EFFECTIVE_DATE`, which
+puts in today in the app's zone (`ledger_db::clock`).
 
 `ledger-cli rebuild-lots [--force]` (`npm run db:rebuild-lots`) runs the
 backfill and exits 1 on failure. An update collects the pairs before and

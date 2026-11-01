@@ -93,13 +93,17 @@ export default defineConfig(({ mode }) => {
       "process.env.NEXT_PUBLIC_POSTHOG_KEY": inline(env.NEXT_PUBLIC_POSTHOG_KEY),
       "process.env.NEXT_PUBLIC_POSTHOG_HOST": inline(env.NEXT_PUBLIC_POSTHOG_HOST),
       "process.env.NEXT_PUBLIC_APP_VERSION": JSON.stringify(packageJson.version),
+      // The deploy sets it, so that an open page sees a new commit of the
+      // same version (client/version-check.ts).
+      "process.env.NEXT_PUBLIC_BUILD_COMMIT": inline(env.NEXT_PUBLIC_BUILD_COMMIT),
     },
     server: {
       port: 3000,
       strictPort: true,
       // Keep the browser's Host header. The cross-origin write check of the
-      // Rust server compares it with the Origin.
-      proxy: { "/api": { target: rustApiTarget(mode, process.cwd()), changeOrigin: false } },
+      // Rust server compares it with the Origin. `ws` passes the upgrade of
+      // the book socket through.
+      proxy: { "/api": { target: rustApiTarget(mode, process.cwd()), changeOrigin: false, ws: true } },
     },
     build: {
       outDir: "build",

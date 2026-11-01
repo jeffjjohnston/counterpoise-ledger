@@ -201,6 +201,8 @@ if [[ $CREATE_PR == 0 ]]; then
 fi
 
 echo "==> Creating PR to main..."
+# The list is the commits that the release adds to main, so it starts at
+# origin/main. No step moves the local main, so it can be far behind.
 # NO APOSTROPHES IN THE BODY BELOW. It is a heredoc inside a command
 # substitution inside another command substitution, and bash scans that
 # nesting for quote pairs before it recognises the heredoc: a lone ' in the
@@ -214,7 +216,7 @@ PR_URL=$(gh pr create \
 ## Release $NEW_VERSION
 
 ### Changes since last release
-$(git log $(git describe --tags --abbrev=0 main 2>/dev/null || echo main)..$RELEASE_BRANCH --oneline --no-decorate | head -30)
+$(git log origin/main..$RELEASE_BRANCH --oneline --no-decorate | head -30)
 
 ---
 *Created by \`scripts/release.sh\`*

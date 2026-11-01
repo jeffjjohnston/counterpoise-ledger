@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { summarizeTypeSafe } from "@/lib/typesafe/report";
+import { summarizeEntries, summarizeTypeSafe, type EntryEvaluation, type EntryOutcome } from "@/lib/typesafe/report";
 import type { TypeSafeDecision as Decision, TypeSafeEvaluation as Evaluation } from "@/types/db";
 
 const pick = (choice: string) => ({ choice, probabilities: { [choice]: 1 }, confidence: 1 });
@@ -137,9 +137,16 @@ interface History {
   evaluations: FixtureEvaluation[];
   decisions: FixtureDecision[];
 }
+interface EntryCase {
+  name: string;
+  evaluations: EntryEvaluation[];
+  outcomes: EntryOutcome[];
+  expected: Record<string, number>;
+}
 interface Fixture {
   snapshots: Record<string, Evaluation["snapshot"]>;
   cases: (History & Outcome)[];
+  entryCases: EntryCase[];
 }
 
 const fixture = JSON.parse(
@@ -192,4 +199,14 @@ function expectOutcome(history: History, outcome: Outcome) {
 
 describe("summarizeTypeSafe on the shared hand-worked cases", () => {
   it.each(fixture.cases)("$name", (testCase) => expectOutcome(testCase, testCase));
+});
+
+describe("entry summary", () => {
+  it("has entry cases", () => expect(fixture.entryCases.length).toBeGreaterThan(0));
+  for (const entryCase of fixture.entryCases) {
+    it(entryCase.name, () => {
+      expect(JSON.stringify(summarizeEntries(entryCase.evaluations, entryCase.outcomes)))
+        .toBe(JSON.stringify(entryCase.expected));
+    });
+  }
 });

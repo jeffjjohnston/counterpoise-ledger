@@ -37,10 +37,11 @@ export function ChartCard({ storageKey, title = "Chart", actions, children }: {
   }
 
   return (
-    <section className="bg-surface rounded-lg border border-border shadow-soft p-4">
+    // A hidden chart leaves only its header row, with less padding, so that it takes little height.
+    <section className={`bg-surface rounded-lg border border-border shadow-soft px-4 ${hidden ? "py-2" : "py-4"}`}>
       {/* On a narrow screen, the actions go to a second line. If they are still too wide, each group
           moves to its own line. Each group keeps its labels whole. */}
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+      <div className={`flex flex-wrap items-center justify-between gap-x-3 gap-y-2${hidden ? "" : " mb-2"}`}>
         <h2 className="text-sm font-medium text-fg-tertiary">{title}</h2>
         <div className="ml-auto flex flex-wrap items-center justify-end gap-x-3 gap-y-1">
           {!hidden && actions}

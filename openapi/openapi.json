@@ -3,7 +3,7 @@
   "info": {
     "title": "Counterpoise API",
     "description": "The routes a native client uses. Money is integer cents. Shares and prices are integer micros, except that fetchTiingoPrices returns prices as decimal dollars. Dates are YYYY-MM-DD strings.",
-    "version": "1.54.0",
+    "version": "1.60.2",
     "x-api-contract": 1
   },
   "servers": [
@@ -1313,6 +1313,58 @@
           },
           "410": {
             "description": "The cursor is not usable: it is newer than the change log, the database was restored from a snapshot after the cursor was given, or more than 5000 transactions changed after it. Download all transactions again in full mode.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error. The body carries a message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          }
+        ]
+      }
+    },
+    "/api/b/{bookId}/socket": {
+      "get": {
+        "tags": [
+          "live"
+        ],
+        "summary": "Live updates: a WebSocket that names the tables of the book that change. A generated client cannot use it; read it with a WebSocket client.",
+        "operationId": "openBookSocket",
+        "parameters": [
+          {
+            "name": "bookId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching Protocols. The WebSocket opens, and the server sends JSON text messages."
+          },
+          "403": {
+            "description": "A cookie sent from another origin (\"Cross-origin request rejected\").",
             "content": {
               "application/json": {
                 "schema": {
@@ -6146,6 +6198,10 @@
           "apiContract": {
             "type": "integer",
             "description": "Increases on a breaking change to this contract."
+          },
+          "commit": {
+            "type": "string",
+            "description": "The commit of the deploy, when the deploy names one. Commits between releases share a version."
           }
         }
       }

@@ -1,4 +1,4 @@
-type Picks = Partial<Record<"match" | "payee" | "category", string>>;
+type Picks = Partial<Record<"match" | "payee" | "category" | "pattern", string>>;
 
 /**
  * A valid TypeSafe reply for every question in the request that `init` sent.

@@ -2,9 +2,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createHash, randomBytes } from "node:crypto";
 import { hashPassword } from "../helpers/password";
 import { generateApiKey, hashApiKey } from "../helpers/api-keys";
-import { resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
+import { addBookMember, createBook, createUser, resetTestDatabase, setupTestDatabase } from "../helpers/db-utils";
 import { count, exec, insert, scalar } from "../helpers/sql";
-import { startHttpTestServer } from "../helpers/http-parity";
+import { onWorker, startHttpTestServer } from "../helpers/http-parity";
 
 describe("auth HTTP parity", () => {
   let baseUrl: string;
@@ -43,6 +43,34 @@ describe("auth HTTP parity", () => {
     expect(await logout.json()).toEqual({ success: true });
     expect((await request("/api/auth/me", { headers: { cookie: cookie! } })).status).toBe(401);
   });
+
+  it("marks the login cookie Secure, HttpOnly and SameSite", async () => {
+    await exec("UPDATE users SET password_hash = $1 WHERE id = $2", [await hashPassword("password123"), 1]);
+    const login = await request("/api/auth/login", json("POST", { username: "testuser", password: "password123" }));
+    expect(login.status).toBe(200);
+    const setCookie = login.headers.get("set-cookie")!;
+    expect(setCookie).toContain("; Secure");
+    expect(setCookie).toContain("; HttpOnly");
+    expect(setCookie).toMatch(/; SameSite=lax/i);
+  });
+
+  // A deployed Worker sets no NODE_ENV, and the suite's Worker gets none
+  // either. Whatever NODE_ENV says, the Worker's cookie is Secure; only the
+  // native server leaves Secure off outside production, for plain-HTTP
+  // development.
+  it("leaves Secure off only on the native server outside production", async () => {
+    const other = await startHttpTestServer({ REGISTRATION_ENABLED: "true", NODE_ENV: "development" });
+    try {
+      const registered = await fetch(`${other.baseUrl}/api/auth/register`, json("POST", { username: "devuser", password: "password123" }));
+      expect(registered.status).toBe(200);
+      const setCookie = registered.headers.get("set-cookie")!;
+      expect(setCookie).toContain("; HttpOnly");
+      if (onWorker) expect(setCookie).toContain("; Secure");
+      else expect(setCookie).not.toContain("; Secure");
+    } finally {
+      await other.stop();
+    }
+  }, 120_000);
 
   it("authenticates an existing Node password hash and keeps cookie-only credential routes", async () => {
     await exec("UPDATE users SET password_hash = $1 WHERE id = $2", [await hashPassword("oldpassword"), 1]);
@@ -85,6 +113,63 @@ describe("auth HTTP parity", () => {
     expect(await count("sessions")).toBe(1);
   });
 
+  it("gives an API key the book role of its user", async () => {
+    const viewer = await createUser({ username: "viewer" });
+    await addBookMember({ bookId: 1, userId: viewer.id, role: "viewer" });
+    const other = await createBook({ name: "Other" });
+    const key = generateApiKey();
+    await insert("api_keys", { userId: viewer.id, name: "Viewer", keyHash: await hashApiKey(key), keyPrefix: key.slice(0, 8) });
+    const asViewer = (path: string, init: RequestInit = {}) =>
+      request(path, { ...init, headers: { ...init.headers, authorization: `Bearer ${key}` } });
+
+    const read = await asViewer("/api/b/1/accounts");
+    expect([read.status, await read.json()]).toEqual([200, []]);
+    const write = await asViewer("/api/b/1/accounts", json("POST", { name: "Denied", type: "asset" }));
+    expect([write.status, await write.json()]).toEqual([403, { error: "You have read-only access to this book" }]);
+    const ownerOnly = await asViewer("/api/books/1", json("PUT", { name: "Denied" }));
+    expect([ownerOnly.status, await ownerOnly.json()]).toEqual([403, { error: "Only an owner can do this" }]);
+    const notMember = await asViewer(`/api/b/${other.id}/accounts`);
+    expect([notMember.status, await notMember.json()]).toEqual([404, { error: "Book not found" }]);
+    // A key that no row has passes the gate, and the route refuses it.
+    const unknown = await request("/api/b/1/accounts", { headers: { authorization: `Bearer cpk_${"0".repeat(48)}` } });
+    expect([unknown.status, await unknown.json()]).toEqual([401, { error: "Not authenticated" }]);
+    expect(await count("accounts")).toBe(0);
+  });
+
+  // The lockout bucket is the client IP plus the first 8 characters of the
+  // key. Thus an attacker who guesses keys from one IP locks out only that
+  // prefix from that IP. The same user can still use a key with another
+  // prefix, and the same key still works from another IP.
+  it("locks out a failing API key prefix from one IP only", async () => {
+    const key = generateApiKey();
+    let otherKey = generateApiKey();
+    while (otherKey.slice(0, 8) === key.slice(0, 8)) otherKey = generateApiKey();
+    for (const [name, value] of [["Phone", key], ["Laptop", otherKey]]) {
+      await insert("api_keys", { userId: 1, name, keyHash: await hashApiKey(value), keyPrefix: value.slice(0, 8) });
+    }
+    // The Worker reads the client IP from CF-Connecting-IP, which
+    // Cloudflare sets; the native server behind a trusted proxy reads
+    // X-Forwarded-For.
+    const ipHeader = onWorker ? "cf-connecting-ip" : "x-forwarded-for";
+    const fromIp = (bearer: string, ip: string) =>
+      request("/api/b/1/accounts", { headers: { authorization: `Bearer ${bearer}`, [ipHeader]: ip } });
+
+    // Two real hash mismatches, then malformed keys with the same prefix.
+    // The malformed keys reach the limit without 20 serial scrypt runs.
+    const wrongSamePrefix = `${key.slice(0, 8)}${key[8] === "0" ? "1" : "0"}${key.slice(9)}`;
+    const malformedSamePrefix = `${key.slice(0, 8)}g${key.slice(9)}`;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const denied = await fromIp(attempt < 2 ? wrongSamePrefix : malformedSamePrefix, "198.51.100.9");
+      expect([denied.status, await denied.json()]).toEqual([401, { error: "Not authenticated" }]);
+    }
+    const locked = await fromIp(key, "198.51.100.9");
+    expect([locked.status, await locked.json()], "the valid key from the locked IP").toEqual([401, { error: "Not authenticated" }]);
+    const otherPrefix = await fromIp(otherKey, "198.51.100.9");
+    expect([otherPrefix.status, await otherPrefix.json()], "another prefix from the locked IP").toEqual([200, []]);
+    const otherIp = await fromIp(key, "198.51.100.10");
+    expect([otherIp.status, await otherIp.json()], "the same key from another IP").toEqual([200, []]);
+  });
+
   it("accepts existing Node session tokens and API key hashes", async () => {
     const token = randomBytes(32).toString("hex");
     await insert("sessions", {
@@ -117,13 +202,15 @@ describe("auth HTTP parity", () => {
     expect([malformed.status, await malformed.json()]).toEqual([500, { error: "Failed to log in" }]);
     const invalid = await request("/api/auth/login", json("POST", { username: {}, password: "password123" }));
     expect([invalid.status, await invalid.json()]).toEqual([400, { error: "Username and password must be strings" }]);
+    // An absent user gets the same body as a wrong password.
     for (let attempt = 0; attempt < 5; attempt++) {
       const response = await request("/api/auth/login", json("POST", { username: "nobody", password: "password123" }));
-      expect(response.status).toBe(401);
+      expect([response.status, await response.json()]).toEqual([401, { error: "Invalid username or password" }]);
     }
     const limited = await request("/api/auth/login", json("POST", { username: "nobody", password: "password123" }));
     expect(limited.status).toBe(429);
     expect(limited.headers.get("retry-after")).toBe("60");
+    expect(await limited.json()).toEqual({ error: "Too many attempts. Try again in 60s." });
     const invalidName = await request("/api/auth/api-keys", json("POST", { name: "  " }));
     expect(invalidName.status).toBe(401); // Cookie check precedes body validation.
     const badId = await request("/api/auth/api-keys/nope", { method: "DELETE" });
@@ -134,7 +221,7 @@ describe("auth HTTP parity", () => {
   // server uses the header only when a proxy is trusted: this server listens on
   // loopback, so by default it is. With TRUST_PROXY=false the IP bucket is the
   // TCP peer, and a new header value does not give a new bucket.
-  it("keys the IP bucket on the TCP peer unless the proxy is trusted", async () => {
+  it.skipIf(onWorker)("keys the IP bucket on the TCP peer unless the proxy is trusted", async () => {
     const attempt = (base: string, i: number) => fetch(`${base}/api/auth/login`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-forwarded-for": `203.0.113.${i}` },
@@ -151,6 +238,22 @@ describe("auth HTTP parity", () => {
     }
     for (let i = 100; i < 121; i++) expect((await attempt(baseUrl, i)).status).toBe(401);
   }, 120_000);
+
+  // A Worker has no proxy to trust: Cloudflare sets CF-Connecting-IP on
+  // each request, over any value the client sent, and a client can write
+  // any X-Forwarded-For.
+  it.runIf(onWorker)("keys the IP bucket on CF-Connecting-IP and ignores X-Forwarded-For", async () => {
+    const attempt = (i: number, ip: string) => fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": ip, "x-forwarded-for": `203.0.113.${i}` },
+      body: JSON.stringify({ username: `spray${i}`, password: "password123" }),
+    });
+    for (let i = 0; i < 20; i++) expect((await attempt(i, "192.0.2.1")).status).toBe(401);
+    const limited = await attempt(20, "192.0.2.1");
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("60");
+    expect((await attempt(21, "192.0.2.2")).status).toBe(401);
+  });
 
   it("closes registration when configured and still validates the body first", async () => {
     const closedServer = await startHttpTestServer({ REGISTRATION_ENABLED: "false" });

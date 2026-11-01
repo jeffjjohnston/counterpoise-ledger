@@ -300,6 +300,47 @@ describe("Transactions page — remember selected account", () => {
   });
 
   /* ----------------------------------------------------------------
+   * 3b. The redirect needs only the account list: the page data for
+   *     "no account" is not loaded, because the redirect loads it again
+   *     for the chosen account
+   * ---------------------------------------------------------------- */
+  it("loads only the account list before it redirects", async () => {
+    searchParamsValue = new URLSearchParams(); // no accountId
+    localStorage.setItem("lastSelectedAccountId:1", "2"); // Savings
+    vi.stubGlobal("fetch", buildFetchMock());
+
+    const { default: TransactionsPage } = await import(
+      "@/app/b/[bookId]/transactions/page"
+    );
+
+    render(<TransactionsPage />);
+
+    await waitFor(() => {
+      expect(replaceMock).toHaveBeenCalledWith(
+        "/b/1/transactions?accountId=2",
+        { scroll: false }
+      );
+    });
+    // The mock router keeps the URL, so a load that went on would show
+    // here.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const urls = (fetch as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call: unknown[]) => (typeof call[0] === "string" ? call[0] : String(call[0]))
+    );
+    const pageData = urls.filter((url) =>
+      [
+        "/api/b/1/transactions",
+        "/api/b/1/payees",
+        "/api/b/1/investments/account-values",
+        "/api/b/1/recurring/projected",
+        "/api/b/1/sync/pending-transactions",
+      ].some((prefix) => url.startsWith(prefix))
+    );
+    expect(pageData).toEqual([]);
+    expect(urls.filter((url) => url.startsWith("/api/b/1/accounts"))).toHaveLength(1);
+  });
+
+  /* ----------------------------------------------------------------
    * 4. Inactive account skip: stored account is inactive → fall back
    *    to favorites
    * ---------------------------------------------------------------- */

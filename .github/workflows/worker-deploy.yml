@@ -1,0 +1,166 @@
+name: Deploy the Worker
+
+# The Cloudflare target: `wrangler deploy` of rust-api/worker with the client
+# build, then a probe of the deployed Worker. The Docker release path
+# (scripts/deploy.sh with the default target, docker) stays a supported
+# target.
+#
+# THREE WAYS IN.
+#   - A release merge into main: worker-release.yml publishes the tag and
+#     calls this workflow (workflow_call) with the merge commit and the
+#     target "production". That is how production gets a release.
+#     deploy.sh with COUNTERPOISE_DEPLOY_TARGET=worker waits for that run.
+#   - A pushed tag vX.Y.Z deploys to WORKER_TAG_TARGET. While production is
+#     on Docker, deploy.sh pushes the tag, and the tag deploys staging. A tag
+#     that worker-release.yml pushes with GITHUB_TOKEN starts no workflow, so
+#     a release is not deployed twice.
+#   - A manual run deploys the ref it names to the target it names, staging
+#     unless told otherwise, for a check before a release.
+#
+# TWO TARGETS, EACH ITS OWN WORKER. "staging" is [env.staging] in
+# wrangler.toml, the Worker counterpoise-staging, with its own Durable Object
+# and export bucket; "production" is the top-level Worker. A tag deploys to
+# the repository variable WORKER_TAG_TARGET, "staging" if unset, so tags
+# reach staging until the cutover sets it to "production". A manual run
+# and a call never read that variable.
+#
+# OFF UNTIL THE REPOSITORY TURNS IT ON. The job runs only when the repository
+# variable WORKER_DEPLOY is "true", so a tag pushed before the Cloudflare
+# account is set up deploys nothing and fails nothing.
+#
+# NOTHING ABOUT THE ACCOUNT IS IN THIS FILE. Each target has a GitHub
+# environment that holds it, `worker-staging` and `worker`, so the public
+# tree names no account, hostname or token. Each holds:
+#   secrets  CLOUDFLARE_API_TOKEN   a token that can edit Workers and R2
+#            CLOUDFLARE_ACCOUNT_ID
+#            WORKER_DOMAIN          the custom domain the Worker serves; the
+#                                   deploy and the probe use it, but the
+#                                   deploy does not attach it (the domain is
+#                                   managed outside this repository)
+#            ACCESS_CLIENT_ID       a Cloudflare Access service token, sent
+#            ACCESS_CLIENT_SECRET   by the probe; empty when Access is not on
+#   vars     NEXT_PUBLIC_POSTHOG_KEY   the PostHog project key and host of the
+#            NEXT_PUBLIC_POSTHOG_HOST  client build; unset, no analytics
+# The Worker's own secrets (CRON_SECRET, PLAID_*, ...) are set once with
+# `scripts/wrangler.sh secret put` (with `--env` for the staging Worker), and a
+# deploy keeps them.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to deploy
+        type: string
+        required: true
+      target:
+        description: The Worker to deploy, staging or production
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The commit, branch or tag to deploy
+        required: true
+        default: dev
+      target:
+        description: The Worker to deploy
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: vars.WORKER_DEPLOY == 'true'
+    # A GitHub-hosted runner, so a fork can use this file as it is. The
+    # Worker is WebAssembly, so the runner's architecture does not matter.
+    runs-on: ubuntu-latest
+    # A tag push has no inputs, so it falls through to WORKER_TAG_TARGET.
+    environment: ${{ (inputs.target || vars.WORKER_TAG_TARGET || 'staging') == 'production' && 'worker' || 'worker-staging' }}
+    timeout-minutes: 30
+    # One deploy at a time, and none cancelled: a cancelled `wrangler deploy`
+    # can leave the Worker and its assets at different versions until the
+    # next one. On the job and not on the workflow, so that it also holds
+    # when worker-release.yml calls this workflow. `queue: max` keeps each
+    # waiting deploy: with the default, `single`, a staging run queued behind
+    # a production deploy that waits would replace it.
+    concurrency:
+      group: worker-deploy
+      cancel-in-progress: false
+      queue: max
+    env:
+      TARGET: ${{ inputs.target || vars.WORKER_TAG_TARGET || 'staging' }}
+
+    steps:
+      # A misspelt WORKER_TAG_TARGET would otherwise deploy to staging.
+      - name: Check the target
+        run: |
+          case "$TARGET" in
+            staging | production) echo "Deploying to $TARGET" ;;
+            *) echo "Unknown target '$TARGET': use staging or production" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install the WASM tools
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          bash scripts/install-worker-build.sh
+          bash scripts/install-wasm-opt.sh
+
+      - run: npm ci
+
+      # The Worker serves this build as its static assets. The commit lets an
+      # open page see a new commit of the same version (/api/version).
+      # The PostHog project key goes into the client build, as the Docker
+      # build argument does. It is not a secret: every browser gets it. It is
+      # a variable of the environment, so a fork without one builds with no
+      # analytics.
+      - name: Build the client
+        env:
+          NEXT_PUBLIC_POSTHOG_KEY: ${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
+          NEXT_PUBLIC_POSTHOG_HOST: ${{ vars.NEXT_PUBLIC_POSTHOG_HOST }}
+        run: NEXT_PUBLIC_BUILD_COMMIT="$(git rev-parse HEAD)" npm run build
+
+      # The build command in wrangler.toml builds the Worker first.
+      - name: Deploy
+        working-directory: rust-api/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_DOMAIN: ${{ secrets.WORKER_DOMAIN }}
+          WORKER_ENV: ${{ env.TARGET == 'staging' && 'staging' || '' }}
+          WRANGLER_SEND_METRICS: "false"
+        run: >-
+          bash ../../scripts/wrangler.sh deploy
+          ${WORKER_ENV:+--env "$WORKER_ENV"}
+          --var "BUILD_COMMIT:$(git rev-parse HEAD)"
+          --var "COUNTERPOISE_PUBLIC_URL:https://$WORKER_DOMAIN"
+          --message "$(git rev-parse --short HEAD)"
+
+      # Stands in for `docker compose up --wait`: the deployed Worker answers
+      # from this commit, its object opens the database, and it runs this
+      # build's version.
+      - name: Probe the deployed Worker
+        env:
+          WORKER_DOMAIN: ${{ secrets.WORKER_DOMAIN }}
+          ACCESS_CLIENT_ID: ${{ secrets.ACCESS_CLIENT_ID }}
+          ACCESS_CLIENT_SECRET: ${{ secrets.ACCESS_CLIENT_SECRET }}
+        run: >-
+          bash scripts/worker-probe.sh "https://$WORKER_DOMAIN"
+          "$(node -p "require('./package.json').version")"
+          "$(git rev-parse HEAD)"

@@ -27,7 +27,10 @@ const config = [
   // copy, and with several worktrees it runs out of memory.
   {
     ignores: [
-      ".next", "node_modules", "coverage", "dist", "build", "out", ".claude/worktrees", "lib/wasm/generated",
+      ".next", "node_modules", "coverage", "out", ".claude/worktrees", "lib/wasm/generated",
+      // Build output at any depth, as in .gitignore, such as the local Worker
+      // bundle in rust-api/worker/build/.
+      "**/build", "**/dist",
       // Local generated output (gitignored), such as analysis bundles.
       "output",
     ],

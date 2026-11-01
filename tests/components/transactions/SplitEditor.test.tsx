@@ -94,6 +94,98 @@ describe("SplitEditor", () => {
     expect(screen.getByText("Off by $20.00")).toBeInTheDocument();
   });
 
+  describe("balance scale", () => {
+    const scale = () => screen.getByRole("img", { name: /balanced|unbalanced|balance unknown/i });
+
+    it("is level when the splits sum to zero", () => {
+      render(
+        <SplitEditor
+          splits={[
+            { accountId: 1, amount: 5000 },
+            { accountId: 2, amount: -5000 },
+          ]}
+          onChange={vi.fn()}
+          accounts={mockAccounts}
+        />
+      );
+      expect(scale()).toHaveAccessibleName("Balanced");
+      expect(scale()).toHaveAttribute("data-state", "level");
+    });
+
+    it("tips toward debits when debits are heavier", () => {
+      render(
+        <SplitEditor
+          splits={[
+            { accountId: 1, amount: 5000 },
+            { accountId: 2, amount: -3000 },
+          ]}
+          onChange={vi.fn()}
+          accounts={mockAccounts}
+        />
+      );
+      expect(scale()).toHaveAccessibleName("Unbalanced by $20.00: debits are heavier");
+      expect(scale()).toHaveAttribute("data-state", "debit");
+    });
+
+    it("tips toward credits when credits are heavier", () => {
+      render(
+        <SplitEditor
+          splits={[
+            { accountId: 1, amount: 1000 },
+            { accountId: 2, amount: -1250 },
+          ]}
+          onChange={vi.fn()}
+          accounts={mockAccounts}
+        />
+      );
+      expect(scale()).toHaveAccessibleName("Unbalanced by $2.50: credits are heavier");
+      expect(scale()).toHaveAttribute("data-state", "credit");
+    });
+
+    it("goes level when an edit balances the splits", () => {
+      const { rerender } = render(
+        <SplitEditor
+          splits={[
+            { accountId: 1, amount: 5000 },
+            { accountId: 2, amount: -3000 },
+          ]}
+          onChange={vi.fn()}
+          accounts={mockAccounts}
+        />
+      );
+      expect(scale()).toHaveAttribute("data-state", "debit");
+      rerender(
+        <SplitEditor
+          splits={[
+            { accountId: 1, amount: 5000 },
+            { accountId: 2, amount: -5000 },
+          ]}
+          onChange={vi.fn()}
+          accounts={mockAccounts}
+        />
+      );
+      expect(scale()).toHaveAccessibleName("Balanced");
+      expect(scale()).toHaveAttribute("data-state", "level");
+    });
+
+    it("does not tip while an amount is unresolved", () => {
+      render(
+        <SplitEditor
+          splits={[
+            { accountId: 1, amount: 5000 },
+            { accountId: 2, amount: -5000 },
+          ]}
+          onChange={vi.fn()}
+          accounts={mockAccounts}
+        />
+      );
+      const [debit] = screen.getAllByPlaceholderText("0.00");
+      fireEvent.change(debit, { target: { value: "50+" } });
+      expect(scale()).toHaveAccessibleName("Balance unknown until the amounts resolve");
+      expect(scale()).toHaveAttribute("data-state", "pending");
+    });
+  });
+
   it("shows Add Line button", () => {
     const splits: SplitInput[] = [
       { accountId: 1, amount: 5000 },

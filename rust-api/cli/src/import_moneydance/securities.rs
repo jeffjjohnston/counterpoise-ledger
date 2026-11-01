@@ -1,15 +1,15 @@
 //! Phase 5 (security prices) and phase 6 (stock splits).
 
-use ledger_db::engine::{Db, DbConnection};
-use sqlx::QueryBuilder;
+use ledger_db::sql;
+use ledger_db::store::{self, Sql, Transaction, params};
 
 use super::values::{
     Item, convert_date, convert_price_to_micros, field, int8, integer_text,
     parse_stock_split_ratio, text,
 };
 use super::{
-    ImportContext, NewInvestmentSplit, NewTransaction, finish, insert_investment_split,
-    insert_transaction, row_error,
+    ImportContext, NewInvestmentSplit, NewTransaction, insert_investment_split, insert_transaction,
+    row_error,
 };
 
 /// A price insert holds at most this many rows.
@@ -34,11 +34,11 @@ pub struct PhaseStats {
     pub errors: usize,
 }
 
-pub async fn import_security_prices(
-    connection: &mut DbConnection,
+pub fn import_security_prices(
+    tx: &Transaction<'_>,
     context: &mut ImportContext,
     items: &[&Item],
-) -> Result<PhaseStats, sqlx::Error> {
+) -> Result<PhaseStats, store::Error> {
     context.heading("💰 Phase 5: Importing Security Prices");
     let mut stats = PhaseStats::default();
     let snapshots = of_type(items, "csnap");
@@ -103,27 +103,19 @@ pub async fn import_security_prices(
                 .collect::<Result<Vec<_>, String>>();
             let outcome = match prices {
                 Err(message) => Err(message),
-                Ok(prices) => {
-                    let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-                    let mut insert: QueryBuilder<Db> = QueryBuilder::new(
-                        "INSERT INTO security_prices (security_id, book_id, price_date, price_micros, source) ",
-                    );
-                    insert.push_values(prices, |mut row, (security_id, date, price)| {
-                        row.push_bind(security_id)
-                            .push_bind(context.book_id)
-                            .push_bind(date)
-                            .push_bind(price)
-                            .push_bind("moneydance_import");
-                    });
-                    insert.push(" ON CONFLICT DO NOTHING");
-                    let outcome = insert
-                        .build()
-                        .execute(&mut *savepoint)
-                        .await
-                        .map(|_| ())
-                        .map_err(row_error);
-                    finish(savepoint, outcome).await?
-                }
+                Ok(prices) => tx.savepoint(|sp| {
+                    sp.execute(
+                        &format!(
+                            "INSERT INTO security_prices
+                                   (security_id, book_id, price_date, price_micros, source)
+                                 {} ON CONFLICT DO NOTHING",
+                            sql::json_rows(&["#0", "?1", "#1", "#2", "'moneydance_import'"], "?2")
+                        ),
+                        &params![context.book_id, sql::json_array(&prices)],
+                    )
+                    .map(|_| ())
+                    .map_err(row_error)
+                })?,
             };
             match outcome {
                 Ok(()) => stats.imported += chunk.len(),
@@ -151,11 +143,11 @@ pub async fn import_security_prices(
     Ok(stats)
 }
 
-pub async fn import_stock_splits(
-    connection: &mut DbConnection,
+pub fn import_stock_splits(
+    tx: &Transaction<'_>,
     context: &mut ImportContext,
     items: &[&Item],
-) -> Result<PhaseStats, sqlx::Error> {
+) -> Result<PhaseStats, store::Error> {
     context.heading("📊 Phase 6: Importing Stock Splits");
     let mut stats = PhaseStats::default();
     let splits = of_type(items, "csplit");
@@ -232,10 +224,9 @@ pub async fn import_stock_splits(
             let outcome = match parsed {
                 Err(message) => Err(message),
                 Ok((date, (numerator, denominator))) => {
-                    let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-                    let outcome = async {
+                    tx.savepoint(|sp| {
                         let transaction_id = insert_transaction(
-                            &mut savepoint,
+                            sp,
                             context.book_id,
                             context.now,
                             &NewTransaction {
@@ -249,12 +240,11 @@ pub async fn import_stock_splits(
                                 payee_id: None,
                                 is_reconciled: false,
                             },
-                        )
-                        .await?;
+                        )?;
                         // A stock split has no account: it applies to every
                         // account that holds the security.
                         insert_investment_split(
-                            &mut savepoint,
+                            sp,
                             context.book_id,
                             &NewInvestmentSplit {
                                 transaction_id,
@@ -267,12 +257,8 @@ pub async fn import_stock_splits(
                                 split_ratio: Some((numerator, denominator)),
                             },
                         )
-                        .await
-                    }
-                    .await;
-                    finish(savepoint, outcome)
-                        .await?
-                        .map(|()| (date, numerator, denominator))
+                    })?
+                    .map(|()| (date, numerator, denominator))
                 }
             };
             match outcome {

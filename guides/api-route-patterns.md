@@ -45,11 +45,9 @@ pub(crate) async fn list_payees(
     .await?;
     let params = first_query_values(raw_query.as_deref());
     // ...
-    let rows: Vec<PayeeListRow> = sqlx::query_as("SELECT ... WHERE p.book_id = $1 ...")
-        .bind(book.book_id)
-        // ...
-        .fetch_all(&state.pool)
-        .await
+    let rows: Vec<PayeeListRow> = state
+        .database
+        .query("SELECT ... WHERE p.book_id = ?1 ...", &params![book.book_id(), /* ... */])
         .map_err(|cause| internal_error(cause, "Failed to fetch payees"))?;
     Ok(Json(to_value(rows).expect("payee rows serialize")))
 }
@@ -73,13 +71,23 @@ pub(crate) async fn list_payees(
   before use. A validator proves the shape of an ID, not that it is yours.
   `require_account_parent()` in `validation.rs` checks `id` **and** `book_id`;
   follow that pattern.
-- **SQL**: use `sqlx::query()`, `query_as()` and `query_scalar()`. Do not
-  use the `query!` macros: they need a database or query metadata at build
-  time. Use the helpers of `ledger_db::sql` (`today!()`, `EFFECTIVE_DATE`,
-  `in_integers`, `json`) and the rules in
-  [database-management.md](database-management.md#sql-rules). Open a write
-  transaction with `ledger_db::locks::begin` or `begin_pool`. The HTTP tests
-  are what check a query.
+- **SQL**: run a query on `state.database` (`ledger_db::Database`) through
+  the `ledger_db::store::Sql` trait: `query`, `query_row`, `query_optional`,
+  `execute` and `exec_batch`, with `?N` placeholders and `params!`. A row
+  struct derives `ledger_db::store::FromRow`, which reads each field from the
+  column of its name (`#[row(rename = "...")]` names another). The calls are
+  synchronous, and this API is the one the Workers build will run on. Use the
+  helpers of `ledger_db::sql` (`today_literal()`, `EFFECTIVE_DATE`,
+  `in_integers`, `json_rows`, `json`) and the rules in
+  [database-management.md](database-management.md#sql-rules). Build a
+  statement with optional clauses with `ledger_db::store::Builder`, which
+  numbers its `?N` binds. Open a write transaction with `write_transaction`
+  in `rust-api/server/src/db_scope.rs`, and a read that must see one
+  snapshot with `read_transaction`: the closure gets the transaction and
+  returns `Result<_, ApiError>`, and a database error becomes a 500 with the
+  route's failure message. A helper that runs inside one takes
+  `&impl Sql`, so the same function serves the database and a transaction.
+  The HTTP tests are what check a query.
 
 ## Access Levels
 
@@ -138,11 +146,33 @@ It returns an `AuthenticatedBook` with the numeric book ID, the user ID and
 the role. Use its book ID for scoped queries and its user ID for event
 attribution.
 
-A removed member's open `events` (SSE) stream is not closed. It keeps sending
-invalidation hints — no data, just "something changed" — for up to five
-minutes, until the stream's own lifetime ends. Every *data* request answers
-404 at once, because each one re-checks membership. The stream reconnect does
-too.
+**A write helper takes a proof, never a raw book ID.** A helper that writes
+book data takes `&BookAccess<'_, Write>`. An owner-only helper (the Plaid
+Hosted Link sessions and the Plaid account refresh) takes
+`&BookAccess<'_, Owner>`. The helper reads the book ID from the proof
+(`access.book_id()`). The handler gets the proof from its `AuthenticatedBook`:
+`book.write()?` or `book.owner()?`. These check the role in memory, and a
+refusal is the same 403 that `authenticate_book` gives. A helper that only
+reads can keep `book_id: i32`, because its SQL binds the book.
+`rust-api/server/src/book_scope.rs` makes the proofs.
+
+The reason: the security review of 2026-10-05 found an owner-only write that
+ran at `Read`. `GET .../sync/tokens/[id]/accounts?refresh=true` (now
+`POST .../accounts/refresh`) rewrote the account mappings for a viewer. The static test reads only the level in the
+handler body, so it cannot see the level that a helper needs. The compiler
+checks a type: a handler that has only `BookAccess<Read>` cannot call a write
+helper.
+
+A job with no user (the Plaid sync, the recurring rules and the TypeSafe
+cleanup) uses `BookAccess::for_system_job(book_id)`. Only the jobs that
+`scheduler/mod.rs` and the `/api/cron/*` routes run may call it. An MCP tool that
+calls a write helper directly, not through a route, gets its proof from
+`caller.book(...)` and `write_access(&book)` in `mcp/call.rs`.
+
+A removed member's open book socket closes at once with code 4404: the hint
+that names `book_members` makes each socket of the book check its credential
+again. Every *data* request answers 404 at once too, because each one
+re-checks membership.
 
 ## Route Areas
 
@@ -188,9 +218,10 @@ They keep these Node rules:
 - The payee name uses JavaScript whitespace for trim and collapse. Rust's
   `char::is_whitespace` differs at U+0085 and U+FEFF, so use
   `is_js_whitespace` in `validation.rs`.
-- `POST /payees` returns the stored payee for a case variant. It lowercases
-  the name in Rust and compares it with SQL `lower()`, which folds Unicode
-  case (`ledger_db::functions`).
+- `POST /payees` returns the stored payee for a case variant (the exact
+  spelling first, then the oldest). It lowercases the name in Rust and
+  compares it with SQL `lower()`, which folds Unicode case
+  (`ledger_db::functions`).
 
 The investment and security routes are in
 `rust-api/server/src/routes/{investments,securities,realized_gains}.rs`:
@@ -365,10 +396,13 @@ The routes keep these Node rules:
 
 - A connection write needs the owner. Clearing the staged rows of a
   connection needs only write access. The account refresh
-  (`GET .../tokens/[id]/accounts?refresh=true`) is a connection write: it
-  rewrites the mappings and calls Plaid with the stored token. The route is
-  a GET at `Read` for the plain list, so the handler checks the owner role
-  by hand when `refresh` is set.
+  (`POST .../tokens/[id]/accounts/refresh`) is a connection write: it
+  rewrites the mappings, deletes the mappings that Plaid no longer reports,
+  and calls Plaid with the stored token. Until 2026-10-30 it was
+  `GET .../tokens/[id]/accounts?refresh=true`. The cross-origin guard in
+  `security.rs` does not examine a GET, and the session cookie is
+  `SameSite=Lax`, so a link on another site could start the refresh. A GET
+  must not change data. The GET now reads only, and it ignores `refresh`.
 - The `[id]` routes read the ID with `parseInt(id, 10)`. A value that is not a
   finite number is a 400. An ID outside the int4 range fails only when a
   query binds it, so a `PUT` validates its body first. `transactions/[id]/plaid`
@@ -393,9 +427,8 @@ The routes keep these Node rules:
   transaction commits, as `recordTypeSafeUnlink` does. A failure there is
   logged and does not change the response. The route sends
   `sync_transaction_unlinked`.
-- A sync holds the session lock `SessionLock::plaid_sync(token ID)` (a file
-  lock under `<database>.locks/`) on one reserved connection and runs every
-  query on it. A second sync of the connection gets 409 and does not wait. A
+- A sync holds the lease `leases::plaid_sync(token ID)` (a row of
+  `job_leases`) and runs every query on one reserved connection. A second sync of the connection gets 409 and does not wait. A
   demo connection is refused before the step that records `last_error`;
   every later failure is recorded there. An ID outside the int4 range gets
   the message that the PostgreSQL lock query gave (`parse_pg_int4`), with a
@@ -477,22 +510,24 @@ creation sends `issue_report_created` through the shared PostHog helper.
 `/api/health` is public and returns only `{ ok, db }`, with a 503 response
 when the database probe fails. The deploy check reads it. `/health` answers
 the `rust-api` container's healthcheck with an empty 200 or 503. `/api/system/status`
-requires authentication and reads the scheduler status directory with the same
-missing, failed, stale, unverified, and unreadable states as the Node handler.
+requires authentication and reads the job runs (`job_runs`) with the
+missing, failed, stale and unverified states of the Node handler. Before any
+job has recorded a run (a new install, a development server, the E2E server),
+every job is `unknown` and `overall` is `unknown`, so the navbar shows
+nothing; a database error also gives every job the state `unknown`.
 A Plaid sync or price sync with no secret writes `notConfigured: true` and the
 missing setting in `detail`. `evaluate` gives that job the state
 `not_configured`. It does not cause `overall: "attention"`. A manual
-`/api/cron/*` run writes the same status record as a scheduled run, but only
-when the install has a status directory: `STATUS_DIR`, or `/backups`
-(`job_status::configured_status_dir`). Without one, as in development and CI,
-the run writes nothing and logs nothing.
+`/api/cron/*` run writes the same record as a scheduled run.
 `ledger-cli backup` writes the record only when the backup goes to the
 scheduler's own backup directory. That means no `--dir`, or the same directory
-(`ledger_db::job_status`).
+(`ledger_db::jobs`). An older release kept the records in files under
+`STATUS_DIR` (default `/backups/status`); the server copies them into
+`job_runs` when it starts, for each job that has no row yet.
 
 For any route that writes a timestamp column, follow the UTC storage rule in
-[the schema guide](schema.md#timezones-and-timestamp-columns). The app's `TZ`
-(through `cp_today()`) defines calendar dates, not the representation of
+[the schema guide](schema.md#timezones-and-timestamp-columns). The app's zone
+(`APP_TZ`, through `ledger_db::clock::today()`) defines calendar dates, not the representation of
 stored instants.
 
 The API gate in `security.rs` applies the common cookie gate before the
@@ -502,27 +537,76 @@ that reaches a route but has no valid session or API key.
 
 ### Rust live updates
 
-`GET /api/b/[bookId]/events` runs in `routes/events.rs`. It authenticates with
-`AccessLevel::Read` before it subscribes. Every 500 from that step becomes 503
-`Live updates unavailable`, because the Node route answers every thrown error
-with 503. The frames, the headers, the 10-second startup wait, the 25-second
-heartbeat and the five-minute lifetime are the same as in Node.
+`GET /api/b/[bookId]/socket` runs in `routes/socket.rs`, and sends the book's
+change hints over a WebSocket (the messages are in
+[api-contract.md](api-contract.md#live-updates)). It replaced a server-sent
+events stream, because a Durable Object can hibernate with a WebSocket open
+and an open event stream keeps it awake. The handler refuses a cookie from
+another origin before anything else: a browser applies no same-origin rule
+to a WebSocket, so a page of another site could open one with the user's
+cookie. It then authenticates with `AccessLevel::Read`; every 500 from that
+step becomes 503 `Live updates unavailable`.
 
 The hub reads `change_marks` (see [architecture.md](architecture.md#live-book-updates)).
-A new stream waits until the hub has read the counts of its book, then sends
-`ready`. When the counts cannot be read in 10 seconds, the route answers 503.
-The counts cannot be lost, so the hub never sends `reset`.
+A new socket waits until the hub has read the counts of its book, then
+upgrades. When the counts cannot be read in 10 seconds, the route answers
+503. The counts cannot be lost, so the hub never sends `reset`. The hub drops
+a subscriber whose queue of eight hints is full: the socket closes with 1013
+and the client reconnects.
 
-The hub drops a subscriber whose queue of eight frames is full. Node dropped
-a stream whose queue was full. The effect is the same: the stream ends after
-the frames already queued, and the browser reconnects.
+The socket has no lifetime.
+Instead it checks the credential again, and closes with 4000 + the status of
+the refusal, when:
 
-`tests/http/book-events.test.ts` covers access, the frames, per-book
-filtering, the windows, a write that rolls back (no hint), and one hint to
-every stream of a book. The Rust unit tests in `book_changes.rs` and
-`routes/events.rs` cover the triggers of each change table, writes from
-another connection, the stalled reader, the heartbeat, the lifetime and the
-shutdown with paused time.
+- `state.revocations` (`Revocations`, a watch channel) fires. `routes/auth.rs`
+  fires it after a logout, after a password change deletes the other
+  sessions, and after an API key is deleted. A new route that revokes a
+  credential must fire it too.
+- a hint names `book_members`. This also covers a member removed by another
+  process, since the triggers count every writer.
+- five minutes pass: a session that expires closes then.
+
+The handler subscribes to `state.revocations` before it authenticates, so a
+revocation between the check and the upgrade still reaches the socket. The
+socket checks the credential once more before it sends `ready`: the hub takes
+the book's change counts when the subscription becomes ready, so a member
+removed between the first check and then makes no hint.
+
+`tests/http/book-socket.test.ts` covers access, the cross-origin refusal, a
+hint, a viewer, the close after a key is deleted, after a logout and after a
+member is removed, per-book filtering, the windows, the investment tables, a
+write that rolls back (no hint), and one hint to every socket of a book. It
+runs against the Worker too, except the cases that need a write from this
+process to reach the server at once. The Rust unit tests in
+`book_changes.rs` cover the triggers of each change table, writes from
+another connection and the stalled reader.
+
+On the Worker, the Durable Object serves the route itself
+(`rust-api/worker/src/object.rs`, with the logic in
+`rust-api/server/src/hosted/sockets.rs`), because a socket that is to
+survive hibernation must be accepted with `ctx.acceptWebSocket()`. A timer or
+a poll would keep the object awake, so it has neither:
+
+- `App::admit_socket` makes the checks of the native route (the cross-origin
+  cookie, the book, the upgrade) and returns the `Attachment`: the book and
+  the request's cookie and `Authorization`. The object accepts the socket
+  with the tag `book:{id}`, stores the attachment with it, and sends `ready`.
+- Before each event (a request or the alarm) the object calls
+  `App::watch_books`, which reads the change counts of the books with a
+  socket that its memory lacks, as after a wake. After the event it calls
+  `App::socket_updates`. A count that moved is a hint, and the credential is
+  checked again before the hint goes out, after a revocation in that event,
+  and for every socket at each alarm, which is when an expired session
+  loses its socket. A refusal closes with 4000 + the status.
+- Every write on Cloudflare is an event of the object, so no hint is missed.
+  A write to the object's file from outside (only a test does that) waits
+  for the next event.
+- The runtime answers protocol pings without waking the object; the web
+  client sends none of its own.
+- A close that the server starts reaches the client at once, but workerd
+  leaves the connection for the client to end. Node's WebSocket reports the
+  close only when its 10-second wait ends, and Chromium after 2 seconds, so
+  the socket test allows 15 seconds on the Worker.
 
 ### Rust request validation and references
 
@@ -561,11 +645,20 @@ Every Rust write handler uses these helpers, account `POST` included.
 
 ### Rust rate limiting
 
-`rust-api/server/src/rate_limit.rs` holds one in-memory limiter shared by all
-auth scopes (`login`, `register`, `password`, `apikey`, `book-member-add`). It
-matches the Node 15-minute window, five-failure username budget,
-twenty-failure IP budget, escalating one-to-fifteen-minute lockouts, and
-ten-thousand-entry bound that retains active lockouts during eviction.
+`rust-api/server/src/rate_limit.rs` holds one limiter shared by all auth
+scopes (`login`, `register`, `password`, `apikey`, `book-member-add`,
+`oauth-register`, `oauth-token`). It keeps the Node policy: a 15-minute
+window, a five-failure username budget, a twenty-failure IP budget, and
+lockouts that grow from one to fifteen minutes. Its state is the table
+`rate_limits` (see [schema.md](schema.md)), not memory, so a lockout
+survives a restart and a Durable Object that hibernates. Every 512th failure
+deletes the expired rows, and so does the daily prune job. Past 10,000 rows
+(a flood of distinct buckets inside one window expires nothing) the same
+prune evicts the unlocked rows that expire first, down to 9,000. An active
+lockout is never deleted, even when that leaves the table above the cap. The time is `platform::timestamp()`, UTC text. A failure
+to read or write the table is logged and lets the request through, since the
+request then fails on the same database. A good API key clears its bucket
+only when a row exists, so the common request does not write.
 
 A route must not read `X-Forwarded-For` for a rate-limit key. A client that
 connects directly can write any value in it and get a new IP bucket for each
@@ -620,14 +713,17 @@ All four cron routes run in Rust: `rust-api/server/src/routes/cron.rs` serves
 `rust-api/server/src/routes/typesafe.rs` serves `typesafe-cleanup`. Each one
 writes on every call.
 
-The server runs these jobs on their schedule (`rust-api/server/src/scheduler.rs`);
-a route runs one now. One lock per job (`JobLocks` in `state.rs`) keeps two
-runs of a job apart. A job reports a failure of one token, symbol, or book in
+The server runs these jobs on their schedule (`rust-api/server/src/scheduler/mod.rs`);
+a route runs one now. One lease per job (`leases::Job` in
+`rust-api/server/src/leases.rs`, a row of `job_leases`) keeps two runs of a
+job apart, also across processes. A scheduled run does not start a job whose
+lease is held, and starts it at a later wake once the lease is free; a manual
+run waits for it. A job reports a failure of one token, symbol, or book in
 its body and still succeeds, as the Node route did, so such a failure does not
 mark the job failed. A scheduled run writes a status record. A manual
 `/api/cron/*` run writes the same record. `ledger-cli backup` writes it only
 into the scheduler's backup directory. `GET /api/system/status` reads the
-status files in `rust-api/server/src/routes/system.rs`.
+records in `rust-api/server/src/routes/system.rs`.
 
 `rust-api/server/src/analytics.rs` is the server capture helper. It is a no-op
 without `NEXT_PUBLIC_POSTHOG_KEY`; otherwise it sends the user ID as the
@@ -635,20 +731,26 @@ PostHog distinct ID, the unchanged event name, and the route's property object.
 Call it after a successful write as the Node handler does. Analytics failures
 are logged and do not change the route response.
 
-`ledger_db::locks::with_session_lock` and `with_transaction` in
-`rust-api/server/src/db_scope.rs` are the database scopes. The session lock
-takes a file lock under `<database>.locks/` without waiting, then reserves
-one SQLx connection for its whole callback. Dropping the file releases the
-lock, also on cancellation. The transaction helper opens `BEGIN IMMEDIATE`
-on the caller's connection, so a transaction inside a lock stays on that
-same connection and rolls back on cancellation.
-Pass the callback's connection into every query and nested helper; borrowing
-the pool while holding a lock can deadlock when enough holders occupy it.
+A lease (`rust-api/server/src/leases.rs`) is the scope of a long run. `try_take`
+takes a lease without waiting, and `wait` retries until it is free. The
+holder renews the lease every 20 seconds, and dropping it releases it, also
+on cancellation. A process that dies stops renewing, and its lease lapses
+after 60 seconds: the row is not a file lock, which the system would release
+at once. A process that stops for longer (a suspended machine) can wake to
+find another run holding its lease, so run the work through `Held::guard`,
+which drops it at its next await once a renewal finds the lease lost. The
+lease alone keeps two runs apart: the Plaid sync runs each of its writes in
+its own `Database::transaction` on `state.database`, between its network
+calls, and holds no connection across an await. A transaction is
+synchronous, so a cancelled run stops between two transactions, never inside
+one.
 
 The Rust HTTP contract adapters in `server/src/http_contract_tests.rs` exercise
 these helpers against a temporary SQLite database
-(`ledger_db::testing::TempDatabase`) without publishing a test route. `tests/e2e/rust-api-parity.spec.ts` checks the HTTP contract through
-the Rust server that serves the E2E client build.
+(`ledger_db::testing::TempDatabase`) without publishing a test route. The suites in `tests/http/` check the HTTP
+contract against the real Rust binary, and `tests/e2e/static-client.spec.ts`
+checks that the server that serves the E2E client build also answers `/api` on
+the same origin.
 
 ## Transaction Creation Pattern
 The transaction routes in `routes/transactions.rs` hold the write path: the

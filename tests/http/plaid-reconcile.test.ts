@@ -287,10 +287,13 @@ describe("Plaid reconciliation HTTP parity", () => {
   it("reuses a payee whose name differs only in a final sigma", async () => {
     const f = await fixture();
     // PostgreSQL lowercased the final sigma as σ and JavaScript as ς, so the
-    // lookup missed the payee and the insert hit the unique index. SQL lower()
-    // is now the Rust lowercase, so the lookup finds it.
+    // lookup missed the payee and the insert hit the unique index. The lookup
+    // now compares name_fold, the Rust lowercase, so it finds the payee.
     const payee = await createPayee({ name: "ΟΔΟΣ" });
-    await exec("UPDATE plaid_transaction_reconciliation SET merchant_name = $1 WHERE id = $2", ["ΟΔΟΣ", f.coffeeRow.id]);
+    await exec(
+      "UPDATE plaid_transaction_reconciliation SET merchant_name = $1, merchant_key = $2 WHERE id = $3",
+      ["ΟΔΟΣ", "ΟΔΟΣ".toLowerCase(), f.coffeeRow.id],
+    );
     const created = await ok(client, `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`, json("POST", { reconciliationId: f.coffeeRow.id, action: "create", counterAccountId: f.food.id }));
     const transaction = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [created.matchedTransactionId]);
     expect(transaction.payeeId).toBe(payee.id);
@@ -316,6 +319,46 @@ describe("Plaid reconciliation HTTP parity", () => {
     expect(await reconciled()).toBe(true);
     await ok(client, `/api/b/1/sync/accounts/${savingsLink.id}/reconcile`, json("POST", { reconciliationId: incoming.id, action: "unlink" }));
     expect(await reconciled()).toBe(false);
+  });
+
+  // Production, book 2: a row flagged as modified was resolved with Create.
+  // The old transaction stayed reconciled with no link, a duplicate charge.
+  it("clears the old transaction when a row flagged for review is linked again", async () => {
+    const reconciled = async (id: number) => (await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [id])).isReconciled;
+    const decisions = [
+      (f: Awaited<ReturnType<typeof fixture>>) => ({ action: "create", counterAccountId: f.food.id }),
+      (f: Awaited<ReturnType<typeof fixture>>) => ({ action: "match", transactionId: f.coffeeSameDay.id }),
+      (f: Awaited<ReturnType<typeof fixture>>) => ({ action: "match_update_amount", transactionId: f.coffeeSameDay.id }),
+    ];
+    for (const decision of decisions) {
+      await resetTestDatabase();
+      client = await sessionHttpClient(baseUrl);
+      const f = await fixture();
+      await exec("UPDATE transactions SET is_reconciled = true WHERE id = $1", [f.coffeeLater.id]);
+      const body = decision(f);
+      const item = await ok(client, `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`, json("POST", { reconciliationId: f.reviewRow.id, ...body }));
+      expect(item.matchedTransactionId, body.action).not.toBe(f.coffeeLater.id);
+      expect(await reconciled(item.matchedTransactionId), body.action).toBe(true);
+      expect(await reconciled(f.coffeeLater.id), body.action).toBe(false);
+    }
+  });
+
+  it("keeps the old transaction reconciled when another row still links it, or when it is linked again", async () => {
+    const f = await fixture();
+    const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+    const reconciled = async (id: number) => (await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [id])).isReconciled;
+    // A transfer is matched on both of its links.
+    const savingsLink = await createPlaidAccount({ tokenId: f.token.id, plaidAccountId: "pa-savings", name: "S", type: "depository", counterpoiseAccountId: f.savings.id });
+    await createPlaidReconciliation({ plaidAccountLinkId: savingsLink.id, plaidTransactionId: "in", date: "2025-03-10", amountCents: -5000, name: "in", resolutionStatus: "matched", matchedTransactionId: f.transfer.id });
+    await exec("UPDATE plaid_transaction_reconciliation SET matched_transaction_id = $1 WHERE id = $2", [f.transfer.id, f.reviewRow.id]);
+    await exec("UPDATE transactions SET is_reconciled = true WHERE id IN ($1, $2)", [f.transfer.id, f.coffeeLater.id]);
+    await ok(client, path, json("POST", { reconciliationId: f.reviewRow.id, action: "match", transactionId: f.coffeeSameDay.id }));
+    expect(await reconciled(f.transfer.id)).toBe(true);
+
+    // The same transaction again stays reconciled.
+    await exec("UPDATE plaid_transaction_reconciliation SET review_reason = 'plaid_modified' WHERE id = $1", [f.reviewRow.id]);
+    await ok(client, path, json("POST", { reconciliationId: f.reviewRow.id, action: "match", transactionId: f.coffeeSameDay.id }));
+    expect(await reconciled(f.coffeeSameDay.id)).toBe(true);
   });
 
   it("records the TypeSafe observation of a decision", async () => {

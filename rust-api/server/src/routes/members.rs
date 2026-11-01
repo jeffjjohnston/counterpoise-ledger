@@ -1,6 +1,8 @@
 use crate::{
     book_auth::{AccessLevel, BookRole, authenticate_book},
+    db_scope::write_transaction,
     error::{ApiError, ApiResult, error, internal_error},
+    platform,
     rate_limit::{Keys, RateLimitError, Scope},
     state::AppState,
     validation::parse_json_body,
@@ -12,12 +14,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use chrono::{NaiveDateTime, SecondsFormat, Utc};
-use ledger_db::engine::Db;
+use chrono::{NaiveDateTime, SecondsFormat};
 use ledger_db::locks::FOR_UPDATE;
+use ledger_db::store::{Sql, params};
 use serde_json::{Value, json};
-use sqlx::{FromRow, Transaction};
-use std::time::Instant;
 
 const CANNOT_ADD: &str = "Cannot add that user";
 const LAST_OWNER: &str = "A book must keep at least one owner";
@@ -49,7 +49,7 @@ impl IntoResponse for AddError {
     }
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, ledger_db::store::FromRow)]
 struct MemberRow {
     user_id: i32,
     username: String,
@@ -57,7 +57,7 @@ struct MemberRow {
     created_at: NaiveDateTime,
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct LockedMember {
     user_id: i32,
     role: String,
@@ -93,31 +93,33 @@ fn target_id(raw: &str) -> Result<i32, ApiError> {
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid user ID"))
 }
 
-async fn get_member(
-    tx: &mut Transaction<'_, Db>,
+fn get_member(
+    tx: &impl Sql,
     book_id: i32,
     user_id: i32,
     failure: &'static str,
 ) -> Result<MemberRow, ApiError> {
-    sqlx::query_as::<_, MemberRow>(
-        "SELECT bm.user_id, u.username, bm.role, bm.created_at FROM book_members bm JOIN users u ON u.id = bm.user_id WHERE bm.book_id = $1 AND bm.user_id = $2"
+    tx.query_optional::<MemberRow>(
+        "SELECT bm.user_id, u.username, bm.role, bm.created_at
+         FROM book_members bm JOIN users u ON u.id = bm.user_id
+         WHERE bm.book_id = ?1 AND bm.user_id = ?2",
+        &params![book_id, user_id],
     )
-    .bind(book_id).bind(user_id).fetch_optional(tx.as_mut()).await
     .map_err(|cause| internal_error(cause, failure))?
     .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_MEMBER))
 }
 
-async fn lock_members(
-    tx: &mut Transaction<'_, Db>,
+fn lock_members(
+    tx: &impl Sql,
     book_id: i32,
     failure: &'static str,
 ) -> Result<Vec<LockedMember>, ApiError> {
-    sqlx::query_as::<_, LockedMember>(&format!(
-        "SELECT user_id, role FROM book_members WHERE book_id = $1 ORDER BY user_id{FOR_UPDATE}"
-    ))
-    .bind(book_id)
-    .fetch_all(tx.as_mut())
-    .await
+    tx.query(
+        &format!(
+            "SELECT user_id, role FROM book_members WHERE book_id = ?1 ORDER BY user_id{FOR_UPDATE}"
+        ),
+        &params![book_id],
+    )
     .map_err(|cause| internal_error(cause, failure))
 }
 
@@ -145,9 +147,7 @@ pub(crate) async fn list_members(
         "Failed to list members",
     )
     .await?;
-    let rows = sqlx::query_as::<_, MemberRow>(
-        "SELECT bm.user_id, u.username, bm.role, bm.created_at FROM book_members bm JOIN users u ON u.id = bm.user_id WHERE bm.book_id = $1 ORDER BY bm.created_at, bm.user_id"
-    ).bind(auth.book_id()).fetch_all(&state.pool).await
+    let rows = state.database.query::<MemberRow>("SELECT bm.user_id, u.username, bm.role, bm.created_at FROM book_members bm JOIN users u ON u.id = bm.user_id WHERE bm.book_id = ?1 ORDER BY bm.created_at, bm.user_id", &params![auth.book_id()])
     .map_err(|cause| internal_error(cause, "Failed to list members"))?;
     Ok(Json(Value::Array(
         rows.into_iter().map(member_json).collect(),
@@ -189,35 +189,43 @@ pub(crate) async fn add_member(
         };
         state
             .rate_limits
-            .enforce(Scope::BookMemberAdd, &keys, Instant::now())?;
-        let mut tx = ledger_db::locks::begin_pool(&state.pool)
-            .await
-            .map_err(|cause| internal_error(cause, "Failed to add member"))?;
-        let rows = lock_members(&mut tx, auth.book_id(), "Failed to add member").await?;
-        require_owner(&rows, auth.user_id())?;
-        let target: Option<i32> = sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
-            .bind(username)
-            .fetch_optional(tx.as_mut())
-            .await
-            .map_err(|cause| internal_error(cause, "Failed to add member"))?;
-        let Some(target) = target else {
+            .enforce(Scope::BookMemberAdd, &keys, platform::timestamp())?;
+        const FAILURE: &str = "Failed to add member";
+        // The limiter writes on the same connection, so it records an unknown
+        // username after the transaction ends: inside it, the call would wait
+        // on the lock this transaction holds, and a rollback would undo it.
+        let mut unknown_user = false;
+        let member = write_transaction(&state.database, FAILURE, |tx| {
+            let rows = lock_members(tx, auth.book_id(), FAILURE)?;
+            require_owner(&rows, auth.user_id())?;
+            let target: Option<i32> = tx
+                .query_optional(
+                    "SELECT id FROM users WHERE username = ?1",
+                    &params![username],
+                )
+                .map_err(|cause| internal_error(cause, FAILURE))?;
+            let Some(target) = target else {
+                unknown_user = true;
+                return Err(error(StatusCode::BAD_REQUEST, CANNOT_ADD));
+            };
+            let inserted: Option<i32> = tx
+                .query_optional(
+                    "INSERT INTO book_members (book_id, user_id, role, created_at)
+                     VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING RETURNING user_id",
+                    &params![auth.book_id(), target, role, platform::timestamp()],
+                )
+                .map_err(|cause| internal_error(cause, FAILURE))?;
+            if inserted.is_none() {
+                return Err(error(StatusCode::BAD_REQUEST, CANNOT_ADD));
+            }
+            get_member(tx, auth.book_id(), target, FAILURE)
+        });
+        if unknown_user {
             state
                 .rate_limits
-                .failure(Scope::BookMemberAdd, &keys, Instant::now());
-            return Err(error(StatusCode::BAD_REQUEST, CANNOT_ADD).into());
-        };
-        let inserted: Option<i32> = sqlx::query_scalar(
-            "INSERT INTO book_members (book_id, user_id, role, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING user_id"
-        ).bind(auth.book_id()).bind(target).bind(role).bind(Utc::now().naive_utc()).fetch_optional(tx.as_mut()).await
-        .map_err(|cause| internal_error(cause, "Failed to add member"))?;
-        if inserted.is_none() {
-            return Err(error(StatusCode::BAD_REQUEST, CANNOT_ADD).into());
+                .failure(Scope::BookMemberAdd, &keys, platform::timestamp());
         }
-        let member = get_member(&mut tx, auth.book_id(), target, "Failed to add member").await?;
-        tx.commit()
-            .await
-            .map_err(|cause| internal_error(cause, "Failed to add member"))?;
-        Ok(Json(member_json(member)))
+        Ok(Json(member_json(member?)))
     }
     run(&state, &book_id, &headers, &body).await.into_response()
 }
@@ -239,32 +247,27 @@ pub(crate) async fn change_member(
     let target = target_id(&user_id)?;
     let body = parse_json_body(&body, "Failed to change member")?;
     let new_role = role(body.get("role"))?;
-    let mut tx = ledger_db::locks::begin_pool(&state.pool)
-        .await
-        .map_err(|cause| internal_error(cause, "Failed to change member"))?;
-    let rows = lock_members(&mut tx, auth.book_id(), "Failed to change member").await?;
-    require_owner(&rows, auth.user_id())?;
-    let current = rows
-        .iter()
-        .find(|row| row.user_id == target)
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_MEMBER))?;
-    if current.role == "owner"
-        && new_role != "owner"
-        && rows.iter().filter(|row| row.role == "owner").count() == 1
-    {
-        return Err(error(StatusCode::BAD_REQUEST, LAST_OWNER));
-    }
-    sqlx::query("UPDATE book_members SET role = $1 WHERE book_id = $2 AND user_id = $3")
-        .bind(new_role)
-        .bind(auth.book_id())
-        .bind(target)
-        .execute(tx.as_mut())
-        .await
-        .map_err(|cause| internal_error(cause, "Failed to change member"))?;
-    let member = get_member(&mut tx, auth.book_id(), target, "Failed to change member").await?;
-    tx.commit()
-        .await
-        .map_err(|cause| internal_error(cause, "Failed to change member"))?;
+    const FAILURE: &str = "Failed to change member";
+    let member = write_transaction(&state.database, FAILURE, |tx| {
+        let rows = lock_members(tx, auth.book_id(), FAILURE)?;
+        require_owner(&rows, auth.user_id())?;
+        let current = rows
+            .iter()
+            .find(|row| row.user_id == target)
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_MEMBER))?;
+        if current.role == "owner"
+            && new_role != "owner"
+            && rows.iter().filter(|row| row.role == "owner").count() == 1
+        {
+            return Err(error(StatusCode::BAD_REQUEST, LAST_OWNER));
+        }
+        tx.execute(
+            "UPDATE book_members SET role = ?1 WHERE book_id = ?2 AND user_id = ?3",
+            &params![new_role, auth.book_id(), target],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
+        get_member(tx, auth.book_id(), target, FAILURE)
+    })?;
     Ok(Json(member_json(member)))
 }
 
@@ -285,29 +288,26 @@ pub(crate) async fn remove_member(
     if target != auth.user_id() && auth.role() != BookRole::Owner {
         return Err(error(StatusCode::FORBIDDEN, "Only an owner can do this"));
     }
-    let mut tx = ledger_db::locks::begin_pool(&state.pool)
-        .await
-        .map_err(|cause| internal_error(cause, "Failed to remove member"))?;
-    let rows = lock_members(&mut tx, auth.book_id(), "Failed to remove member").await?;
-    if target != auth.user_id() {
-        require_owner(&rows, auth.user_id())?;
-    }
-    let current = rows
-        .iter()
-        .find(|row| row.user_id == target)
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_MEMBER))?;
-    if current.role == "owner" && rows.iter().filter(|row| row.role == "owner").count() == 1 {
-        return Err(error(StatusCode::BAD_REQUEST, LAST_OWNER));
-    }
-    sqlx::query("DELETE FROM book_members WHERE book_id = $1 AND user_id = $2")
-        .bind(auth.book_id())
-        .bind(target)
-        .execute(tx.as_mut())
-        .await
-        .map_err(|cause| internal_error(cause, "Failed to remove member"))?;
-    tx.commit()
-        .await
-        .map_err(|cause| internal_error(cause, "Failed to remove member"))?;
+    const FAILURE: &str = "Failed to remove member";
+    write_transaction(&state.database, FAILURE, |tx| {
+        let rows = lock_members(tx, auth.book_id(), FAILURE)?;
+        if target != auth.user_id() {
+            require_owner(&rows, auth.user_id())?;
+        }
+        let current = rows
+            .iter()
+            .find(|row| row.user_id == target)
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_MEMBER))?;
+        if current.role == "owner" && rows.iter().filter(|row| row.role == "owner").count() == 1 {
+            return Err(error(StatusCode::BAD_REQUEST, LAST_OWNER));
+        }
+        tx.execute(
+            "DELETE FROM book_members WHERE book_id = ?1 AND user_id = ?2",
+            &params![auth.book_id(), target],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
+        Ok(())
+    })?;
     Ok(Json(json!({"success": true})))
 }
 
@@ -315,27 +315,22 @@ pub(crate) async fn remove_member(
 mod tests {
     use super::{NOT_MEMBER, get_member};
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use ledger_db::store::Sql;
 
     use serde_json::{Value, json};
 
     #[tokio::test]
     async fn missing_joined_user_returns_not_found() {
-        let database = ledger_db::testing::TempDatabase::new(1).await;
-        let pool = database.pool().clone();
-        let mut tx = ledger_db::locks::begin_pool(&pool).await.unwrap();
-        sqlx::query("CREATE TEMP TABLE book_members (book_id integer, user_id integer, role text, created_at timestamp)")
-            .execute(tx.as_mut()).await.unwrap();
-        sqlx::query("CREATE TEMP TABLE users (id integer, username text)")
-            .execute(tx.as_mut())
-            .await
+        let database = ledger_db::Database::open_in_memory().unwrap();
+        database
+            .exec_batch(
+                "CREATE TABLE book_members (book_id integer, user_id integer, role text,
+                   created_at timestamp);
+                 CREATE TABLE users (id integer, username text);
+                 INSERT INTO book_members VALUES (1, 7, 'viewer', '2026-10-21 00:00:00');",
+            )
             .unwrap();
-        sqlx::query("INSERT INTO book_members VALUES (1, 7, 'viewer', $1)")
-            .bind(chrono::Utc::now().naive_utc())
-            .execute(tx.as_mut())
-            .await
-            .unwrap();
-        let response = get_member(&mut tx, 1, 7, "Failed to change member")
-            .await
+        let response = get_member(&database, 1, 7, "Failed to change member")
             .unwrap_err()
             .into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

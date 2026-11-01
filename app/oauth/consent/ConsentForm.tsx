@@ -34,9 +34,30 @@ type Redirect = { redirectTo: string };
  */
 type Refused = { error: string; returnTo: string; returnHost: string };
 
+/** Where the page sent the browser, and the host to name on the page. */
+type Departure = { url: string; host: string };
+
+/**
+ * How long the page waits for the browser to leave before it says the user
+ * can close it. The navigation does not always replace the page: macOS can
+ * give an https redirect URI (a universal link) to a desktop app, and a
+ * browser can block or drop a navigation to a loopback listener. The tab
+ * then stays here with nothing more to do.
+ */
+export const STALLED_AFTER_MS = 3000;
+
 /** Opens a URL of another site. */
 function leavePage(url: string): void {
   window.location.assign(url);
+}
+
+/** The host of a URL, or the URL when it does not parse. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
 }
 
 /**
@@ -59,8 +80,10 @@ export function ConsentForm({
   const [details, setDetails] = useState<ConsentDetails | null>(null);
   const [refused, setRefused] = useState<Refused | null>(null);
   const [error, setError] = useState("");
-  const [leaving, setLeaving] = useState(false);
+  const [departure, setDeparture] = useState<Departure | null>(null);
+  const [stalled, setStalled] = useState(false);
   const [deciding, setDeciding] = useState(false);
+  const leaving = departure !== null;
 
   useEffect(() => {
     const load = async () => {
@@ -79,6 +102,19 @@ export function ConsentForm({
     void load();
   }, [query, leave]);
 
+  // The page goes to the app only once. When the browser stays, the page
+  // offers a link and does not navigate again on its own.
+  useEffect(() => {
+    if (!departure) return;
+    const timer = setTimeout(() => setStalled(true), STALLED_AFTER_MS);
+    return () => clearTimeout(timer);
+  }, [departure]);
+
+  const depart = (url: string, host: string) => {
+    setDeparture({ url, host });
+    leave(url);
+  };
+
   const decide = async (approve: boolean) => {
     setError("");
     setDeciding(true);
@@ -89,8 +125,7 @@ export function ConsentForm({
         setDeciding(false);
         return;
       }
-      setLeaving(true);
-      leave(data.redirectTo);
+      depart(data.redirectTo, details?.redirectHost ?? hostOf(data.redirectTo));
     } catch (err) {
       setError(toMessage(err, "Could not send your decision"));
       setDeciding(false);
@@ -99,8 +134,7 @@ export function ConsentForm({
 
   const returnToApp = () => {
     if (!refused) return;
-    setLeaving(true);
-    leave(refused.returnTo);
+    depart(refused.returnTo, refused.returnHost);
   };
 
   const message = error || refused?.error || "";
@@ -133,7 +167,22 @@ export function ConsentForm({
             </div>
           )}
 
-          {leaving && <p className="text-sm text-fg-tertiary text-center">Returning to the app...</p>}
+          {departure && !stalled && (
+            <p className="text-sm text-fg-tertiary text-center">Returning to the app...</p>
+          )}
+
+          {departure && stalled && (
+            <div className="space-y-2 text-center" data-testid="consent-done">
+              <p className="text-sm text-fg">You can close this window.</p>
+              <p className="text-xs text-fg-tertiary">
+                If the app did not open, go to{" "}
+                <a href={departure.url} className="text-fg-accent underline break-all">
+                  {departure.host}
+                </a>
+                .
+              </p>
+            </div>
+          )}
 
           {!details && !message && !leaving && (
             <p className="text-sm text-fg-tertiary text-center">Loading...</p>

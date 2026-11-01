@@ -17,6 +17,7 @@ use super::{
     Positions, SeedError, SeedResult, Seeder, Split, buy_allocation, gross_cents, insert_payees,
     split,
 };
+use crate::store::Sql;
 
 const PAYEES: [&str; 26] = [
     "Summit Software",
@@ -102,237 +103,162 @@ struct Accounts {
     opening: i32,
 }
 
-async fn create_accounts(seeder: &mut Seeder<'_>) -> SeedResult<Accounts> {
+fn create_accounts(seeder: &mut Seeder<'_, impl Sql>) -> SeedResult<Accounts> {
     let (asset, liability, income, expense) = ("asset", "liability", "income", "expense");
-    let checking = seeder
-        .account("Checking", asset, Some("bank"), None, true, None)
-        .await?;
-    let savings = seeder
-        .account("Savings", asset, Some("bank"), None, true, None)
-        .await?;
-    let home = seeder
-        .account("Home", asset, Some("other"), None, false, None)
-        .await?;
-    let k401 = seeder
-        .account("401(k)", asset, Some("investment"), None, false, None)
-        .await?;
-    let k401_cash = seeder
-        .account("401(k) Cash", asset, Some("cash"), Some(k401), false, None)
-        .await?;
-    let roth = seeder
-        .account("Roth IRA", asset, Some("investment"), None, false, None)
-        .await?;
-    let roth_cash = seeder
-        .account(
-            "Roth IRA Cash",
-            asset,
-            Some("cash"),
-            Some(roth),
-            false,
-            None,
-        )
-        .await?;
-    let brokerage = seeder
-        .account("Brokerage", asset, Some("investment"), None, true, None)
-        .await?;
-    let brokerage_cash = seeder
-        .account(
-            "Brokerage Cash",
-            asset,
-            Some("cash"),
-            Some(brokerage),
-            false,
-            None,
-        )
-        .await?;
+    let checking = seeder.account("Checking", asset, Some("bank"), None, true, None)?;
+    let savings = seeder.account("Savings", asset, Some("bank"), None, true, None)?;
+    let home = seeder.account("Home", asset, Some("other"), None, false, None)?;
+    let k401 = seeder.account("401(k)", asset, Some("investment"), None, false, None)?;
+    let k401_cash = seeder.account("401(k) Cash", asset, Some("cash"), Some(k401), false, None)?;
+    let roth = seeder.account("Roth IRA", asset, Some("investment"), None, false, None)?;
+    let roth_cash = seeder.account(
+        "Roth IRA Cash",
+        asset,
+        Some("cash"),
+        Some(roth),
+        false,
+        None,
+    )?;
+    let brokerage = seeder.account("Brokerage", asset, Some("investment"), None, true, None)?;
+    let brokerage_cash = seeder.account(
+        "Brokerage Cash",
+        asset,
+        Some("cash"),
+        Some(brokerage),
+        false,
+        None,
+    )?;
     (seeder.log)("  Created asset accounts");
 
-    let mortgage = seeder
-        .account("Mortgage", liability, Some("loan"), None, false, None)
-        .await?;
-    let card = seeder
-        .account(
-            "Capital One Quicksilver",
-            liability,
-            Some("credit_card"),
-            None,
-            true,
-            None,
-        )
-        .await?;
+    let mortgage = seeder.account("Mortgage", liability, Some("loan"), None, false, None)?;
+    let card = seeder.account(
+        "Capital One Quicksilver",
+        liability,
+        Some("credit_card"),
+        None,
+        true,
+        None,
+    )?;
     (seeder.log)("  Created liability accounts");
 
     // Each top-level category has its own icon. Miscellaneous has none on
     // purpose, as in the household dataset.
-    let salary = seeder
-        .account("Salary", income, None, None, false, Some("\u{1f4b0}"))
-        .await?;
-    let interest_income = seeder
-        .account(
-            "Interest Income",
-            income,
-            None,
-            None,
-            false,
-            Some("\u{1f3e6}"),
-        )
-        .await?;
-    let dividends = seeder
-        .account("Dividends", income, None, None, false, Some("\u{1f4c8}"))
-        .await?;
+    let salary = seeder.account("Salary", income, None, None, false, Some("\u{1f4b0}"))?;
+    let interest_income = seeder.account(
+        "Interest Income",
+        income,
+        None,
+        None,
+        false,
+        Some("\u{1f3e6}"),
+    )?;
+    let dividends = seeder.account("Dividends", income, None, None, false, Some("\u{1f4c8}"))?;
     (seeder.log)("  Created income accounts");
 
-    let taxes = seeder
-        .account(
-            "Taxes",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1f3db}\u{fe0f}"),
-        )
-        .await?;
-    let tax_federal = seeder
-        .account("Taxes:Federal", expense, None, Some(taxes), false, None)
-        .await?;
-    let tax_state = seeder
-        .account("Taxes:Colorado", expense, None, Some(taxes), false, None)
-        .await?;
-    let tax_ss = seeder
-        .account(
-            "Taxes:Social Security",
-            expense,
-            None,
-            Some(taxes),
-            false,
-            None,
-        )
-        .await?;
-    let tax_medicare = seeder
-        .account("Taxes:Medicare", expense, None, Some(taxes), false, None)
-        .await?;
-    let health = seeder
-        .account(
-            "Health Insurance",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1fa7a}"),
-        )
-        .await?;
-    let housing = seeder
-        .account("Housing", expense, None, None, false, Some("\u{1f3e0}"))
-        .await?;
-    let mortgage_interest = seeder
-        .account(
-            "Housing:Mortgage Interest",
-            expense,
-            None,
-            Some(housing),
-            false,
-            None,
-        )
-        .await?;
-    let property_tax = seeder
-        .account(
-            "Housing:Property Tax",
-            expense,
-            None,
-            Some(housing),
-            false,
-            None,
-        )
-        .await?;
-    let home_insurance = seeder
-        .account(
-            "Housing:Homeowners Insurance",
-            expense,
-            None,
-            Some(housing),
-            false,
-            None,
-        )
-        .await?;
-    let utilities = seeder
-        .account(
-            "Housing:Electric & Gas",
-            expense,
-            None,
-            Some(housing),
-            false,
-            None,
-        )
-        .await?;
-    let internet = seeder
-        .account(
-            "Housing:Internet",
-            expense,
-            None,
-            Some(housing),
-            false,
-            Some("\u{1f310}"),
-        )
-        .await?;
-    let auto = seeder
-        .account("Auto", expense, None, None, false, Some("\u{1f697}"))
-        .await?;
-    let car_lease = seeder
-        .account("Auto:Car Lease", expense, None, Some(auto), false, None)
-        .await?;
-    let auto_insurance = seeder
-        .account("Auto:Insurance", expense, None, Some(auto), false, None)
-        .await?;
-    let fuel = seeder
-        .account("Auto:Fuel", expense, None, Some(auto), false, None)
-        .await?;
-    let phone = seeder
-        .account("Phone", expense, None, None, false, Some("\u{1f4f1}"))
-        .await?;
-    let groceries = seeder
-        .account("Groceries", expense, None, None, false, Some("\u{1f6d2}"))
-        .await?;
-    let dining = seeder
-        .account(
-            "Dining",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1f37d}\u{fe0f}"),
-        )
-        .await?;
-    let shopping = seeder
-        .account(
-            "Shopping",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1f6cd}\u{fe0f}"),
-        )
-        .await?;
-    let subscriptions = seeder
-        .account(
-            "Subscriptions",
-            expense,
-            None,
-            None,
-            false,
-            Some("\u{1f4fa}"),
-        )
-        .await?;
-    let medical = seeder
-        .account("Medical", expense, None, None, false, Some("\u{1f3e5}"))
-        .await?;
-    seeder
-        .account("Miscellaneous", expense, None, None, false, None)
-        .await?;
+    let taxes = seeder.account(
+        "Taxes",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1f3db}\u{fe0f}"),
+    )?;
+    let tax_federal = seeder.account("Taxes:Federal", expense, None, Some(taxes), false, None)?;
+    let tax_state = seeder.account("Taxes:Colorado", expense, None, Some(taxes), false, None)?;
+    let tax_ss = seeder.account(
+        "Taxes:Social Security",
+        expense,
+        None,
+        Some(taxes),
+        false,
+        None,
+    )?;
+    let tax_medicare = seeder.account("Taxes:Medicare", expense, None, Some(taxes), false, None)?;
+    let health = seeder.account(
+        "Health Insurance",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1fa7a}"),
+    )?;
+    let housing = seeder.account("Housing", expense, None, None, false, Some("\u{1f3e0}"))?;
+    let mortgage_interest = seeder.account(
+        "Housing:Mortgage Interest",
+        expense,
+        None,
+        Some(housing),
+        false,
+        None,
+    )?;
+    let property_tax = seeder.account(
+        "Housing:Property Tax",
+        expense,
+        None,
+        Some(housing),
+        false,
+        None,
+    )?;
+    let home_insurance = seeder.account(
+        "Housing:Homeowners Insurance",
+        expense,
+        None,
+        Some(housing),
+        false,
+        None,
+    )?;
+    let utilities = seeder.account(
+        "Housing:Electric & Gas",
+        expense,
+        None,
+        Some(housing),
+        false,
+        None,
+    )?;
+    let internet = seeder.account(
+        "Housing:Internet",
+        expense,
+        None,
+        Some(housing),
+        false,
+        Some("\u{1f310}"),
+    )?;
+    let auto = seeder.account("Auto", expense, None, None, false, Some("\u{1f697}"))?;
+    let car_lease = seeder.account("Auto:Car Lease", expense, None, Some(auto), false, None)?;
+    let auto_insurance =
+        seeder.account("Auto:Insurance", expense, None, Some(auto), false, None)?;
+    let fuel = seeder.account("Auto:Fuel", expense, None, Some(auto), false, None)?;
+    let phone = seeder.account("Phone", expense, None, None, false, Some("\u{1f4f1}"))?;
+    let groceries = seeder.account("Groceries", expense, None, None, false, Some("\u{1f6d2}"))?;
+    let dining = seeder.account(
+        "Dining",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1f37d}\u{fe0f}"),
+    )?;
+    let shopping = seeder.account(
+        "Shopping",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1f6cd}\u{fe0f}"),
+    )?;
+    let subscriptions = seeder.account(
+        "Subscriptions",
+        expense,
+        None,
+        None,
+        false,
+        Some("\u{1f4fa}"),
+    )?;
+    let medical = seeder.account("Medical", expense, None, None, false, Some("\u{1f3e5}"))?;
+    seeder.account("Miscellaneous", expense, None, None, false, None)?;
     (seeder.log)("  Created expense accounts");
 
-    let opening = seeder
-        .account("Opening Balances", "equity", None, None, false, None)
-        .await?;
+    let opening = seeder.account("Opening Balances", "equity", None, None, false, None)?;
     (seeder.log)("  Created equity account");
 
     Ok(Accounts {
@@ -418,40 +344,34 @@ struct End {
 }
 
 /// Writes the single-homeowner rows into the book of `seeder`.
-pub(super) async fn seed(seeder: &mut Seeder<'_>, window: Window) -> SeedResult<()> {
-    let a = create_accounts(seeder).await?;
+pub(super) fn seed(seeder: &mut Seeder<'_, impl Sql>, window: Window) -> SeedResult<()> {
+    let a = create_accounts(seeder)?;
     let vti = Security::new(
-        seeder
-            .security("Vanguard Total Stock Market ETF", "VTI")
-            .await?,
+        seeder.security("Vanguard Total Stock Market ETF", "VTI")?,
         "VTI",
         &VTI_PRICES,
         window,
     );
     let vxus = Security::new(
-        seeder
-            .security("Vanguard Total International Stock ETF", "VXUS")
-            .await?,
+        seeder.security("Vanguard Total International Stock ETF", "VXUS")?,
         "VXUS",
         &VXUS_PRICES,
         window,
     );
     let bnd = Security::new(
-        seeder
-            .security("Vanguard Total Bond Market ETF", "BND")
-            .await?,
+        seeder.security("Vanguard Total Bond Market ETF", "BND")?,
         "BND",
         &BND_PRICES,
         window,
     );
     (seeder.log)("  Created securities");
-    seed_prices(seeder, &[vti, vxus, bnd], window).await?;
+    seed_prices(seeder, &[vti, vxus, bnd], window)?;
     (seeder.log)("  Created security price history");
-    let payees = insert_payees(seeder, &PAYEES).await?;
+    let payees = insert_payees(seeder, &PAYEES)?;
     (seeder.log)("  Created payees");
 
     let mut positions = Positions::default();
-    seed_opening(seeder, &a, window, &mut positions, [vti, vxus, bnd]).await?;
+    seed_opening(seeder, &a, window, &mut positions, [vti, vxus, bnd])?;
     (seeder.log)("  Generating transactions...");
     let end = seed_months(
         seeder,
@@ -460,17 +380,16 @@ pub(super) async fn seed(seeder: &mut Seeder<'_>, window: Window) -> SeedResult<
         window,
         &mut positions,
         [vti, vxus, bnd],
-    )
-    .await?;
-    seed_plaid(seeder, &plaid_demo(&a), window.today).await?;
-    write_rules(seeder, rules(&a, &end), &payees, window.today).await?;
+    )?;
+    seed_plaid(seeder, &plaid_demo(&a), window.today)?;
+    write_rules(seeder, rules(&a, &end), &payees, window.today)?;
     Ok(())
 }
 
 /// The opening balances on the day before the window, and the first buys of
 /// the investment accounts on its first day.
-async fn seed_opening(
-    seeder: &mut Seeder<'_>,
+fn seed_opening(
+    seeder: &mut Seeder<'_, impl Sql>,
     a: &Accounts,
     window: Window,
     positions: &mut Positions,
@@ -487,14 +406,12 @@ async fn seed_opening(
         ("Opening Balance - Roth IRA", a.roth_cash, 1_500_000),
         ("Opening Balance - Brokerage", a.brokerage_cash, 1_000_000),
     ] {
-        seeder
-            .transaction(
-                &opening,
-                description,
-                None,
-                &[split(account, amount), split(a.opening, -amount)],
-            )
-            .await?;
+        seeder.transaction(
+            &opening,
+            description,
+            None,
+            &[split(account, amount), split(a.opening, -amount)],
+        )?;
     }
     let start = format_date(window.start);
     for (account, cash, amount, allocation, label) in [
@@ -530,8 +447,7 @@ async fn seed_opening(
             amount,
             &allocation,
             label,
-        )
-        .await?;
+        )?;
     }
     Ok(())
 }
@@ -539,8 +455,8 @@ async fn seed_opening(
 /// The events of each month of the window. Every random value of an event is
 /// drawn before its date is checked, so the rows before `today` do not
 /// depend on `today`.
-async fn seed_months(
-    seeder: &mut Seeder<'_>,
+fn seed_months(
+    seeder: &mut Seeder<'_, impl Sql>,
     a: &Accounts,
     payees: &HashMap<&'static str, i32>,
     window: Window,
@@ -564,20 +480,18 @@ async fn seed_months(
         let (interest, principal) = mortgage_parts(mortgage_balance);
         if let Some(day) = on(1) {
             let escrow = PROPERTY_TAX + HOMEOWNERS_INSURANCE;
-            seeder
-                .transaction(
-                    &format_date(day),
-                    "Mortgage Payment",
-                    payee("Front Range Mortgage"),
-                    &[
-                        split(a.mortgage, principal),
-                        split(a.mortgage_interest, interest),
-                        split(a.property_tax, PROPERTY_TAX),
-                        split(a.home_insurance, HOMEOWNERS_INSURANCE),
-                        split(a.checking, -(principal + interest + escrow)),
-                    ],
-                )
-                .await?;
+            seeder.transaction(
+                &format_date(day),
+                "Mortgage Payment",
+                payee("Front Range Mortgage"),
+                &[
+                    split(a.mortgage, principal),
+                    split(a.mortgage_interest, interest),
+                    split(a.property_tax, PROPERTY_TAX),
+                    split(a.home_insurance, HOMEOWNERS_INSURANCE),
+                    split(a.checking, -(principal + interest + escrow)),
+                ],
+            )?;
             mortgage_balance -= principal;
         }
 
@@ -587,14 +501,12 @@ async fn seed_months(
         if roth > 0
             && let Some(day) = on(3)
         {
-            seeder
-                .transaction(
-                    &format_date(day),
-                    "Roth IRA Contribution",
-                    payee("Main Street Bank"),
-                    &[split(a.roth_cash, roth), split(a.checking, -roth)],
-                )
-                .await?;
+            seeder.transaction(
+                &format_date(day),
+                "Roth IRA Contribution",
+                payee("Main Street Bank"),
+                &[split(a.roth_cash, roth), split(a.checking, -roth)],
+            )?;
             *roth_by_year.entry(year).or_default() += roth;
             if let Some(buy_day) = on(4) {
                 buy_allocation(
@@ -607,24 +519,21 @@ async fn seed_months(
                     roth,
                     &[(vti, 0.7), (vxus, 0.0)],
                     "Roth IRA",
-                )
-                .await?;
+                )?;
             }
         }
 
         // Brokerage on the 5th, the buy on the 6th.
         if let Some(day) = on(5) {
-            seeder
-                .transaction(
-                    &format_date(day),
-                    "Transfer to Brokerage",
-                    payee("Main Street Bank"),
-                    &[
-                        split(a.brokerage_cash, BROKERAGE_TRANSFER),
-                        split(a.checking, -BROKERAGE_TRANSFER),
-                    ],
-                )
-                .await?;
+            seeder.transaction(
+                &format_date(day),
+                "Transfer to Brokerage",
+                payee("Main Street Bank"),
+                &[
+                    split(a.brokerage_cash, BROKERAGE_TRANSFER),
+                    split(a.checking, -BROKERAGE_TRANSFER),
+                ],
+            )?;
             if let Some(buy_day) = on(6) {
                 buy_allocation(
                     seeder,
@@ -636,8 +545,7 @@ async fn seed_months(
                     BROKERAGE_TRANSFER,
                     &[(vti, 0.8), (bnd, 0.0)],
                     "Brokerage",
-                )
-                .await?;
+                )?;
             }
         }
 
@@ -649,14 +557,12 @@ async fn seed_months(
         };
         let utilities = 9_000 * season / 10 + seeder.rand.int(-1_500, 1_500);
         if let Some(day) = on(9) {
-            seeder
-                .transaction(
-                    &format_date(day),
-                    "Electric & Gas",
-                    payee("Xcel Energy"),
-                    &[split(a.utilities, utilities), split(a.checking, -utilities)],
-                )
-                .await?;
+            seeder.transaction(
+                &format_date(day),
+                "Electric & Gas",
+                payee("Xcel Energy"),
+                &[split(a.utilities, utilities), split(a.checking, -utilities)],
+            )?;
         }
 
         for (day, description, payee_name, account, amount) in [
@@ -678,30 +584,26 @@ async fn seed_months(
             ),
         ] {
             if let Some(day) = on(day) {
-                seeder
-                    .transaction(
-                        &format_date(day),
-                        description,
-                        payee(payee_name),
-                        &[split(account, amount), split(a.checking, -amount)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &format_date(day),
+                    description,
+                    payee(payee_name),
+                    &[split(account, amount), split(a.checking, -amount)],
+                )?;
             }
         }
 
         // Savings transfer on the 16th.
         if let Some(day) = on(16) {
-            seeder
-                .transaction(
-                    &format_date(day),
-                    "Transfer to Savings",
-                    payee("Transfer"),
-                    &[
-                        split(a.savings, SAVINGS_TRANSFER),
-                        split(a.checking, -SAVINGS_TRANSFER),
-                    ],
-                )
-                .await?;
+            seeder.transaction(
+                &format_date(day),
+                "Transfer to Savings",
+                payee("Transfer"),
+                &[
+                    split(a.savings, SAVINGS_TRANSFER),
+                    split(a.checking, -SAVINGS_TRANSFER),
+                ],
+            )?;
             savings_balance += SAVINGS_TRANSFER;
         }
 
@@ -743,14 +645,12 @@ async fn seed_months(
         let mut after_statement: i64 = 0;
         for (day, name, account, amount) in charges {
             if let Some(charge_day) = on(day) {
-                seeder
-                    .transaction(
-                        &format_date(charge_day),
-                        name,
-                        payee(name),
-                        &[split(account, amount), split(a.card, -amount)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &format_date(charge_day),
+                    name,
+                    payee(name),
+                    &[split(account, amount), split(a.card, -amount)],
+                )?;
                 if day <= 21 {
                     before_statement += amount;
                 } else {
@@ -761,14 +661,12 @@ async fn seed_months(
         let statement = carried + before_statement;
         if let Some(day) = on(22) {
             if statement > 0 {
-                seeder
-                    .transaction(
-                        &format_date(day),
-                        "Credit Card Payment",
-                        payee("Capital One"),
-                        &[split(a.card, statement), split(a.checking, -statement)],
-                    )
-                    .await?;
+                seeder.transaction(
+                    &format_date(day),
+                    "Credit Card Payment",
+                    payee("Capital One"),
+                    &[split(a.card, statement), split(a.checking, -statement)],
+                )?;
             }
             carried = after_statement;
         } else {
@@ -790,14 +688,12 @@ async fn seed_months(
                 limit_401k(paid.year()) - k401_by_year.get(&paid.year()).copied().unwrap_or(0);
             let contribution = CONTRIBUTION.min(room.max(0));
             *k401_by_year.entry(paid.year()).or_default() += contribution;
-            seeder
-                .transaction(
-                    &format_date(paid),
-                    "Paycheck - Summit Software",
-                    payee("Summit Software"),
-                    &paycheck_splits(a, contribution),
-                )
-                .await?;
+            seeder.transaction(
+                &format_date(paid),
+                "Paycheck - Summit Software",
+                payee("Summit Software"),
+                &paycheck_splits(a, contribution),
+            )?;
             let buy_day = paid + Days::new(1);
             if contribution > 0 && buy_day <= window.today {
                 buy_allocation(
@@ -810,8 +706,7 @@ async fn seed_months(
                     contribution,
                     &[(vti, 0.6), (vxus, 0.3), (bnd, 0.0)],
                     "401(k)",
-                )
-                .await?;
+                )?;
             }
         }
 
@@ -833,17 +728,15 @@ async fn seed_months(
                     let value = gross_cents(held, security.price_micros(day)?);
                     let amount = value * basis_points / 40_000;
                     if amount > 0 {
-                        seeder
-                            .dividend(
-                                &format_date(day),
-                                account,
-                                cash,
-                                a.dividends,
-                                security.id,
-                                amount,
-                                &format!("{} Dividend - {label}", security.symbol),
-                            )
-                            .await?;
+                        seeder.dividend(
+                            &format_date(day),
+                            account,
+                            cash,
+                            a.dividends,
+                            security.id,
+                            amount,
+                            &format!("{} Dividend - {label}", security.symbol),
+                        )?;
                     }
                 }
             }
@@ -857,17 +750,15 @@ async fn seed_months(
             let held = positions.get(a.brokerage, vti.id);
             let trim = held * 15 / 100 / 100 * 100;
             if trim > 0 {
-                seeder
-                    .sell(
-                        &format_date(day),
-                        a.brokerage,
-                        a.brokerage_cash,
-                        vti.id,
-                        trim,
-                        vti.price_micros(month_date)?,
-                        "Sell VTI - Rebalance",
-                    )
-                    .await?;
+                seeder.sell(
+                    &format_date(day),
+                    a.brokerage,
+                    a.brokerage_cash,
+                    vti.id,
+                    trim,
+                    vti.price_micros(month_date)?,
+                    "Sell VTI - Rebalance",
+                )?;
                 positions.add(a.brokerage, vti.id, -trim);
             }
         }
@@ -876,17 +767,15 @@ async fn seed_months(
         let interest_day = last_day_of_month(year, month);
         if let Some(day) = on(interest_day) {
             let interest = (savings_balance * 400 + 60_000) / 120_000;
-            seeder
-                .transaction(
-                    &format_date(day),
-                    "Interest Payment",
-                    payee("Main Street Bank"),
-                    &[
-                        split(a.savings, interest),
-                        split(a.interest_income, -interest),
-                    ],
-                )
-                .await?;
+            seeder.transaction(
+                &format_date(day),
+                "Interest Payment",
+                payee("Main Street Bank"),
+                &[
+                    split(a.savings, interest),
+                    split(a.interest_income, -interest),
+                ],
+            )?;
             savings_balance += interest;
         }
     }

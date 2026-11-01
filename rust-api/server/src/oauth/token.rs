@@ -8,19 +8,19 @@
 //!   revokes its grant (OAuth 2.1 section 4.1.3).
 //! - A refresh token is good for one exchange: each exchange gives a new
 //!   access token and a new refresh token (rotation, which the specification
-//!   requires for a public client). A used refresh token sent again within
-//!   [`REFRESH_REUSE_GRACE_SECONDS`] gets `invalid_grant`, so a retry after
-//!   a timeout costs the client nothing. Later, a second use means that a
-//!   copy of the token leaked, and the grant is revoked.
+//!   requires for a public client). A second use of a refresh token revokes
+//!   its grant, also immediately after the first use. A bearer token cannot
+//!   show if the second use is a retry or a thief, so a retry after a timeout
+//!   disconnects the client.
 //! - Failed exchanges count against a per-address limit.
 
 use super::{
-    ACCESS_TOKEN_PREFIX, ACCESS_TOKEN_SECONDS, REFRESH_REUSE_GRACE_SECONDS, REFRESH_TOKEN_DAYS,
-    REFRESH_TOKEN_PREFIX, SCOPE, new_secret, no_store, not_configured, now, oauth_error, sweep,
+    ACCESS_TOKEN_PREFIX, ACCESS_TOKEN_SECONDS, REFRESH_TOKEN_DAYS, REFRESH_TOKEN_PREFIX, SCOPE,
+    new_secret, no_store, not_configured, now, oauth_error, sweep,
 };
 use crate::{
     auth::token_hash,
-    client_ip,
+    client_ip, platform,
     rate_limit::{Keys, Scope},
     state::AppState,
 };
@@ -33,10 +33,13 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, NaiveDateTime};
-use ledger_db::locks::begin_pool;
+use ledger_db::{
+    Sql,
+    store::{self, params},
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
 use subtle::ConstantTimeEq;
 
 /// The form parameters, or `None` when one occurs twice.
@@ -92,7 +95,7 @@ pub(super) async fn exchange(
     let keys = Keys { username: None, ip };
     if let Err(limited) = state
         .rate_limits
-        .enforce(Scope::OAuthToken, &keys, Instant::now())
+        .enforce(Scope::OAuthToken, &keys, platform::timestamp())
     {
         return limited.into_response();
     }
@@ -136,7 +139,7 @@ pub(super) async fn exchange(
             if refusal.code == "invalid_grant" {
                 state
                     .rate_limits
-                    .failure(Scope::OAuthToken, &keys, Instant::now());
+                    .failure(Scope::OAuthToken, &keys, platform::timestamp());
             }
             oauth_error(StatusCode::BAD_REQUEST, refusal.code, refusal.description)
         }
@@ -155,24 +158,29 @@ fn required<'a>(
         .ok_or(refused("invalid_request", description))
 }
 
-fn database(cause: sqlx::Error) -> Refused {
+fn database(cause: impl std::fmt::Display) -> Refused {
     tracing::error!(error = %cause, "OAuth token request failed");
     refused("server_error", "The server could not complete the request")
+}
+
+impl From<store::Error> for Refused {
+    fn from(cause: store::Error) -> Self {
+        database(cause)
+    }
 }
 
 /// Revokes a grant: its codes and tokens go with it.
 async fn revoke_grant(state: &AppState, grant_id: i32, reason: &str) {
     tracing::warn!(grant_id, reason, "Revoking an OAuth grant");
-    if let Err(cause) = sqlx::query("DELETE FROM oauth_grants WHERE id = $1")
-        .bind(grant_id)
-        .execute(&state.pool)
-        .await
+    if let Err(cause) = state
+        .database
+        .execute("DELETE FROM oauth_grants WHERE id = ?1", &params![grant_id])
     {
         tracing::error!(error = %cause, "Could not revoke an OAuth grant");
     }
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct CodeRow {
     id: i32,
     grant_id: i32,
@@ -183,7 +191,7 @@ struct CodeRow {
     client_id: String,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct RefreshRow {
     id: i32,
     grant_id: i32,
@@ -208,18 +216,18 @@ async fn authorization_code(
     // binds the code to the client. An OAuth 2.0 client still sends it, and
     // then it must agree with the authorization request.
     let redirect_uri = parameters.get("redirect_uri").map(String::as_str);
-    let row: Option<CodeRow> = sqlx::query_as(
-        "SELECT c.id, c.grant_id, c.redirect_uri, c.code_challenge, c.expires_at, c.used_at,
+    let row: Option<CodeRow> = state
+        .database
+        .query_optional(
+            "SELECT c.id, c.grant_id, c.redirect_uri, c.code_challenge, c.expires_at, c.used_at,
                     oc.client_id
              FROM oauth_codes c
              JOIN oauth_grants g ON g.id = c.grant_id
              JOIN oauth_clients oc ON oc.id = g.client_id
-             WHERE c.code_hash = $1",
-    )
-    .bind(token_hash(code))
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(database)?;
+             WHERE c.code_hash = ?1",
+            &params![token_hash(code)],
+        )
+        .map_err(database)?;
     let Some(CodeRow {
         id: code_id,
         grant_id,
@@ -244,21 +252,22 @@ async fn authorization_code(
         return Err(BAD_GRANT);
     }
     let now = now();
-    let mut transaction = begin_pool(&state.pool).await.map_err(database)?;
-    let marked =
-        sqlx::query("UPDATE oauth_codes SET used_at = $2 WHERE id = $1 AND used_at IS NULL")
-            .bind(code_id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database)?;
-    if marked.rows_affected() != 1 {
-        drop(transaction);
+    // `None` when another request used the code first. The grant is
+    // revoked after this transaction ends.
+    let response = state.database.transaction(|tx| {
+        let marked = tx.execute(
+            "UPDATE oauth_codes SET used_at = ?2 WHERE id = ?1 AND used_at IS NULL",
+            &params![code_id, now],
+        )?;
+        if marked != 1 {
+            return Ok(None);
+        }
+        issue(tx, grant_id, now).map(Some)
+    })?;
+    let Some(response) = response else {
         revoke_grant(state, grant_id, "an authorization code was used twice").await;
         return Err(BAD_GRANT);
-    }
-    let response = issue(&mut transaction, grant_id, now).await?;
-    transaction.commit().await.map_err(database)?;
+    };
     Ok(response)
 }
 
@@ -273,17 +282,17 @@ async fn refresh_token(
         "The request has no refresh_token",
     )?;
     let client_id = required(parameters, "client_id", "The request has no client_id")?;
-    let row: Option<RefreshRow> = sqlx::query_as(
-        "SELECT t.id, t.grant_id, t.expires_at, t.used_at, oc.client_id, g.resource
+    let row: Option<RefreshRow> = state
+        .database
+        .query_optional(
+            "SELECT t.id, t.grant_id, t.expires_at, t.used_at, oc.client_id, g.resource
              FROM oauth_tokens t
              JOIN oauth_grants g ON g.id = t.grant_id
              JOIN oauth_clients oc ON oc.id = g.client_id
-             WHERE t.token_hash = $1 AND t.kind = 'refresh'",
-    )
-    .bind(token_hash(token))
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(database)?;
+             WHERE t.token_hash = ?1 AND t.kind = 'refresh'",
+            &params![token_hash(token)],
+        )
+        .map_err(database)?;
     let Some(RefreshRow {
         id: token_id,
         grant_id,
@@ -295,39 +304,36 @@ async fn refresh_token(
     else {
         return Err(BAD_GRANT);
     };
-    let now = now();
-    if let Some(used_at) = used_at {
-        if now - used_at > Duration::seconds(REFRESH_REUSE_GRACE_SECONDS) {
-            revoke_grant(state, grant_id, "a used refresh token was sent again").await;
-        }
+    if used_at.is_some() {
+        revoke_grant(state, grant_id, "a used refresh token was sent again").await;
         return Err(BAD_GRANT);
     }
+    let now = now();
     if expires_at <= now || owner != client_id || grant_resource != resource {
         return Err(BAD_GRANT);
     }
-    let mut transaction = begin_pool(&state.pool).await.map_err(database)?;
-    let marked =
-        sqlx::query("UPDATE oauth_tokens SET used_at = $2 WHERE id = $1 AND used_at IS NULL")
-            .bind(token_id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database)?;
-    if marked.rows_affected() != 1 {
+    // `None` when another request used the token first. The grant is
+    // revoked after this transaction ends.
+    let response = state.database.transaction(|tx| {
+        let marked = tx.execute(
+            "UPDATE oauth_tokens SET used_at = ?2 WHERE id = ?1 AND used_at IS NULL",
+            &params![token_id, now],
+        )?;
+        if marked != 1 {
+            return Ok(None);
+        }
+        issue(tx, grant_id, now).map(Some)
+    })?;
+    let Some(response) = response else {
+        revoke_grant(state, grant_id, "a used refresh token was sent again").await;
         return Err(BAD_GRANT);
-    }
-    let response = issue(&mut transaction, grant_id, now).await?;
-    transaction.commit().await.map_err(database)?;
+    };
     Ok(response)
 }
 
 /// Stores a new access token and refresh token for a grant, and gives the
 /// token response (RFC 6749 section 5.1).
-async fn issue(
-    transaction: &mut sqlx::Transaction<'_, ledger_db::engine::Db>,
-    grant_id: i32,
-    now: NaiveDateTime,
-) -> Result<Response, Refused> {
+fn issue(tx: &impl Sql, grant_id: i32, now: NaiveDateTime) -> Result<Response, Refused> {
     let unavailable = |_| refused("server_error", "Could not make a token");
     let access = new_secret(ACCESS_TOKEN_PREFIX).map_err(unavailable)?;
     let refresh = new_secret(REFRESH_TOKEN_PREFIX).map_err(unavailable)?;
@@ -343,18 +349,11 @@ async fn issue(
             now + Duration::days(REFRESH_TOKEN_DAYS),
         ),
     ] {
-        sqlx::query(
+        tx.execute(
             "INSERT INTO oauth_tokens (token_hash, grant_id, kind, expires_at, created_at)
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(token_hash(secret))
-        .bind(grant_id)
-        .bind(kind)
-        .bind(expires_at)
-        .bind(now)
-        .execute(&mut **transaction)
-        .await
-        .map_err(database)?;
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &params![token_hash(secret), grant_id, kind, expires_at, now],
+        )?;
     }
     Ok(no_store(
         Json(json!({
@@ -390,16 +389,14 @@ pub(super) async fn revoke(State(state): State<AppState>, body: Bytes) -> Respon
             "The request has no token",
         );
     };
-    let row: Result<Option<(i32, i32, String, String)>, _> = sqlx::query_as(
+    let row: Result<Option<(i32, i32, String, String)>, _> = state.database.query_optional(
         "SELECT t.id, t.grant_id, t.kind, oc.client_id
          FROM oauth_tokens t
          JOIN oauth_grants g ON g.id = t.grant_id
          JOIN oauth_clients oc ON oc.id = g.client_id
-         WHERE t.token_hash = $1",
-    )
-    .bind(token_hash(token))
-    .fetch_optional(&state.pool)
-    .await;
+         WHERE t.token_hash = ?1",
+        &params![token_hash(token)],
+    );
     match row {
         Ok(Some((token_id, grant_id, kind, owner))) => {
             if parameters
@@ -413,15 +410,13 @@ pub(super) async fn revoke(State(state): State<AppState>, body: Bytes) -> Respon
                 );
             }
             let deleted = if kind == "refresh" {
-                sqlx::query("DELETE FROM oauth_grants WHERE id = $1")
-                    .bind(grant_id)
-                    .execute(&state.pool)
-                    .await
+                state
+                    .database
+                    .execute("DELETE FROM oauth_grants WHERE id = ?1", &params![grant_id])
             } else {
-                sqlx::query("DELETE FROM oauth_tokens WHERE id = $1")
-                    .bind(token_id)
-                    .execute(&state.pool)
-                    .await
+                state
+                    .database
+                    .execute("DELETE FROM oauth_tokens WHERE id = ?1", &params![token_id])
             };
             if let Err(cause) = deleted {
                 tracing::error!(error = %cause, "Could not revoke an OAuth token");

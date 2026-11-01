@@ -152,6 +152,7 @@ interface TransactionListProps {
   highlightTransactionId?: number | null;
   onHighlightAnimated?: () => void;
   onNavigateToAccount?: (accountId: number, transactionId: number) => void;
+  onNavigateToPayee?: (payeeId: number) => void;
   isLoading?: boolean;
 }
 
@@ -193,6 +194,7 @@ export function TransactionList({
   highlightTransactionId,
   onHighlightAnimated,
   onNavigateToAccount,
+  onNavigateToPayee,
   isLoading = false,
 }: TransactionListProps) {
   const isMobile = useIsMobile();
@@ -207,6 +209,7 @@ export function TransactionList({
   // reconcile / go-to are reachable without right-click (and at all on touch).
   const hasRowActions = !!(
     onNavigateToAccount ||
+    onNavigateToPayee ||
     onToggleReconciled ||
     onMoveToNextBusinessDay
   );
@@ -283,9 +286,10 @@ export function TransactionList({
   const hasRowMenuActions = useCallback(
     (transaction: DisplayTransaction) =>
       (!!onNavigateToAccount && getGoToAccounts(transaction).length > 0) ||
+      (!!onNavigateToPayee && !!transaction.payee) ||
       !!onToggleReconciled ||
       (!!onMoveToNextBusinessDay && !transaction.isReconciled),
-    [onNavigateToAccount, onToggleReconciled, onMoveToNextBusinessDay, getGoToAccounts]
+    [onNavigateToAccount, onNavigateToPayee, onToggleReconciled, onMoveToNextBusinessDay, getGoToAccounts]
   );
 
   const handleContextMenu = useCallback(
@@ -313,9 +317,9 @@ export function TransactionList({
       e.stopPropagation();
       if (transaction.isProjected || transaction.isPlaidPending || !hasRowMenuActions(transaction)) return;
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      const goToCount = onNavigateToAccount
-        ? getGoToAccounts(transaction).length
-        : 0;
+      const goToCount =
+        (onNavigateToAccount ? getGoToAccounts(transaction).length : 0) +
+        (onNavigateToPayee && transaction.payee ? 1 : 0);
       const reconcileCount = onToggleReconciled ? 1 : 0;
       const moveDateCount =
         onMoveToNextBusinessDay && !transaction.isReconciled ? 1 : 0;
@@ -335,7 +339,7 @@ export function TransactionList({
       window.getSelection()?.removeAllRanges();
       setContextMenu({ x, y, transaction });
     },
-    [onNavigateToAccount, onToggleReconciled, onMoveToNextBusinessDay, getGoToAccounts, hasRowMenuActions]
+    [onNavigateToAccount, onNavigateToPayee, onToggleReconciled, onMoveToNextBusinessDay, getGoToAccounts, hasRowMenuActions]
   );
 
   useEffect(() => {
@@ -1293,7 +1297,9 @@ export function TransactionList({
     // Only render actions whose handlers are actually wired — a no-op item that
     // just closes the menu reads as broken. If nothing is actionable, render
     // nothing rather than an empty floating box.
-    const showGoTo = !!onNavigateToAccount && contextMenuGoToAccounts.length > 0;
+    const showGoToAccounts = !!onNavigateToAccount && contextMenuGoToAccounts.length > 0;
+    const contextMenuPayee = onNavigateToPayee ? contextMenu.transaction.payee : null;
+    const showGoTo = showGoToAccounts || !!contextMenuPayee;
     const showReconcile = !!onToggleReconciled;
     // Only for unreconciled transactions — a reconciled date is the cleared date
     // and shouldn't be nudged. Handles scheduled ACH payments that miss their day.
@@ -1307,7 +1313,7 @@ export function TransactionList({
         className="fixed z-50 min-w-[160px] rounded-md border border-border bg-surface-elevated py-1 shadow-lg"
         style={{ top: contextMenu.y, left: contextMenu.x }}
       >
-        {showGoTo &&
+        {showGoToAccounts &&
           contextMenuGoToAccounts.map((account) => (
             <button
               key={`goto-${account.accountId}`}
@@ -1322,6 +1328,19 @@ export function TransactionList({
               Go to {account.accountName}
             </button>
           ))}
+        {contextMenuPayee && (
+          <button
+            type="button"
+            role="menuitem"
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-sm text-fg-secondary hover:bg-surface-tertiary"
+            onClick={() => {
+              onNavigateToPayee!(contextMenuPayee.id);
+              setContextMenu(null);
+            }}
+          >
+            Go to payee {contextMenuPayee.name}
+          </button>
+        )}
         {showGoTo && (showReconcile || showMoveDate) && (
           <div className="my-1 border-t border-border-secondary" />
         )}

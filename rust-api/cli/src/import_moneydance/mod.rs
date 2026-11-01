@@ -28,38 +28,19 @@ mod securities;
 mod transactions;
 mod values;
 
-use ledger_db::engine::{Db, DbConnection};
+use ledger_db::store::{self, Sql, Transaction, params};
 use std::collections::HashMap;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::Value;
-use sqlx::QueryBuilder;
 
 use values::{Item, int4, int8, text};
 
 /// The message of a row that failed. The run records it and goes on.
 pub type RowError = String;
 
-pub fn row_error(cause: sqlx::Error) -> RowError {
+pub fn row_error(cause: store::Error) -> RowError {
     cause.to_string()
-}
-
-/// Releases the savepoint when `outcome` is a success, and rolls it back
-/// when it is a failure. Only an error of the savepoint itself is fatal.
-async fn finish<T>(
-    savepoint: sqlx::Transaction<'_, Db>,
-    outcome: Result<T, RowError>,
-) -> Result<Result<T, RowError>, sqlx::Error> {
-    match outcome {
-        Ok(value) => {
-            savepoint.commit().await?;
-            Ok(Ok(value))
-        }
-        Err(message) => {
-            savepoint.rollback().await?;
-            Ok(Err(message))
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -139,7 +120,7 @@ pub struct IdMapper {
     pub securities: HashMap<String, i32>,
 }
 
-/// What every phase shares, apart from the connection. The connection stays
+/// What every phase shares, apart from the transaction. The transaction stays
 /// a separate argument, so a savepoint can borrow it while a phase reads the
 /// context.
 pub struct ImportContext {
@@ -171,34 +152,37 @@ pub struct NewTransaction {
     pub is_reconciled: bool,
 }
 
-async fn insert_transaction(
-    connection: &mut DbConnection,
+fn insert_transaction(
+    tx: &Transaction<'_>,
     book_id: i32,
     now: NaiveDateTime,
     transaction: &NewTransaction,
 ) -> Result<i32, RowError> {
-    sqlx::query_scalar(
+    tx.query_row(
         "INSERT INTO transactions
-           (book_id, date, description, check_number, payee_id, is_reconciled, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+           (book_id, date, description, check_number, payee_id, is_reconciled, created_at, updated_at,
+            description_fold, check_number_fold)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)
          RETURNING id",
+        &params![
+            book_id,
+            &transaction.date,
+            &transaction.description,
+            &transaction.check_number,
+            transaction.payee_id,
+            transaction.is_reconciled,
+            now,
+            ledger_db::folds::fold_option(transaction.description.as_deref()),
+            ledger_db::folds::fold_option(transaction.check_number.as_deref())
+        ],
     )
-    .bind(book_id)
-    .bind(&transaction.date)
-    .bind(&transaction.description)
-    .bind(&transaction.check_number)
-    .bind(transaction.payee_id)
-    .bind(transaction.is_reconciled)
-    .bind(now)
-    .fetch_one(connection)
-    .await
     .map_err(row_error)
 }
 
 /// Inserts `(account, amount)` splits in one statement, in the order given.
 /// Every amount is checked first, so a bad amount writes none of them.
-async fn insert_splits(
-    connection: &mut DbConnection,
+fn insert_splits(
+    tx: &Transaction<'_>,
     book_id: i32,
     transaction_id: i32,
     splits: &[(i32, f64)],
@@ -207,20 +191,18 @@ async fn insert_splits(
         .iter()
         .map(|(account_id, amount)| Ok((*account_id, int4(*amount)?)))
         .collect::<Result<Vec<_>, RowError>>()?;
-    let mut insert: QueryBuilder<Db> = QueryBuilder::new(
-        "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) ",
-    );
-    insert.push_values(amounts, |mut row, (account_id, amount)| {
-        row.push_bind(book_id)
-            .push_bind(transaction_id)
-            .push_bind(account_id)
-            .push_bind(amount);
-    });
-    insert
-        .build()
-        .execute(connection)
-        .await
-        .map_err(row_error)?;
+    tx.execute(
+        &format!(
+            "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) {}",
+            ledger_db::sql::json_rows(&["?1", "?2", "#0", "#1"], "?3")
+        ),
+        &params![
+            book_id,
+            transaction_id,
+            ledger_db::sql::json_array(&amounts)
+        ],
+    )
+    .map_err(row_error)?;
     Ok(())
 }
 
@@ -235,8 +217,8 @@ pub struct NewInvestmentSplit {
     pub split_ratio: Option<(f64, f64)>,
 }
 
-async fn insert_investment_split(
-    connection: &mut DbConnection,
+fn insert_investment_split(
+    tx: &Transaction<'_>,
     book_id: i32,
     split: &NewInvestmentSplit,
 ) -> Result<(), RowError> {
@@ -244,24 +226,24 @@ async fn insert_investment_split(
         .split_ratio
         .map(|(numerator, denominator)| Ok::<_, RowError>((int4(numerator)?, int4(denominator)?)))
         .transpose()?;
-    sqlx::query(
+    tx.execute(
         "INSERT INTO investment_splits
            (book_id, transaction_id, account_id, security_id, action, shares_micros, price_micros,
             fees_cents, split_numerator, split_denominator)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        &params![
+            book_id,
+            split.transaction_id,
+            split.account_id,
+            split.security_id,
+            split.action,
+            int8(split.shares_micros)?,
+            int8(split.price_micros)?,
+            int4(split.fees_cents)?,
+            ratio.map(|(numerator, _)| numerator),
+            ratio.map(|(_, denominator)| denominator)
+        ],
     )
-    .bind(book_id)
-    .bind(split.transaction_id)
-    .bind(split.account_id)
-    .bind(split.security_id)
-    .bind(split.action)
-    .bind(int8(split.shares_micros)?)
-    .bind(int8(split.price_micros)?)
-    .bind(int4(split.fees_cents)?)
-    .bind(ratio.map(|(numerator, _)| numerator))
-    .bind(ratio.map(|(_, denominator)| denominator))
-    .execute(connection)
-    .await
     .map_err(row_error)?;
     Ok(())
 }
@@ -328,10 +310,7 @@ pub struct ImportSummary {
 }
 
 /// Deletes the importable rows of one book, children first.
-pub async fn overwrite_book(
-    connection: &mut DbConnection,
-    book_id: i32,
-) -> Result<(), sqlx::Error> {
+pub fn overwrite_book(tx: &Transaction<'_>, book_id: i32) -> Result<(), store::Error> {
     for table in [
         "plaid_transaction_reconciliation",
         "plaid_accounts",
@@ -347,10 +326,10 @@ pub async fn overwrite_book(
         "payees",
         "accounts",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE book_id = $1"))
-            .bind(book_id)
-            .execute(&mut *connection)
-            .await?;
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE book_id = ?1"),
+            &params![book_id],
+        )?;
     }
     Ok(())
 }
@@ -358,13 +337,13 @@ pub async fn overwrite_book(
 /// Runs every phase against `export`. A database error stops the run, and
 /// the caller rolls its transaction back. `today` dates an opening balance that
 /// has no creation date and moves stale reminders forward.
-pub async fn run_import(
-    connection: &mut DbConnection,
+pub fn run_import(
+    tx: &Transaction<'_>,
     export: &Export,
     book_id: i32,
     options: ImportOptions,
     today: NaiveDate,
-) -> Result<ImportSummary, sqlx::Error> {
+) -> Result<ImportSummary, store::Error> {
     let mut by_type: Vec<(&str, usize)> = Vec::new();
     let (mut accounts, mut transactions, mut reminders) = (Vec::new(), Vec::new(), Vec::new());
     for item in &export.items {
@@ -397,50 +376,30 @@ pub async fn run_import(
         now: chrono::Utc::now().naive_utc(),
     };
 
-    let account_stats =
-        accounts::import_accounts(connection, &mut context, &accounts, &all_items).await?;
-    let balance_stats = accounts::create_opening_balances(
-        connection,
-        &mut context,
-        &account_stats.with_balances,
-        today,
-    )
-    .await?;
-    let payee_stats = transactions::import_payees(connection, &mut context, &transactions).await?;
-    let transaction_stats =
-        transactions::import_transactions(connection, &mut context, &transactions).await?;
-    let investment_stats = investments::import_investment_transactions(
-        connection,
-        &mut context,
-        &transactions,
-        &all_items,
-    )
-    .await?;
-    let price_stats =
-        securities::import_security_prices(connection, &mut context, &all_items).await?;
-    let split_stats = securities::import_stock_splits(connection, &mut context, &all_items).await?;
+    let account_stats = accounts::import_accounts(tx, &mut context, &accounts, &all_items)?;
+    let balance_stats =
+        accounts::create_opening_balances(tx, &mut context, &account_stats.with_balances, today)?;
+    let payee_stats = transactions::import_payees(tx, &mut context, &transactions)?;
+    let transaction_stats = transactions::import_transactions(tx, &mut context, &transactions)?;
+    let investment_stats =
+        investments::import_investment_transactions(tx, &mut context, &transactions, &all_items)?;
+    let price_stats = securities::import_security_prices(tx, &mut context, &all_items)?;
+    let split_stats = securities::import_stock_splits(tx, &mut context, &all_items)?;
 
     context.heading("🔁 Phase 6.5: Rebuilding Investment Lots");
     let mut pairs = 0;
     if options.dry_run {
         println!("  [DRY RUN] Would rebuild investment lots for all (account, security) pairs");
     } else {
-        let found = ledger_db::lots::find_all_lot_pairs(&mut *connection, book_id).await?;
+        let found = ledger_db::lots::find_all_lot_pairs(tx, book_id)?;
         for pair in &found {
-            ledger_db::lots::rebuild_lots(
-                &mut *connection,
-                book_id,
-                pair.account_id,
-                pair.security_id,
-            )
-            .await?;
+            ledger_db::lots::rebuild_lots(tx, book_id, pair.account_id, pair.security_id)?;
         }
         pairs = found.len();
         println!("  Rebuilt {pairs} (account, security) pair(s)");
     }
 
-    let reminder_stats =
-        reminders::import_reminders(connection, &mut context, &reminders, today).await?;
+    let reminder_stats = reminders::import_reminders(tx, &mut context, &reminders, today)?;
 
     let lines = vec![
         "  Accounts:".to_owned(),

@@ -7,8 +7,7 @@
 //! investment split, or a lot is deleted. Those cascades are in the DDL, not
 //! in this file.
 
-use crate::engine::{Db, DbConnection, DbPool};
-use crate::locks::{TransactionLock, lock_transaction};
+use crate::store::{Database, Error, Sql, params};
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
@@ -16,7 +15,6 @@ use ledger_core::{
     accounting::InvestmentAction,
     lots::{ReplaySplit, replay_lots},
 };
-use sqlx::{QueryBuilder, Row};
 
 /// One (account, security) pair. Account and security IDs are global serials,
 /// so the pair alone identifies a set of lots.
@@ -28,38 +26,29 @@ pub struct LotPair {
 
 /// The effective date: a floating transaction resolves to today in the
 /// session time zone, as `effectiveDateSql` does.
-const EFFECTIVE_DATE: &str = crate::sql::EFFECTIVE_DATE;
+use crate::sql::{self, EFFECTIVE_DATE};
 
-/// PostgreSQL accepts at most 65,535 bind parameters in one statement.
+/// Rows per bulk insert. Each insert binds one JSON parameter for its rows,
+/// so this bounds only the size of that value.
 const INSERT_CHUNK_ROWS: usize = 1_000;
 
-fn investment_action(value: &str) -> Result<InvestmentAction, sqlx::Error> {
+fn investment_action(value: &str) -> Result<InvestmentAction, Error> {
     serde_json::from_value(serde_json::Value::String(value.to_owned()))
-        .map_err(|cause| sqlx::Error::Decode(Box::new(cause)))
+        .map_err(|cause| Error::Invalid(format!("investment action {value:?}: {cause}")))
 }
 
 /// Deletes and regenerates the lots and allocations of one pair by replaying
 /// its investment splits.
 ///
-/// The advisory lock is the first statement, before the read that drives the
-/// inserts. It serializes concurrent rebuilds of one pair, including a new
-/// pair whose DELETE matches no rows. It is released at commit or rollback, so
-/// the caller must pass a connection inside an explicit transaction.
-pub async fn rebuild_lots(
-    connection: &mut DbConnection,
+/// Run it inside a write transaction, a [`Database::transaction`]. The
+/// transaction holds the write lock of the file from its start, so no other
+/// rebuild of the pair runs between the read of the splits and the inserts.
+pub fn rebuild_lots(
+    sql: &impl Sql,
     book_id: i32,
     account_id: i32,
     security_id: i32,
-) -> Result<(), sqlx::Error> {
-    lock_transaction(
-        connection,
-        TransactionLock::LotPair {
-            account_id,
-            security_id,
-        },
-    )
-    .await?;
-
+) -> Result<(), Error> {
     // A stock split has no account and applies to every account that holds
     // the security, so it is read with this account's own rows.
     let query = format!(
@@ -67,46 +56,56 @@ pub async fn rebuild_lots(
                 s.split_numerator, s.split_denominator, {EFFECTIVE_DATE} AS transaction_date
          FROM investment_splits s
          JOIN transactions t ON t.id = s.transaction_id
-         WHERE s.book_id = $1 AND s.security_id = $2
-           AND (s.account_id = $3 OR (s.account_id IS NULL AND s.action = 'split'))
+         WHERE s.book_id = ?1 AND s.security_id = ?2
+           AND (s.account_id = ?3 OR (s.account_id IS NULL AND s.action = 'split'))
          ORDER BY {EFFECTIVE_DATE}, t.id, s.id"
     );
-    let rows = sqlx::query(&query)
-        .bind(book_id)
-        .bind(security_id)
-        .bind(account_id)
-        .fetch_all(&mut *connection)
-        .await?;
+    type SplitRow = (
+        i32,
+        i32,
+        String,
+        i64,
+        i64,
+        i32,
+        Option<i32>,
+        Option<i32>,
+        String,
+    );
+    let rows: Vec<SplitRow> = sql.query(&query, &params![book_id, security_id, account_id])?;
     let splits = rows
-        .iter()
-        .map(|row| {
-            Ok(ReplaySplit {
-                investment_split_id: i64::from(row.try_get::<i32, _>("id")?),
-                transaction_id: i64::from(row.try_get::<i32, _>("transaction_id")?),
-                action: investment_action(row.try_get("action")?)?,
-                shares_micros: row.try_get("shares_micros")?,
-                price_micros: row.try_get("price_micros")?,
-                fees_cents: i64::from(row.try_get::<i32, _>("fees_cents")?),
-                split_numerator: row
-                    .try_get::<Option<i32>, _>("split_numerator")?
-                    .map(i64::from),
-                split_denominator: row
-                    .try_get::<Option<i32>, _>("split_denominator")?
-                    .map(i64::from),
-                transaction_date: row.try_get("transaction_date")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        .into_iter()
+        .map(
+            |(
+                id,
+                transaction_id,
+                action,
+                shares_micros,
+                price_micros,
+                fees_cents,
+                split_numerator,
+                split_denominator,
+                transaction_date,
+            )| {
+                Ok(ReplaySplit {
+                    investment_split_id: i64::from(id),
+                    transaction_id: i64::from(transaction_id),
+                    action: investment_action(&action)?,
+                    shares_micros,
+                    price_micros,
+                    fees_cents: i64::from(fees_cents),
+                    split_numerator: split_numerator.map(i64::from),
+                    split_denominator: split_denominator.map(i64::from),
+                    transaction_date,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, Error>>()?;
 
     // Allocations cascade from lots, so deleting the lots clears both.
-    sqlx::query(
-        "DELETE FROM investment_lots WHERE book_id = $1 AND account_id = $2 AND security_id = $3",
-    )
-    .bind(book_id)
-    .bind(account_id)
-    .bind(security_id)
-    .execute(&mut *connection)
-    .await?;
+    sql.execute(
+        "DELETE FROM investment_lots WHERE book_id = ?1 AND account_id = ?2 AND security_id = ?3",
+        &params![book_id, account_id, security_id],
+    )?;
 
     let result = replay_lots(&splits);
     if result.lots.is_empty() {
@@ -134,7 +133,7 @@ pub async fn rebuild_lots(
         }));
     for (column, value) in cents {
         if i32::try_from(value).is_err() {
-            return Err(sqlx::Error::Protocol(format!(
+            return Err(Error::Invalid(format!(
                 "rebuild_lots: {column} {value} is out of the integer range \
                  (book {book_id}, account {account_id}, security {security_id})"
             )));
@@ -147,34 +146,49 @@ pub async fn rebuild_lots(
     let now = Utc::now().naive_utc();
     let mut lot_ids: HashMap<i64, i32> = HashMap::new();
     for chunk in result.lots.chunks(INSERT_CHUNK_ROWS) {
-        let mut insert = QueryBuilder::<Db>::new(
+        let rows: Vec<_> = chunk
+            .iter()
+            .map(|lot| {
+                (
+                    &lot.acquired_date,
+                    lot.opened_split_id,
+                    lot.opened_transaction_id,
+                    lot.closed_transaction_id,
+                    lot.original_shares_micros,
+                    lot.original_basis_cents,
+                    lot.remaining_shares_micros,
+                    lot.remaining_basis_cents,
+                )
+            })
+            .collect();
+        let insert = format!(
             "INSERT INTO investment_lots (book_id, account_id, security_id, acquired_date,
                opened_split_id, opened_transaction_id, closed_transaction_id,
                original_shares_micros, original_basis_cents, remaining_shares_micros,
-               remaining_basis_cents, created_at) ",
+               remaining_basis_cents, created_at)
+             {} RETURNING id, opened_split_id",
+            sql::json_rows(
+                &[
+                    "?1", "?2", "?3", "#0", "#1", "#2", "#3", "#4", "#5", "#6", "#7", "?4"
+                ],
+                "?5"
+            )
         );
-        insert.push_values(chunk, |mut values, lot| {
-            values
-                .push_bind(book_id)
-                .push_bind(account_id)
-                .push_bind(security_id)
-                .push_bind(&lot.acquired_date)
-                .push_bind(lot.opened_split_id)
-                .push_bind(lot.opened_transaction_id)
-                .push_bind(lot.closed_transaction_id)
-                .push_bind(lot.original_shares_micros)
-                .push_bind(lot.original_basis_cents)
-                .push_bind(lot.remaining_shares_micros)
-                .push_bind(lot.remaining_basis_cents)
-                .push_bind(now);
-        });
-        insert.push(" RETURNING id, opened_split_id");
+        let inserted: Vec<(i32, Option<i32>)> = sql.query(
+            &insert,
+            &params![
+                book_id,
+                account_id,
+                security_id,
+                now,
+                sql::json_array(&rows)
+            ],
+        )?;
         // Map by opened_split_id, which is unique per lot, not by the order of
         // the RETURNING rows.
-        for row in insert.build().fetch_all(&mut *connection).await? {
-            let opened: Option<i32> = row.try_get("opened_split_id")?;
+        for (id, opened) in inserted {
             if let Some(opened) = opened {
-                lot_ids.insert(i64::from(opened), row.try_get("id")?);
+                lot_ids.insert(i64::from(opened), id);
             }
         }
     }
@@ -195,40 +209,36 @@ pub async fn rebuild_lots(
         let mut rows = Vec::with_capacity(chunk.len());
         for allocation in chunk {
             let lot_id = *id_by_key.get(&allocation.lot_key).ok_or_else(|| {
-                sqlx::Error::Protocol(format!(
+                Error::Invalid(format!(
                     "rebuild_lots: no persisted lot for key {} (book {book_id}, account {account_id}, security {security_id})",
                     allocation.lot_key
                 ))
             })?;
-            rows.push((lot_id, allocation));
+            rows.push((
+                lot_id,
+                allocation.sell_split_id,
+                allocation.transaction_id,
+                allocation.shares_micros,
+                allocation.basis_cents,
+                allocation.proceeds_cents,
+            ));
         }
-        let mut insert = QueryBuilder::<Db>::new(
+        let insert = format!(
             "INSERT INTO investment_lot_allocations (book_id, lot_id, sell_split_id,
-               transaction_id, shares_micros, basis_cents, proceeds_cents) ",
+               transaction_id, shares_micros, basis_cents, proceeds_cents) {}",
+            sql::json_rows(&["?1", "#0", "#1", "#2", "#3", "#4", "#5"], "?2")
         );
-        insert.push_values(rows, |mut values, (lot_id, allocation)| {
-            values
-                .push_bind(book_id)
-                .push_bind(lot_id)
-                .push_bind(allocation.sell_split_id)
-                .push_bind(allocation.transaction_id)
-                .push_bind(allocation.shares_micros)
-                .push_bind(allocation.basis_cents)
-                .push_bind(allocation.proceeds_cents);
-        });
-        insert.build().execute(&mut *connection).await?;
+        sql.execute(&insert, &params![book_id, sql::json_array(&rows)])?;
     }
     Ok(())
 }
 
-/// Rebuilds each distinct pair once, in (account, security) order. Every
-/// caller takes the advisory locks in the same order, so two callers with
-/// overlapping pairs queue and cannot deadlock.
-pub async fn rebuild_lots_for_pairs(
-    connection: &mut DbConnection,
+/// Rebuilds each distinct pair once, in (account, security) order.
+pub fn rebuild_lots_for_pairs(
+    sql: &impl Sql,
     book_id: i32,
     pairs: &[LotPair],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), Error> {
     let mut ordered: Vec<LotPair> = pairs
         .iter()
         .copied()
@@ -237,26 +247,23 @@ pub async fn rebuild_lots_for_pairs(
         .collect();
     ordered.sort();
     for pair in ordered {
-        rebuild_lots(connection, book_id, pair.account_id, pair.security_id).await?;
+        rebuild_lots(sql, book_id, pair.account_id, pair.security_id)?;
     }
     Ok(())
 }
 
-async fn find_pairs(
-    connection: &mut DbConnection,
+fn find_pairs(
+    sql: &impl Sql,
     book_id: i32,
     security_id: Option<i32>,
-) -> Result<Vec<LotPair>, sqlx::Error> {
-    let rows: Vec<(i32, i32)> = sqlx::query_as(
+) -> Result<Vec<LotPair>, Error> {
+    let rows: Vec<(i32, i32)> = sql.query(
         "SELECT DISTINCT account_id, security_id FROM investment_splits
-         WHERE book_id = $1 AND action IN ('buy', 'sell') AND account_id IS NOT NULL
-           AND ($2 IS NULL OR security_id = $2)
+         WHERE book_id = ?1 AND action IN ('buy', 'sell') AND account_id IS NOT NULL
+           AND (?2 IS NULL OR security_id = ?2)
          ORDER BY account_id, security_id",
-    )
-    .bind(book_id)
-    .bind(security_id)
-    .fetch_all(&mut *connection)
-    .await?;
+        &params![book_id, security_id],
+    )?;
     Ok(rows
         .into_iter()
         .map(|(account_id, security_id)| LotPair {
@@ -268,34 +275,28 @@ async fn find_pairs(
 
 /// Every pair with at least one buy or sell in the book. A stock split has no
 /// account and only changes pairs that a buy already established.
-pub async fn find_all_lot_pairs(
-    connection: &mut DbConnection,
-    book_id: i32,
-) -> Result<Vec<LotPair>, sqlx::Error> {
-    find_pairs(connection, book_id, None).await
+pub fn find_all_lot_pairs(sql: &impl Sql, book_id: i32) -> Result<Vec<LotPair>, Error> {
+    find_pairs(sql, book_id, None)
 }
 
 /// Every pair that the investment splits of one transaction can change. A
 /// stock split applies to every account that holds the security, so it
 /// expands to all of them. The expansion reads splits, not lots, so it is
 /// correct before any lot exists.
-pub async fn collect_affected_pairs(
-    connection: &mut DbConnection,
+pub fn collect_affected_pairs(
+    sql: &impl Sql,
     book_id: i32,
     transaction_id: i32,
-) -> Result<Vec<LotPair>, sqlx::Error> {
-    let rows: Vec<(Option<i32>, i32, String)> = sqlx::query_as(
+) -> Result<Vec<LotPair>, Error> {
+    let rows: Vec<(Option<i32>, i32, String)> = sql.query(
         "SELECT account_id, security_id, action FROM investment_splits
-         WHERE book_id = $1 AND transaction_id = $2",
-    )
-    .bind(book_id)
-    .bind(transaction_id)
-    .fetch_all(&mut *connection)
-    .await?;
+         WHERE book_id = ?1 AND transaction_id = ?2",
+        &params![book_id, transaction_id],
+    )?;
     let mut pairs = Vec::new();
     for (account_id, security_id, action) in rows {
         if action == "split" {
-            pairs.extend(find_pairs(connection, book_id, Some(security_id)).await?);
+            pairs.extend(find_pairs(sql, book_id, Some(security_id))?);
         } else if let Some(account_id) = account_id {
             pairs.push(LotPair {
                 account_id,
@@ -313,6 +314,35 @@ pub struct BackfillResult {
     pub skipped: bool,
 }
 
+/// The backfill guard alone: true when the file has a buy or a sell and no
+/// allocation, as a converted or restored database does. A Durable Object
+/// checks it at construction; it cannot rebuild every lot there.
+pub fn lots_missing(database: &Database) -> Result<bool, Error> {
+    let allocations: i64 =
+        database.query_row("SELECT COUNT(*) FROM investment_lot_allocations", &[])?;
+    let trades: i64 = database.query_row(
+        "SELECT COUNT(*) FROM investment_splits WHERE action IN ('buy', 'sell')",
+        &[],
+    )?;
+    Ok(allocations == 0 && trades > 0)
+}
+
+/// Whether the file has a buy that opens a lot and no lot at all: a file
+/// that the stepped rebuild ([`rebuild_lots_step`]) must fill. Unlike
+/// [`lots_missing`], it is false for a file whose trades are all buys, which
+/// has lots and no allocation, for a file of sells alone, which a rebuild
+/// leaves with no lot, and for a file that a stepped rebuild has started on.
+pub fn lots_absent(database: &Database) -> Result<bool, Error> {
+    // The replay opens a lot for each buy of more than zero shares in an
+    // account.
+    database.query_row(
+        "SELECT NOT EXISTS (SELECT 1 FROM investment_lots)
+           AND EXISTS (SELECT 1 FROM investment_splits
+             WHERE action = 'buy' AND shares_micros > 0 AND account_id IS NOT NULL)",
+        &[],
+    )
+}
+
 /// The startup backfill: the server runs it before it serves, and
 /// `ledger-cli rebuild-lots` runs it by hand.
 ///
@@ -321,63 +351,118 @@ pub struct BackfillResult {
 /// one transaction per pair, a crash and restart part way through would let
 /// the guard read partial progress as "already populated" and skip the
 /// remaining pairs, which would then report zero cost basis.
-pub async fn backfill_lots(pool: &DbPool, force: bool) -> Result<BackfillResult, sqlx::Error> {
-    if !force {
-        let allocations: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM investment_lot_allocations")
-                .fetch_one(pool)
-                .await?;
-        if allocations > 0 {
-            return Ok(BackfillResult {
-                books_processed: 0,
-                pairs_rebuilt: 0,
-                skipped: true,
-            });
-        }
-        let trades: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM investment_splits WHERE action IN ('buy', 'sell')",
-        )
-        .fetch_one(pool)
-        .await?;
-        if trades == 0 {
-            return Ok(BackfillResult {
-                books_processed: 0,
-                pairs_rebuilt: 0,
-                skipped: true,
-            });
-        }
+pub fn backfill_lots(database: &Database, force: bool) -> Result<BackfillResult, Error> {
+    if !force && !lots_missing(database)? {
+        return Ok(BackfillResult {
+            books_processed: 0,
+            pairs_rebuilt: 0,
+            skipped: true,
+        });
     }
 
-    let mut transaction = crate::locks::begin_pool(pool).await?;
-    let books: Vec<i32> = sqlx::query_scalar("SELECT id FROM books ORDER BY id")
-        .fetch_all(&mut *transaction)
-        .await?;
-    let mut pairs_rebuilt = 0;
-    for book_id in &books {
-        for pair in find_all_lot_pairs(&mut transaction, *book_id).await? {
-            rebuild_lots(
-                &mut transaction,
-                *book_id,
-                pair.account_id,
-                pair.security_id,
-            )
-            .await?;
-            pairs_rebuilt += 1;
-        }
-    }
     // The count is returned only after the commit succeeds, so no result
     // reports pairs that did not commit.
-    transaction.commit().await?;
-    Ok(BackfillResult {
-        books_processed: books.len(),
-        pairs_rebuilt,
-        skipped: false,
+    database.transaction(|tx| {
+        let books: Vec<i32> = tx.query("SELECT id FROM books ORDER BY id", &[])?;
+        let mut pairs_rebuilt = 0;
+        for book_id in &books {
+            for pair in find_all_lot_pairs(tx, *book_id)? {
+                rebuild_lots(tx, *book_id, pair.account_id, pair.security_id)?;
+                pairs_rebuilt += 1;
+            }
+        }
+        Ok(BackfillResult {
+            books_processed: books.len(),
+            pairs_rebuilt,
+            skipped: false,
+        })
+    })
+}
+
+/// Where a stepped rebuild of every lot ([`rebuild_lots_step`]) goes on:
+/// after this book and pair.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RebuildCursor {
+    pub book_id: i32,
+    pub pair: LotPair,
+}
+
+impl std::fmt::Display for RebuildCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let LotPair {
+            account_id,
+            security_id,
+        } = self.pair;
+        write!(formatter, "{}:{account_id}:{security_id}", self.book_id)
+    }
+}
+
+impl std::str::FromStr for RebuildCursor {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self, Error> {
+        let invalid = || Error::Invalid(format!("lot rebuild cursor {text:?}"));
+        let parts: Vec<i32> = text
+            .split(':')
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .map_err(|_| invalid())?;
+        match parts[..] {
+            [book_id, account_id, security_id] => Ok(Self {
+                book_id,
+                pair: LotPair {
+                    account_id,
+                    security_id,
+                },
+            }),
+            _ => Err(invalid()),
+        }
+    }
+}
+
+/// One step of a rebuild of every lot in the file, for a host whose events
+/// have a time limit (a Durable Object). It rebuilds at most `limit` pairs,
+/// in (book, account, security) order, from the first after `after`, in one
+/// transaction. It returns the last pair rebuilt when more remain: where
+/// the next step starts.
+///
+/// The caller keeps that cursor between steps, because neither guard
+/// ([`lots_missing`], [`lots_absent`]) tells a rebuild that stopped half way
+/// from one that is done.
+pub fn rebuild_lots_step(
+    database: &Database,
+    after: Option<RebuildCursor>,
+    limit: usize,
+) -> Result<Option<RebuildCursor>, Error> {
+    database.transaction(|tx| {
+        let books: Vec<i32> = tx.query(
+            "SELECT id FROM books WHERE id >= ?1 ORDER BY id",
+            &params![after.map_or(i32::MIN, |after| after.book_id)],
+        )?;
+        let mut last = None;
+        let mut done = 0;
+        for book_id in books {
+            for pair in find_all_lot_pairs(tx, book_id)? {
+                let at = RebuildCursor { book_id, pair };
+                if after.is_some_and(|after| at <= after) {
+                    continue;
+                }
+                if done == limit {
+                    return Ok(last);
+                }
+                rebuild_lots(tx, book_id, pair.account_id, pair.security_id)?;
+                last = Some(at);
+                done += 1;
+            }
+        }
+        Ok(None)
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::investment_action;
+    use crate::store::Sql;
     use ledger_core::accounting::InvestmentAction;
 
     #[test]
@@ -390,13 +475,109 @@ mod tests {
         assert!(investment_action("short").is_err());
     }
 
+    /// The steps of a stepped rebuild, one pair each, write the lots that
+    /// the whole rebuild writes, and a step after the last does nothing.
+    #[test]
+    fn a_stepped_rebuild_writes_the_lots_of_a_whole_rebuild() {
+        let file = crate::testing::TempDatabase::new();
+        let database = file.database();
+        database
+            .exec_batch(
+                "INSERT INTO users (id, username, password_hash, created_at)
+                   VALUES (1, 'u', 'h', '2025-01-01 00:00:00');
+                 INSERT INTO books (id, user_id, name, created_at, updated_at)
+                   VALUES (1, 1, 'A', '2025-01-01 00:00:00', '2025-01-01 00:00:00'),
+                          (2, 1, 'B', '2025-01-01 00:00:00', '2025-01-01 00:00:00');",
+            )
+            .unwrap();
+        for book_id in [1, 2] {
+            database
+                .transaction(|tx| {
+                    crate::seed::seed_book(
+                        tx,
+                        book_id,
+                        crate::seed::DemoDataset::Household,
+                        chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
+                        &mut |_| {},
+                    )
+                })
+                .unwrap();
+        }
+        let whole = crate::testing::lot_rows(database);
+        assert!(whole.len() > 1, "the seed has lots");
+        database
+            .exec_batch("DELETE FROM investment_lot_allocations; DELETE FROM investment_lots;")
+            .unwrap();
+        assert!(super::lots_missing(database).unwrap());
+        assert!(super::lots_absent(database).unwrap());
+
+        let mut cursors = Vec::new();
+        let mut after = None;
+        while let Some(next) = super::rebuild_lots_step(database, after, 1).unwrap() {
+            assert_eq!(
+                next.to_string().parse::<super::RebuildCursor>().unwrap(),
+                next
+            );
+            cursors.push(next);
+            after = Some(next);
+            // A rebuild that has started is not asked for again.
+            assert!(!super::lots_absent(database).unwrap());
+        }
+        assert_eq!(crate::testing::lot_rows(database), whole);
+        // Each step rebuilt one pair, and the steps went through both books.
+        let pairs: usize = [1, 2]
+            .iter()
+            .map(|book| super::find_all_lot_pairs(database, *book).unwrap().len())
+            .sum();
+        assert_eq!(cursors.len() + 1, pairs);
+        assert!(cursors.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(cursors.iter().any(|cursor| cursor.book_id == 2));
+    }
+
+    /// A file whose trades are all buys has lots and no allocation: the
+    /// backfill guard reads it as missing its lots, the hosted guard does
+    /// not. Nor does the hosted guard ask a rebuild for sells alone.
+    #[test]
+    fn a_file_of_buys_alone_has_its_lots() {
+        let file = crate::testing::TempDatabase::new();
+        let database = file.database();
+        database
+            .exec_batch(
+                "INSERT INTO users (id, username, password_hash, created_at)
+                   VALUES (1, 'u', 'h', '2025-01-01 00:00:00');
+                 INSERT INTO books (id, user_id, name, created_at, updated_at)
+                   VALUES (1, 1, 'B', '2025-01-01 00:00:00', '2025-01-01 00:00:00');
+                 INSERT INTO accounts (id, book_id, name, type, created_at, updated_at)
+                   VALUES (10, 1, 'Brokerage', 'asset', '2025-01-01 00:00:00', '2025-01-01 00:00:00');
+                 INSERT INTO securities (id, book_id, name, symbol, security_type, created_at)
+                   VALUES (20, 1, 'Fund', 'FND', 'stock', '2025-01-01 00:00:00');
+                 INSERT INTO transactions (id, book_id, date, created_at, updated_at)
+                   VALUES (30, 1, '2025-01-02', '2025-01-02 00:00:00', '2025-01-02 00:00:00');
+                 INSERT INTO investment_splits
+                   (book_id, transaction_id, account_id, security_id, action, shares_micros, price_micros)
+                   VALUES (1, 30, 10, 20, 'sell', 1000000, 10000000);",
+            )
+            .unwrap();
+        // A sell alone opens no lot, so a rebuild would leave none.
+        assert!(!super::lots_absent(database).unwrap());
+        database
+            .exec_batch("UPDATE investment_splits SET action = 'buy'")
+            .unwrap();
+        assert!(super::lots_absent(database).unwrap());
+        database
+            .transaction(|tx| super::rebuild_lots(tx, 1, 10, 20))
+            .unwrap();
+        assert!(super::lots_missing(database).unwrap());
+        assert!(!super::lots_absent(database).unwrap());
+    }
+
     /// A basis that does not fit a 32-bit integer is refused, and no lot is
     /// written: the readers could not decode it.
-    #[tokio::test]
-    async fn a_basis_out_of_the_integer_range_is_refused() {
-        let database = crate::testing::TempDatabase::new(1).await;
-        let pool = database.pool();
-        sqlx::raw_sql(
+    #[test]
+    fn a_basis_out_of_the_integer_range_is_refused() {
+        let file = crate::testing::TempDatabase::new();
+        let database = file.database();
+        database.exec_batch(
             "INSERT INTO users (id, username, password_hash, created_at)
                VALUES (1, 'u', 'h', '2025-01-01 00:00:00');
              INSERT INTO books (id, user_id, name, created_at, updated_at)
@@ -412,12 +593,9 @@ mod tests {
                (book_id, transaction_id, account_id, security_id, action, shares_micros, price_micros)
                VALUES (1, 30, 10, 20, 'buy', 1000000, 30000000000000);",
         )
-        .execute(pool)
-        .await
         .unwrap();
-        let mut transaction = crate::locks::begin_pool(pool).await.unwrap();
-        let refused = super::rebuild_lots(transaction.as_mut(), 1, 10, 20)
-            .await
+        let refused = database
+            .transaction(|tx| super::rebuild_lots(tx, 1, 10, 20))
             .err()
             .map(|cause| cause.to_string())
             .unwrap_or_default();
@@ -425,10 +603,8 @@ mod tests {
             refused.contains("original_basis_cents 3000000000"),
             "{refused}"
         );
-        transaction.rollback().await.unwrap();
-        let lots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM investment_lots")
-            .fetch_one(pool)
-            .await
+        let lots: i64 = database
+            .query_row("SELECT COUNT(*) FROM investment_lots", &[])
             .unwrap();
         assert_eq!(lots, 0);
     }

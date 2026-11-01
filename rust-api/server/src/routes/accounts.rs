@@ -1,6 +1,9 @@
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
+    book_scope::{BookAccess, Write},
+    db_scope::write_transaction,
     error::{ApiError, ApiResult, error, internal_error},
+    platform,
     state::AppState,
     validation::{
         first_query_values, local_today, parse_int_auto_radix, parse_json_body,
@@ -13,11 +16,10 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{NaiveDate, NaiveDateTime, SecondsFormat, Utc};
-use ledger_db::engine::{Db, DbConnection, DbPool};
+use chrono::{NaiveDate, NaiveDateTime, SecondsFormat};
+use ledger_db::store::{self, Builder, Sql, params};
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
-use sqlx::QueryBuilder;
 use std::collections::{HashMap, HashSet};
 
 /// The filter of `accounts_with_balances()`.
@@ -60,7 +62,7 @@ fn parse_account_query(raw: Option<&str>) -> Result<AccountQuery, ApiError> {
 const ACCOUNT_COLUMNS: &str = "id, book_id, name, type AS account_type, subtype, parent_id,
     is_active, is_favorite, is_investment_cash, icon, created_at, updated_at";
 
-#[derive(Clone, sqlx::FromRow, Serialize)]
+#[derive(Clone, ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountRow {
     id: i32,
@@ -120,30 +122,24 @@ struct AccountWithChildren {
     children: Vec<AccountRow>,
 }
 
-async fn account_with_children(
-    pool: &DbPool,
+fn account_with_children(
+    sql: &impl Sql,
     book_id: i32,
     account_id: i32,
     failure_message: &'static str,
 ) -> Result<Option<AccountWithChildren>, ApiError> {
-    let query = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE book_id = $1 AND id = $2");
-    let Some(account) = sqlx::query_as::<_, AccountRow>(&query)
-        .bind(book_id)
-        .bind(account_id)
-        .fetch_optional(pool)
-        .await
+    let query = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE book_id = ?1 AND id = ?2");
+    let Some(account) = sql
+        .query_optional::<AccountRow>(&query, &params![book_id, account_id])
         .map_err(|cause| internal_error(cause, failure_message))?
     else {
         return Ok(None);
     };
     let query = format!(
-        "SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE book_id = $1 AND parent_id = $2 ORDER BY id"
+        "SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE book_id = ?1 AND parent_id = ?2 ORDER BY id"
     );
-    let children = sqlx::query_as::<_, AccountRow>(&query)
-        .bind(book_id)
-        .bind(account_id)
-        .fetch_all(pool)
-        .await
+    let children = sql
+        .query::<AccountRow>(&query, &params![book_id, account_id])
         .map_err(|cause| internal_error(cause, failure_message))?;
     Ok(Some(AccountWithChildren { account, children }))
 }
@@ -162,48 +158,49 @@ fn is_investment_account(account_type: &str, subtype: Option<&str>) -> bool {
 /// Creates or renames the automatic cash sub-account of an investment
 /// account. The caller's transaction also holds the investment account's own
 /// write, so the pair changes together.
-async fn ensure_investment_cash_account(
-    connection: &mut DbConnection,
-    book_id: i32,
+fn ensure_investment_cash_account(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     account_id: i32,
     account_name: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), store::Error> {
+    let book_id = access.book_id();
     let desired_name = format!("{account_name} Cash");
-    let existing: Option<(i32, String)> = sqlx::query_as(
+    let existing: Option<(i32, String)> = sql.query_optional(
         "SELECT id, name FROM accounts
-         WHERE book_id = $1 AND parent_id = $2 AND is_investment_cash = true
+         WHERE book_id = ?1 AND parent_id = ?2 AND is_investment_cash = true
          LIMIT 1",
-    )
-    .bind(book_id)
-    .bind(account_id)
-    .fetch_optional(&mut *connection)
-    .await?;
-    let now = Utc::now().naive_utc();
+        &params![book_id, account_id],
+    )?;
+    let now = platform::timestamp();
     match existing {
         None => {
-            sqlx::query(
+            sql.execute(
                 "INSERT INTO accounts
                    (name, type, subtype, parent_id, is_active, is_investment_cash, book_id,
-                    created_at, updated_at)
-                 VALUES ($1, 'asset', 'cash', $2, true, true, $3, $4, $4)",
-            )
-            .bind(desired_name)
-            .bind(account_id)
-            .bind(book_id)
-            .bind(now)
-            .execute(&mut *connection)
-            .await?;
+                    created_at, updated_at, name_fold)
+                 VALUES (?1, 'asset', 'cash', ?2, true, true, ?3, ?4, ?4, ?5)",
+                &params![
+                    &desired_name,
+                    account_id,
+                    book_id,
+                    now,
+                    ledger_db::folds::fold(&desired_name)
+                ],
+            )?;
         }
         Some((cash_id, name)) if name != desired_name => {
-            sqlx::query(
-                "UPDATE accounts SET name = $1, updated_at = $2 WHERE id = $3 AND book_id = $4",
-            )
-            .bind(desired_name)
-            .bind(now)
-            .bind(cash_id)
-            .bind(book_id)
-            .execute(&mut *connection)
-            .await?;
+            sql.execute(
+                "UPDATE accounts SET name = ?1, updated_at = ?2, name_fold = ?5
+                 WHERE id = ?3 AND book_id = ?4",
+                &params![
+                    &desired_name,
+                    now,
+                    cash_id,
+                    book_id,
+                    ledger_db::folds::fold(&desired_name)
+                ],
+            )?;
         }
         Some(_) => {}
     }
@@ -219,40 +216,42 @@ pub(crate) async fn create_account(
     const FAILURE: &str = "Failed to create account";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let input = validate_account_create(&parse_json_body(&body, FAILURE)?)?;
-    require_account_parent(&state.pool, book.book_id(), input.parent_id, FAILURE).await?;
+    require_account_parent(&state.database, book.book_id(), input.parent_id, FAILURE)?;
     let parent_id = input.parent_id.map(|id| id as i32);
 
-    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?;
-    let now = Utc::now().naive_utc();
+    let now = platform::timestamp();
     let query = format!(
         "INSERT INTO accounts
-           (name, type, subtype, parent_id, icon, is_active, book_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, true, $6, $7, $7)
+           (name, type, subtype, parent_id, icon, is_active, book_id, created_at, updated_at,
+            name_fold)
+         VALUES (?1, ?2, ?3, ?4, ?5, true, ?6, ?7, ?7, ?8)
          RETURNING {ACCOUNT_COLUMNS}"
     );
-    let account: AccountRow = sqlx::query_as(&query)
-        .bind(&input.name)
-        .bind(&input.account_type)
-        .bind(&input.subtype)
-        .bind(parent_id)
-        .bind(&input.icon)
-        .bind(book.book_id())
-        .bind(now)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?;
-    if is_investment_account(&account.account_type, account.subtype.as_deref()) {
-        ensure_investment_cash_account(&mut transaction, book.book_id(), account.id, &account.name)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?;
+    let account = write_transaction(&state.database, FAILURE, |tx| {
+        let database = |cause| internal_error(cause, FAILURE);
+        let account: AccountRow = tx
+            .query_row(
+                &query,
+                &params![
+                    &input.name,
+                    &input.account_type,
+                    &input.subtype,
+                    parent_id,
+                    &input.icon,
+                    book.book_id(),
+                    now,
+                    ledger_db::folds::fold(&input.name)
+                ],
+            )
+            .map_err(database)?;
+        if is_investment_account(&account.account_type, account.subtype.as_deref()) {
+            ensure_investment_cash_account(tx, &access, account.id, &account.name)
+                .map_err(database)?;
+        }
+        Ok(account)
+    })?;
 
     state.analytics.capture_event(
         book.user_id(),
@@ -283,96 +282,82 @@ pub(crate) async fn update_account(
     const FAILURE: &str = "Failed to update account";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let input = validate_account_update(&parse_json_body(&body, FAILURE)?)?;
     require_account_parent(
-        &state.pool,
+        &state.database,
         book.book_id(),
         input.parent_id.flatten(),
         FAILURE,
-    )
-    .await?;
+    )?;
     let account_id = account_path_id(&raw_id)
         .ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
 
-    let mut transaction = ledger_db::locks::begin_pool(&state.pool)
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?;
-    let query = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = $1 AND book_id = $2");
-    let existing: AccountRow = sqlx::query_as(&query)
-        .bind(account_id)
-        .bind(book.book_id())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Account not found"))?;
+    write_transaction(&state.database, FAILURE, |tx| {
+        let database = |cause| internal_error(cause, FAILURE);
+        let query =
+            format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ?1 AND book_id = ?2");
+        let existing: AccountRow = tx
+            .query_optional(&query, &params![account_id, book.book_id()])
+            .map_err(database)?
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, "Account not found"))?;
 
-    let now = Utc::now().naive_utc();
-    let mut update = QueryBuilder::<Db>::new("UPDATE accounts SET updated_at = ");
-    update.push_bind(now);
-    if let Some(name) = &input.name {
-        update.push(", name = ").push_bind(name);
-    }
-    if let Some(subtype) = &input.subtype {
-        update.push(", subtype = ").push_bind(subtype);
-    }
-    if let Some(parent_id) = input.parent_id {
-        update
-            .push(", parent_id = ")
-            .push_bind(parent_id.map(|id| id as i32));
-    }
-    if let Some(is_active) = input.is_active {
-        update.push(", is_active = ").push_bind(is_active);
-    }
-    if let Some(is_favorite) = input.is_favorite {
-        update.push(", is_favorite = ").push_bind(is_favorite);
-    }
-    if let Some(icon) = &input.icon {
-        update.push(", icon = ").push_bind(icon);
-    }
-    update
-        .push(" WHERE id = ")
-        .push_bind(account_id)
-        .push(" AND book_id = ")
-        .push_bind(book.book_id());
-    update
-        .build()
-        .execute(&mut *transaction)
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?;
-
-    // Node derives the pair rule with `??`, so a subtype sent as null falls
-    // back to the stored subtype here, although the row now holds NULL.
-    let name = input.name.as_deref().unwrap_or(&existing.name);
-    let subtype = input
-        .subtype
-        .as_ref()
-        .and_then(Option::as_deref)
-        .or(existing.subtype.as_deref());
-    if is_investment_account(&existing.account_type, subtype) {
-        ensure_investment_cash_account(&mut transaction, book.book_id(), account_id, name)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
-        if let Some(is_active) = input.is_active {
-            sqlx::query(
-                "UPDATE accounts SET is_active = $1, updated_at = $2
-                 WHERE parent_id = $3 AND is_investment_cash = true AND book_id = $4",
-            )
-            .bind(is_active)
-            .bind(Utc::now().naive_utc())
-            .bind(account_id)
-            .bind(book.book_id())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
+        let now = platform::timestamp();
+        let mut update = Builder::new("UPDATE accounts SET updated_at = ");
+        update.push_bind(now);
+        if let Some(name) = &input.name {
+            update.push(", name = ").push_bind(name);
+            update
+                .push(", name_fold = ")
+                .push_bind(ledger_db::folds::fold(name));
         }
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(|cause| internal_error(cause, FAILURE))?;
+        if let Some(subtype) = &input.subtype {
+            update.push(", subtype = ").push_bind(subtype);
+        }
+        if let Some(parent_id) = input.parent_id {
+            update
+                .push(", parent_id = ")
+                .push_bind(parent_id.map(|id| id as i32));
+        }
+        if let Some(is_active) = input.is_active {
+            update.push(", is_active = ").push_bind(is_active);
+        }
+        if let Some(is_favorite) = input.is_favorite {
+            update.push(", is_favorite = ").push_bind(is_favorite);
+        }
+        if let Some(icon) = &input.icon {
+            update.push(", icon = ").push_bind(icon);
+        }
+        update
+            .push(" WHERE id = ")
+            .push_bind(account_id)
+            .push(" AND book_id = ")
+            .push_bind(book.book_id());
+        update.execute(tx).map_err(database)?;
 
-    let updated = account_with_children(&state.pool, book.book_id(), account_id, FAILURE)
-        .await?
+        // Node derives the pair rule with `??`, so a subtype sent as null falls
+        // back to the stored subtype here, although the row now holds NULL.
+        let name = input.name.as_deref().unwrap_or(&existing.name);
+        let subtype = input
+            .subtype
+            .as_ref()
+            .and_then(Option::as_deref)
+            .or(existing.subtype.as_deref());
+        if is_investment_account(&existing.account_type, subtype) {
+            ensure_investment_cash_account(tx, &access, account_id, name).map_err(database)?;
+            if let Some(is_active) = input.is_active {
+                tx.execute(
+                    "UPDATE accounts SET is_active = ?1, updated_at = ?2
+                 WHERE parent_id = ?3 AND is_investment_cash = true AND book_id = ?4",
+                    &params![is_active, platform::timestamp(), account_id, book.book_id()],
+                )
+                .map_err(database)?;
+            }
+        }
+        Ok(())
+    })?;
+
+    let updated = account_with_children(&state.database, book.book_id(), account_id, FAILURE)?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Account not found"))?;
     Ok(Json(
         serde_json::to_value(updated).expect("account with children serializes"),
@@ -390,42 +375,41 @@ pub(crate) async fn delete_account(
     let account_id = account_path_id(&raw_id)
         .ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
     // Node checks in this order: transactions, sub-accounts, then the delete.
-    let split_count: i32 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS integer) FROM transaction_splits
-         WHERE account_id = $1 AND book_id = $2",
-    )
-    .bind(account_id)
-    .bind(book.book_id())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+    let split_count: i32 = state
+        .database
+        .query_row(
+            "SELECT CAST(COUNT(*) AS integer) FROM transaction_splits
+         WHERE account_id = ?1 AND book_id = ?2",
+            &params![account_id, book.book_id()],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if split_count > 0 {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "Cannot delete account with transactions",
         ));
     }
-    let child_count: i32 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS integer) FROM accounts WHERE parent_id = $1 AND book_id = $2",
-    )
-    .bind(account_id)
-    .bind(book.book_id())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, FAILURE))?;
+    let child_count: i32 = state
+        .database
+        .query_row(
+            "SELECT CAST(COUNT(*) AS integer) FROM accounts WHERE parent_id = ?1 AND book_id = ?2",
+            &params![account_id, book.book_id()],
+        )
+        .map_err(|cause| internal_error(cause, FAILURE))?;
     if child_count > 0 {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "Cannot delete account with sub-accounts",
         ));
     }
-    let deleted = sqlx::query("DELETE FROM accounts WHERE id = $1 AND book_id = $2")
-        .bind(account_id)
-        .bind(book.book_id())
-        .execute(&state.pool)
-        .await
+    let deleted = state
+        .database
+        .execute(
+            "DELETE FROM accounts WHERE id = ?1 AND book_id = ?2",
+            &params![account_id, book.book_id()],
+        )
         .map_err(|cause| internal_error(cause, FAILURE))?;
-    if deleted.rows_affected() == 0 {
+    if deleted == 0 {
         return Err(error(StatusCode::NOT_FOUND, "Account not found"));
     }
     Ok(Json(json!({ "success": true })))
@@ -451,22 +435,20 @@ pub(crate) async fn get_account(
         ));
     };
     let AccountWithChildren { account, children } = account_with_children(
-        &state.pool,
+        &state.database,
         book.book_id(),
         account_id,
         "Failed to fetch account",
-    )
-    .await?
+    )?
     .ok_or_else(|| error(StatusCode::NOT_FOUND, "Account not found"))?;
-    let (balance, count): (i32, i32) = sqlx::query_as(
-        "SELECT COALESCE(CAST(SUM(amount) AS integer), 0), CAST(COUNT(*) AS integer)
-         FROM transaction_splits WHERE account_id = $1 AND book_id = $2",
-    )
-    .bind(account_id)
-    .bind(book.book_id())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, "Failed to fetch account"))?;
+    let (balance, count): (i32, i32) = state
+        .database
+        .query_row(
+            "SELECT COALESCE(CAST(SUM(amount) AS integer), 0), CAST(COUNT(*) AS integer)
+         FROM transaction_splits WHERE account_id = ?1 AND book_id = ?2",
+            &params![account_id, book.book_id()],
+        )
+        .map_err(|cause| internal_error(cause, "Failed to fetch account"))?;
     Ok(Json(
         serde_json::to_value(AccountDetail {
             account,
@@ -529,31 +511,33 @@ fn account_tree(rows: Vec<AccountRow>, balances: Vec<(i32, i32, i32)>) -> Vec<Ac
         .collect()
 }
 
+/// An account ID, its split total and its split count.
+type Balance = (i32, i32, i32);
+
 /// The accounts that `query` selects, ordered by type and then name, and the
-/// split total and split count of each account that has splits.
-async fn account_rows(
-    pool: &DbPool,
+/// balance of each account that has splits.
+fn account_rows(
+    sql: &impl Sql,
     book_id: i32,
     query: &AccountQuery,
-) -> sqlx::Result<(Vec<AccountRow>, Vec<(i32, i32, i32)>)> {
-    let mut account_sql =
-        format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE book_id = $1 AND ($2 OR is_active)");
-    if query.account_type.is_some() {
-        account_sql.push_str(" AND type = $3");
-    }
-    account_sql.push_str(" ORDER BY type, name");
-    let mut account_query = sqlx::query_as::<_, AccountRow>(&account_sql)
-        .bind(book_id)
-        .bind(query.include_inactive);
+) -> Result<(Vec<AccountRow>, Vec<Balance>), store::Error> {
+    let mut accounts = Builder::new(format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE book_id = "
+    ));
+    accounts
+        .push_bind(book_id)
+        .push(" AND (")
+        .push_bind(query.include_inactive)
+        .push(" OR is_active)");
     if let Some(account_type) = &query.account_type {
-        account_query = account_query.bind(account_type);
+        accounts.push(" AND type = ").push_bind(account_type);
     }
-    let rows = account_query.fetch_all(pool).await?;
+    accounts.push(" ORDER BY type, name");
+    let rows = accounts.query(sql)?;
 
-    let mut balance_query = QueryBuilder::<Db>::new("");
-    push_balance_query(&mut balance_query, book_id, query.as_of_date.as_deref());
-    let balances: Vec<(i32, i32, i32)> = balance_query.build_query_as().fetch_all(pool).await?;
-    Ok((rows, balances))
+    let mut balances = Builder::default();
+    push_balance_query(&mut balances, book_id, query.as_of_date.as_deref());
+    Ok((rows, balances.query(sql)?))
 }
 
 /// Pushes the query for the split total and the split count of each account
@@ -563,7 +547,7 @@ async fn account_rows(
 /// Only the date filter reads the transaction. Without a date, the query
 /// reads only the index idx_transaction_splits_book_account. On a large book,
 /// the join alone made the query more than five times slower.
-fn push_balance_query(builder: &mut QueryBuilder<'_, Db>, book_id: i32, as_of_date: Option<&str>) {
+fn push_balance_query(builder: &mut Builder, book_id: i32, as_of_date: Option<&str>) {
     builder.push(
         "SELECT s.account_id, CAST(SUM(s.amount) AS integer), CAST(COUNT(*) AS integer)
          FROM transaction_splits s",
@@ -577,7 +561,7 @@ fn push_balance_query(builder: &mut QueryBuilder<'_, Db>, book_id: i32, as_of_da
             .push(" AND (CASE WHEN t.is_floating THEN ")
             .push_bind(local_today())
             .push(" ELSE t.date END) <= ")
-            .push_bind(as_of_date.to_owned());
+            .push_bind(as_of_date);
     }
     builder.push(" GROUP BY s.account_id");
 }
@@ -587,12 +571,12 @@ fn push_balance_query(builder: &mut QueryBuilder<'_, Db>, book_id: i32, as_of_da
 /// parent the filter leaves out stays in the list. The MCP tools
 /// `list_accounts` and `get_account_tree` shape this list; `GET /accounts`
 /// gives a tree that drops such an account, so the tools cannot use it.
-pub(crate) async fn accounts_with_balances(
-    pool: &DbPool,
+pub(crate) fn accounts_with_balances(
+    sql: &impl Sql,
     book_id: i32,
     query: &AccountQuery,
-) -> sqlx::Result<Vec<Value>> {
-    let (rows, balances) = account_rows(pool, book_id, query).await?;
+) -> Result<Vec<Value>, store::Error> {
+    let (rows, balances) = account_rows(sql, book_id, query)?;
     let totals: HashMap<i32, (i32, i32)> = balances
         .into_iter()
         .map(|(id, sum, count)| (id, (sum, count)))
@@ -628,8 +612,7 @@ pub(crate) async fn list_accounts(
     let book_id = authenticated.book_id();
 
     let query = parse_account_query(raw_query.as_deref())?;
-    let (rows, balances) = account_rows(&state.pool, book_id, &query)
-        .await
+    let (rows, balances) = account_rows(&state.database, book_id, &query)
         .map_err(|cause| internal_error(cause, "Failed to fetch accounts"))?;
     Ok(Json(
         serde_json::to_value(account_tree(rows, balances)).expect("account tree serializes"),
@@ -640,6 +623,8 @@ pub(crate) async fn list_accounts(
 pub(crate) mod tests {
     use super::parse_account_query;
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use ledger_db::Database;
+    use ledger_db::store::{Builder, Sql, params};
     use serde_json::{Value, json};
 
     #[tokio::test]
@@ -674,58 +659,50 @@ pub(crate) mod tests {
     /// an inactive expense (4). One transaction floats: its effective date is
     /// today. Book 2 has an account (5) with splits that book 1 must not
     /// count.
-    pub(crate) async fn balance_fixture() -> ledger_db::testing::TempDatabase {
-        let database = ledger_db::testing::TempDatabase::new(1).await;
-        let now = chrono::Utc::now().naive_utc();
+    pub(crate) fn balance_fixture() -> Database {
+        let database = Database::open_in_memory().unwrap();
+        ledger_db::migrate(&database).unwrap();
+        let now = crate::platform::timestamp();
         for sql in [
-            "INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'u', 'h', $1)",
-            "INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES (1, 1, 'A', $1, $1), (2, 1, 'B', $1, $1)",
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'u', 'h', ?1)",
+            "INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES (1, 1, 'A', ?1, ?1), (2, 1, 'B', ?1, ?1)",
             "INSERT INTO accounts (id, book_id, name, type, is_active, created_at, updated_at) VALUES
-               (1, 1, 'Checking', 'asset', 1, $1, $1), (2, 1, 'Salary', 'income', 1, $1, $1),
-               (3, 1, 'Groceries', 'expense', 1, $1, $1), (4, 1, 'Old', 'expense', 0, $1, $1),
-               (5, 2, 'Other', 'expense', 1, $1, $1)",
+               (1, 1, 'Checking', 'asset', 1, ?1, ?1), (2, 1, 'Salary', 'income', 1, ?1, ?1),
+               (3, 1, 'Groceries', 'expense', 1, ?1, ?1), (4, 1, 'Old', 'expense', 0, ?1, ?1),
+               (5, 2, 'Other', 'expense', 1, ?1, ?1)",
             "INSERT INTO transactions (id, book_id, date, is_floating, created_at, updated_at) VALUES
-               (1, 1, '2025-01-10', 0, $1, $1), (2, 1, '2025-02-01', 0, $1, $1),
-               (3, 1, '2024-12-31', 1, $1, $1), (4, 1, '2025-03-01', 0, $1, $1),
-               (5, 2, '2025-01-10', 0, $1, $1)",
+               (1, 1, '2025-01-10', 0, ?1, ?1), (2, 1, '2025-02-01', 0, ?1, ?1),
+               (3, 1, '2024-12-31', 1, ?1, ?1), (4, 1, '2025-03-01', 0, ?1, ?1),
+               (5, 2, '2025-01-10', 0, ?1, ?1)",
             "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) VALUES
                (1, 1, 1, 500000), (1, 1, 2, -500000), (1, 2, 3, 1234), (1, 2, 1, -1234),
                (1, 3, 3, 700), (1, 3, 1, -700), (1, 4, 4, 100), (1, 4, 1, -100),
                (2, 5, 5, 999), (2, 5, 5, -1)",
         ] {
-            sqlx::query(sql)
-                .bind(now)
-                .execute(database.pool())
-                .await
-                .unwrap();
+            // The splits name no timestamp.
+            let binds = params![now];
+            let binds: &[_] = if sql.contains("?1") { &binds } else { &[] };
+            database.execute(sql, binds).unwrap();
         }
         database
     }
 
     /// The `detail` column of each step of the query plan.
-    pub(crate) async fn plan(
-        pool: &ledger_db::engine::DbPool,
-        push: impl FnOnce(&mut sqlx::QueryBuilder<'_, ledger_db::engine::Db>),
-    ) -> Vec<String> {
-        let mut query = sqlx::QueryBuilder::new("EXPLAIN QUERY PLAN ");
+    pub(crate) fn plan(database: &Database, push: impl FnOnce(&mut Builder)) -> Vec<String> {
+        let mut query = Builder::new("EXPLAIN QUERY PLAN ");
         push(&mut query);
         query
-            .build_query_as::<(i64, i64, i64, String)>()
-            .fetch_all(pool)
-            .await
+            .query::<(i64, i64, i64, String)>(database)
             .unwrap()
             .into_iter()
             .map(|(_, _, _, detail)| detail)
             .collect()
     }
 
-    async fn balances(
-        pool: &ledger_db::engine::DbPool,
-        as_of_date: Option<&str>,
-    ) -> Vec<(i32, i32, i32)> {
-        let mut query = sqlx::QueryBuilder::new("");
+    fn balances(database: &Database, as_of_date: Option<&str>) -> Vec<(i32, i32, i32)> {
+        let mut query = Builder::default();
         super::push_balance_query(&mut query, 1, as_of_date);
-        let mut rows: Vec<(i32, i32, i32)> = query.build_query_as().fetch_all(pool).await.unwrap();
+        let mut rows: Vec<(i32, i32, i32)> = query.query(database).unwrap();
         rows.sort_unstable();
         rows
     }
@@ -733,21 +710,21 @@ pub(crate) mod tests {
     /// Without a date, the query does not read the transactions, and a date
     /// after every transaction (the floating one included) gives the same
     /// totals and counts.
-    #[tokio::test]
-    async fn balances_with_and_without_a_date_agree() {
-        let database = balance_fixture().await;
-        let pool = database.pool();
+    #[test]
+    fn balances_with_and_without_a_date_agree() {
+        let database = balance_fixture();
+        let pool = &database;
         let all = vec![
             (1, 497_966, 4),
             (2, -500_000, 1),
             (3, 1_934, 2),
             (4, 100, 1),
         ];
-        assert_eq!(balances(pool, None).await, all);
-        assert_eq!(balances(pool, Some("9999-12-31")).await, all);
+        assert_eq!(balances(pool, None), all);
+        assert_eq!(balances(pool, Some("9999-12-31")), all);
         // The floating transaction is dated today, after this date.
         assert_eq!(
-            balances(pool, Some("2025-01-31")).await,
+            balances(pool, Some("2025-01-31")),
             vec![(1, 500_000, 1), (2, -500_000, 1)]
         );
     }
@@ -755,14 +732,11 @@ pub(crate) mod tests {
     /// Without a date, the query reads only the covering index of
     /// migration 0002: no split row and no transaction. The join to the
     /// transactions made the account list five times slower on a large book.
-    #[tokio::test]
-    async fn balances_without_a_date_read_only_the_covering_index() {
-        let database = balance_fixture().await;
+    #[test]
+    fn balances_without_a_date_read_only_the_covering_index() {
+        let database = balance_fixture();
         assert_eq!(
-            plan(database.pool(), |query| super::push_balance_query(
-                query, 1, None
-            ))
-            .await,
+            plan(&database, |query| super::push_balance_query(query, 1, None)),
             ["SEARCH s USING COVERING INDEX idx_transaction_splits_book_account (book_id=?)"]
         );
     }

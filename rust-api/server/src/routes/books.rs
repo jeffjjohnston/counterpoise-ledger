@@ -2,6 +2,7 @@ use crate::{
     auth::session_user,
     book_auth::{AccessLevel, authenticate_book_membership, parse_book_id},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
+    platform,
     state::AppState,
     validation::{database_integer, from_json_bytes, parse_json_body},
 };
@@ -11,12 +12,12 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{Local, NaiveDateTime, SecondsFormat, Utc};
+use chrono::{NaiveDateTime, SecondsFormat};
 use ledger_db::seed::{DemoDataset, SeedError, seed_book};
+use ledger_db::store::{FromRow, Row, Sql, params};
 use serde_json::{Value, json};
-use sqlx::FromRow;
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct BookRow {
     id: i32,
     user_id: i32,
@@ -88,21 +89,21 @@ const BOOK_COLUMNS: &str = "id, user_id, name, upcoming_days, typesafe_reconcili
 pub(crate) async fn list_books(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     let user_id = session_user(&state, &headers, "Failed to fetch books").await?;
     let sql = format!(
-        "SELECT {} , bm.role FROM book_members bm JOIN books b ON b.id = bm.book_id WHERE bm.user_id = $1 ORDER BY b.id",
+        "SELECT {} , bm.role FROM book_members bm JOIN books b ON b.id = bm.book_id WHERE bm.user_id = ?1 ORDER BY b.id",
         BOOK_COLUMNS
             .split(", ")
             .map(|field| format!("b.{field}"))
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let rows: Vec<(BookRow, String)> = sqlx::query(&sql)
-        .bind(user_id)
-        .try_map(|row: ledger_db::engine::DbRow| {
-            use sqlx::Row;
-            Ok((BookRow::from_row(&row)?, row.try_get("role")?))
+    let rows: Vec<(BookRow, String)> = state
+        .database
+        .query::<Row>(&sql, &params![user_id])
+        .and_then(|rows| {
+            rows.iter()
+                .map(|row| Ok((BookRow::from_row(row)?, row.column("role")?)))
+                .collect()
         })
-        .fetch_all(&state.pool)
-        .await
         .map_err(|cause| internal_error(cause, "Failed to fetch books"))?;
     Ok(Json(Value::Array(
         rows.into_iter()
@@ -121,12 +122,9 @@ pub(crate) async fn create_book(
     let sql = format!(
         "INSERT INTO books (user_id, name, created_at, updated_at) VALUES ($1, $2, $3, $3) RETURNING {BOOK_COLUMNS}"
     );
-    let row = sqlx::query_as::<_, BookRow>(&sql)
-        .bind(user_id)
-        .bind(name)
-        .bind(Utc::now().naive_utc())
-        .fetch_one(&state.pool)
-        .await
+    let row = state
+        .database
+        .query_row::<BookRow>(&sql, &params![user_id, name, platform::timestamp()])
         .map_err(|cause| internal_error(cause, "Failed to create book"))?;
     Ok(Json(book_json(row, None)))
 }
@@ -152,13 +150,17 @@ pub(crate) async fn update_book(
     let sql = format!(
         "UPDATE books SET name = $1, upcoming_days = COALESCE($2, upcoming_days), updated_at = $3 WHERE id = $4 RETURNING {BOOK_COLUMNS}"
     );
-    let row = sqlx::query_as::<_, BookRow>(&sql)
-        .bind(name)
-        .bind(upcoming)
-        .bind(Utc::now().naive_utc())
-        .bind(authenticated.book_id())
-        .fetch_optional(&state.pool)
-        .await
+    let row = state
+        .database
+        .query_optional::<BookRow>(
+            &sql,
+            &params![
+                name,
+                upcoming,
+                platform::timestamp(),
+                authenticated.book_id()
+            ],
+        )
         .map_err(|cause| internal_error(cause, "Failed to update book"))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Book not found"))?;
     Ok(Json(book_json(row, None)))
@@ -179,10 +181,12 @@ pub(crate) async fn delete_book(
         "Failed to delete book",
     )
     .await?;
-    sqlx::query("DELETE FROM books WHERE id = $1")
-        .bind(authenticated.book_id())
-        .execute(&state.pool)
-        .await
+    state
+        .database
+        .execute(
+            "DELETE FROM books WHERE id = ?1",
+            &params![authenticated.book_id()],
+        )
         .map_err(|cause| internal_error(cause, "Failed to delete book"))?;
     Ok(Json(json!({ "success": true })))
 }
@@ -241,34 +245,33 @@ fn demo_dataset(body: &Bytes) -> Result<DemoDataset, ApiError> {
 ///
 /// One transaction holds the book and the seed. A failure leaves no book
 /// that holds part of a dataset.
-async fn seed_demo_book(
-    pool: &ledger_db::engine::DbPool,
+fn seed_demo_book(
+    database: &ledger_db::Database,
     user_id: i32,
     dataset: DemoDataset,
 ) -> Result<BookRow, SeedError> {
-    let mut transaction = ledger_db::locks::begin_pool(pool).await?;
-    let taken: Vec<String> = sqlx::query_scalar("SELECT name FROM books WHERE user_id = $1")
-        .bind(user_id)
-        .fetch_all(&mut *transaction)
-        .await?;
-    let sql = format!(
-        "INSERT INTO books (user_id, name, created_at, updated_at) VALUES ($1, $2, $3, $3) RETURNING {BOOK_COLUMNS}"
-    );
-    let book = sqlx::query_as::<_, BookRow>(&sql)
-        .bind(user_id)
-        .bind(next_demo_book_name(dataset.book_name(), &taken))
-        .bind(Utc::now().naive_utc())
-        .fetch_one(&mut *transaction)
-        .await?;
-    let today = Local::now().date_naive();
-    seed_book(&mut transaction, book.id, dataset, today, &mut |_| {}).await?;
-    transaction.commit().await?;
-    Ok(book)
+    database.transaction(|tx| {
+        let taken: Vec<String> =
+            tx.query("SELECT name FROM books WHERE user_id = ?1", &params![user_id])?;
+        let sql = format!(
+            "INSERT INTO books (user_id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3) RETURNING {BOOK_COLUMNS}"
+        );
+        let book: BookRow = tx.query_row(
+            &sql,
+            &params![
+                user_id,
+                next_demo_book_name(dataset.book_name(), &taken),
+                platform::timestamp()
+            ],
+        )?;
+        seed_book(tx, book.id, dataset, platform::today(), &mut |_| {})?;
+        Ok(book)
+    })
 }
 
-/// The seed writes thousands of rows and takes seconds. It runs in its own
-/// task, so it commits when the client leaves before the response. The
-/// request future alone would be dropped, and the seed would roll back.
+/// The seed writes thousands of rows and takes seconds. It runs on a
+/// blocking thread of its own, so it commits when the client leaves before
+/// the response, and no thread of the async runtime waits on it.
 pub(crate) async fn create_demo_book(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -276,8 +279,8 @@ pub(crate) async fn create_demo_book(
 ) -> ApiResult {
     let user_id = session_user(&state, &headers, DEMO_FAILURE).await?;
     let dataset = demo_dataset(&body)?;
-    let pool = state.pool.clone();
-    let seeded = tokio::spawn(async move { seed_demo_book(&pool, user_id, dataset).await })
+    let database = state.database.clone();
+    let seeded = platform::blocking(move || seed_demo_book(&database, user_id, dataset))
         .await
         .map_err(|cause| cause.to_string())
         .and_then(|result| result.map_err(|cause| cause.to_string()));

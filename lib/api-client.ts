@@ -1,3 +1,5 @@
+import { ACCESS_REDIRECT, accessExpired, renewAccessSession } from "./access-session";
+
 /**
  * The single client-side entry point for talking to this app's API.
  *
@@ -42,13 +44,20 @@ export async function apiFetch<T>(url: string, init: ApiInit = {}): Promise<T> {
   // AbortSignal.timeout) still matching. Wrapping it lets a cancelled request
   // be mistaken for a real answer, which silently serves stale data.
   const res = await fetch(url, {
+    redirect: ACCESS_REDIRECT,
     ...rest,
     headers: finalHeaders,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
-  // Routes used by this helper answer with JSON. The book event stream uses
-  // EventSource directly and never passes through here. res.json() can
+  // Cloudflare Access answered: its token expired. The reload renews it.
+  if (accessExpired(res)) {
+    renewAccessSession();
+    throw new ApiError("Your sign-in expired. Reload the page to continue.", 401);
+  }
+
+  // Routes used by this helper answer with JSON. The book's live updates use
+  // a WebSocket directly and never pass through here. res.json() can
   // still reject, and only a genuine parse failure is tolerable here — a
   // 500 serving an HTML error page, or an empty body. Both reject with
   // SyntaxError.

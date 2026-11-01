@@ -12,9 +12,11 @@ import { PlaidLinkModal } from "@/components/sync/PlaidLinkModal";
 import { formatDate, toDateString } from "@/lib/wasm-client";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
+import { useBookChanges } from "@/components/BookChangesProvider";
 import { apiGet, apiPost, apiDelete, toMessage } from "@/lib/api-client";
 import { cn } from "@/lib/utils";
 import { SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
+import { onTabReturn } from "@/lib/tab-return";
 import type { AssignedSyncAccount } from "@/types";
 
 function formatLastSynced(value: string | null) {
@@ -119,8 +121,19 @@ export default function SyncPage() {
     void fetchInitial();
   }, [fetchAssignedAccounts]);
 
-  // The navbar badge polls this book's pending count every 60s. Without the same
-  // cadence here the page's counts drift away from the badge directly above them.
+  // The navbar badge follows the book socket's hints for the Plaid tables, so
+  // the counts here follow them too, or they drift away from the badge above
+  // them. A reset (focus, a new socket) needs no fetch here: the tab-return
+  // refresh below and the poll cover it. The 60s poll stays: the last sync
+  // time and error are in plaid_tokens, which sends no hint.
+  useBookChanges((change) => {
+    if (change.tables.some((table) =>
+      table === "plaid_accounts" || table === "plaid_transaction_reconciliation")) {
+      void fetchAssignedAccounts().catch(() => {
+        // Best-effort, as the poll below.
+      });
+    }
+  });
   useEffect(() => {
     const refresh = () => {
       void fetchAssignedAccounts().catch(() => {
@@ -130,18 +143,12 @@ export default function SyncPage() {
     };
 
     const interval = setInterval(refresh, 60_000);
-    const onFocus = () => {
-      if (document.visibilityState === "visible") refresh();
-    };
-
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onFocus);
+    const stopRefreshes = onTabReturn(refresh);
     window.addEventListener(SYNC_QUEUE_CHANGED_EVENT, refresh);
 
     return () => {
       clearInterval(interval);
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onFocus);
+      stopRefreshes();
       window.removeEventListener(SYNC_QUEUE_CHANGED_EVENT, refresh);
     };
   }, [fetchAssignedAccounts]);

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import { setupTestDatabase, resetTestDatabase, createUser } from "@/tests/helpers/db-utils";
+import { onWorker } from "@/tests/helpers/http-parity";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
 import { count, insert, rows } from "@/tests/helpers/sql";
@@ -18,19 +19,13 @@ async function createIssueReport(
 const callTool = (name: string, args: Record<string, unknown> = {}) =>
   callMcpTool(mcp.client, name, args);
 
-// The Rust server reads STATUS_DIR from its own environment, which is fixed
-// when it starts, so the directory is set at connect as well as per test.
-const MISSING_STATUS_DIR = "/tmp/counterpoise-test-no-such-status-dir";
-
 describe("MCP Issue Report Tools", () => {
   const userId = 1; // the user of the test client's key
 
   beforeAll(async () => {
     await setupTestDatabase();
 
-    mcp = await connectMcpTestClient({
-      env: { STATUS_DIR: MISSING_STATUS_DIR },
-    });
+    mcp = await connectMcpTestClient();
   }, 120_000);
 
   beforeEach(async () => {
@@ -211,11 +206,12 @@ describe("MCP Issue Report Tools", () => {
   });
 
   describe("get_system_status", () => {
-    it("reports unknown when no status directory is mounted", async () => {
+    it("reports unknown before any job has run", async () => {
       const { data, isError } = await callTool("get_system_status");
 
       expect(isError).toBe(false);
       expect(data.overall).toBe("unknown");
+      expect(data.jobs.every((j: { state: string }) => j.state === "unknown")).toBe(true);
       expect(data.jobs.map((j: { job: string }) => j.job)).toEqual(
         expect.arrayContaining([
           "backup",
@@ -223,9 +219,11 @@ describe("MCP Issue Report Tools", () => {
           "recurring",
           "plaid-sync",
           "price-sync",
-          "reindex",
+          // A Durable Object has no file to reindex.
+          ...(onWorker ? [] : ["reindex"]),
         ])
       );
+      expect(data.jobs.some((j: { job: string }) => j.job === "reindex")).toBe(!onWorker);
     });
   });
 });

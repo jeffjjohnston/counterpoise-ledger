@@ -66,6 +66,19 @@ Every browser request to the API goes through this module:
 - `ApiError` - carries the status and the server's `error` message
 - `toMessage(error)` - the text to show for any thrown value
 
+### `/lib/access-session.ts`
+Cloudflare Access in front of a deployment. An expired Access token turns
+each API request into a redirect to the Access login on another origin, so
+`apiFetch()` and the book socket's handshake check fetch with
+`redirect: "manual"`. `accessExpired(response)` spots the redirect, and
+`renewAccessSession()` reloads the page (once a minute at most), which
+renews the token or shows the login. No API route redirects a `fetch`.
+
+### `/lib/tab-return.ts`
+`onTabReturn(callback)` calls `callback` once when the user comes back to the
+tab, and returns the function that removes its listeners. One return fires
+both `focus` and `visibilitychange`, so the events within 100 ms make one call.
+
 ### `/lib/navigation.tsx`
 Every router use in the client goes through this module: `Link`,
 `useRouter()` (`push` and `replace`, with the `scroll` option),
@@ -119,6 +132,12 @@ enforces every level regardless of what the client shows
   fallback for input that JSON cannot carry
 - `/lib/expression.ts` - `evaluateExpression()`, the parser for amount inputs
   (`+`, `-`, `*`, `/`, parentheses; a user can type `12.50 + 3`)
+- `/lib/save-chord.ts` - the optional chord when the transaction form saves:
+  the per-device setting (localStorage) and `prepareSaveChord()`, which makes
+  the AudioContext inside the submit gesture and returns the function that
+  plays the chord once the save handler reports success. Only
+  `TransactionForm` calls it; imports, sync, recurring processing and MCP
+  writes stay silent
 - `/lib/recurring.ts` - the recurrence limits and helpers
   (`MAX_*_INTERVAL_*`, `isValidAutoCreateDaysBefore()`,
   `parseAutoCreateDaysBefore()`, `addDaysToDateString()`) and the types for
@@ -180,7 +199,8 @@ enforces every level regardless of what the client shows
   price entry pill
 - `/lib/job-health.ts` - the job names, their schedules (`JOB_SCHEDULES`),
   and `evaluateJobHealth()`. The status page uses it for its empty state; the
-  server evaluates in `rust-api/server/src/routes/system.rs`
+  server evaluates in `rust-api/server/src/routes/system.rs`, whose Worker
+  table drops the reindex and runs one backup a day
 - `/lib/posthog-client.ts` - `identifyUser()`, `resetUser()`
 - `/lib/posthog-url.ts` - `redactedCaptureUrl()`
 - `/lib/typesafe/events.ts`, `/lib/typesafe/types.ts` - the TypeSafe
@@ -250,21 +270,59 @@ Database code that the server and `ledger-cli` both run:
 - `seed/` (a directory) - `seed_book()`, the sample datasets (`household`, `single`) of
   `npm run db:seed` and of `POST /api/books/demo`. The dates are relative to
   `today`. Snapshot and invariant tests: `rust-api/db/src/seed/tests.rs`
-- `database.rs` - `open()` (the pragmas and the SQL functions on each pooled
+- `database.rs` - `open()` (the pragmas and the limits on each pooled
   connection), `migrate()` (the embedded migrations of
   `rust-api/db/migrations/`), and `lock_server()` (the `<database>.lock` file
   lock)
-- `functions.rs` - the SQL functions that each connection registers:
-  Unicode `lower()`, case-sensitive `LIKE`, `cp_today()` and
-  `cp_merchant_key()`
-- `sql.rs` - the SQL helpers: `today!()`, `EFFECTIVE_DATE`, `in_integers()`,
-  `in_texts()`, `json()`, `json_array()` and `MERCHANT_KEY`
-- `locks.rs` - `begin()` and `begin_pool()` (`BEGIN IMMEDIATE`), and
-  `with_session_lock()`, a file lock under `<database>.locks/` that spans
-  several transactions
+- `store.rs` - the synchronous API: `Database` (`open()`, `transaction()`,
+  `read_transaction()`), the `Sql` trait (`query`, `query_row`,
+  `query_optional`, `execute`, `exec_batch`), `Value`, `Row`, `FromRow`,
+  `params!` and `Builder` (a statement with optional clauses). `#[derive(FromRow)]`
+  comes from the `ledger-db-derive` crate (`rust-api/derive/`) and reads each
+  field from the column of its name. See
+  [database-management.md](database-management.md#the-synchronous-api)
+- `engine/` - the one module that names the engine. `engine/native.rs` is
+  the rusqlite backend of `store.rs` (`Database`, `Transaction` and its
+  `savepoint()`), built with the `native` feature. `engine/hosted.rs` is the
+  backend without it: a `Connection` trait that the host implements (a
+  Durable Object's `SqlStorage`), with `Database::new()`. Its tests run it
+  over rusqlite
+- `limits.rs` - `LIMITS`: a Durable Object's SQLite limits, which
+  `Database::open()` sets on every connection
+- `folds.rs` - the `*_fold` columns and the Plaid `merchant_key`:
+  `FOLD_COLUMNS`, `fold()` and `merchant_key()` (from `ledger_core::names`),
+  `check()` and `repair()` (on the synchronous API), which the native
+  server runs at start, the Worker's object once for each build, and
+  `ledger-cli repair-folds` by hand
+- `clock.rs` - the app's zone (`APP_TZ`, else `TZ`) and `today()` in it
+- `env.rs` - `var()`, which every setting read goes through. A process reads
+  its environment; a Worker has none, so the Durable Object passes its
+  variables and secrets to `set()` before it starts
+- `sql.rs` - the SQL helpers: `today_literal()`, `date_literal()`,
+  `EFFECTIVE_DATE`, `in_integers()`, `in_texts()`, `json_rows()`, `json()`
+  and `json_array()` (`store::Builder::push_in_integers()` is the builder's)
+- `locks.rs` - `FOR_UPDATE` and `FOR_SHARE`, both empty: `BEGIN IMMEDIATE`
+  already holds the write lock
+- `jobs.rs` - the job leases (`acquire()`, `renew()`, `release()` and
+  `held()` on `job_leases`), the job runs (`record_run()` and `runs()` on
+  `job_runs`), and the scheduler's slots and requests (`slots()`,
+  `claim()`, `advance()`, `finish()` on `job_slots`; `request()` and
+  `requests()` on `job_requests`)
 - `backup.rs` - `snapshot()`: a `VACUUM INTO` copy, checked with
-  `PRAGMA integrity_check`
+  `PRAGMA integrity_check`; `daily_dump()` and `write_dump()`
+- `dump.rs` - `dump()` and `load()`: the portable JSON dump that moves the
+  data between a file and a Durable Object. `dump_json()` writes the same
+  dump as text a row at a time; use it to store a dump, because a tree of
+  JSON values takes several times the memory of its text. `load()` reads a
+  dump into a new file, and `dump::import()` reads one into a migrated database
+  with no user, as the admin import route does
+- `sync_floor.rs` - `SYNC_FLOOR_BOOK_ID` and the floor marker that a
+  backup copy and a loaded dump add to `transaction_changes`
 - `testing.rs` - `TempDatabase`, a migrated database file for a Rust test
+
+`backup.rs`, `database.rs` (`open()` and the server lock), `limits.rs` and
+`testing.rs` need a file and rusqlite, so they build only with the `native`
+feature, which is the default.
 
 ### `rust-api/server/src`
 Shared server modules:
@@ -292,15 +350,51 @@ Shared server modules:
   validators
 - `transaction_input.rs`, `recurring_input.rs` - the transaction and
   recurring-rule input rules, including `expected_updated_at()`
-- `db_scope.rs` - `with_transaction()` opens `BEGIN IMMEDIATE` on the
-  caller's connection. Inside `ledger_db::locks::with_session_lock()`, run
-  the callback's transaction and queries on the connection that it hands
-  over, never on the pool
-- `rate_limit.rs` - the login, registration, password, API-key and
-  member-add limits. `client_ip()` reads the forwarded address
+- `db_scope.rs` - `write_transaction()` and `read_transaction()` run a
+  route's closure in a transaction of `state.database` and answer a database
+  error with the route's 500. `write_transaction_or()` takes the route's
+  own answer to a database error, for a route whose failure is not a 500
+  (the TypeSafe routes answer 503)
+- `platform.rs` - what the server takes from the runtime: `now()`,
+  `timestamp()`, `today()`, `instant()`, `random()`, `spawn()`,
+  `spawn_to_finish()` (background work that must end, which a Durable
+  Object keeps itself up for with `waitUntil`), `blocking()`, `sleep()`, `timeout()`, `process_name()`, the socket peer
+  (`CF-Connecting-IP` on the Worker) and the HTTP client (`http_client()`;
+  each request sets its own `.timeout()`). Server code calls these, not
+  `Utc::now`, `Instant::now`, `tokio::spawn`, `spawn_blocking`,
+  `tokio::time`, `getrandom` or `std::process::id`, so that the Workers
+  build can replace each in one place: on wasm32 the standard library's
+  clock and process id panic. A test in the module fails on a direct call
+  outside it and the native-only files. `outbound()` wraps each outgoing
+  request, since a request future on wasm32 is not `Send`.
+  `post_without_redirects()` is the POST of a client that sends a key (the
+  weekly review, TypeSafe): it hands back a 3xx instead of following it. On
+  wasm32 it calls `fetch` itself with `redirect: "manual"`, since reqwest
+  cannot refuse a redirect there
+- `hosted.rs` - `start()`, the Worker's version of the native start: it
+  checks the version, the zone and the migrations, asks
+  for the stepped lot rebuild when trades exist and no lot does, and returns an `App`:
+  the router with the security layers, `repair_folds()`, which the object
+  runs once for each build, `next_wake()` and `alarm()`, which
+  run the scheduler from the object's alarm, and the hibernating book
+  sockets (`hosted/sockets.rs`: `admit_socket()`, `watch_books()`,
+  `socket_updates()`). The router also has the admin import route
+  (`hosted/import.rs`), which is off without `IMPORT_SECRET`. The Durable
+  Object calls it. `hosted/restore.rs` checks the point-in-time restore
+  route, which the object serves itself, and `App::after_restore()` adds the
+  floor marker at the first start after a restore
+- `revocations.rs` - `Revocations`, the watch channel that ends a book
+  socket when a session or API key is revoked
+- `leases.rs` - `try_take()` and `wait()`: a lease on a job or a Plaid
+  connection, renewed while it is held and released when it drops
+- `rate_limit.rs` - the login, registration, password, API-key, member-add
+  and OAuth limits, in the table `rate_limits`. `client_ip::from_headers()`
+  (`client_ip.rs`) reads the forwarded address
 - `book_changes.rs` - `BookChangeHub`, which polls `change_marks` for the
-  event stream
-- `scheduler.rs` - the scheduled jobs and their status files
+  book socket
+- `scheduler/mod.rs` - the scheduled jobs, their steps and their run
+  records; `scheduler/plan.rs` - `plan()`, the jobs due now and the next
+  wake from the time and the job tables
 - `health_probe.rs` - `counterpoise-rust-api health`, the image's
   healthcheck
 - `analytics.rs` - `capture_event()`. A route that runs for an MCP tool
@@ -308,6 +402,10 @@ Shared server modules:
 - `plaid.rs`, `tiingo.rs` - the Plaid and Tiingo clients
 - `typesafe.rs`, `typesafe_client.rs`, `typesafe_questions.rs` - the
   TypeSafe experiment
+- `weekly_review/` - the weekly review: `input.rs` (the data and the request
+  document), `output.rs` (the schema and the checks), `anthropic.rs` (the
+  Messages API client) and `mod.rs` (start, run, save, prune). The routes are
+  `routes/weekly_review.rs`. See [guides/weekly-review.md](weekly-review.md)
 - `openapi/` - the OpenAPI document. See [guides/api-contract.md](api-contract.md)
 - `mcp/` - the MCP server. See [guides/mcp-server.md](mcp-server.md)
 - `oauth/` - OAuth 2.1 for `/api/mcp`: discovery, client registration and
@@ -323,8 +421,9 @@ One module per route area. `routes/mod.rs` registers each entry of
   and changes nothing. A floating row sorts above the settled rows of its
   effective date (`REGISTER_ORDER`)
 - `payees.rs` - `normalize_name()`: trims, collapses whitespace runs and
-  straightens quotes. It does **not** lowercase: "IKEA" and "Ikea" are two
-  payees. `create_exact()` creates a payee with the exact name
+  straightens quotes. It does **not** lowercase, but a payee name matches
+  without case: "IKEA" and "Ikea" are one payee. `create_exact()` creates a
+  payee, or returns the name of the existing payee that matches
 - `members.rs` - member changes. An unknown username and an existing member
   both fail with "Cannot add that user", so the answer does not disclose
   which usernames exist. Only an unknown username counts against the
@@ -345,7 +444,7 @@ One module per route area. `routes/mod.rs` registers each entry of
   reconciliation queue and `resolve()`
 - `recurring.rs` - recurring rules and `process_rules()`
 - `system.rs` - version, health, and job status
-- `cron.rs`, `typesafe.rs`, `typesafe_suggestion.rs`, `events.rs`,
+- `cron.rs`, `typesafe.rs`, `typesafe_suggestion.rs`, `socket.rs`,
   `issue_reports.rs`
 
 ## Critical Files Reference
@@ -353,20 +452,22 @@ One module per route area. `routes/mod.rs` registers each entry of
 | File | Purpose |
 |------|---------|
 | `/rust-api/db/migrations/` | The schema: `0001_baseline.sql` and each later numbered file. Never edit one that has run |
-| `/rust-api/db/src/database.rs` | Opening the file: pragmas, SQL functions, the server lock, the embedded migrations |
+| `/rust-api/db/src/database.rs` | Opening the file: pragmas, limits, the server lock, the embedded migrations |
 | `/types/db.ts` | The TypeScript row types that the client and the test helpers use |
 | `/rust-api/routes.json` | The routes that `routes/mod.rs` registers from its handler table |
 | `/rust-api/server/src/routes/mod.rs` | The Axum router, and the routes that it registers by name (`/health`, `/api/health`, `/api/mcp`, WebMCP) |
 | `/rust-api/server/src/book_auth.rs` | Book access at a level |
 | `/rust-api/db/src/lots.rs` | The lot rebuild. Lots and allocations are derived state |
 | `/rust-api/cli/src/main.rs` | `ledger-cli`: `migrate`, `seed [--book-id N \| --reset]`, `list-books`, `rebuild-lots [--force]`, `import-moneydance`, `backup [--dir D]`. Each uses `DATABASE_PATH` (default `data/counterpoise.db`) |
-| `/rust-api/server/src/scheduler.rs` | The scheduled jobs (recurring, Plaid, prices, TypeSafe cleanup, backup, prune, `VACUUM`), on when `COUNTERPOISE_SCHEDULER=on` |
+| `/rust-api/server/src/scheduler/mod.rs` | The scheduled jobs (recurring, Plaid, prices, TypeSafe cleanup, backup, prune, `VACUUM`), on when `COUNTERPOISE_SCHEDULER=on` |
 | `/rust-api/cli/src/import_moneydance/mod.rs` | Moneydance import orchestration, run by `ledger-cli import-moneydance` and `npm run import:moneydance` |
 | `/rust-api/server/src/mcp/` | The MCP server: the tool registry, the stdio and HTTP transports, WebMCP, and one handler module per tool group. See [mcp-server.md](mcp-server.md) |
 | `/rust-api/server/src/oauth/` | OAuth 2.1 for `/api/mcp`, on when `COUNTERPOISE_PUBLIC_URL` is set. See [mcp-server.md](mcp-server.md#oauth-for-custom-connectors) |
 | `/rust-api/server/mcp-tools.json` | The source of each MCP tool's name, title, description, annotations and input schema |
 | `/rust-api/server/src/openapi/` | The source of `openapi/openapi.json` |
-| `/rust-api/server/src/security.rs` | The only copy of the session gate, the cross-origin write check and the security headers: `protect()` adds the headers (HSTS when `ENABLE_HSTS=true`), the cross-origin write check, the API gate (401 for an `/api/` request without credentials, before the router), and the gate for unmatched paths (404 for `/api/`, a redirect to `/login` for a page without a session) |
+| `/rust-api/server/src/security.rs` | The only copy of the session gate, the cross-origin write check and the security headers: `protect()` adds the headers (HSTS when `ENABLE_HSTS=true`), the cross-origin write check, the API gate (401 for an `/api/` request without credentials, before the router), and the gate for unmatched paths (404 for `/api/`, a redirect to `/login` for a page without a session). `page_gate()` is that page decision alone, which the Worker also runs |
+| `/rust-api/server/src/lib.rs` | The server crate's root: its modules, `serve()`, stdio MCP and `run()`, the command line that `main.rs` calls. The Worker crate links it as `counterpoise_rust_api` |
+| `/rust-api/worker/` | The Worker and its Durable Object. `route()` decides which paths go to the object; `wrangler.toml` holds the bindings and lists the secrets. `src/object.rs` is `LedgerObject`: it starts the server with `hosted::start()`, serves the router, holds the book sockets with hibernation, runs the scheduled jobs from its alarm and sets the next one, gives the backup job the `EXPORTS` bucket, and passes promised background work to `waitUntil`; a panic aborts the object so that the next request builds it again. `src/storage.rs` is the database of the object: `SqlStorage` behind `ledger_db`'s `Connection`, with the bindings workers-rs lacks (`transactionSync`, the point-in-time bookmarks, `abort`, `waitUntil`). Reset the object only with its `reset()`, which calls `ctx.abort` from a timer: `abort` throws, and a throw through Wasm frames leaves the instance unable to finish any future until the next deploy |
 | `/rust-api/server/src/compression.rs` | The gzip and br layer that `serve()` puts around every response. It never compresses an event stream, an image, a WOFF font or a tiny body |
 | `/rust-api/server/src/static_pages.rs` | The page service behind the page gate. It serves the client build that `COUNTERPOISE_STATIC_DIR` names: `index.html` for each page path, 404 for a missing file under `/assets/`, a one-year immutable cache for `/assets/` and `no-cache` for the rest. The server refuses to start when the folder has no `index.html` |
 | `/vite.config.ts` | The client build (to `build/`) and the development server on port 3000. It proxies `/api` to `RUST_API_URL` and puts the `NEXT_PUBLIC_*` values into the bundle at build time |

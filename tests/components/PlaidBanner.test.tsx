@@ -116,7 +116,7 @@ describe("PlaidBanner", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "/api/b/1/transactions/10/plaid/unlink",
-      { method: "POST" }
+      { method: "POST", redirect: "manual" }
     );
   });
 

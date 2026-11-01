@@ -3,16 +3,35 @@ name = "ledger-db"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["native"]
+# The rusqlite backend and what needs a file system: the server file lock,
+# the backups. Without it the host supplies the connection
+# (`engine::hosted`), as a Cloudflare Durable Object does.
+native = ["dep:rusqlite", "dep:libsqlite3-sys"]
+
 [dependencies]
 ledger-core = { path = "../core" }
+ledger-db-derive = { path = "../derive" }
 chrono = "0.4"
-# The C library that sqlx bundles. The db crate registers SQL functions
-# through its API; the version must stay the one that sqlx-sqlite uses.
-libsqlite3-sys = "0.30"
-serde = "1"
-serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "migrate", "macros"] }
+# The SQLite C library, compiled into each binary (`bundled`): no build or
+# image needs a system SQLite, and every target runs the same version.
+# `limits.rs` sets the connection limits through its API. This version must
+# stay the one that rusqlite links.
+libsqlite3-sys = { version = "0.30", features = ["bundled"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
+# The native backend of `ledger_db::store` (`engine/native.rs`). 0.32 is the last
+# release on libsqlite3-sys 0.30.
+rusqlite = { version = "0.32", optional = true }
+# The checksum of a migration file: SHA-384, as sqlx recorded it.
+sha2 = "0.10"
+
+# The clock reads `Date.now()` on wasm32.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono = { version = "0.4", features = ["wasmbind"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
 unicode-segmentation = "1"

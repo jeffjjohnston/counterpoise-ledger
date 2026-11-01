@@ -29,7 +29,8 @@ The source is `rust-api/server/src/openapi/`:
   Rust server reads it at build time, with the package version.
 
 `GET /api/version` is public and returns the package version and
-`API_CONTRACT`.
+`API_CONTRACT`. A deploy that sets `BUILD_COMMIT` (the Worker deploy) also
+returns `commit`, because commits between releases share a version.
 
 ## Commands
 
@@ -152,6 +153,36 @@ A native client must not send `Origin` or `Sec-Fetch-Site`. The server's
 cross-origin check (`rust-api/server/src/security.rs`) rejects a write whose
 `Origin` host differs from `Host`.
 
+### Signing in through Cloudflare Access
+
+A deployment behind Cloudflare Access refuses a request that carries
+neither an Access cookie nor an Access token, before the server sees it. A
+browser signs in on Access's own page and keeps its cookie. A native client
+has no cookie jar to share, so it gets a token through a hand-off:
+
+1. The client makes a random `state` (16 to 128 base64url characters) and
+   opens `GET /api/auth/access-handoff?state=...` in the system's web
+   authentication sheet (`ASWebAuthenticationSession` on Apple platforms).
+2. Access signs the person in and forwards the request with its application
+   token in `Cf-Access-Jwt-Assertion`.
+3. The route answers `303` to `counterpoise://access?token=...&state=...`,
+   with `Cache-Control: no-store`.
+4. The client checks that `state` is the one it made, keeps the token, and
+   sends it in the `cf-access-token` header of every request, beside its
+   bearer key. When Access refuses the token, because its session ended, the
+   client runs the hand-off again.
+
+The route is `rust-api/server/src/routes/access_handoff.rs`. It never
+verifies the token. It only hands back what Access forwarded, to the one
+fixed callback scheme, and Access verifies the token on every later request.
+It answers `404`, as an unknown API path does, on the native server and to a
+Worker request that has no token, and `400` to a bad `state`. It is not in
+`routes.json` or the OpenAPI document: it is a browser redirect, not a JSON
+route. Its HTTP tests run on both servers.
+
+The Access token is not a Counterpoise credential. The client still needs
+its API key, and the API gate still checks it.
+
 ## Delta sync
 
 `GET /api/b/{bookId}/transactions/changes` (`listTransactionChanges`) lets a
@@ -188,20 +219,51 @@ that embed it. This is deliberate: one account rename would log every
 transaction of that account. Thus a client that syncs with this route must
 not show the embedded `payee`, `account` and `security` objects. It must look
 up each one by `payeeId`, `accountId` or `securityId` in its own copy of
-those tables, which it reads again on the SSE hint for the table.
+those tables, which it reads again on the live-update hint for the table.
 
 ## Live updates
 
-`GET /api/b/{bookId}/events` is a Server-Sent Events stream. It accepts a
-bearer key like any data route. It is not in `openapi.json`, because a
-generated client cannot consume a stream from the document. The client reads
-it by hand. The stream authenticates once when it opens and stays open for
-up to five minutes. Revoking a key does not close a stream that is already
-open. The next reconnect fails.
+`GET /api/b/{bookId}/socket` (`openBookSocket`) is a WebSocket. It accepts a
+bearer key like any data route, and a cookie only from the app's own origin.
+`openapi.json` lists it with a 101 response, but a generated client cannot
+use it: the client opens it with a WebSocket client and reads the messages by
+hand. A request that fails authentication gets the HTTP error of any data
+route (400, 401, 404, or 403 for a cookie from another origin) and no
+upgrade.
 
-A `change` frame is `event: change` with `data: {"tables": [...]}`. It names
-the tables that changed in this book, and carries no row data. A client reads
-again the data of each table it shows. These table names can occur:
+The server sends JSON text messages and reads none. The first is
+`{"type":"ready"}`: the socket is listening, and the client reads again
+everything it shows, since a hint of the gap before it is lost. Then each
+`{"type":"change","tables":[...]}` names the tables that changed in this
+book, and carries no row data. A client reads again the data of each table it
+shows. A client ignores a message of another `type`.
+
+The server checks the credential again when a session logs out or changes its
+password, when a key is deleted, when the book's members change, and every
+five minutes. A credential that no longer reads the book closes the socket
+with code 4000 + the HTTP status that a request would get: 4401, 4403 or
+4404. Do not reconnect after one of these: the next attempt gets the same
+answer. After any other close, such as 1001 (the server shuts down), 1013
+(the client fell behind) or a dropped network, reconnect with a growing
+delay. A browser reports a refused handshake as 1006, without its status, so
+the web client sends the same `GET` without the upgrade after a socket that
+closed before `ready`: 400 means the credential still reads the book, and
+401, 403 or 404 means stop. The server pings every 25 seconds.
+
+On the Worker, the same path, messages and close codes apply, with these
+differences. The Durable Object holds the socket with hibernation, and it has
+no timer, because a timer would keep it awake:
+
+- A hint goes out after the object's next event (a request or an alarm), not
+  from a poll. Each write reaches the object as a request, so a write gives
+  its hint at once.
+- The object checks the credential again when a session or a key is
+  revoked, when the book's members change, and at each alarm. It does not
+  check every five minutes.
+- The object sends no ping. A client must not take a quiet socket as a dead
+  one. It reconnects when the socket closes.
+
+These table names can occur in a hint:
 
 | Table | Changes when |
 | --- | --- |

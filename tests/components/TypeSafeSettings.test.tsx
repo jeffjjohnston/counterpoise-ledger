@@ -40,7 +40,7 @@ describe("TypeSafe Settings", () => {
     ).toBe(true);
     first.unmount();
     render(<TypeSafeSettings bookId="1" bookName="Family" />);
-    await waitFor(() => expect(screen.getByRole("checkbox")).toBeChecked());
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: "Suggest Plaid transaction matches" })).toBeChecked());
   });
 
   it("shows a failed disable and retains the persisted on state, even when the provider is unavailable", async () => {
@@ -57,7 +57,7 @@ describe("TypeSafe Settings", () => {
       ),
     );
     render(<TypeSafeSettings bookId="1" bookName="Family" />);
-    const toggle = screen.getByRole("checkbox");
+    const toggle = screen.getByRole("checkbox", { name: "Suggest Plaid transaction matches" });
     await waitFor(() => expect(toggle).toBeChecked());
     expect(toggle).toBeEnabled();
     fireEvent.click(toggle);
@@ -78,7 +78,7 @@ describe("TypeSafe Settings", () => {
     );
     vi.stubGlobal("fetch", fetcher);
     render(<TypeSafeSettings bookId="1" bookName="Family" />);
-    await waitFor(() => expect(screen.getByRole("checkbox")).toBeChecked());
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: "Suggest Plaid transaction matches" })).toBeChecked());
     fireEvent.click(
       screen.getByRole("button", { name: "Clear experiment data" }),
     );
@@ -93,5 +93,28 @@ describe("TypeSafe Settings", () => {
     expect(
       fetcher.mock.calls.some(([, init]) => init?.method === "DELETE"),
     ).toBe(true);
+  });
+
+  it("turns the entry suggestions on with their own switch", async () => {
+    let entry = false;
+    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") entry = JSON.parse(init.body as string).entrySuggestionsEnabled;
+      return new Response(
+        JSON.stringify({ enabled: false, entrySuggestionsEnabled: entry, configured: true, revision: entry ? 1 : 0 }),
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(<TypeSafeSettings bookId="1" bookName="Family" />);
+    const toggle = screen.getByRole("checkbox", { name: "Suggest entries for new transactions" });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(
+      fetcher.mock.calls.some(
+        ([, init]) => init?.method === "PATCH" && init.body === '{"entrySuggestionsEnabled":true}',
+      ),
+    ).toBe(true);
+    expect(screen.getByRole("checkbox", { name: "Suggest Plaid transaction matches" })).not.toBeChecked();
   });
 });

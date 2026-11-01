@@ -7,7 +7,9 @@
  * headers are correct (`static_pages.rs`), so the browser is not the cause.
  *
  * This module asks `/api/version` for the version of the server and compares
- * it with the version of this build. It asks when the page becomes visible,
+ * it with the version of this build. Commits between releases share a
+ * version, so when the server and this build both name their commit, a
+ * different commit is a new build too. It asks when the page becomes visible,
  * when the window gets focus, when the browser restores the page from its
  * back-forward cache, and at a slow interval. When the versions are
  * different:
@@ -18,7 +20,7 @@
  */
 
 import { createPath, type createBrowserRouter } from "react-router";
-import { getAppVersion } from "@/lib/api-contract";
+import { getAppVersion, getBuildCommit } from "@/lib/api-contract";
 
 /**
  * The sessionStorage key that holds the server version of the last automatic
@@ -33,22 +35,29 @@ export const CHECK_INTERVAL_MS = 10 * 60_000;
 type Listener = () => void;
 type AppRouter = ReturnType<typeof createBrowserRouter>;
 
-let serverVersion: string | null = null;
+/** The build on the server: its version, and its commit when it names one. */
+let serverBuild: string | null = null;
 let checking = false;
 const listeners = new Set<Listener>();
 
-function setServerVersion(version: string | null) {
-  if (version === serverVersion) return;
-  serverVersion = version;
+function setServerBuild(build: string | null) {
+  if (build === serverBuild) return;
+  serverBuild = build;
   for (const listener of listeners) listener();
 }
 
 /**
- * The version on the server when it is different from this build. Null when
- * they are the same, or before the first check.
+ * The build on the server when it is different from this build. Null when
+ * they are the same, or before the first check. It is the version, or the
+ * version and the commit (`<version>+<commit>`) for a new commit of this
+ * version.
  */
 export function getNewVersion(): string | null {
-  return serverVersion !== null && serverVersion !== getAppVersion() ? serverVersion : null;
+  if (serverBuild === null) return null;
+  const [version, commit] = serverBuild.split("+");
+  if (version !== getAppVersion()) return version;
+  const own = getBuildCommit();
+  return commit && own && commit !== own ? serverBuild : null;
 }
 
 /** For `useSyncExternalStore`. */
@@ -67,9 +76,10 @@ export async function checkForNewVersion(): Promise<void> {
   try {
     const response = await fetch("/api/version", { cache: "no-store" });
     if (!response.ok) return;
-    const body: unknown = await response.json();
-    const version = (body as { version?: unknown } | null)?.version;
-    if (typeof version === "string" && version !== "") setServerVersion(version);
+    const body = (await response.json()) as { version?: unknown; commit?: unknown } | null;
+    const version = body?.version;
+    const commit = typeof body?.commit === "string" && body.commit !== "" ? body.commit : null;
+    if (typeof version === "string" && version !== "") setServerBuild(commit ? `${version}+${commit}` : version);
   } catch {
     // Keep the last known version.
   } finally {

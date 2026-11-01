@@ -23,7 +23,8 @@ use ledger_core::{
         point_dates,
     },
 };
-use ledger_db::{engine::DbPool, sql::EFFECTIVE_DATE};
+use ledger_db::sql::EFFECTIVE_DATE;
+use ledger_db::store::{self, Sql, params};
 use serde_json::{json, to_value};
 
 const FAILURE: &str = "Failed to fetch net worth history";
@@ -53,12 +54,11 @@ pub(crate) async fn net_worth_history(
             "startDate must not be after endDate",
         ));
     }
-    let pool = &state.pool;
+    let pool = &*state.database;
     let book_id = book.book_id();
     // The first point is the later of the start date and the first transaction.
     // A book with no transaction, or one that starts after the end, has no points.
     let first = first_transaction_date(pool, book_id)
-        .await
         .map_err(|cause| internal_error(cause, FAILURE))?
         .map(|first| match start_date {
             Some(start) if start > first => start,
@@ -75,25 +75,18 @@ pub(crate) async fn net_worth_history(
     let input = NetWorthInput {
         dates,
         book_months: book_months(pool, book_id, &end_date)
-            .await
             .map_err(|cause| internal_error(cause, FAILURE))?,
         splits: investment_splits(pool, book_id, None, Some(&end_date))
-            .await
             .map_err(|cause| internal_error(cause, FAILURE))?,
-        prices: recorded_prices(pool, book_id)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?,
+        prices: recorded_prices(pool, book_id).map_err(|cause| internal_error(cause, FAILURE))?,
         fixed_prices: fixed_prices(pool, book_id)
-            .await
             .map_err(|cause| internal_error(cause, FAILURE))?,
         investment_account_ids: investment_accounts(pool, book_id)
-            .await
             .map_err(|cause| internal_error(cause, FAILURE))?,
     };
     if by_account {
-        let accounts = book_accounts(pool, book_id)
-            .await
-            .map_err(|cause| internal_error(cause, FAILURE))?;
+        let accounts =
+            book_accounts(pool, book_id).map_err(|cause| internal_error(cause, FAILURE))?;
         let grouped = net_worth_by_group(&input, &accounts);
         return Ok(Json(to_value(grouped).expect("groups serialize")));
     }
@@ -109,43 +102,37 @@ fn parse_date(text: &str) -> Result<NaiveDate, crate::error::ApiError> {
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))
 }
 
-async fn first_transaction_date(
-    pool: &DbPool,
-    book_id: i32,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(&format!(
-        "SELECT MIN({EFFECTIVE_DATE}) FROM transactions t WHERE t.book_id = $1"
-    ))
-    .bind(book_id)
-    .fetch_one(pool)
-    .await
+fn first_transaction_date(pool: &impl Sql, book_id: i32) -> Result<Option<String>, store::Error> {
+    pool.query_row(
+        &format!("SELECT MIN({EFFECTIVE_DATE}) FROM transactions t WHERE t.book_id = ?1"),
+        &params![book_id],
+    )
 }
 
 /// The split sums by account and month of the asset and liability accounts
 /// that are not investment accounts. An investment cash child is an
 /// ordinary asset account here.
-async fn book_months(
-    pool: &DbPool,
+fn book_months(
+    pool: &impl Sql,
     book_id: i32,
     end_date: &str,
-) -> Result<Vec<MonthTotal>, sqlx::Error> {
-    let rows: Vec<(i32, String, i64)> = sqlx::query_as(&format!(
-        "SELECT s.account_id, substr({EFFECTIVE_DATE}, 1, 7) AS month,
+) -> Result<Vec<MonthTotal>, store::Error> {
+    let rows: Vec<(i32, String, i64)> = pool.query(
+        &format!(
+            "SELECT s.account_id, substr({EFFECTIVE_DATE}, 1, 7) AS month,
                 CAST(SUM(s.amount) AS INTEGER)
          FROM transaction_splits s
          JOIN transactions t ON t.id = s.transaction_id
          JOIN accounts a ON a.id = s.account_id
-         WHERE s.book_id = $1
+         WHERE s.book_id = ?1
            AND a.type IN ('asset', 'liability')
            AND (a.subtype IS NULL OR a.subtype <> 'investment')
-           AND {EFFECTIVE_DATE} <= $2
+           AND {EFFECTIVE_DATE} <= ?2
          GROUP BY s.account_id, month
          ORDER BY month, s.account_id"
-    ))
-    .bind(book_id)
-    .bind(end_date)
-    .fetch_all(pool)
-    .await?;
+        ),
+        &params![book_id, end_date],
+    )?;
     Ok(rows
         .into_iter()
         .map(|(account_id, month, amount_cents)| MonthTotal {
@@ -156,16 +143,11 @@ async fn book_months(
         .collect())
 }
 
-async fn recorded_prices(
-    pool: &DbPool,
-    book_id: i32,
-) -> Result<Vec<SecurityPriceRow>, sqlx::Error> {
-    let rows: Vec<(i32, i64, String)> = sqlx::query_as(
-        "SELECT security_id, price_micros, price_date FROM security_prices WHERE book_id = $1",
-    )
-    .bind(book_id)
-    .fetch_all(pool)
-    .await?;
+fn recorded_prices(pool: &impl Sql, book_id: i32) -> Result<Vec<SecurityPriceRow>, store::Error> {
+    let rows: Vec<(i32, i64, String)> = pool.query(
+        "SELECT security_id, price_micros, price_date FROM security_prices WHERE book_id = ?1",
+        &params![book_id],
+    )?;
     Ok(rows
         .into_iter()
         .map(|(security_id, price_micros, price_date)| SecurityPriceRow {
@@ -176,14 +158,12 @@ async fn recorded_prices(
         .collect())
 }
 
-async fn fixed_prices(pool: &DbPool, book_id: i32) -> Result<Vec<FixedPrice>, sqlx::Error> {
-    let rows: Vec<(i32, i64)> = sqlx::query_as(
+fn fixed_prices(pool: &impl Sql, book_id: i32) -> Result<Vec<FixedPrice>, store::Error> {
+    let rows: Vec<(i32, i64)> = pool.query(
         "SELECT id, fixed_price_micros FROM securities
-         WHERE book_id = $1 AND fixed_price_micros IS NOT NULL",
-    )
-    .bind(book_id)
-    .fetch_all(pool)
-    .await?;
+         WHERE book_id = ?1 AND fixed_price_micros IS NOT NULL",
+        &params![book_id],
+    )?;
     Ok(rows
         .into_iter()
         .map(|(security_id, price_micros)| FixedPrice {
@@ -193,23 +173,21 @@ async fn fixed_prices(pool: &DbPool, book_id: i32) -> Result<Vec<FixedPrice>, sq
         .collect())
 }
 
-async fn investment_accounts(pool: &DbPool, book_id: i32) -> Result<Vec<i64>, sqlx::Error> {
-    let ids: Vec<i32> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE book_id = $1 AND subtype = 'investment'")
-            .bind(book_id)
-            .fetch_all(pool)
-            .await?;
+fn investment_accounts(pool: &impl Sql, book_id: i32) -> Result<Vec<i64>, store::Error> {
+    let ids: Vec<i32> = pool.query(
+        "SELECT id FROM accounts WHERE book_id = ?1 AND subtype = 'investment'",
+        &params![book_id],
+    )?;
     Ok(ids.into_iter().map(i64::from).collect())
 }
 
 /// Each account of the book, with its parent, so that a value can go to its
 /// top-level account.
-async fn book_accounts(pool: &DbPool, book_id: i32) -> Result<Vec<TreeAccount>, sqlx::Error> {
-    let rows: Vec<(i32, Option<i32>, String)> =
-        sqlx::query_as("SELECT id, parent_id, name FROM accounts WHERE book_id = $1")
-            .bind(book_id)
-            .fetch_all(pool)
-            .await?;
+fn book_accounts(pool: &impl Sql, book_id: i32) -> Result<Vec<TreeAccount>, store::Error> {
+    let rows: Vec<(i32, Option<i32>, String)> = pool.query(
+        "SELECT id, parent_id, name FROM accounts WHERE book_id = ?1",
+        &params![book_id],
+    )?;
     Ok(rows
         .into_iter()
         .map(|(id, parent_id, name)| TreeAccount {

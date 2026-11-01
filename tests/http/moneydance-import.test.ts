@@ -11,7 +11,7 @@ import {
   resetTestDatabase,
   setupTestDatabase,
 } from "../helpers/db-utils";
-import { count as countWhere, rows, script } from "../helpers/sql";
+import { count as countWhere, insert, rows, scalar, script } from "../helpers/sql";
 import { workerDatabasePath } from "../helpers/test-database";
 import { dumpTables } from "../helpers/table-dump";
 
@@ -278,5 +278,14 @@ describe("Moneydance import with the Rust CLI", () => {
     }
     expect(await count("transactions", 1)).toBe(0);
     expect(await count("accounts", 1)).toBe(1);
+  }, TIMEOUT);
+
+  it("links imported transactions to an existing payee of the book, whatever its letter case", async () => {
+    const existing = await insert<{ id: number }>("payees", { bookId: 1, name: "GREEN GROCER", createdAt: new Date() });
+    const exact = await insert<{ id: number }>("payees", { bookId: 1, name: "City Power", createdAt: new Date() });
+    await rustImport(fixturePath("moneydance-sample.json"), "--book-id", "1");
+    expect(await scalar("SELECT COUNT(*) FROM payees WHERE book_id = 1 AND lower(name) = 'green grocer'")).toBe(1);
+    expect(await scalar("SELECT COUNT(*) FROM transactions WHERE payee_id = $1", [existing.id])).toBe(2);
+    expect(await scalar("SELECT COUNT(*) FROM transactions WHERE payee_id = $1", [exact.id])).toBe(1);
   }, TIMEOUT);
 });

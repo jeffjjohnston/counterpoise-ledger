@@ -7,20 +7,21 @@
 //! message from the Node SyntaxError.
 
 use crate::validation::{from_json_bytes, js_json, js_string};
-use reqwest::Client;
+use futures_util::{
+    FutureExt,
+    stream::{FuturesUnordered, StreamExt},
+};
+use reqwest::{
+    Client,
+    header::{AUTHORIZATION, HeaderValue},
+};
 use serde::Serialize;
 use serde_json::Value;
-use std::{
-    fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
-use tokio::sync::Semaphore;
+use std::{fmt, future::Future, time::Duration};
 
 const DEFAULT_BASE_URL: &str = "https://api.tiingo.com";
+/// How long one symbol's request may take.
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The key is not set, so no request can go to Tiingo.
 #[derive(Debug)]
@@ -101,8 +102,8 @@ impl From<String> for Failure {
 impl Tiingo {
     pub(crate) fn from_env() -> Self {
         Self::new(
-            std::env::var("TIINGO_API_KEY").ok(),
-            std::env::var("TIINGO_API_URL").ok(),
+            ledger_db::env::var("TIINGO_API_KEY").ok(),
+            ledger_db::env::var("TIINGO_API_URL").ok(),
         )
     }
 
@@ -112,10 +113,7 @@ impl Tiingo {
         Self {
             // Node's fetch has no deadline of its own. This one stops a
             // stalled request from holding the route open.
-            client: Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .expect("HTTP client"),
+            client: crate::platform::http_client(),
             key: key.filter(|key| !key.is_empty()),
             base_url: base_url
                 .filter(|url| !url.is_empty())
@@ -139,68 +137,98 @@ impl Tiingo {
         concurrency: usize,
     ) -> Result<(Vec<LatestPrice>, Vec<SymbolError>), NotConfigured> {
         let key = self.key.as_deref().ok_or(NotConfigured)?;
-        // This loop takes each permit before it starts the request, so the
-        // requests start in the input order. A task that gets a 429 sets
-        // `limited` before it gives its permit back, so the loop sees it
-        // before the next request starts.
-        let permits = Arc::new(Semaphore::new(concurrency.max(1)));
-        let limited = Arc::new(AtomicBool::new(false));
-        let mut tasks = Vec::with_capacity(symbols.len());
-        for symbol in symbols {
-            let permit = permits
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("the semaphore is never closed");
-            if limited.load(Ordering::SeqCst) {
-                tasks.push(None);
-                continue;
-            }
+        let authorization = authorization(key);
+        let outcomes = run_batch(symbols.len(), concurrency, |index| {
             // The symbol goes into the URL as JavaScript writes it, with no
             // encoding. URL parsing then encodes it as `fetch` does.
             let url = format!(
-                "{}/tiingo/daily/{}/prices?token={key}",
+                "{}/tiingo/daily/{}/prices",
                 self.base_url,
-                js_string(symbol)
+                js_string(&symbols[index])
             );
-            let client = self.client.clone();
-            let symbol = symbol.clone();
-            let limited = limited.clone();
-            tasks.push(Some(tokio::spawn(async move {
-                let result = fetch_symbol(&client, &url, &symbol).await;
-                if matches!(&result, Err(failure) if failure.kind == FailureKind::RateLimited) {
-                    limited.store(true, Ordering::SeqCst);
-                }
-                drop(permit);
-                result
-            })));
-        }
+            let client = &self.client;
+            let authorization = &authorization;
+            async move { fetch_symbol(client, &url, authorization, &symbols[index]).await }
+        })
+        .await;
         let mut prices = Vec::new();
         let mut errors = Vec::new();
-        for (task, symbol) in tasks.into_iter().zip(symbols) {
-            let outcome = match task {
-                Some(task) => task.await,
-                None => Ok(Err(Failure {
+        for (outcome, symbol) in outcomes.into_iter().zip(symbols) {
+            let outcome = outcome.unwrap_or_else(|| {
+                Err(Failure {
                     error: "Not fetched: the Tiingo request limit was reached".to_owned(),
                     kind: FailureKind::NotSent,
-                })),
-            };
+                })
+            });
             match outcome {
-                Ok(Ok(price)) => prices.push(price),
-                Ok(Err(failure)) => errors.push(SymbolError {
+                Ok(price) => prices.push(price),
+                Err(failure) => errors.push(SymbolError {
                     symbol: js_json(symbol),
                     error: failure.error,
                     kind: failure.kind,
-                }),
-                Err(_) => errors.push(SymbolError {
-                    symbol: js_json(symbol),
-                    error: "Unknown error".to_owned(),
-                    kind: FailureKind::Other,
                 }),
             }
         }
         Ok((prices, errors))
     }
+}
+
+/// The `Authorization` header that carries the key: `Token <key>`.
+///
+/// THE KEY NEVER GOES INTO THE URL. Tiingo also takes it as the query
+/// parameter `token`, but a URL is what logs and traces record: Workers
+/// traces keep the URL of each outgoing request. The header is marked
+/// sensitive, so the HTTP client does not show it in its debug output.
+fn authorization(key: &str) -> Result<HeaderValue, String> {
+    let mut value = HeaderValue::from_str(&format!("Token {key}"))
+        .map_err(|_| "TIINGO_API_KEY is not a valid HTTP header value".to_owned())?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+/// Runs `start(index)` for each index below `count`, at most `concurrency`
+/// at a time, in index order, and gives each outcome at its index. After a
+/// 429 nothing more starts, and the indexes not started stay `None`.
+///
+/// The requests run as futures of this one, not as tasks: Workers has no
+/// threads to spawn onto. Before the batch is refilled, every request that
+/// has finished is taken, so a 429 that finished alongside a success still
+/// stops the batch.
+async fn run_batch<T, F>(
+    count: usize,
+    concurrency: usize,
+    mut start: impl FnMut(usize) -> F,
+) -> Vec<Option<Result<T, Failure>>>
+where
+    F: Future<Output = Result<T, Failure>>,
+{
+    let concurrency = concurrency.max(1);
+    let mut outcomes: Vec<Option<Result<T, Failure>>> = (0..count).map(|_| None).collect();
+    let mut running = FuturesUnordered::new();
+    let mut next = 0;
+    let mut limited = false;
+    loop {
+        while !limited && running.len() < concurrency && next < count {
+            let work = start(next);
+            let index = next;
+            running.push(async move { (index, work.await) });
+            next += 1;
+        }
+        let Some(first) = running.next().await else {
+            break;
+        };
+        let mut finished = vec![first];
+        while let Some(Some(done)) = running.next().now_or_never() {
+            finished.push(done);
+        }
+        for (index, result) in finished {
+            if matches!(&result, Err(failure) if failure.kind == FailureKind::RateLimited) {
+                limited = true;
+            }
+            outcomes[index] = Some(result);
+        }
+    }
+    outcomes
 }
 
 /// JavaScript truthiness of a parsed JSON value.
@@ -254,33 +282,53 @@ fn unreadable(value: Option<&Value>, name: &str) -> String {
 
 /// The body of the async callback in `fetchLatestTiingoPrices`, in its
 /// order of evaluation.
-async fn fetch_symbol(client: &Client, url: &str, symbol: &Value) -> Result<LatestPrice, Failure> {
-    let text = js_string(symbol);
-    // `fetch` rejects every network failure with this message.
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| "fetch failed".to_owned())?;
-    let status = response.status();
-    if !status.is_success() {
-        // `statusText` is the phrase on the status line, as the server sent it.
-        let reason = response
-            .extensions()
-            .get::<hyper::ext::ReasonPhrase>()
-            .map(|reason| String::from_utf8_lossy(reason.as_bytes()).into_owned())
-            .or_else(|| status.canonical_reason().map(str::to_owned))
-            .unwrap_or_default();
-        return Err(Failure {
-            error: format!("Failed to fetch price for {text}: {reason}"),
-            kind: match status {
-                reqwest::StatusCode::NOT_FOUND => FailureKind::NotFound,
-                reqwest::StatusCode::TOO_MANY_REQUESTS => FailureKind::RateLimited,
-                _ => FailureKind::Other,
-            },
-        });
-    }
-    Ok(latest_price(response, symbol).await?)
+async fn fetch_symbol(
+    client: &Client,
+    url: &str,
+    authorization: &Result<HeaderValue, String>,
+    symbol: &Value,
+) -> Result<LatestPrice, Failure> {
+    crate::platform::outbound(async {
+        let text = js_string(symbol);
+        let authorization = authorization.clone().map_err(|error| Failure {
+            error,
+            kind: FailureKind::Other,
+        })?;
+        // `fetch` rejects every network failure with this message.
+        let response = client
+            .get(url)
+            .header(AUTHORIZATION, authorization)
+            .timeout(TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| "fetch failed".to_owned())?;
+        let status = response.status();
+        if !status.is_success() {
+            // `statusText` is the phrase on the status line, as the server sent it.
+            // reqwest's wasm32 response does not carry it, so there it is the
+            // standard phrase.
+            #[cfg(not(target_arch = "wasm32"))]
+            let sent = response
+                .extensions()
+                .get::<hyper::ext::ReasonPhrase>()
+                .map(|reason| String::from_utf8_lossy(reason.as_bytes()).into_owned());
+            #[cfg(target_arch = "wasm32")]
+            let sent: Option<String> = None;
+            let reason = sent
+                .or_else(|| status.canonical_reason().map(str::to_owned))
+                .unwrap_or_default();
+            return Err(Failure {
+                error: format!("Failed to fetch price for {text}: {reason}"),
+                kind: match status {
+                    reqwest::StatusCode::NOT_FOUND => FailureKind::NotFound,
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => FailureKind::RateLimited,
+                    _ => FailureKind::Other,
+                },
+            });
+        }
+        Ok(latest_price(response, symbol).await?)
+    })
+    .await
 }
 
 /// The newest price in a successful response.
@@ -321,6 +369,7 @@ async fn latest_price(response: reqwest::Response, symbol: &Value) -> Result<Lat
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn javascript_checks_on_the_response_body() {
@@ -396,6 +445,35 @@ mod tests {
             errors[1].error,
             "Not fetched: the Tiingo request limit was reached"
         );
+    }
+
+    #[tokio::test]
+    async fn a_429_that_finished_with_a_success_stops_the_batch() {
+        use std::sync::Mutex;
+
+        // Both first requests are done before the batch looks at either, and
+        // the success comes out first. The 429 behind it must still be seen
+        // before a third request starts.
+        let started = Mutex::new(Vec::new());
+        let outcomes = run_batch(4, 2, |index| {
+            started.lock().unwrap().push(index);
+            async move {
+                match index {
+                    1 => Err(Failure {
+                        error: "429".to_owned(),
+                        kind: FailureKind::RateLimited,
+                    }),
+                    _ => Ok(index),
+                }
+            }
+        })
+        .await;
+        assert_eq!(*started.lock().unwrap(), [0, 1]);
+        assert!(matches!(outcomes[0], Some(Ok(0))));
+        assert!(
+            matches!(&outcomes[1], Some(Err(failure)) if failure.kind == FailureKind::RateLimited)
+        );
+        assert!(outcomes[2].is_none() && outcomes[3].is_none());
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ import type { ShortcutDef } from "@/components/KeyboardShortcutProvider";
 import { PRICES_SAVED_EVENT } from "@/lib/events";
 import { apiGet, apiPost, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
+import { onTabReturn } from "@/lib/tab-return";
 
 type DueSecurity = {
   securityId: number;
@@ -52,8 +53,8 @@ export function PriceEntryPill({
     let cancelled = false;
     let latestSeq = 0;
     const load = async () => {
-      // Rechecks can overlap (focus and visibilitychange both fire on tab
-      // return); only the most recently started one may apply
+      // Rechecks can overlap (a tab return while the first load runs); only
+      // the most recently started one may apply
       const seq = ++latestSeq;
       try {
         const data = await apiGet<PricesDueResponse>(`/api/b/${bookId}/securities/prices-due`);
@@ -89,15 +90,10 @@ export function PriceEntryPill({
     void load();
     // The due date advances while the app sits open (early-morning price
     // sync), so re-check whenever the user comes back
-    const recheck = () => {
-      if (document.visibilityState === "visible") void load();
-    };
-    window.addEventListener("focus", recheck);
-    document.addEventListener("visibilitychange", recheck);
+    const stopRechecks = onTabReturn(() => { void load(); });
     return () => {
       cancelled = true;
-      window.removeEventListener("focus", recheck);
-      document.removeEventListener("visibilitychange", recheck);
+      stopRechecks();
     };
   }, [bookId]);
 

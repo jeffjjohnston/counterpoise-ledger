@@ -24,7 +24,9 @@ async function startTiingo() {
   tiingo = createServer((request, response) => {
     tiingoRequests.push(request.url ?? "");
     const url = new URL(request.url ?? "/", "http://fake");
-    const ok = url.pathname === "/tiingo/daily/VTI/prices" && url.searchParams.get("token") === TIINGO_KEY;
+    // The key goes only in the Authorization header, never in the URL.
+    const ok = url.pathname === "/tiingo/daily/VTI/prices" &&
+      request.headers.authorization === `Token ${TIINGO_KEY}` && url.search === "";
     response.writeHead(ok ? 200 : 404, { "content-type": "application/json" });
     response.end(
       ok

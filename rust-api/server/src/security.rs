@@ -43,7 +43,7 @@ use tower::{Layer, Service};
 /// has no `script-src` or `style-src`, and `frame-ancestors 'none'` stops a
 /// page on another site from framing a response. It has no `script-src`
 /// because the theme script in `index.html` is inline.
-const SECURITY_HEADERS: [(&str, &str); 5] = [
+pub const SECURITY_HEADERS: [(&str, &str); 5] = [
     ("x-frame-options", "DENY"),
     ("x-content-type-options", "nosniff"),
     ("referrer-policy", "same-origin"),
@@ -58,7 +58,7 @@ const SECURITY_HEADERS: [(&str, &str); 5] = [
 ];
 
 /// Sent only when `ENABLE_HSTS=true`.
-const HSTS: (&str, &str) = (
+pub const HSTS: (&str, &str) = (
     "strict-transport-security",
     "max-age=31536000; includeSubDomains",
 );
@@ -156,7 +156,14 @@ fn is_cross_origin_write(method: &Method, uri: &Uri, headers: &HeaderMap) -> boo
     if !uri.path().starts_with("/api/") {
         return false;
     }
+    is_cross_origin(uri, headers)
+}
 
+/// A request that another site's page sent, by `Sec-Fetch-Site`, else by
+/// `Origin` against the host that the browser used. A request with neither
+/// header (not from a browser) is not cross-origin. The order of the tests is
+/// part of the rule.
+pub(crate) fn is_cross_origin(uri: &Uri, headers: &HeaderMap) -> bool {
     // "same-site" (for example a sibling subdomain) gets the same refusal as
     // "cross-site". This is deliberate: nothing correct posts to this app from
     // a sibling subdomain, and to trust same-site would make the hole that
@@ -266,25 +273,49 @@ fn is_public_api(path: &str) -> bool {
 }
 
 async fn gate_unrouted(request: Request, next: Next) -> Response {
-    let path = request.uri().path();
-    let session = cookie_token(request.headers()).is_some();
-
-    if path.starts_with("/api/") {
+    if request.uri().path().starts_with("/api/") {
         // No API route matched, and the API gate let the request through, so
         // it is public or has credentials. The page service must never see
         // an API path.
         return StatusCode::NOT_FOUND.into_response();
     }
-
-    // Pages carry no authentication of their own, so for them this gate is
-    // the only authentication. A page never accepts a key: a bearer header
-    // does not open it.
-    if is_public_page(path) || session {
-        return next.run(request).await;
+    match page_gate(request.uri().path(), request.headers()) {
+        PageGate::Serve => next.run(request).await,
+        PageGate::Login => login_redirect(),
     }
-    // A relative `Location`, as the Next server sent. This server cannot know
-    // the scheme that the browser used behind a proxy that terminates TLS,
-    // and an absolute `http:` URL would send the browser away from HTTPS.
+}
+
+/// What the session gate does with a request for a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageGate {
+    /// Serve the page or the asset.
+    Serve,
+    /// Send the browser to `/login`: [`login_redirect`].
+    Login,
+}
+
+/// The session gate for a page path, which is any path outside `/api/`. The
+/// native server runs it on a request that no route matched, and the Worker
+/// on each page request.
+///
+/// Pages carry no authentication of their own, so for them this gate is the
+/// only authentication. It checks only that a well-formed session cookie is
+/// present: a stale one fails at the client's first API call, which sends
+/// the browser to `/login`. A page never accepts a key: a bearer header does
+/// not open it.
+pub fn page_gate(path: &str, headers: &HeaderMap) -> PageGate {
+    if is_public_page(path) || cookie_token(headers).is_some() {
+        PageGate::Serve
+    } else {
+        PageGate::Login
+    }
+}
+
+/// The answer of [`PageGate::Login`]. A relative `Location`, as the Next
+/// server sent. This server cannot know the scheme that the browser used
+/// behind a proxy that terminates TLS, and an absolute `http:` URL would send
+/// the browser away from HTTPS.
+pub fn login_redirect() -> Response {
     (
         StatusCode::TEMPORARY_REDIRECT,
         [(header::LOCATION, "/login")],
@@ -878,12 +909,11 @@ mod tests {
         assert_security_headers(&response, false);
     }
 
-    // The real router, with a pool that never connects. Each case here is
-    // decided before a route reads the database.
+    // The real router, on a database in memory. Each case here is decided
+    // before a route reads the database.
 
     fn real_app() -> Router {
-        let state =
-            AppState::new(std::path::Path::new("/nonexistent/counterpoise.db")).expect("lazy pool");
+        let state = AppState::in_memory();
         protect(routes().with_state(state), no_pages(), false)
     }
 

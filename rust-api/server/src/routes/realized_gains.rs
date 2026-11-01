@@ -12,10 +12,9 @@ use axum::{
 };
 use chrono::{Datelike, NaiveDate};
 use ledger_core::accounting::gross_amount_cents;
-use ledger_db::engine::{Db, DbPool};
+use ledger_db::store::{self, Builder, Sql};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::{FromRow, QueryBuilder};
 
 const FAILURE: &str = "Failed to generate realized gains report";
 
@@ -37,7 +36,7 @@ struct GainRow {
     term: &'static str,
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct AllocationRecord {
     sell_date: String,
     transaction_id: i32,
@@ -52,7 +51,7 @@ struct AllocationRecord {
     basis_cents: i32,
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct SellRecord {
     sell_date: String,
     transaction_id: i32,
@@ -120,7 +119,7 @@ fn parse_filters(raw_query: Option<&str>) -> Result<Filters, ApiError> {
 }
 
 fn push_filters(
-    query: &mut QueryBuilder<'_, Db>,
+    query: &mut Builder,
     filters: &Filters,
     account_column: &str,
     account_id: Option<i32>,
@@ -128,12 +127,12 @@ fn push_filters(
     if let Some(start) = &filters.start_date {
         query
             .push(format!(" AND {EFFECTIVE_DATE} >= "))
-            .push_bind(start.clone());
+            .push_bind(start);
     }
     if let Some(end) = &filters.end_date {
         query
             .push(format!(" AND {EFFECTIVE_DATE} <= "))
-            .push_bind(end.clone());
+            .push_bind(end);
     }
     if let Some(account_id) = account_id {
         query
@@ -144,13 +143,13 @@ fn push_filters(
 
 /// Sell shares that no lot could satisfy. They are reported with an unknown
 /// basis, because a dropped disposal would understate a gain.
-async fn unallocated_rows(
-    pool: &DbPool,
+fn unallocated_rows(
+    pool: &impl Sql,
     book_id: i32,
     filters: &Filters,
     account_id: Option<i32>,
-) -> Result<Vec<GainRow>, sqlx::Error> {
-    let mut query = QueryBuilder::<Db>::new(format!(
+) -> Result<Vec<GainRow>, store::Error> {
+    let mut query = Builder::new(format!(
         "SELECT {EFFECTIVE_DATE} AS sell_date, s.transaction_id, s.security_id,
                 sec.symbol AS security_symbol, sec.name AS security_name, s.account_id,
                 a.name AS account_name, s.shares_micros, s.price_micros, s.fees_cents,
@@ -166,7 +165,7 @@ async fn unallocated_rows(
     ));
     query.push_bind(book_id).push(" AND s.action = 'sell'");
     push_filters(&mut query, filters, "s.account_id", account_id);
-    let sells: Vec<SellRecord> = query.build_query_as().fetch_all(pool).await?;
+    let sells: Vec<SellRecord> = query.query(pool)?;
     Ok(sells
         .into_iter()
         .filter_map(|sell| {
@@ -201,13 +200,13 @@ async fn unallocated_rows(
 /// with an unknown basis for sell shares that no lot covered, and the totals.
 /// The route calls this after its query checks; the MCP tool calls it with
 /// its own arguments.
-pub(crate) async fn report(
-    pool: &DbPool,
+pub(crate) fn report(
+    pool: &impl Sql,
     book_id: i32,
     filters: &Filters,
     account_id: Option<i32>,
-) -> Result<Value, sqlx::Error> {
-    let mut query = QueryBuilder::<Db>::new(format!(
+) -> Result<Value, store::Error> {
+    let mut query = Builder::new(format!(
         "SELECT {EFFECTIVE_DATE} AS sell_date, al.transaction_id, l.security_id,
                 sec.symbol AS security_symbol, sec.name AS security_name, l.account_id,
                 a.name AS account_name, al.shares_micros, l.acquired_date, al.proceeds_cents,
@@ -222,7 +221,7 @@ pub(crate) async fn report(
     query.push_bind(book_id);
     push_filters(&mut query, filters, "l.account_id", account_id);
     query.push(format!(" ORDER BY {EFFECTIVE_DATE}, al.id"));
-    let allocations: Vec<AllocationRecord> = query.build_query_as().fetch_all(pool).await?;
+    let allocations: Vec<AllocationRecord> = query.query(pool)?;
 
     let mut rows: Vec<GainRow> = allocations
         .into_iter()
@@ -249,7 +248,7 @@ pub(crate) async fn report(
             }
         })
         .collect();
-    rows.extend(unallocated_rows(pool, book_id, filters, account_id).await?);
+    rows.extend(unallocated_rows(pool, book_id, filters, account_id)?);
     rows.sort_by(|a, b| a.sell_date.cmp(&b.sell_date));
 
     // An unknown-basis row stays out of the totals, so a data gap cannot move
@@ -302,8 +301,7 @@ pub(crate) async fn realized_gains(
         })
         .transpose()?;
 
-    let report = report(&state.pool, book.book_id(), &filters, account_id)
-        .await
+    let report = report(&*state.database, book.book_id(), &filters, account_id)
         .map_err(|cause| internal_error(cause, FAILURE))?;
     state.analytics.capture_event(
         book.user_id(),

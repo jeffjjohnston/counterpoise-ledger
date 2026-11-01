@@ -6,13 +6,12 @@
 //! in `f64` with [`js_round`], because it began as a port of a TypeScript
 //! seed. A new dataset can use integer arithmetic.
 
-use crate::engine::{Db, DbConnection};
-use sqlx::QueryBuilder;
+use crate::sql;
+use crate::store::{Sql, params};
 use std::collections::HashMap;
 use std::fmt;
-use std::time::Instant;
 
-use chrono::{NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
 use crate::lots::{find_all_lot_pairs, rebuild_lots};
 
@@ -30,7 +29,7 @@ use prices::Security;
 /// A failure that stops the seed. The caller's transaction rolls back.
 #[derive(Debug)]
 pub enum SeedError {
-    Database(sqlx::Error),
+    Database(crate::store::Error),
     Invalid(String),
 }
 
@@ -52,8 +51,8 @@ impl std::error::Error for SeedError {
     }
 }
 
-impl From<sqlx::Error> for SeedError {
-    fn from(cause: sqlx::Error) -> Self {
+impl From<crate::store::Error> for SeedError {
+    fn from(cause: crate::store::Error) -> Self {
         Self::Database(cause)
     }
 }
@@ -136,19 +135,18 @@ pub struct SeedSummary {
     pub investment_lots: i64,
 }
 
-/// One seed run: the target book, the clock, and the connection. The
-/// connection must be inside a transaction, because the lot rebuild takes an
-/// advisory lock that lasts until commit.
-struct Seeder<'a> {
-    connection: &'a mut DbConnection,
+/// One seed run: the target book, the clock, and the statements, which run
+/// inside the caller's write transaction.
+struct Seeder<'a, S: Sql> {
+    sql: &'a S,
     book_id: i32,
     now: NaiveDateTime,
     rand: Mulberry32,
     log: &'a mut (dyn FnMut(&str) + Send),
 }
 
-impl Seeder<'_> {
-    async fn account(
+impl<S: Sql> Seeder<'_, S> {
+    fn account(
         &mut self,
         name: &str,
         account_type: &str,
@@ -158,41 +156,43 @@ impl Seeder<'_> {
         icon: Option<&str>,
     ) -> SeedResult<i32> {
         let is_investment_cash = subtype == Some("cash");
-        Ok(sqlx::query_scalar(
+        Ok(self.sql.query_row(
             "INSERT INTO accounts
                (book_id, name, type, subtype, parent_id, is_favorite, is_investment_cash, icon,
-                created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+                created_at, updated_at, name_fold)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
              RETURNING id",
-        )
-        .bind(self.book_id)
-        .bind(name)
-        .bind(account_type)
-        .bind(subtype)
-        .bind(parent_id)
-        .bind(is_favorite)
-        .bind(is_investment_cash)
-        .bind(icon)
-        .bind(self.now)
-        .fetch_one(&mut *self.connection)
-        .await?)
+            &params![
+                self.book_id,
+                name,
+                account_type,
+                subtype,
+                parent_id,
+                is_favorite,
+                is_investment_cash,
+                icon,
+                self.now,
+                crate::folds::fold(name)
+            ],
+        )?)
     }
 
-    async fn security(&mut self, name: &str, symbol: &str) -> SeedResult<i32> {
-        Ok(sqlx::query_scalar(
-            "INSERT INTO securities (book_id, name, symbol, security_type, created_at)
-             VALUES ($1, $2, $3, 'etf', $4)
+    fn security(&mut self, name: &str, symbol: &str) -> SeedResult<i32> {
+        Ok(self.sql.query_row(
+            "INSERT INTO securities (book_id, name, symbol, security_type, created_at, symbol_fold)
+             VALUES (?1, ?2, ?3, 'etf', ?4, ?5)
              RETURNING id",
-        )
-        .bind(self.book_id)
-        .bind(name)
-        .bind(symbol)
-        .bind(self.now)
-        .fetch_one(&mut *self.connection)
-        .await?)
+            &params![
+                self.book_id,
+                name,
+                symbol,
+                self.now,
+                crate::folds::fold(symbol)
+            ],
+        )?)
     }
 
-    async fn transaction(
+    fn transaction(
         &mut self,
         date: &str,
         description: &str,
@@ -205,19 +205,21 @@ impl Seeder<'_> {
                 "Splits don't balance! Total={total}, desc=\"{description}\", date={date}"
             )));
         }
-        let transaction_id: i32 = sqlx::query_scalar(
+        let transaction_id: i32 = self.sql.query_row(
             "INSERT INTO transactions
-               (book_id, date, description, payee_id, is_reconciled, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, false, $5, $5)
+               (book_id, date, description, payee_id, is_reconciled, created_at, updated_at,
+                description_fold)
+             VALUES (?1, ?2, ?3, ?4, false, ?5, ?5, ?6)
              RETURNING id",
-        )
-        .bind(self.book_id)
-        .bind(date)
-        .bind(description)
-        .bind(payee_id)
-        .bind(self.now)
-        .fetch_one(&mut *self.connection)
-        .await?;
+            &params![
+                self.book_id,
+                date,
+                description,
+                payee_id,
+                self.now,
+                crate::folds::fold(description)
+            ],
+        )?;
         let accounts: Vec<i32> = splits.iter().map(|split| split.account_id).collect();
         let amounts: Vec<i32> = splits
             .iter()
@@ -226,27 +228,21 @@ impl Seeder<'_> {
             .map_err(|_| {
                 SeedError::Invalid(format!("Split amount too large: \"{description}\""))
             })?;
-        // One multi-row VALUES insert keeps the splits in the order given, so
-        // their IDs follow that order.
-        let book_id = self.book_id;
-        let mut insert = QueryBuilder::<Db>::new(
-            "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) ",
-        );
-        insert.push_values(
-            accounts.iter().zip(&amounts),
-            |mut row, (account, amount)| {
-                row.push_bind(book_id)
-                    .push_bind(transaction_id)
-                    .push_bind(*account)
-                    .push_bind(*amount);
-            },
-        );
-        insert.build().execute(&mut *self.connection).await?;
+        // One insert keeps the splits in the order given, so their IDs follow
+        // that order.
+        let rows: Vec<(i32, i32)> = accounts.into_iter().zip(amounts).collect();
+        self.sql.execute(
+            &format!(
+                "INSERT INTO transaction_splits (book_id, transaction_id, account_id, amount) {}",
+                sql::json_rows(&["?1", "?2", "#0", "#1"], "?3")
+            ),
+            &params![self.book_id, transaction_id, sql::json_array(&rows)],
+        )?;
         Ok(transaction_id)
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn investment_split(
+    fn investment_split(
         &mut self,
         transaction_id: i32,
         account_id: i32,
@@ -255,26 +251,26 @@ impl Seeder<'_> {
         shares_micros: i64,
         price_micros: i64,
     ) -> SeedResult<()> {
-        sqlx::query(
+        self.sql.execute(
             "INSERT INTO investment_splits
                (book_id, transaction_id, account_id, security_id, action, shares_micros,
                 price_micros, fees_cents, split_numerator, split_denominator)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 0, NULL, NULL)",
-        )
-        .bind(self.book_id)
-        .bind(transaction_id)
-        .bind(account_id)
-        .bind(security_id)
-        .bind(action)
-        .bind(shares_micros)
-        .bind(price_micros)
-        .execute(&mut *self.connection)
-        .await?;
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, NULL)",
+            &params![
+                self.book_id,
+                transaction_id,
+                account_id,
+                security_id,
+                action,
+                shares_micros,
+                price_micros
+            ],
+        )?;
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn buy(
+    fn buy(
         &mut self,
         date: &str,
         investment_account_id: i32,
@@ -285,17 +281,15 @@ impl Seeder<'_> {
         description: &str,
     ) -> SeedResult<()> {
         let gross = gross_cents(shares_micros, price_micros);
-        let transaction_id = self
-            .transaction(
-                date,
-                description,
-                None,
-                &[
-                    split(investment_account_id, gross),
-                    split(cash_account_id, -gross),
-                ],
-            )
-            .await?;
+        let transaction_id = self.transaction(
+            date,
+            description,
+            None,
+            &[
+                split(investment_account_id, gross),
+                split(cash_account_id, -gross),
+            ],
+        )?;
         self.investment_split(
             transaction_id,
             investment_account_id,
@@ -304,14 +298,13 @@ impl Seeder<'_> {
             shares_micros,
             price_micros,
         )
-        .await
     }
 
     /// The ledger records the sale at proceeds, as `buildSellSplits` does
     /// when no cost basis is given. The realized gains report takes the gain
     /// from the lots that the rebuild at the end computes.
     #[allow(clippy::too_many_arguments)]
-    async fn sell(
+    fn sell(
         &mut self,
         date: &str,
         investment_account_id: i32,
@@ -322,17 +315,15 @@ impl Seeder<'_> {
         description: &str,
     ) -> SeedResult<()> {
         let gross = gross_cents(shares_micros, price_micros);
-        let transaction_id = self
-            .transaction(
-                date,
-                description,
-                None,
-                &[
-                    split(cash_account_id, gross),
-                    split(investment_account_id, -gross),
-                ],
-            )
-            .await?;
+        let transaction_id = self.transaction(
+            date,
+            description,
+            None,
+            &[
+                split(cash_account_id, gross),
+                split(investment_account_id, -gross),
+            ],
+        )?;
         self.investment_split(
             transaction_id,
             investment_account_id,
@@ -341,12 +332,11 @@ impl Seeder<'_> {
             shares_micros,
             price_micros,
         )
-        .await
     }
 
     /// A dividend has 0 shares and a 0 price, as the importer writes it.
     #[allow(clippy::too_many_arguments)]
-    async fn dividend(
+    fn dividend(
         &mut self,
         date: &str,
         investment_account_id: i32,
@@ -356,17 +346,15 @@ impl Seeder<'_> {
         amount_cents: i64,
         description: &str,
     ) -> SeedResult<()> {
-        let transaction_id = self
-            .transaction(
-                date,
-                description,
-                None,
-                &[
-                    split(cash_account_id, amount_cents),
-                    split(income_account_id, -amount_cents),
-                ],
-            )
-            .await?;
+        let transaction_id = self.transaction(
+            date,
+            description,
+            None,
+            &[
+                split(cash_account_id, amount_cents),
+                split(income_account_id, -amount_cents),
+            ],
+        )?;
         self.investment_split(
             transaction_id,
             investment_account_id,
@@ -375,7 +363,6 @@ impl Seeder<'_> {
             0,
             0,
         )
-        .await
     }
 }
 
@@ -396,8 +383,8 @@ impl Positions {
 /// Buys `securities` with `amount_cents` split by `weights`. The last
 /// security takes the remainder, so the amounts sum to `amount_cents`.
 #[allow(clippy::too_many_arguments)]
-async fn buy_allocation(
-    seeder: &mut Seeder<'_>,
+fn buy_allocation(
+    seeder: &mut Seeder<'_, impl Sql>,
     positions: &mut Positions,
     date: &str,
     price_date: NaiveDate,
@@ -422,40 +409,36 @@ async fn buy_allocation(
     for (security, shares, price) in orders {
         if shares > 0 {
             let description = format!("Buy {} - {label}", security.symbol);
-            seeder
-                .buy(
-                    date,
-                    investment_account_id,
-                    cash_account_id,
-                    security.id,
-                    shares,
-                    price,
-                    &description,
-                )
-                .await?;
+            seeder.buy(
+                date,
+                investment_account_id,
+                cash_account_id,
+                security.id,
+                shares,
+                price,
+                &description,
+            )?;
             positions.add(investment_account_id, security.id, shares);
         }
     }
     Ok(())
 }
-async fn verify_and_summarize(seeder: Seeder<'_>, started: Instant) -> SeedResult<SeedSummary> {
+fn verify_and_summarize(
+    seeder: Seeder<'_, impl Sql>,
+    started: DateTime<Utc>,
+) -> SeedResult<SeedSummary> {
     let Seeder {
-        connection,
-        book_id,
-        log,
-        ..
+        sql, book_id, log, ..
     } = seeder;
-    let unbalanced: Vec<(i32, String, Option<String>, i64)> = sqlx::query_as(
+    let unbalanced: Vec<(i32, String, Option<String>, i64)> = sql.query(
         "SELECT t.id, t.date, t.description, CAST(SUM(s.amount) AS bigint)
          FROM transactions t
          JOIN transaction_splits s ON s.transaction_id = t.id
-         WHERE t.book_id = $1
+         WHERE t.book_id = ?1
          GROUP BY t.id, t.date, t.description
          HAVING ABS(SUM(s.amount)) > 1",
-    )
-    .bind(book_id)
-    .fetch_all(&mut *connection)
-    .await?;
+        &params![book_id],
+    )?;
     if !unbalanced.is_empty() {
         let mut message = format!("{} unbalanced transactions found!", unbalanced.len());
         for (id, date, description, total) in &unbalanced {
@@ -475,13 +458,12 @@ async fn verify_and_summarize(seeder: Seeder<'_>, started: Instant) -> SeedResul
         i64,
         i64,
         i64,
-    ) = sqlx::query_as(
+    ) = sql.query_row(
         "SELECT (SELECT COUNT(*) FROM accounts), (SELECT COUNT(*) FROM payees),
                 (SELECT COUNT(*) FROM transactions), (SELECT COUNT(*) FROM transaction_splits),
                 (SELECT COUNT(*) FROM investment_splits), (SELECT COUNT(*) FROM investment_lots)",
-    )
-    .fetch_one(&mut *connection)
-    .await?;
+        &[],
+    )?;
     let summary = SeedSummary {
         accounts,
         payees,
@@ -492,7 +474,10 @@ async fn verify_and_summarize(seeder: Seeder<'_>, started: Instant) -> SeedResul
     };
 
     log("\n  Seed complete!");
-    log(&format!("  Time: {:.1}s", started.elapsed().as_secs_f64()));
+    log(&format!(
+        "  Time: {:.1}s",
+        (Utc::now() - started).num_milliseconds() as f64 / 1000.0
+    ));
     log(&format!("  Accounts: {}", summary.accounts));
     log(&format!("  Payees: {}", summary.payees));
     log(&format!("  Transactions: {}", summary.transactions));
@@ -569,20 +554,17 @@ impl DemoDataset {
 }
 
 /// Inserts `names` as the payees of the book, in order.
-async fn insert_payees(
-    seeder: &mut Seeder<'_>,
+fn insert_payees(
+    seeder: &mut Seeder<'_, impl Sql>,
     names: &[&'static str],
 ) -> SeedResult<HashMap<&'static str, i32>> {
     let mut payees = HashMap::with_capacity(names.len());
     for name in names {
-        let id: i32 = sqlx::query_scalar(
-            "INSERT INTO payees (book_id, name, created_at) VALUES ($1, $2, $3) RETURNING id",
-        )
-        .bind(seeder.book_id)
-        .bind(name)
-        .bind(seeder.now)
-        .fetch_one(&mut *seeder.connection)
-        .await?;
+        let id: i32 = seeder.sql.query_row(
+            "INSERT INTO payees (book_id, name, created_at, name_fold) VALUES (?1, ?2, ?3, ?4)
+             RETURNING id",
+            &params![seeder.book_id, name, seeder.now, crate::folds::fold(name)],
+        )?;
         payees.insert(*name, id);
     }
     Ok(payees)
@@ -590,9 +572,10 @@ async fn insert_payees(
 
 /// Creates the rows of one book. The book must exist. The seed deletes the
 /// rows that the book holds first, so its contract is "reset this book", not
-/// "add to this book". Run it inside a transaction.
-pub async fn seed_book(
-    connection: &mut DbConnection,
+/// "add to this book". Run it inside a write transaction, a
+/// `Database::transaction`.
+pub fn seed_book(
+    sql: &impl Sql,
     book_id: i32,
     dataset: DemoDataset,
     today: NaiveDate,
@@ -602,7 +585,8 @@ pub async fn seed_book(
         "Seeding book {book_id} with the {} dataset...",
         dataset.name()
     ));
-    let started = Instant::now();
+    // `Instant` has no clock on wasm32; chrono reads the host's.
+    let started = Utc::now();
 
     // Foreign keys set this order.
     for table in [
@@ -620,15 +604,15 @@ pub async fn seed_book(
         "accounts",
         "payees",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE book_id = $1"))
-            .bind(book_id)
-            .execute(&mut *connection)
-            .await?;
+        sql.execute(
+            &format!("DELETE FROM {table} WHERE book_id = ?1"),
+            &params![book_id],
+        )?;
     }
     log("  Cleared existing book data");
 
     let mut seeder = Seeder {
-        connection,
+        sql,
         book_id,
         now: Utc::now().naive_utc(),
         rand: Mulberry32::new(42),
@@ -636,21 +620,15 @@ pub async fn seed_book(
     };
     let window = window::Window::new(today, dataset.months());
     match dataset {
-        DemoDataset::Household => household::seed(&mut seeder, window).await?,
-        DemoDataset::Single => single::seed(&mut seeder, window).await?,
+        DemoDataset::Household => household::seed(&mut seeder, window)?,
+        DemoDataset::Single => single::seed(&mut seeder, window)?,
     }
 
-    // Lots are derived state, so the lot engine builds them. The caller's
-    // transaction holds each pair's advisory lock until commit.
-    for pair in find_all_lot_pairs(seeder.connection, book_id).await? {
-        rebuild_lots(
-            seeder.connection,
-            book_id,
-            pair.account_id,
-            pair.security_id,
-        )
-        .await?;
+    // Lots are derived state, so the lot engine builds them, inside the
+    // caller's transaction.
+    for pair in find_all_lot_pairs(sql, book_id)? {
+        rebuild_lots(sql, book_id, pair.account_id, pair.security_id)?;
     }
 
-    verify_and_summarize(seeder, started).await
+    verify_and_summarize(seeder, started)
 }

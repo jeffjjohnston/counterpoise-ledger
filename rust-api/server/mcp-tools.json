@@ -296,7 +296,7 @@
   {
     "name": "create_payee",
     "title": "Create Payee",
-    "description": "Create a payee in the book. Does not fold case, so 'IKEA' and 'Ikea' are both created as distinct payees, and it does not search for a similar existing payee — use list_payees first to check for one. An EXACT repeat of an existing name in this book fails rather than inserting a second row, since the book allows only one payee per exact name.",
+    "description": "Create a payee in the book. A payee name matches without letter case: if the book already has the name, also in another case ('IKEA' after 'Ikea'), the call fails and names the existing payee rather than inserting a second row. It does not search for a similar existing payee — use list_payees first to check for one.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -309,7 +309,7 @@
         "name": {
           "type": "string",
           "minLength": 1,
-          "description": "The payee's name. Normalized on save: whitespace runs collapse to one space and curly quotes straighten to '. Case is NOT changed — \"IKEA\" and \"Ikea\" stay two different payees."
+          "description": "The payee's name. Normalized on save: whitespace runs collapse to one space and curly quotes straighten to '. The case is kept as typed, but \"IKEA\" and \"Ikea\" are the same payee."
         }
       },
       "required": [
@@ -1524,7 +1524,7 @@
   {
     "name": "get_system_status",
     "title": "Get System Status",
-    "description": "Report the health of Counterpoise's background jobs: database backup, backup pruning, hourly recurring-transaction processing, bank sync, security price sync, and the monthly database compaction (the job named reindex). Each job reports one of ok, stale, unverified, failed, missing, not_configured (Plaid sync or price sync with no secret set — normal, and the detail names the missing setting), or unknown (no status directory mounted — the normal case in local development). Overall is 'attention' if any job needs it; not_configured and unknown never cause it.",
+    "description": "Report the health of Counterpoise's background jobs: the database backup, pruning, hourly recurring-transaction processing, bank sync, security price sync, the weekly review and the issue sync. The list depends on where the server runs: the native server backs up hourly, prunes old backups and runs a monthly database compaction (the job named reindex); a Cloudflare Worker exports the database daily, prunes rate limits and has no reindex job. Each job reports one of ok, stale, unverified, failed, missing, not_configured (Plaid sync or price sync with no secret set — normal, and the detail names the missing setting), or unknown (no status directory mounted — the normal case in local development). Overall is 'attention' if any job needs it; not_configured and unknown never cause it.",
     "inputSchema": {
       "type": "object",
       "properties": {},
@@ -1573,6 +1573,26 @@
     "execution": {
       "taskSupport": "forbidden"
     }
+  },
+  {
+    "name": "get_weekly_review",
+    "title": "Get Weekly Review",
+    "description": "The newest weekly review of a book, if the book opted in: a summary of the week and items to check (possible duplicates, missed payments, unusual amounts) or insights (price changes, new regular payments, spending changes). Each item names its transaction IDs or its recurring rule ID. Dismissed items are left out. Also says whether the server is configured, whether the book opted in, whether a review is running, and the newest failure. This tool cannot start a review: the user starts one in the app.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bookId": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The book ID to query"
+        }
+      },
+      "required": ["bookId"],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "execution": { "taskSupport": "forbidden" }
   },
   {
     "name": "list_accounts",

@@ -1,14 +1,14 @@
 //! Phase 2 (payees) and phase 3 (standard transactions).
 
-use ledger_db::engine::DbConnection;
+use ledger_db::store::{self, Sql, Transaction, params};
 
 use super::values::{
     Item, convert_date, field, int, is_transaction_reconciled, normalize_name,
     normalize_optional_text, split_indexes, text,
 };
 use super::{
-    ImportContext, NewTransaction, RowError, describe, finish, insert_splits, insert_transaction,
-    item_id, row_error,
+    ImportContext, NewTransaction, RowError, describe, insert_splits, insert_transaction, item_id,
+    row_error,
 };
 
 #[derive(Default)]
@@ -17,27 +17,37 @@ pub struct PayeeStats {
     pub errors: usize,
 }
 
+/// The key of a payee name: the app matches payee names without letter case,
+/// so "IKEA" and "Ikea" are one payee.
+pub fn payee_key(name: &str) -> String {
+    name.to_lowercase()
+}
+
 /// The distinct normalized descriptions of every transaction, in order of
-/// first appearance.
+/// first appearance. Names that differ only by letter case are one payee,
+/// with the first spelling.
 fn payee_names(transactions: &[&Item]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
     for transaction in transactions {
         let Some(description) = field(transaction, "desc") else {
             continue;
         };
         let name = normalize_name(&description);
-        if !name.is_empty() && !names.contains(&name) {
+        let key = payee_key(&name);
+        if !name.is_empty() && !keys.contains(&key) {
+            keys.push(key);
             names.push(name);
         }
     }
     names
 }
 
-pub async fn import_payees(
-    connection: &mut DbConnection,
+pub fn import_payees(
+    tx: &Transaction<'_>,
     context: &mut ImportContext,
     transactions: &[&Item],
-) -> Result<PayeeStats, sqlx::Error> {
+) -> Result<PayeeStats, store::Error> {
     context.heading("👤 Phase 2: Importing Payees");
     let mut stats = PayeeStats::default();
     let names = payee_names(transactions);
@@ -53,20 +63,49 @@ pub async fn import_payees(
         }
         stats.imported = names.len();
     } else {
+        // A payee that the book already has, in any letter case, is reused:
+        // the exact spelling first, then the oldest.
+        let mut existing: std::collections::HashMap<String, Vec<(i32, String)>> =
+            std::collections::HashMap::new();
+        let rows: Vec<(i32, String)> = tx.query(
+            "SELECT id, name FROM payees WHERE book_id = ?1 ORDER BY id",
+            &params![context.book_id],
+        )?;
+        for (id, name) in rows {
+            existing
+                .entry(payee_key(&name))
+                .or_default()
+                .push((id, name));
+        }
         for (count, name) in names.iter().enumerate() {
-            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-            let outcome = sqlx::query_scalar::<_, i32>(
-                "INSERT INTO payees (book_id, name, created_at) VALUES ($1, $2, $3) RETURNING id",
-            )
-            .bind(context.book_id)
-            .bind(name)
-            .bind(context.now)
-            .fetch_one(&mut *savepoint)
-            .await
-            .map_err(row_error);
-            match finish(savepoint, outcome).await? {
+            if let Some(variants) = existing.get(&payee_key(name)) {
+                let id = variants
+                    .iter()
+                    .find(|(_, stored)| stored == name)
+                    .unwrap_or(&variants[0])
+                    .0;
+                context.ids.payees.insert(payee_key(name), id);
+                if context.options.verbose {
+                    println!("  = {name} (existing payee)");
+                }
+                continue;
+            }
+            let outcome = tx.savepoint(|sp| {
+                sp.query_row::<i32>(
+                    "INSERT INTO payees (book_id, name, created_at, name_fold)
+                     VALUES (?1, ?2, ?3, ?4) RETURNING id",
+                    &params![
+                        context.book_id,
+                        name,
+                        context.now,
+                        ledger_db::folds::fold(name)
+                    ],
+                )
+                .map_err(row_error)
+            })?;
+            match outcome {
                 Ok(payee_id) => {
-                    context.ids.payees.insert(name.clone(), payee_id);
+                    context.ids.payees.insert(payee_key(name), payee_id);
                     if context.options.verbose {
                         println!("  ✓ {name}");
                     } else if (count + 1) % 100 == 0 {
@@ -166,7 +205,7 @@ pub fn payee_of(context: &ImportContext, transaction: &Item) -> Option<i32> {
     if name.is_empty() {
         return None;
     }
-    context.ids.payees.get(&name).copied()
+    context.ids.payees.get(&payee_key(&name)).copied()
 }
 
 #[derive(Default)]
@@ -177,11 +216,11 @@ pub struct TransactionStats {
     pub errors: usize,
 }
 
-pub async fn import_transactions(
-    connection: &mut DbConnection,
+pub fn import_transactions(
+    tx: &Transaction<'_>,
     context: &mut ImportContext,
     transactions: &[&Item],
-) -> Result<TransactionStats, sqlx::Error> {
+) -> Result<TransactionStats, store::Error> {
     context.heading("💸 Phase 3: Importing Standard Transactions");
     let mut stats = TransactionStats::default();
     let standard: Vec<&Item> = transactions
@@ -249,16 +288,10 @@ pub async fn import_transactions(
                 payee_id: payee_of(context, transaction),
                 is_reconciled: is_transaction_reconciled(transaction),
             };
-            let mut savepoint = ledger_db::locks::savepoint(connection).await?;
-            let outcome = write_transaction(
-                &mut savepoint,
-                context,
-                transaction,
-                &new_transaction,
-                &splits,
-            )
-            .await;
-            match finish(savepoint, outcome).await? {
+            let outcome = tx.savepoint(|sp| {
+                write_transaction(sp, context, transaction, &new_transaction, &splits)
+            })?;
+            match outcome {
                 Ok(written) => {
                     stats.splits += written;
                     if context.options.verbose {
@@ -299,15 +332,14 @@ pub async fn import_transactions(
 /// Writes one transaction: the parent account split, which is the sum of the
 /// `pamt` values, then one split per numbered split from its `samt`. Returns
 /// the count of splits.
-async fn write_transaction(
-    connection: &mut DbConnection,
+fn write_transaction(
+    tx: &Transaction<'_>,
     context: &ImportContext,
     transaction: &Item,
     new_transaction: &NewTransaction,
     splits: &[Split],
 ) -> Result<usize, RowError> {
-    let transaction_id =
-        insert_transaction(connection, context.book_id, context.now, new_transaction).await?;
+    let transaction_id = insert_transaction(tx, context.book_id, context.now, new_transaction)?;
     let parent = text(transaction, "acctid")
         .map(|id| id.into_owned())
         .unwrap_or_else(|| "undefined".to_owned());
@@ -320,22 +352,20 @@ async fn write_transaction(
         .sum();
     // One statement per split, as the TypeScript writes them.
     insert_splits(
-        connection,
+        tx,
         context.book_id,
         transaction_id,
         &[(parent_account, parent_amount)],
-    )
-    .await?;
+    )?;
     for split in splits {
         let account = cash_or_account(context, &split.account)
             .ok_or_else(|| format!("Account mapping not found for {}", split.account))?;
         insert_splits(
-            connection,
+            tx,
             context.book_id,
             transaction_id,
             &[(account, split.amount)],
-        )
-        .await?;
+        )?;
     }
     Ok(splits.len() + 1)
 }
@@ -359,6 +389,15 @@ mod tests {
             payee_names(&[&first, &second, &blank, &third]),
             ["Green Grocer", "Joe's"]
         );
+    }
+
+    #[test]
+    fn payee_names_that_differ_only_by_case_are_one_payee() {
+        // The first spelling wins, as the app matches names without case.
+        let upper = item(json!({"desc": "IKEA"}));
+        let mixed = item(json!({"desc": "Ikea"}));
+        assert_eq!(payee_names(&[&upper, &mixed]), ["IKEA"]);
+        assert_eq!(payee_key("Ikea"), payee_key("IKEA"));
     }
 
     #[test]

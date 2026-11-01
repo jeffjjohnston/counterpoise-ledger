@@ -2,7 +2,7 @@
 //! schedule. The routes `/api/cron/plaid-sync`, `/api/cron/price-sync` and
 //! `/api/cron/recurring` run one now, for a caller with
 //! `Bearer $CRON_SECRET`. One run of a job waits for another run of the same
-//! job to finish (`JobLocks`).
+//! job to finish: each run holds the job's lease (`crate::leases`).
 //!
 //! A manual run records its status as a scheduled run does
 //! (`scheduler::record_run`).
@@ -11,6 +11,7 @@
 //! still succeeds, as the Node route did.
 
 use crate::{
+    book_scope::BookAccess,
     cron_auth::require_cron_secret,
     error::{ApiResult, error},
     routes::{
@@ -27,20 +28,23 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
 };
-use ledger_db::engine::Db;
+use ledger_db::sql;
+use ledger_db::store::{Sql, params};
 use serde_json::{Value, json};
-use sqlx::QueryBuilder;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 const PRICE_SCALE: f64 = 1_000_000.0;
 
 fn cron_secret() -> Option<String> {
-    std::env::var("CRON_SECRET").ok()
+    ledger_db::env::var("CRON_SECRET").ok()
 }
 
 // ---------------------------------------------------------------------------
 // GET /api/cron/plaid-sync
 // ---------------------------------------------------------------------------
+
+/// The answer of a manual run that stopped because its lease lapsed.
+pub(crate) const LEASE_LOST: &str = "The job stopped before it finished";
 
 /// Syncs each connection that has a linked asset or liability account.
 ///
@@ -50,42 +54,70 @@ fn cron_secret() -> Option<String> {
 /// book's Sync page.
 pub(crate) async fn plaid_sync(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     require_cron_secret(&headers, cron_secret().as_deref())?;
-    let _running = state.jobs.plaid_sync.lock().await;
-    let result = run_plaid_sync(&state).await;
+    let running = crate::leases::wait(&state.database, crate::leases::Job::PlaidSync.lease_name())
+        .await
+        .map_err(|cause| crate::error::internal_error(cause, "Failed to start the job"))?;
+    let result = running
+        .guard(run_plaid_sync(&state))
+        .await
+        .unwrap_or_else(|lost| Err(crate::error::internal_error(lost, LEASE_LOST)));
     // A manual run leaves the same record as a scheduled run.
-    crate::scheduler::record_run("plaid-sync", &result).await;
+    crate::scheduler::record_run(&state, "plaid-sync", &result);
     result
 }
 
 /// The Plaid sync job, without the caller check and the job lock.
 pub(crate) async fn run_plaid_sync(state: &AppState) -> ApiResult {
+    Ok(sync_connections(state, None, usize::MAX).await?.0)
+}
+
+/// Syncs at most `limit` of the linked connections, in ID order, from the
+/// first after `after`. The second value is the ID of the last connection
+/// synced when more remain: where the next step starts. A scheduled run
+/// syncs a few connections per step, so one step fits in the time that a
+/// Workers alarm has.
+pub(crate) async fn sync_connections(
+    state: &AppState,
+    after: Option<i32>,
+    limit: usize,
+) -> Result<(Json<Value>, Option<i32>), crate::error::ApiError> {
     const FAILURE: &str = "Failed to run Plaid sync cron";
     if let Some(setting) = state.plaid.missing_setting() {
-        return Ok(Json(json!({
-            "success": true, "skipped": true, "reason": "Plaid not configured",
-            "missingSetting": setting,
-        })));
+        return Ok((
+            Json(json!({
+                "success": true, "skipped": true, "reason": "Plaid not configured",
+                "missingSetting": setting,
+            })),
+            None,
+        ));
     }
-    let tokens: Vec<(i32, i32)> = sqlx::query_as(
-        "SELECT DISTINCT t.id, t.book_id FROM plaid_tokens t
+    let mut tokens: Vec<(i32, i32)> = state
+        .database
+        .query(
+            "SELECT DISTINCT t.id, t.book_id FROM plaid_tokens t
          JOIN plaid_accounts p ON p.token_id = t.id
          JOIN accounts a ON a.id = p.counterpoise_account_id
          WHERE t.is_demo = false
            AND p.counterpoise_account_id IS NOT NULL
            AND a.type IN ('asset', 'liability')
+           AND t.id > ?1
          ORDER BY t.id",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| {
-        tracing::error!(error = %cause, "Plaid sync cron failed");
-        error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE)
-    })?;
+            &params![after.unwrap_or(i32::MIN)],
+        )
+        .map_err(|cause| {
+            tracing::error!(error = %cause, "Plaid sync cron failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE)
+        })?;
+    let more = tokens.len() > limit;
+    tokens.truncate(limit);
 
     let (mut synced, mut skipped) = (0, 0);
     let mut errors = Vec::new();
     for &(token_id, book_id) in &tokens {
-        match sync_token(state, book_id, token_id).await {
+        // A scheduled job has no user. The query above chose the token and its
+        // book.
+        let access = BookAccess::for_system_job(book_id);
+        match sync_token(state, &access, token_id).await {
             Ok(_) => synced += 1,
             // A manual sync of this connection is running. It fetches what
             // this sync would fetch, so the overlap is not a failure. A
@@ -109,7 +141,12 @@ pub(crate) async fn run_plaid_sync(state: &AppState) -> ApiResult {
     if !errors.is_empty() {
         result["errors"] = Value::Array(errors);
     }
-    Ok(Json(result))
+    let next = if more {
+        tokens.last().map(|&(token_id, _)| token_id)
+    } else {
+        None
+    };
+    Ok((Json(result), next))
 }
 
 // ---------------------------------------------------------------------------
@@ -134,10 +171,15 @@ fn price_micros(price: Option<&Value>) -> Option<i64> {
 /// day before, which is already stored, so the job can run again safely.
 pub(crate) async fn price_sync(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     require_cron_secret(&headers, cron_secret().as_deref())?;
-    let _running = state.jobs.price_sync.lock().await;
-    let result = run_price_sync(&state).await;
+    let running = crate::leases::wait(&state.database, crate::leases::Job::PriceSync.lease_name())
+        .await
+        .map_err(|cause| crate::error::internal_error(cause, "Failed to start the job"))?;
+    let result = running
+        .guard(run_price_sync(&state))
+        .await
+        .unwrap_or_else(|lost| Err(crate::error::internal_error(lost, LEASE_LOST)));
     // A manual run leaves the same record as a scheduled run.
-    crate::scheduler::record_run("price-sync", &result).await;
+    crate::scheduler::record_run(&state, "price-sync", &result);
     result
 }
 
@@ -157,14 +199,15 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
     // Tiingo has no feed for a fixed-price security, such as the fixed NAV of
     // a money market fund. A fixed price also sets fetch_prices off, so this
     // filter only applies if the two disagree.
-    let mut fetchable: Vec<(i32, i32, String)> = sqlx::query_as(
-        "SELECT id, book_id, symbol FROM securities
+    let mut fetchable: Vec<(i32, i32, String)> = state
+        .database
+        .query(
+            "SELECT id, book_id, symbol FROM securities
          WHERE fetch_prices = true AND fixed_price_micros IS NULL
          ORDER BY id",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|cause| failed(cause.to_string()))?;
+            &[],
+        )
+        .map_err(|cause| failed(cause.to_string()))?;
     // A security that no book holds needs no price. Each request counts
     // against the hourly Tiingo limit, and an old security, such as an
     // expired option, can use all of it. A position is open when
@@ -172,9 +215,8 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
     let books: BTreeSet<i32> = fetchable.iter().map(|(_, book_id, _)| *book_id).collect();
     let mut held = HashSet::new();
     for book_id in books {
-        let open = positions(&state.pool, book_id, None)
-            .await
-            .map_err(|cause| failed(cause.to_string()))?;
+        let open =
+            positions(&state.database, book_id, None).map_err(|cause| failed(cause.to_string()))?;
         held.extend(open.into_iter().map(|position| position.security_id));
     }
     fetchable.retain(|(id, _, _)| held.contains(&i64::from(*id)));
@@ -237,41 +279,40 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
         .map(|(id, _, _)| *id)
         .collect();
 
-    let written: Result<u64, sqlx::Error> = async {
-        let mut transaction = ledger_db::locks::begin_pool(&state.pool).await?;
+    let written = state.database.transaction(|tx| {
         let mut inserted = 0;
         if !security_ids.is_empty() {
-            let mut insert = QueryBuilder::<Db>::new(
-                "INSERT INTO security_prices (security_id, book_id, price_date, price_micros, source) ",
-            );
-            insert.push_values(0..security_ids.len(), |mut row, index| {
-                row.push_bind(security_ids[index])
-                    .push_bind(book_ids[index])
-                    .push_bind(dates[index].clone())
-                    .push_bind(micros[index])
-                    .push_bind("tiingo");
-            });
-            insert.push(" ON CONFLICT (security_id, price_date) DO NOTHING");
-            inserted = insert
-                .build()
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected();
+            let rows: Vec<_> = (0..security_ids.len())
+                .map(|index| {
+                    (
+                        security_ids[index],
+                        book_ids[index],
+                        &dates[index],
+                        micros[index],
+                    )
+                })
+                .collect();
+            inserted = tx.execute(
+                &format!(
+                    "INSERT INTO security_prices
+                       (security_id, book_id, price_date, price_micros, source)
+                     {} ON CONFLICT (security_id, price_date) DO NOTHING",
+                    sql::json_rows(&["#0", "#1", "#2", "#3", "'tiingo'"], "?1")
+                ),
+                &params![sql::json_array(&rows)],
+            )?;
         }
         if !disabled.is_empty() {
-            let mut update =
-                QueryBuilder::<Db>::new("UPDATE securities SET fetch_prices = false WHERE id IN (");
-            let mut ids = update.separated(", ");
-            for id in &disabled {
-                ids.push_bind(*id);
-            }
-            update.push(")");
-            update.build().execute(&mut *transaction).await?;
+            tx.execute(
+                &format!(
+                    "UPDATE securities SET fetch_prices = false WHERE id {}",
+                    sql::in_integers("?1")
+                ),
+                &params![sql::json_array(&disabled)],
+            )?;
         }
-        transaction.commit().await?;
-        Ok(inserted)
-    }
-    .await;
+        Ok::<_, ledger_db::store::Error>(inserted)
+    });
     let inserted = written.map_err(|cause| failed(cause.to_string()))?;
     for failure in &errors {
         tracing::warn!(symbol = %failure.symbol, error = %failure.error, "Tiingo price fetch failed");
@@ -320,26 +361,32 @@ pub(crate) async fn run_price_sync(state: &AppState) -> ApiResult {
 /// logged and the job continues with the next book.
 pub(crate) async fn recurring(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     require_cron_secret(&headers, cron_secret().as_deref())?;
-    let _running = state.jobs.recurring.lock().await;
-    let result = run_recurring(&state).await;
+    let running = crate::leases::wait(&state.database, crate::leases::Job::Recurring.lease_name())
+        .await
+        .map_err(|cause| crate::error::internal_error(cause, "Failed to start the job"))?;
+    let result = running
+        .guard(run_recurring(&state))
+        .await
+        .unwrap_or_else(|lost| Err(crate::error::internal_error(lost, LEASE_LOST)));
     // A manual run leaves the same record as a scheduled run.
-    crate::scheduler::record_run("recurring", &result).await;
+    crate::scheduler::record_run(&state, "recurring", &result);
     result
 }
 
 /// The recurring job, without the caller check and the job lock.
 pub(crate) async fn run_recurring(state: &AppState) -> ApiResult {
     const FAILURE: &str = "Failed to process recurring rules";
-    let books: Vec<i32> = sqlx::query_scalar("SELECT id FROM books ORDER BY id")
-        .fetch_all(&state.pool)
-        .await
+    let books: Vec<i32> = state
+        .database
+        .query("SELECT id FROM books ORDER BY id", &[])
         .map_err(|cause| {
             tracing::error!(error = %cause, "Recurring cron failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE)
         })?;
     let mut transaction_ids = Vec::new();
     for &book_id in &books {
-        match process_all(&state.pool, book_id, FAILURE).await {
+        let access = BookAccess::for_system_job(book_id);
+        match process_all(&state.database, &access, FAILURE) {
             Ok(processed) => transaction_ids.extend(processed.transaction_ids),
             // process_all logs the cause.
             Err(_) => tracing::error!(book_id, "Recurring rules of a book failed"),

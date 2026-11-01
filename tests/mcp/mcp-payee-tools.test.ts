@@ -161,20 +161,15 @@ describe("MCP Payee Tools", () => {
       expect(data.bookId).toBe(bookId);
     });
 
-    it("does not fold case — IKEA and Ikea both succeed as distinct payees, through the tool's own wiring", async () => {
-      // Exercises the CREATE annotation's contract through call_tool, not
-      // lib/payees.ts directly: the library-level IKEA/Ikea test in
-      // tests/lib/payees.test.ts calls createPayee() itself, so it can't
-      // see a dedup check bolted onto the TOOL's handler instead. If the
-      // tool ever grew the HTTP route's case-insensitive pre-check, the
-      // second call below would silently return the first call's id
-      // instead of succeeding with a new one.
+    it("refuses a case variant of an existing payee, as it refuses an exact repeat", async () => {
+      // A payee name matches without letter case: "Ikea"
+      // after "IKEA" is the same payee, so the tool names the existing one.
       const upper = await callTool("create_payee", { bookId, name: "IKEA" });
       const mixed = await callTool("create_payee", { bookId, name: "Ikea" });
 
       expect(upper.isError).toBe(false);
-      expect(mixed.isError).toBe(false);
-      expect(upper.data.id).not.toBe(mixed.data.id);
+      expect(mixed.isError).toBe(true);
+      expect(JSON.stringify(mixed.data)).toContain("IKEA");
     });
 
     it("refuses a name of only whitespace at the schema boundary, before the book gate", async () => {

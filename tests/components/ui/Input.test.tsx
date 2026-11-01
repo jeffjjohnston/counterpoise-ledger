@@ -3,28 +3,30 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { Input } from "@/components/ui/Input";
 
 describe("Input", () => {
-  it("renders input element", () => {
-    render(<Input id="test" />);
-    expect(screen.getByRole("textbox")).toBeInTheDocument();
-  });
-
-  it("renders label when provided", () => {
-    render(<Input id="test" label="Test Label" />);
-    expect(screen.getByText("Test Label")).toBeInTheDocument();
-  });
-
-  it("associates label with input via id", () => {
+  it("gives the input its label as the accessible name", () => {
     render(<Input id="test-input" label="Test Label" />);
-    const input = screen.getByLabelText("Test Label");
-    expect(input).toHaveAttribute("id", "test-input");
+    expect(screen.getByRole("textbox", { name: "Test Label" })).toHaveAttribute("id", "test-input");
   });
 
-  it("handles value changes", () => {
-    const handleChange = vi.fn();
-    render(<Input id="test" onChange={handleChange} />);
+  it("keeps the accessible name when the label is hidden, and adds the suffix to it", () => {
+    render(
+      <>
+        <Input id="hidden" label="Amount" labelHidden />
+        <Input id="suffixed" label="Memo" labelSuffix="optional" />
+      </>
+    );
+    expect(screen.getByRole("textbox", { name: "Amount" })).toHaveAttribute("id", "hidden");
+    // jsdom's name calculation drops the space before the dash. A browser keeps it.
+    expect(screen.getByRole("textbox", { name: /^Memo\s*— optional$/ })).toHaveAttribute("id", "suffixed");
+  });
 
-    fireEvent.change(screen.getByRole("textbox"), { target: { value: "test" } });
-    expect(handleChange).toHaveBeenCalled();
+  it("sends value changes to the onChange handler", () => {
+    const handleChange = vi.fn();
+    render(<Input id="test" label="Name" onChange={handleChange} />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "test" } });
+    expect(handleChange).toHaveBeenCalledTimes(1);
+    expect(handleChange.mock.calls[0][0].target.value).toBe("test");
   });
 
   it("displays error message when provided", () => {
@@ -60,10 +62,11 @@ describe("Input", () => {
     expect(input).toBeDisabled();
   });
 
-  it("accepts custom className", () => {
-    render(<Input id="test" className="custom-class" />);
+  it("lets a caller class replace a conflicting default class", () => {
+    render(<Input id="test" className="custom-class px-1" />);
     const input = screen.getByRole("textbox");
-    expect(input).toHaveClass("custom-class");
+    expect(input).toHaveClass("custom-class", "px-1");
+    expect(input).not.toHaveClass("px-3");
   });
 
   it("supports different input types", () => {

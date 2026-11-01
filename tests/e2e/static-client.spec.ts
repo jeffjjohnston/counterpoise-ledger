@@ -38,6 +38,23 @@ test.describe("static client", () => {
     await expect(page).toHaveURL("/");
   });
 
+  // In production one process serves the client build and the API on one
+  // origin. An API path must get the API, never index.html. The HTTP suite
+  // starts the server without a client build, so only this spec checks it.
+  test("an API path gets JSON from the API, not the page", async ({ page }) => {
+    const accounts = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/b/1/accounts");
+    await page.goto("/b/1");
+    const response = await accounts;
+    expect(new URL(response.url()).origin).toBe(new URL(page.url()).origin);
+    expect(response.status()).toBe(200);
+    expect(response.headers()["content-type"]).toContain("application/json");
+    expect(Array.isArray(await response.json())).toBe(true);
+
+    const unknown = await page.request.get("/api/no-such-route");
+    expect(unknown.status()).toBe(404);
+    expect(unknown.headers()["content-type"] ?? "").not.toContain("text/html");
+  });
+
   test("a chunk that is not there gets 404, not the page", async ({ page }) => {
     const response = await page.request.get("/assets/no-such-chunk-000000.js");
     expect(response.status()).toBe(404);

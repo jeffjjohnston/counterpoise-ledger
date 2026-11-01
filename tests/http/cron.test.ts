@@ -1,8 +1,5 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { toDateString } from "../../lib/formatters";
 import type { PlaidToken, RecurringRule, SecurityPrice } from "../../types/db";
@@ -33,7 +30,7 @@ async function cron(client: Client, path: string) {
 }
 
 /** A mock that answers each request path with its queued reply. The server may not call the real API. */
-async function startMock(key: (path: string, body: string) => string) {
+async function startMock(key: (path: string, body: string, authorization: string | undefined) => string) {
   const replies = new Map<string, Reply>();
   const requests: string[] = [];
   const gates = new Map<string, { arrived: () => void; released: Promise<void> }>();
@@ -41,7 +38,7 @@ async function startMock(key: (path: string, body: string) => string) {
     let text = "";
     request.on("data", (chunk) => { text += chunk; });
     request.on("end", () => {
-      const name = key(request.url ?? "/", text);
+      const name = key(request.url ?? "/", text, request.headers.authorization);
       requests.push(name);
       const gate = gates.get(name);
       gate?.arrived();
@@ -88,11 +85,17 @@ type Mock = Awaited<ReturnType<typeof startMock>>;
 /** The Plaid mock names a request by its access token. */
 const plaidKey = (_path: string, body: string) => (JSON.parse(body) as { access_token: string }).access_token;
 
-/** The Tiingo mock names a request by its decoded symbol, and refuses a wrong key. */
-function tiingoKey(path: string) {
+/**
+ * The Tiingo mock names a request by its decoded symbol. It refuses a wrong
+ * key, and a key in the URL: the key goes only in the Authorization header,
+ * because traces record the URL of each outgoing request.
+ */
+function tiingoKey(path: string, _body: string, authorization: string | undefined) {
   const url = new URL(path, "http://mock");
   const match = /^\/tiingo\/daily\/([^/]*)\/prices$/.exec(url.pathname);
-  return match && url.searchParams.get("token") === TIINGO_KEY ? decodeURIComponent(match[1]) : `bad:${path}`;
+  return match && authorization === `Token ${TIINGO_KEY}` && url.search === ""
+    ? decodeURIComponent(match[1])
+    : `bad:${path}`;
 }
 
 const emptyPage: Reply = {
@@ -144,11 +147,9 @@ describe("cron routes without Plaid or Tiingo", () => {
   let baseUrl: string;
   let stop: () => Promise<void>;
   let client: Client;
-  let statusDir: string;
 
   beforeAll(async () => {
-    statusDir = await mkdtemp(join(tmpdir(), "counterpoise-cron-status-"));
-    ({ baseUrl, stop } = await startHttpTestServer({ ...UNCONFIGURED, STATUS_DIR: statusDir }));
+    ({ baseUrl, stop } = await startHttpTestServer({ ...UNCONFIGURED }));
   }, 120_000);
   beforeEach(async () => {
     await resetTestDatabase();
@@ -156,7 +157,6 @@ describe("cron routes without Plaid or Tiingo", () => {
   });
   afterAll(async () => {
     await stop?.();
-    if (statusDir) await rm(statusDir, { recursive: true, force: true });
   });
 
   it("skips the bank sync and the price sync", async () => {
@@ -174,13 +174,16 @@ describe("cron routes without Plaid or Tiingo", () => {
     await cron(client, "/api/cron/plaid-sync");
     await cron(client, "/api/cron/price-sync");
     await cron(client, "/api/cron/recurring");
-    const plaid = JSON.parse(await readFile(join(statusDir, "plaid-sync.json"), "utf8"));
-    expect(plaid).toMatchObject({
-      job: "plaid-sync", notConfigured: true, detail: "not configured: PLAID_CLIENT_ID is not set",
+    const runs = await rows<{ job: string; lastRunAt: Date; lastOkAt: Date | null; detail: string | null; notConfigured: number }>(
+      "SELECT job, last_run_at, last_ok_at, detail, not_configured FROM job_runs",
+    );
+    const run = (job: string) => runs.find((row) => row.job === job)!;
+    expect(run("plaid-sync")).toMatchObject({
+      notConfigured: 1, detail: "not configured: PLAID_CLIENT_ID is not set",
     });
-    const recurring = JSON.parse(await readFile(join(statusDir, "recurring.json"), "utf8"));
-    expect(recurring.lastOk).toBe(recurring.lastRun);
-    expect(recurring.notConfigured).toBeUndefined();
+    const recurring = run("recurring");
+    expect(recurring.lastOkAt).toEqual(recurring.lastRunAt);
+    expect(recurring.notConfigured).toBe(0);
 
     const status = await (await client.request("/api/system/status")).json();
     const states = Object.fromEntries(status.jobs.map((job: { job: string; state: string }) => [job.job, job.state]));
@@ -290,6 +293,35 @@ describe("cron routes HTTP parity", () => {
     expect(stored.find((token) => token.id === failing.id)?.lastError).toBe(
       "Plaid /transactions/sync request failed: login required (ITEM_LOGIN_REQUIRED)",
     );
+  });
+
+  it("adds a bank transaction once when a second run gets the same page", async () => {
+    await connection("access-again");
+    plaid.reply("access-again", {
+      status: 200,
+      body: {
+        ...emptyPage.body as object,
+        added: [{
+          account_id: "plaid-access-again", account_owner: null, amount: 12.34, authorized_date: null, category: null,
+          date: toDateString(new Date()), iso_currency_code: "USD", merchant_name: null, name: "Coffee",
+          original_description: null, pending: false, pending_transaction_id: null, personal_finance_category: null,
+          transaction_id: "txn-again", unofficial_currency_code: null,
+        }],
+      },
+    });
+    // A second sight of a staged row moves its lastSeenAt and updatedAt,
+    // and nothing else.
+    const stored = async () => ({
+      staged: (await rows<Record<string, unknown>>("SELECT * FROM plaid_transaction_reconciliation ORDER BY id"))
+        .map((row) => Object.fromEntries(Object.entries(row).filter(([key]) => key !== "lastSeenAt" && key !== "updatedAt"))),
+      transactions: await rows("SELECT * FROM transactions ORDER BY id"),
+    });
+    expect(await cron(client, "/api/cron/plaid-sync")).toMatchObject({ tokensSynced: 1 });
+    const first = await stored();
+    expect(first.staged).toHaveLength(1);
+    // A retried run, or Plaid sending the page again, changes nothing.
+    expect(await cron(client, "/api/cron/plaid-sync")).toMatchObject({ tokensSynced: 1 });
+    expect(await stored()).toEqual(first);
   });
 
   it("reports no connections without calling Plaid", async () => {

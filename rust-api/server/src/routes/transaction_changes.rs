@@ -11,6 +11,7 @@
 
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
+    db_scope::read_transaction,
     error::{ApiError, ApiResult, error, internal_error},
     routes::transactions::load_transactions,
     state::AppState,
@@ -21,7 +22,8 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
 };
-use ledger_db::{backup::SYNC_FLOOR_BOOK_ID, locks};
+use ledger_db::store::{Sql, params};
+use ledger_db::sync_floor::SYNC_FLOOR_BOOK_ID;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
@@ -95,88 +97,73 @@ pub(crate) async fn list_transaction_changes(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Read, FAILURE).await?;
     let mode = validate_query(&first_query_values(raw_query.as_deref()))?;
-    let db_error = |cause| internal_error(cause, FAILURE);
+    fn db_error(cause: impl std::fmt::Display) -> ApiError {
+        internal_error(cause, FAILURE)
+    }
 
-    let mut connection = state.pool.acquire().await.map_err(db_error)?;
-    let mut transaction = locks::begin_read(&mut connection).await.map_err(db_error)?;
-    // The first read takes the snapshot of the transaction.
-    let cursor: i64 = sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM transaction_changes")
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(db_error)?;
+    let body = read_transaction(&state.database, FAILURE, |tx| {
+        // The first read takes the snapshot of the transaction.
+        let cursor: i64 = tx
+            .query_row("SELECT coalesce(max(seq), 0) FROM transaction_changes", &[])
+            .map_err(db_error)?;
 
-    let body = match mode {
-        Mode::Full { after_id, limit } => {
-            let mut ids: Vec<i32> = sqlx::query_scalar(
-                "SELECT id FROM transactions WHERE book_id = $1 AND id > $2 ORDER BY id LIMIT $3",
-            )
-            .bind(book.book_id())
-            .bind(after_id)
-            .bind(limit + 1)
-            .fetch_all(&mut *transaction)
-            .await
+        Ok(match mode {
+            Mode::Full { after_id, limit } => {
+                let mut ids: Vec<i32> = tx.query("SELECT id FROM transactions WHERE book_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3", &params![book.book_id(), after_id, limit + 1])
             .map_err(db_error)?;
-            let has_more = ids.len() as i64 > limit;
-            ids.truncate(limit as usize);
-            let transactions = load_transactions(&mut transaction, book.book_id(), &ids)
-                .await
-                .map_err(db_error)?;
-            json!({
-                "cursor": cursor,
-                "transactions": transactions,
-                "deletedIds": [],
-                "hasMore": has_more,
-            })
-        }
-        Mode::Delta { since } => {
-            // A cursor from a newer log, for example from before a restore.
-            if since > cursor {
-                return Err(error(StatusCode::GONE, FUTURE_CURSOR));
+                let has_more = ids.len() as i64 > limit;
+                ids.truncate(limit as usize);
+                let transactions = load_transactions(tx, book.book_id(), &ids).map_err(db_error)?;
+                json!({
+                    "cursor": cursor,
+                    "transactions": transactions,
+                    "deletedIds": [],
+                    "hasMore": has_more,
+                })
             }
-            let floor: i64 = sqlx::query_scalar(
-                "SELECT coalesce(max(seq), 0) FROM transaction_changes WHERE book_id = $1",
-            )
-            .bind(SYNC_FLOOR_BOOK_ID)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(db_error)?;
-            if since < floor {
-                return Err(error(StatusCode::GONE, RESTORED));
+            Mode::Delta { since } => {
+                // A cursor from a newer log, for example from before a restore.
+                if since > cursor {
+                    return Err(error(StatusCode::GONE, FUTURE_CURSOR));
+                }
+                let floor: i64 = tx
+                    .query_row(
+                        "SELECT coalesce(max(seq), 0) FROM transaction_changes WHERE book_id = ?1",
+                        &params![SYNC_FLOOR_BOOK_ID],
+                    )
+                    .map_err(db_error)?;
+                if since < floor {
+                    return Err(error(StatusCode::GONE, RESTORED));
+                }
+                let ids: Vec<i32> = tx
+                    .query(
+                        "SELECT DISTINCT transaction_id FROM transaction_changes
+                 WHERE book_id = ?1 AND seq > ?2 ORDER BY transaction_id LIMIT ?3",
+                        &params![book.book_id(), since, MAX_DELTA as i64 + 1],
+                    )
+                    .map_err(db_error)?;
+                if ids.len() > MAX_DELTA {
+                    return Err(error(StatusCode::GONE, TOO_MANY_CHANGES));
+                }
+                let transactions = load_transactions(tx, book.book_id(), &ids).map_err(db_error)?;
+                // A logged ID that is not a transaction of this book is deleted.
+                let found: HashSet<i64> = transactions
+                    .iter()
+                    .filter_map(|transaction| transaction["id"].as_i64())
+                    .collect();
+                let deleted_ids: Vec<i32> = ids
+                    .into_iter()
+                    .filter(|id| !found.contains(&i64::from(*id)))
+                    .collect();
+                json!({
+                    "cursor": cursor,
+                    "transactions": transactions,
+                    "deletedIds": deleted_ids,
+                    "hasMore": false,
+                })
             }
-            let ids: Vec<i32> = sqlx::query_scalar(
-                "SELECT DISTINCT transaction_id FROM transaction_changes
-                 WHERE book_id = $1 AND seq > $2 ORDER BY transaction_id LIMIT $3",
-            )
-            .bind(book.book_id())
-            .bind(since)
-            .bind(MAX_DELTA as i64 + 1)
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(db_error)?;
-            if ids.len() > MAX_DELTA {
-                return Err(error(StatusCode::GONE, TOO_MANY_CHANGES));
-            }
-            let transactions = load_transactions(&mut transaction, book.book_id(), &ids)
-                .await
-                .map_err(db_error)?;
-            // A logged ID that is not a transaction of this book is deleted.
-            let found: HashSet<i64> = transactions
-                .iter()
-                .filter_map(|transaction| transaction["id"].as_i64())
-                .collect();
-            let deleted_ids: Vec<i32> = ids
-                .into_iter()
-                .filter(|id| !found.contains(&i64::from(*id)))
-                .collect();
-            json!({
-                "cursor": cursor,
-                "transactions": transactions,
-                "deletedIds": deleted_ids,
-                "hasMore": false,
-            })
-        }
-    };
-    transaction.commit().await.map_err(db_error)?;
+        })
+    })?;
     Ok(Json(body))
 }
 

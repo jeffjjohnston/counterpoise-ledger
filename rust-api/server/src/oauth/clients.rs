@@ -12,7 +12,7 @@ use super::{
     CLIENT_ID_PREFIX, cimd, new_secret, no_store, not_configured, now, oauth_error, sweep,
 };
 use crate::{
-    client_ip,
+    client_ip, platform,
     rate_limit::{Keys, Scope},
     state::AppState,
 };
@@ -23,8 +23,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use ledger_db::{Sql, store::params};
 use serde_json::{Value, json};
-use std::time::Instant;
 use url::Host;
 
 const MAX_REDIRECT_URIS: usize = 10;
@@ -56,17 +56,17 @@ pub(super) async fn find(state: &AppState, client_id: &str) -> Result<Client, Lo
     if client_id.starts_with("https://") {
         return cimd::client(state, client_id).await;
     }
-    let row: Option<(i32, String, String)> = sqlx::query_as(
-        "SELECT id, client_name, redirect_uris FROM oauth_clients
-         WHERE client_id = $1 AND metadata_document = 0",
-    )
-    .bind(client_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|cause| {
-        tracing::error!(error = %cause, "Could not read an OAuth client");
-        Lookup::Invalid("The server could not read the client".to_owned())
-    })?;
+    let row: Option<(i32, String, String)> = state
+        .database
+        .query_optional(
+            "SELECT id, client_name, redirect_uris FROM oauth_clients
+         WHERE client_id = ?1 AND metadata_document = 0",
+            &params![client_id],
+        )
+        .map_err(|cause| {
+            tracing::error!(error = %cause, "Could not read an OAuth client");
+            Lookup::Invalid("The server could not read the client".to_owned())
+        })?;
     let Some((id, name, redirect_uris)) = row else {
         return Err(Lookup::Unknown);
     };
@@ -281,15 +281,16 @@ pub(super) async fn register(
     }
     let ip = client_ip::from_headers(&headers);
     let keys = Keys { username: None, ip };
-    if let Err(limited) = state
-        .rate_limits
-        .enforce(Scope::OAuthRegister, &keys, Instant::now())
+    if let Err(limited) =
+        state
+            .rate_limits
+            .enforce(Scope::OAuthRegister, &keys, platform::timestamp())
     {
         return limited.into_response();
     }
     state
         .rate_limits
-        .failure(Scope::OAuthRegister, &keys, Instant::now());
+        .failure(Scope::OAuthRegister, &keys, platform::timestamp());
     let Ok(body) = serde_json::from_slice::<Value>(&body) else {
         return refuse(
             "invalid_client_metadata",
@@ -315,16 +316,16 @@ pub(super) async fn register(
         .name
         .unwrap_or_else(|| "Unnamed MCP client".to_owned());
     let issued_at = now();
-    let inserted = sqlx::query(
+    let inserted = state.database.execute(
         "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at)
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(&client_id)
-    .bind(&name)
-    .bind(json!(metadata.redirect_uris).to_string())
-    .bind(issued_at)
-    .execute(&state.pool)
-    .await;
+         VALUES (?1, ?2, ?3, ?4)",
+        &params![
+            &client_id,
+            &name,
+            json!(metadata.redirect_uris).to_string(),
+            issued_at
+        ],
+    );
     if let Err(cause) = inserted {
         tracing::error!(error = %cause, "Could not register an OAuth client");
         return oauth_error(

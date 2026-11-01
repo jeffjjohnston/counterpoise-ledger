@@ -7,6 +7,7 @@ use chrono::{Datelike, Months, NaiveDate};
 
 use super::window::{date, format_date, last_day_of_month};
 use super::{SeedResult, Seeder, Split};
+use crate::store::{Sql, params};
 
 /// The next `day_of_month` strictly after `today`. The day must be 28 or less.
 pub(super) fn next_monthly_date(today: NaiveDate, day_of_month: u32) -> NaiveDate {
@@ -62,8 +63,8 @@ pub(super) enum Schedule {
 }
 
 /// Writes `rules` and their template splits.
-pub(super) async fn write_rules(
-    seeder: &mut Seeder<'_>,
+pub(super) fn write_rules(
+    seeder: &mut Seeder<'_, impl Sql>,
     rules: Vec<RuleSeed>,
     payees: &HashMap<&'static str, i32>,
     today: NaiveDate,
@@ -110,39 +111,33 @@ pub(super) async fn write_rules(
             ),
         };
         let next = format_date(next);
-        let rule_id: i32 = sqlx::query_scalar(
+        let rule_id: i32 = seeder.sql.query_row(
             "INSERT INTO recurring_rules
                (book_id, name, frequency, interval, days_of_month, days_of_week, start_date,
                 next_date, auto_create_days_before, template_description, payee_id, is_active,
-                business_days_only, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, true, $11, $12)
+                business_days_only, created_at, name_fold, template_description_fold)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, true, ?11, ?12, ?13, ?14)
              RETURNING id",
-        )
-        .bind(seeder.book_id)
-        .bind(name)
-        .bind(frequency)
-        .bind(interval)
-        .bind(days_of_month)
-        .bind(days_of_week)
-        .bind(&next)
-        .bind(auto_create_days_before)
-        .bind(template_description)
-        .bind(payees.get(payee_name).copied())
-        .bind(business_days_only)
-        .bind(seeder.now)
-        .fetch_one(&mut *seeder.connection)
-        .await?;
+            &params![
+                seeder.book_id,
+                name,
+                frequency,
+                interval,
+                days_of_month,
+                days_of_week,
+                &next,
+                auto_create_days_before,
+                template_description,
+                payees.get(payee_name).copied(),
+                business_days_only,
+                seeder.now,
+                crate::folds::fold(name),
+                crate::folds::fold(template_description)
+            ],
+        )?;
         for template in splits {
-            sqlx::query(
-                "INSERT INTO recurring_template_splits (book_id, recurring_rule_id, account_id, amount)
-                 VALUES ($1, $2, $3, $4)",
-            )
-            .bind(seeder.book_id)
-            .bind(rule_id)
-            .bind(template.account_id)
-            .bind(template.amount as i32)
-            .execute(&mut *seeder.connection)
-            .await?;
+            seeder.sql.execute("INSERT INTO recurring_template_splits (book_id, recurring_rule_id, account_id, amount)
+                 VALUES (?1, ?2, ?3, ?4)", &params![seeder.book_id, rule_id, template.account_id, template.amount as i32])?;
         }
     }
     (seeder.log)(&format!("  Recurring rules: {count}"));

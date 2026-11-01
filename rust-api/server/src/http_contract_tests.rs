@@ -1,12 +1,13 @@
 //! HTTP adapters used only by tests while the dependent route ports are
 //! blocked on this shared layer. They exercise the same helpers those routes
-//! will call, through Axum and a real SQLite database file (`TempDatabase`).
+//! will call, through Axum and a real SQLite database (migrated, in memory).
 
 use crate::{
     analytics::PostHogCapture,
     book_auth::{AccessLevel, authenticate_book},
     cron_auth::require_cron_secret,
     error::{ApiError, error, internal_error},
+    platform,
     rate_limit::{Keys, RateLimiter, Scope},
     state::AppState,
     validation::{parse_json_body, require_account_parent, validate_account_create},
@@ -18,10 +19,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use ledger_db::engine::DbPool;
-use ledger_db::locks::{SessionLock, with_session_lock};
+use ledger_db::{Sql, store::params};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 async fn read_book(
     State(state): State<AppState>,
@@ -58,21 +58,19 @@ async fn write_account(
     let body = parse_json_body(&body, "Failed to create account")?;
     let input = validate_account_create(&body)?;
     require_account_parent(
-        &state.pool,
+        &state.database,
         auth.book_id(),
         input.parent_id,
         "Failed to create account",
-    )
-    .await?;
-    let id: i32 = sqlx::query_scalar(
-        "INSERT INTO accounts (book_id, name, type) VALUES ($1, $2, $3) RETURNING id",
-    )
-    .bind(auth.book_id())
-    .bind(&input.name)
-    .bind(&input.account_type)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| internal_error(cause, "Failed to create account"))?;
+    )?;
+    let id: i32 = state
+        .database
+        .query_row(
+            "INSERT INTO accounts (book_id, name, type, created_at, updated_at)
+             VALUES (?1, ?2, ?3, '2026-10-21 00:00:00', '2026-10-21 00:00:00') RETURNING id",
+            &params![auth.book_id(), &input.name, &input.account_type],
+        )
+        .map_err(|cause| internal_error(cause, "Failed to create account"))?;
     Ok(Json(
         json!({"id": id, "bookId": auth.book_id(), "name": input.name}),
     ))
@@ -104,7 +102,7 @@ async fn limited_login(State(limiter): State<Arc<RateLimiter>>) -> axum::respons
         username: Some("alice"),
         ip: Some("10.0.0.1"),
     };
-    let now = Instant::now();
+    let now = platform::timestamp();
     if let Err(denied) = limiter.enforce(Scope::Login, &keys, now) {
         return axum::response::IntoResponse::into_response(denied);
     }
@@ -115,15 +113,12 @@ async fn limited_login(State(limiter): State<Arc<RateLimiter>>) -> axum::respons
     ))
 }
 
-async fn lock_probe(State(pool): State<DbPool>) -> Result<StatusCode, ApiError> {
-    let result = with_session_lock(
-        &pool,
-        SessionLock::new(1_000_004, std::process::id() as i32),
-        |_| Box::pin(async { Ok(()) }),
-    )
-    .await
-    .map_err(|cause| internal_error(cause, "Failed to sync token"))?;
-    if result.is_some() {
+async fn lock_probe(
+    State(database): State<Arc<ledger_db::Database>>,
+) -> Result<StatusCode, ApiError> {
+    let held = crate::leases::try_take(&database, &crate::leases::plaid_sync(4))
+        .map_err(|cause| internal_error(cause, "Failed to sync token"))?;
+    if held.is_some() {
         Ok(StatusCode::OK)
     } else {
         Err(error(
@@ -151,56 +146,42 @@ async fn spawn(app: Router) -> (String, tokio::task::JoinHandle<()>) {
 
 #[tokio::test]
 async fn book_and_body_denials_match_node_http_contract() {
-    let database = ledger_db::testing::TempDatabase::new(1).await;
-    let pool = database.pool().clone();
-    sqlx::query(
-        "CREATE TEMP TABLE sessions (token_hash text, user_id integer, expires_at timestamp)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("CREATE TEMP TABLE books (id integer)")
-        .execute(&pool)
-        .await
+    let state = AppState::in_memory();
+    let database = state.database.clone();
+    // The trigger makes each book's creator its owner.
+    database
+        .exec_batch(
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES
+           (1, 'owner', 'unused', '2026-10-21 00:00:00'),
+           (2, 'editor', 'unused', '2026-10-21 00:00:00'),
+           (3, 'viewer', 'unused', '2026-10-21 00:00:00'),
+           (4, 'other', 'unused', '2026-10-21 00:00:00');
+         INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES
+           (7, 1, 'Shared', '2026-10-21 00:00:00', '2026-10-21 00:00:00'),
+           (8, 4, 'Other', '2026-10-21 00:00:00', '2026-10-21 00:00:00');
+         INSERT INTO book_members (book_id, user_id, role, created_at) VALUES
+           (7, 2, 'editor', '2026-10-21 00:00:00'), (7, 3, 'viewer', '2026-10-21 00:00:00');
+         INSERT INTO accounts (book_id, name, type, created_at, updated_at)
+           VALUES (8, 'Other Parent', 'asset', '2026-10-21 00:00:00', '2026-10-21 00:00:00');",
+        )
         .unwrap();
-    sqlx::query("CREATE TEMP TABLE book_members (book_id integer, user_id integer, role text)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("CREATE TEMP TABLE accounts (id INTEGER PRIMARY KEY, book_id integer, name text, type text)").execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO books VALUES (7), (8)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO book_members VALUES (7, 1, 'owner'), (7, 2, 'editor'), (7, 3, 'viewer')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
     for (token, user_id) in [("owner", 1), ("editor", 2), ("viewer", 3)] {
         use sha2::{Digest, Sha256};
-        sqlx::query("INSERT INTO sessions VALUES ($1, $2, $3)")
-            .bind(hex::encode(Sha256::digest(token.as_bytes())))
-            .bind(user_id)
-            .bind((chrono::Utc::now() + chrono::Duration::hours(1)).naive_utc())
-            .execute(&pool)
-            .await
+        database
+            .execute(
+                "INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, '2026-10-21 00:00:00')",
+                &params![
+                    hex::encode(Sha256::digest(token.as_bytes())),
+                    user_id,
+                    (chrono::Utc::now() + chrono::Duration::hours(1)).naive_utc()
+                ],
+            )
             .unwrap();
     }
-    sqlx::query("INSERT INTO accounts (book_id, name, type) VALUES (8, 'Other Parent', 'asset')")
-        .execute(&pool)
-        .await
+    let other_parent: i32 = database
+        .query_row("SELECT id FROM accounts WHERE book_id = 8", &[])
         .unwrap();
-    let other_parent: i32 = sqlx::query_scalar("SELECT id FROM accounts WHERE book_id = 8")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let mut state = AppState::with_pool(
-        pool.clone(),
-        crate::book_changes::BookChangeHub::new(pool.clone()),
-    );
-    state.pool = pool.clone();
     let app = Router::new()
         .route("/book/{id}/read", get(read_book))
         .route("/book/{id}/write", post(write_account))
@@ -301,10 +282,11 @@ async fn book_and_body_denials_match_node_http_contract() {
     let created: Value = protected.json().await.unwrap();
     assert_eq!(created["bookId"], 7);
     assert_ne!(created["id"], 999);
-    let stored_book: i32 = sqlx::query_scalar("SELECT book_id FROM accounts WHERE id = $1")
-        .bind(created["id"].as_i64().unwrap() as i32)
-        .fetch_one(&pool)
-        .await
+    let stored_book: i32 = database
+        .query_row(
+            "SELECT book_id FROM accounts WHERE id = ?1",
+            &params![created["id"].as_i64().unwrap() as i32],
+        )
         .unwrap();
     assert_eq!(stored_book, 7);
     server.abort();
@@ -335,7 +317,9 @@ async fn cron_and_rate_limit_denials_match_node_http_contract() {
     assert_eq!(allowed.status(), StatusCode::OK);
     server.abort();
 
-    let limiter = Arc::new(RateLimiter::default());
+    let database = ledger_db::Database::open_in_memory().unwrap();
+    ledger_db::migrate(&database).unwrap();
+    let limiter = Arc::new(RateLimiter::new(Arc::new(database)));
     let app = Router::new()
         .route("/login", post(limited_login))
         .with_state(limiter);
@@ -360,31 +344,15 @@ async fn cron_and_rate_limit_denials_match_node_http_contract() {
 
 #[tokio::test]
 async fn advisory_lock_busy_maps_to_the_node_conflict_body() {
-    let database = ledger_db::testing::TempDatabase::new(2).await;
-    let pool = database.pool().clone();
-    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let holder_pool = pool.clone();
-    let holder = tokio::spawn(async move {
-        with_session_lock(
-            &holder_pool,
-            SessionLock::new(1_000_004, std::process::id() as i32),
-            |_| {
-                Box::pin(async move {
-                    held_tx.send(()).unwrap();
-                    release_rx.await.unwrap();
-                    Ok(())
-                })
-            },
-        )
-        .await
+    let database = Arc::new(ledger_db::Database::open_in_memory().unwrap());
+    ledger_db::migrate(&database).unwrap();
+    let held = crate::leases::try_take(&database, &crate::leases::plaid_sync(4))
         .unwrap()
-    });
-    held_rx.await.unwrap();
+        .unwrap();
     let (base, server) = spawn(
         Router::new()
             .route("/sync", post(lock_probe))
-            .with_state(pool),
+            .with_state(database),
     )
     .await;
     let response = reqwest::Client::new()
@@ -397,8 +365,13 @@ async fn advisory_lock_busy_maps_to_the_node_conflict_body() {
         response.json::<Value>().await.unwrap(),
         json!({"error":"A sync is already running for this connection"})
     );
-    release_tx.send(()).unwrap();
-    assert!(holder.await.unwrap().is_some());
+    drop(held);
+    let response = reqwest::Client::new()
+        .post(format!("{base}/sync"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     server.abort();
 }
 

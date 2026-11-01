@@ -479,8 +479,10 @@ function TransactionsPageInner() {
       toast.success("Transaction added");
       scrollContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
       void refreshData(false);
+      return true;
     } catch (e) {
       toast.error(toMessage(e, "Failed to create transaction"));
+      return false;
     }
   };
 
@@ -494,21 +496,23 @@ function TransactionsPageInner() {
     splits: SplitInput[];
     investmentSplits?: InvestmentSplitInput[];
   }) => {
-    if (!editingTransaction) return;
+    if (!editingTransaction) return false;
 
     try {
       await putTransaction(bookId, editingTransaction, data);
       toast.success("Transaction updated");
       setEditingTransaction(null);
       void refreshData(false);
+      return true;
     } catch (e) {
       if (isTransactionConflict(e)) {
         toast.error(TRANSACTION_CONFLICT_MESSAGE);
         setEditingTransaction(null);
         void refreshData(false);
-        return;
+        return false;
       }
       toast.error(toMessage(e, "Failed to update transaction"));
+      return false;
     }
   };
 
@@ -718,6 +722,13 @@ function TransactionsPageInner() {
       router.push(`/b/${bookId}/transactions?${params.toString()}`);
     },
     [bookId, router, scrollTransactionsToTop]
+  );
+
+  const handleNavigateToPayee = useCallback(
+    (payeeId: number) => {
+      router.push(`/b/${bookId}/payees/${payeeId}`);
+    },
+    [bookId, router]
   );
 
   // Pending Plaid rows are fetched unfiltered; respect the page filters here.
@@ -1121,6 +1132,7 @@ function TransactionsPageInner() {
             onNewTransactionAnimated={() => setNewTransactionId(null)}
             highlightTransactionId={highlightTransactionId}
             onNavigateToAccount={handleNavigateToAccount}
+            onNavigateToPayee={handleNavigateToPayee}
             onHighlightAnimated={() => {
               setHighlightTransactionId(null);
               // Clean up URL param
@@ -1186,8 +1198,9 @@ function TransactionsPageInner() {
             isInvestmentAccountSelected={isInvestmentAccount}
             fullLayout
             onSubmit={async (data) => {
-              await handleCreateTransaction(data);
+              const saved = await handleCreateTransaction(data);
               setMobileCreateOpen(false);
+              return saved;
             }}
             onCancel={() => setMobileCreateOpen(false)}
             onAccountsUpdate={() => refreshData(false)}

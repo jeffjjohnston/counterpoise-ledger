@@ -7,7 +7,9 @@
 
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
+    book_scope::{BookAccess, Write, find_payee_by_name},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
+    platform,
     routes::{
         payees::normalize_name,
         plaid_sync::{day_delta, pick_matched_date},
@@ -24,18 +26,20 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{Days, NaiveDate, NaiveDateTime, Utc};
-use ledger_db::engine::{DbConnection, DbExecutor, DbPool};
+use chrono::{Days, NaiveDate, NaiveDateTime};
 use ledger_db::locks::FOR_UPDATE;
-use ledger_db::sql;
+use ledger_db::store::{self, Sql, params};
+use ledger_db::{
+    Database,
+    sql::{in_integers, json_array},
+};
 use serde_json::{Value, json};
-use sqlx::FromRow;
 use std::collections::{HashMap, HashSet};
 
 const INVALID_LINK_ID: &str = "Invalid linked account id";
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// `effectiveDateSql` for the transaction alias `t`.
-pub(crate) const EFFECTIVE_DATE: &str = sql::EFFECTIVE_DATE;
+pub(crate) use ledger_db::sql::EFFECTIVE_DATE;
 
 /// A reconciliation failure. Each route maps these to its own responses.
 pub(crate) enum ReconcileError {
@@ -43,15 +47,15 @@ pub(crate) enum ReconcileError {
     NotFound(&'static str),
     /// `ReconcileValidationError`: 400 with the message.
     Invalid(String),
-    /// Any other error: the route's 500.
-    Failed(sqlx::Error),
+    /// Any other error: the route's 500. The cause goes to the log only.
+    Failed(String),
     /// An error whose message Node repeats in its 500 response.
     Message(&'static str),
 }
 
-impl From<sqlx::Error> for ReconcileError {
-    fn from(cause: sqlx::Error) -> Self {
-        Self::Failed(cause)
+impl From<store::Error> for ReconcileError {
+    fn from(cause: store::Error) -> Self {
+        Self::Failed(cause.to_string())
     }
 }
 
@@ -82,20 +86,17 @@ pub(crate) struct Link {
 }
 
 /// `getReconcilableLink`.
-pub(crate) async fn reconcilable_link<'e, E: DbExecutor<'e>>(
-    pool: E,
+pub(crate) fn reconcilable_link(
+    sql: &impl Sql,
     book_id: i32,
     link_id: i32,
 ) -> Result<Link, ReconcileError> {
-    let row: Option<(i32, i32, String)> = sqlx::query_as(
+    let row: Option<(i32, i32, String)> = sql.query_optional(
         "SELECT pa.id, pa.counterpoise_account_id, a.type
          FROM plaid_accounts pa JOIN accounts a ON pa.counterpoise_account_id = a.id
-         WHERE pa.id = $1 AND pa.book_id = $2 AND a.book_id = $2 LIMIT 1",
-    )
-    .bind(link_id)
-    .bind(book_id)
-    .fetch_optional(pool)
-    .await?;
+         WHERE pa.id = ?1 AND pa.book_id = ?2 AND a.book_id = ?2 LIMIT 1",
+        &params![link_id, book_id],
+    )?;
     let (link_id, account_id, kind) =
         row.ok_or(ReconcileError::NotFound("Linked sync account not found"))?;
     if kind != "asset" && kind != "liability" {
@@ -114,7 +115,7 @@ const ROW_COLUMNS: &str = "r.id, r.book_id, r.plaid_account_link_id, r.plaid_tra
     r.resolution_status, r.review_reason, r.matched_transaction_id, r.pending, r.first_seen_at,
     r.last_seen_at";
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 pub(crate) struct ReconRow {
     pub(crate) id: i32,
     pub(crate) book_id: i32,
@@ -146,23 +147,21 @@ impl ReconRow {
 }
 
 /// `loadReconciliationRow`: the row with this ID on this link in this book.
-pub(crate) async fn load_row(
-    connection: &mut DbConnection,
+pub(crate) fn load_row(
+    sql: &impl Sql,
     link_id: i32,
     reconciliation_id: i32,
     book_id: i32,
     for_update: bool,
-) -> Result<Option<ReconRow>, sqlx::Error> {
+) -> Result<Option<ReconRow>, store::Error> {
     let lock = if for_update { FOR_UPDATE } else { "" };
-    sqlx::query_as(&format!(
-        "SELECT {ROW_COLUMNS} FROM plaid_transaction_reconciliation r
-         WHERE r.id = $1 AND r.plaid_account_link_id = $2 AND r.book_id = $3 LIMIT 1{lock}"
-    ))
-    .bind(reconciliation_id)
-    .bind(link_id)
-    .bind(book_id)
-    .fetch_optional(&mut *connection)
-    .await
+    sql.query_optional(
+        &format!(
+            "SELECT {ROW_COLUMNS} FROM plaid_transaction_reconciliation r
+         WHERE r.id = ?1 AND r.plaid_account_link_id = ?2 AND r.book_id = ?3 LIMIT 1{lock}"
+        ),
+        &params![reconciliation_id, link_id, book_id],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +241,7 @@ fn score(
     (score, tags)
 }
 
-#[derive(FromRow)]
+#[derive(ledger_db::store::FromRow)]
 struct CandidateRow {
     transaction_id: i32,
     date: String,
@@ -254,8 +253,8 @@ struct CandidateRow {
 
 /// `findMatchCandidates`: the five best transactions on the mapped account
 /// within seven days of the bank date.
-pub(crate) async fn match_candidates(
-    connection: &mut DbConnection,
+pub(crate) fn match_candidates(
+    sql: &impl Sql,
     row: &ReconRow,
     mapped_account_id: i32,
 ) -> Result<Vec<Value>, ReconcileError> {
@@ -265,21 +264,19 @@ pub(crate) async fn match_candidates(
     let end = add_days(bank_date, 7)?;
     // No book filter here, as in Node: the mapped account is in this book.
     // The detail query below filters the book.
-    let rows: Vec<CandidateRow> = sqlx::query_as(&format!(
-        "SELECT t.id AS transaction_id, {EFFECTIVE_DATE} AS date, t.description,
+    let rows: Vec<CandidateRow> = sql.query(
+        &format!(
+            "SELECT t.id AS transaction_id, {EFFECTIVE_DATE} AS date, t.description,
                 p.name AS payee_name, t.check_number, s.amount AS linked_split_amount
          FROM transaction_splits s
          JOIN transactions t ON s.transaction_id = t.id
          LEFT JOIN payees p ON t.payee_id = p.id
-         WHERE s.account_id = $1 AND {EFFECTIVE_DATE} >= $2 AND {EFFECTIVE_DATE} <= $3
+         WHERE s.account_id = ?1 AND {EFFECTIVE_DATE} >= ?2 AND {EFFECTIVE_DATE} <= ?3
          ORDER BY {EFFECTIVE_DATE} DESC, t.id DESC
          LIMIT 200"
-    ))
-    .bind(mapped_account_id)
-    .bind(&start)
-    .bind(&end)
-    .fetch_all(&mut *connection)
-    .await?;
+        ),
+        &params![mapped_account_id, &start, &end],
+    )?;
     let mut seen = HashSet::new();
     let rows: Vec<CandidateRow> = rows
         .into_iter()
@@ -289,19 +286,18 @@ pub(crate) async fn match_candidates(
         return Ok(Vec::new());
     }
     let ids: Vec<i32> = rows.iter().map(|row| row.transaction_id).collect();
-    let splits: Vec<(i32, i32, String)> = sqlx::query_as(&format!(
-        "SELECT s.transaction_id, s.account_id, a.name
+    let splits: Vec<(i32, i32, String)> = sql.query(
+        &format!(
+            "SELECT s.transaction_id, s.account_id, a.name
          FROM transaction_splits s
          JOIN transactions t ON t.id = s.transaction_id
          JOIN accounts a ON a.id = s.account_id
-         WHERE t.book_id = $1 AND t.id {in2}
+         WHERE t.book_id = ?1 AND t.id {in2}
          ORDER BY s.id",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(row.book_id)
-    .bind(sql::json_array(&ids))
-    .fetch_all(&mut *connection)
-    .await?;
+            in2 = in_integers("?2")
+        ),
+        &params![row.book_id, json_array(&ids)],
+    )?;
     let mut details: HashMap<i32, Vec<(i32, String)>> = HashMap::new();
     for (transaction_id, account_id, name) in splits {
         details
@@ -309,19 +305,18 @@ pub(crate) async fn match_candidates(
             .or_default()
             .push((account_id, name));
     }
-    let linked: HashSet<i32> = sqlx::query_scalar::<_, i32>(&format!(
-        "SELECT matched_transaction_id FROM plaid_transaction_reconciliation
-         WHERE plaid_account_link_id = $1 AND matched_transaction_id IS NOT NULL
-           AND matched_transaction_id {in2} AND id <> $3",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(row.plaid_account_link_id)
-    .bind(sql::json_array(&ids))
-    .bind(row.id)
-    .fetch_all(&mut *connection)
-    .await?
-    .into_iter()
-    .collect();
+    let linked: HashSet<i32> = sql
+        .query::<i32>(
+            &format!(
+                "SELECT matched_transaction_id FROM plaid_transaction_reconciliation
+         WHERE plaid_account_link_id = ?1 AND matched_transaction_id IS NOT NULL
+           AND matched_transaction_id {in2} AND id <> ?3",
+                in2 = in_integers("?2")
+            ),
+            &params![row.plaid_account_link_id, json_array(&ids), row.id],
+        )?
+        .into_iter()
+        .collect();
 
     let target = row.merchant();
     let mut candidates: Vec<(i64, i64, i64, Value)> = Vec::new();
@@ -378,47 +373,39 @@ pub(crate) async fn match_candidates(
 
 /// `suggestCounterAccountId`: the counter account from the history of the
 /// payee that has the bank's merchant name.
-pub(crate) async fn suggest_counter_account(
-    connection: &mut DbConnection,
+pub(crate) fn suggest_counter_account(
+    sql: &impl Sql,
     row: &ReconRow,
     mapped_account_id: i32,
     book_id: i32,
-) -> Result<Option<i32>, sqlx::Error> {
+) -> Result<Option<i32>, store::Error> {
     let source = normalize_name(row.merchant());
     if source.is_empty() {
         return Ok(None);
     }
-    let payee_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM payees WHERE book_id = $1 AND lower(name) = $2 LIMIT 1")
-            .bind(book_id)
-            .bind(source.to_lowercase())
-            .fetch_optional(&mut *connection)
-            .await?;
+    let payee_id = find_payee_by_name(sql, book_id, &source)?;
     let Some(payee_id) = payee_id else {
         return Ok(None);
     };
-    let transaction_ids: Vec<i32> = sqlx::query_scalar(&format!(
-        "SELECT t.id FROM transactions t WHERE t.book_id = $1 AND t.payee_id = $2
+    let transaction_ids: Vec<i32> = sql.query(
+        &format!(
+            "SELECT t.id FROM transactions t WHERE t.book_id = ?1 AND t.payee_id = ?2
          ORDER BY {EFFECTIVE_DATE} DESC, t.id DESC LIMIT 25"
-    ))
-    .bind(book_id)
-    .bind(payee_id)
-    .fetch_all(&mut *connection)
-    .await?;
+        ),
+        &params![book_id, payee_id],
+    )?;
     if transaction_ids.is_empty() {
         return Ok(None);
     }
-    let counterparts: Vec<(i32, i32)> = sqlx::query_as(&format!(
-        "SELECT account_id, amount FROM transaction_splits
-         WHERE book_id = $1 AND transaction_id {in2} AND account_id <> $3
+    let counterparts: Vec<(i32, i32)> = sql.query(
+        &format!(
+            "SELECT account_id, amount FROM transaction_splits
+         WHERE book_id = ?1 AND transaction_id {in2} AND account_id <> ?3
          ORDER BY transaction_id DESC, id",
-        in2 = sql::in_integers("$2")
-    ))
-    .bind(book_id)
-    .bind(sql::json_array(&transaction_ids))
-    .bind(mapped_account_id)
-    .fetch_all(&mut *connection)
-    .await?;
+            in2 = in_integers("?2")
+        ),
+        &params![book_id, json_array(&transaction_ids), mapped_account_id],
+    )?;
     if let Some((account_id, _)) = counterparts
         .iter()
         .find(|(_, amount)| *amount == row.amount_cents)
@@ -443,14 +430,14 @@ pub(crate) async fn suggest_counter_account(
 }
 
 /// `loadReconciliationItem`: the row with its candidates and suggestion.
-pub(crate) async fn load_item(
-    connection: &mut DbConnection,
+pub(crate) fn load_item(
+    sql: &impl Sql,
     row: &ReconRow,
     mapped_account_id: i32,
     book_id: i32,
 ) -> Result<Value, ReconcileError> {
-    let candidates = match_candidates(connection, row, mapped_account_id).await?;
-    let suggested = suggest_counter_account(connection, row, mapped_account_id, book_id).await?;
+    let candidates = match_candidates(sql, row, mapped_account_id)?;
+    let suggested = suggest_counter_account(sql, row, mapped_account_id, book_id)?;
     Ok(json!({
         "id": row.id,
         "plaidAccountLinkId": row.plaid_account_link_id,
@@ -522,35 +509,30 @@ pub(crate) async fn link_queue(
     let link_id = finite_path_id(&raw_id, INVALID_LINK_ID)?;
     let (limit, offset) = page_query(&first_query_values(raw_query.as_deref()));
     let link_id = database_id(link_id, FAILURE)?;
-    let result: Result<Value, ReconcileError> = async {
-        let link = reconcilable_link(&state.pool, book.book_id(), link_id).await?;
-        let mut connection = state.pool.acquire().await?;
-        let queue = "r.plaid_account_link_id = $1
+    let result: Result<Value, ReconcileError> = (|| {
+        let sql = &*state.database;
+        let link = reconcilable_link(sql, book.book_id(), link_id)?;
+        let queue = "r.plaid_account_link_id = ?1
                      AND (r.resolution_status = 'pending' OR r.review_reason IS NOT NULL)";
-        let rows: Vec<ReconRow> = sqlx::query_as(&format!(
-            "SELECT {ROW_COLUMNS} FROM plaid_transaction_reconciliation r WHERE {queue}
+        let rows: Vec<ReconRow> = sql.query(
+            &format!(
+                "SELECT {ROW_COLUMNS} FROM plaid_transaction_reconciliation r WHERE {queue}
              ORDER BY CASE WHEN r.review_reason IS NOT NULL THEN 1 ELSE 0 END DESC,
                       r.last_seen_at DESC, r.id DESC
-             LIMIT COALESCE($2, -1) OFFSET COALESCE($3, 0)"
-        ))
-        .bind(link.link_id)
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&mut *connection)
-        .await?;
-        let total: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM plaid_transaction_reconciliation r WHERE {queue}"
-        ))
-        .bind(link.link_id)
-        .fetch_one(&mut *connection)
-        .await?;
+             LIMIT COALESCE(?2, -1) OFFSET COALESCE(?3, 0)"
+            ),
+            &params![link.link_id, limit as i64, offset as i64],
+        )?;
+        let total: i64 = sql.query_row(
+            &format!("SELECT COUNT(*) FROM plaid_transaction_reconciliation r WHERE {queue}"),
+            &params![link.link_id],
+        )?;
         let mut items = Vec::with_capacity(rows.len());
         for row in &rows {
-            items.push(load_item(&mut connection, row, link.account_id, book.book_id()).await?);
+            items.push(load_item(sql, row, link.account_id, book.book_id())?);
         }
         Ok(page(items, total, offset, limit))
-    }
-    .await;
+    })();
     result.map(Json).map_err(|cause| cause.into_api(FAILURE))
 }
 
@@ -580,48 +562,41 @@ pub(crate) async fn book_queue(
     let link_id = link_id
         .map(|link_id| database_id(link_id, FAILURE))
         .transpose()?;
-    let result: Result<Value, ReconcileError> = async {
-        if let Some(link_id) = link_id {
-            reconcilable_link(&state.pool, book.book_id(), link_id).await?;
-        }
-        let mut connection = state.pool.acquire().await?;
-        let queue = "r.book_id = $1 AND pa.book_id = $1 AND a.book_id = $1
+    let result: Result<Value, ReconcileError> =
+        (|| {
+            let sql = &*state.database;
+            if let Some(link_id) = link_id {
+                reconcilable_link(sql, book.book_id(), link_id)?;
+            }
+            let queue = "r.book_id = ?1 AND pa.book_id = ?1 AND a.book_id = ?1
                      AND a.type IN ('asset', 'liability')
-                     AND ($2 IS NULL OR pa.id = $2)
+                     AND (?2 IS NULL OR pa.id = ?2)
                      AND (r.resolution_status = 'pending' OR r.review_reason IS NOT NULL)";
-        let joins = "FROM plaid_transaction_reconciliation r
+            let joins = "FROM plaid_transaction_reconciliation r
                      JOIN plaid_accounts pa ON r.plaid_account_link_id = pa.id
                      JOIN accounts a ON pa.counterpoise_account_id = a.id";
-        let rows: Vec<(i32, i32)> = sqlx::query_as(&format!(
-            "SELECT r.id, a.id {joins} WHERE {queue}
+            let rows: Vec<(i32, i32)> = sql.query(
+                &format!(
+                    "SELECT r.id, a.id {joins} WHERE {queue}
              ORDER BY CASE WHEN r.review_reason IS NOT NULL THEN 1 ELSE 0 END DESC,
                       COALESCE(r.authorized_date, r.date) DESC, r.id DESC
-             LIMIT COALESCE($3, -1) OFFSET COALESCE($4, 0)"
-        ))
-        .bind(book.book_id())
-        .bind(link_id)
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&mut *connection)
-        .await?;
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {joins} WHERE {queue}"))
-            .bind(book.book_id())
-            .bind(link_id)
-            .fetch_one(&mut *connection)
-            .await?;
-        let mut items = Vec::with_capacity(rows.len());
-        for (id, mapped_account_id) in rows {
-            let row: ReconRow = sqlx::query_as(&format!(
-                "SELECT {ROW_COLUMNS} FROM plaid_transaction_reconciliation r WHERE r.id = $1"
-            ))
-            .bind(id)
-            .fetch_one(&mut *connection)
-            .await?;
-            items.push(load_item(&mut connection, &row, mapped_account_id, book.book_id()).await?);
-        }
-        Ok(page(items, total, offset, limit))
-    }
-    .await;
+             LIMIT COALESCE(?3, -1) OFFSET COALESCE(?4, 0)"
+                ),
+                &params![book.book_id(), link_id, limit as i64, offset as i64],
+            )?;
+            let total: i64 = sql.query_row(
+                &format!("SELECT COUNT(*) {joins} WHERE {queue}"),
+                &params![book.book_id(), link_id],
+            )?;
+            let mut items = Vec::with_capacity(rows.len());
+            for (id, mapped_account_id) in rows {
+                let row: ReconRow = sql.query_row(&format!(
+                "SELECT {ROW_COLUMNS} FROM plaid_transaction_reconciliation r WHERE r.id = ?1"
+            ), &params![id])?;
+                items.push(load_item(sql, &row, mapped_account_id, book.book_id())?);
+            }
+            Ok(page(items, total, offset, limit))
+        })();
     // Node answers every unexpected error on this route with its own message.
     result.map(Json).map_err(|cause| match cause {
         ReconcileError::Message(_) => error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE),
@@ -752,32 +727,25 @@ fn validate_reconcile(body: &Value) -> Result<ReconcileInput, ApiError> {
 /// payee. The insert has no conflict clause, as in the former TypeScript
 /// resolver. If the match misses a payee with the same name, the insert fails
 /// on the unique index and the decision rolls back.
-async fn resolve_payee(
-    connection: &mut DbConnection,
-    book_id: i32,
+fn resolve_payee(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     payee_name: &str,
-) -> Result<Option<i32>, sqlx::Error> {
+) -> Result<Option<i32>, store::Error> {
+    let book_id = access.book_id();
     let name = normalize_name(payee_name);
     if name.is_empty() {
         return Ok(None);
     }
-    let existing: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM payees WHERE book_id = $1 AND lower(name) = $2 LIMIT 1")
-            .bind(book_id)
-            .bind(name.to_lowercase())
-            .fetch_optional(&mut *connection)
-            .await?;
+    let existing = find_payee_by_name(sql, book_id, &name)?;
     if existing.is_some() {
         return Ok(existing);
     }
-    sqlx::query_scalar(
-        "INSERT INTO payees (name, book_id, created_at) VALUES ($1, $2, $3) RETURNING id",
+    sql.query_optional(
+        "INSERT INTO payees (name, book_id, created_at, name_fold) VALUES (?1, ?2, ?3, ?4)
+         RETURNING id",
+        &params![&name, book_id, now_millis(), ledger_db::folds::fold(&name)],
     )
-    .bind(&name)
-    .bind(book_id)
-    .bind(now_millis())
-    .fetch_optional(&mut *connection)
-    .await
 }
 
 /// An ID from the body as Node binds it to an integer column: PostgreSQL
@@ -793,82 +761,117 @@ fn body_id(value: f64) -> Result<i32, ReconcileError> {
 /// `markMatchedTransaction`: reconciled, and settled when it is floating. A
 /// floating transaction's stored date is its entry date, so it gets the
 /// matched date in the same write. Another transaction keeps its date.
-async fn mark_matched(
-    connection: &mut DbConnection,
-    book_id: i32,
+fn mark_matched(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     transaction_id: i32,
     row: &ReconRow,
     now: NaiveDateTime,
     actor: i32,
 ) -> Result<(), ReconcileError> {
-    let floating: Option<bool> = sqlx::query_scalar(
-        "SELECT is_floating FROM transactions WHERE id = $1 AND book_id = $2 LIMIT 1",
-    )
-    .bind(transaction_id)
-    .bind(book_id)
-    .fetch_optional(&mut *connection)
-    .await?;
+    let book_id = access.book_id();
+    let floating: Option<bool> = sql.query_optional(
+        "SELECT is_floating FROM transactions WHERE id = ?1 AND book_id = ?2 LIMIT 1",
+        &params![transaction_id, book_id],
+    )?;
     let settle = floating == Some(true);
-    let updated: Option<i32> = sqlx::query_scalar(
-        "UPDATE transactions SET is_reconciled = true, updated_at = $3, updated_by = $4,
-                is_floating = CASE WHEN $5 THEN false ELSE is_floating END,
-                date = CASE WHEN $5 THEN $6 ELSE date END
-         WHERE id = $1 AND book_id = $2 RETURNING id",
-    )
-    .bind(transaction_id)
-    .bind(book_id)
-    .bind(now)
-    .bind(actor)
-    .bind(settle)
-    .bind(pick_matched_date(row.authorized_date.as_deref(), &row.date))
-    .fetch_optional(&mut *connection)
-    .await?;
+    let updated: Option<i32> = sql.query_optional(
+        "UPDATE transactions SET is_reconciled = true, updated_at = ?3, updated_by = ?4,
+                is_floating = CASE WHEN ?5 THEN false ELSE is_floating END,
+                date = CASE WHEN ?5 THEN ?6 ELSE date END
+         WHERE id = ?1 AND book_id = ?2 RETURNING id",
+        &params![
+            transaction_id,
+            book_id,
+            now,
+            actor,
+            settle,
+            pick_matched_date(row.authorized_date.as_deref(), &row.date)
+        ],
+    )?;
     updated
         .map(|_| ())
         .ok_or(ReconcileError::NotFound("Transaction not found"))
 }
 
 /// Sets the resolution of the row, and clears its review flag.
-async fn resolve_row(
-    connection: &mut DbConnection,
+fn resolve_row(
+    sql: &impl Sql,
     row: &ReconRow,
     status: &str,
     matched_transaction_id: Option<i32>,
     now: NaiveDateTime,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<(), store::Error> {
+    sql.execute(
         "UPDATE plaid_transaction_reconciliation
-         SET resolution_status = $3, matched_transaction_id = $4, review_reason = NULL,
-             review_metadata_json = NULL, resolved_at = $5, updated_at = $5
-         WHERE id = $1 AND book_id = $2",
-    )
-    .bind(row.id)
-    .bind(row.book_id)
-    .bind(status)
-    .bind(matched_transaction_id)
-    .bind(now)
-    .execute(&mut *connection)
-    .await?;
+         SET resolution_status = ?3, matched_transaction_id = ?4, review_reason = NULL,
+             review_metadata_json = NULL, resolved_at = ?5, updated_at = ?5
+         WHERE id = ?1 AND book_id = ?2",
+        &params![row.id, row.book_id, status, matched_transaction_id, now],
+    )?;
     Ok(())
 }
 
 /// Another staged row on this link is already matched to the transaction.
-async fn linked_elsewhere(
-    connection: &mut DbConnection,
+fn linked_elsewhere(
+    sql: &impl Sql,
     link: Link,
     transaction_id: i32,
     row: &ReconRow,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
+) -> Result<bool, store::Error> {
+    sql.query_row(
         "SELECT EXISTS (SELECT 1 FROM plaid_transaction_reconciliation
-                        WHERE plaid_account_link_id = $1 AND matched_transaction_id = $2
-                          AND id <> $3)",
+                        WHERE plaid_account_link_id = ?1 AND matched_transaction_id = ?2
+                          AND id <> ?3)",
+        &params![link.link_id, transaction_id, row.id],
     )
-    .bind(link.link_id)
-    .bind(transaction_id)
-    .bind(row.id)
-    .fetch_one(&mut *connection)
-    .await
+}
+
+/// The row no longer links `previous`. A transfer is matched on both of its
+/// links, so its reconciled flag is cleared only when no other staged row
+/// still matches it.
+fn release_previous(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
+    previous: i32,
+    row: &ReconRow,
+    now: NaiveDateTime,
+    actor: i32,
+) -> Result<(), store::Error> {
+    let book_id = access.book_id();
+    let still_linked: bool = sql.query_row(
+        "SELECT EXISTS (SELECT 1 FROM plaid_transaction_reconciliation
+                        WHERE matched_transaction_id = ?1 AND book_id = ?2
+                          AND id <> ?3)",
+        &params![previous, book_id, row.id],
+    )?;
+    if !still_linked {
+        sql.execute(
+            "UPDATE transactions SET is_reconciled = false, updated_at = ?3,
+                    updated_by = ?4
+             WHERE id = ?1 AND book_id = ?2",
+            &params![previous, book_id, now, actor],
+        )?;
+    }
+    Ok(())
+}
+
+/// A row flagged for review can be linked again. When the new link is to a
+/// different transaction, the old one is released as by `unlink`.
+fn relink(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
+    row: &ReconRow,
+    transaction_id: i32,
+    now: NaiveDateTime,
+    actor: i32,
+) -> Result<(), store::Error> {
+    match row.matched_transaction_id {
+        Some(previous) if previous != transaction_id => {
+            release_previous(sql, access, previous, row, now, actor)
+        }
+        _ => Ok(()),
+    }
 }
 
 const NOT_ON_LINKED_ACCOUNT: &str = "Selected transaction does not include the linked account";
@@ -876,17 +879,17 @@ const LINKED_ELSEWHERE: &str =
     "This transaction is already linked to a different Plaid transaction for the same account";
 
 /// The decision inside its database transaction. Returns the row ID.
-pub(crate) async fn apply(
-    connection: &mut DbConnection,
-    book_id: i32,
+pub(crate) fn apply(
+    sql: &impl Sql,
+    access: &BookAccess<'_, Write>,
     link: Link,
     input: &ReconcileInput,
     actor: i32,
     now: NaiveDateTime,
 ) -> Result<i32, ReconcileError> {
+    let book_id = access.book_id();
     let reconciliation_id = body_id(input.reconciliation_id)?;
-    let row = load_row(connection, link.link_id, reconciliation_id, book_id, true)
-        .await?
+    let row = load_row(sql, link.link_id, reconciliation_id, book_id, true)?
         .ok_or(ReconcileError::NotFound("Reconciliation row not found"))?;
     // A linked bank row cannot be linked again, unless Plaid has changed it
     // since and it is flagged for review.
@@ -913,34 +916,28 @@ pub(crate) async fn apply(
     match input.action {
         Action::Match => {
             let transaction_id = body_id(input.transaction().map_err(invalid)?)?;
-            let on_account: bool = sqlx::query_scalar(
+            let on_account: bool = sql.query_row(
                 "SELECT EXISTS (SELECT 1 FROM transaction_splits
-                                WHERE transaction_id = $1 AND account_id = $2 AND book_id = $3)",
-            )
-            .bind(transaction_id)
-            .bind(link.account_id)
-            .bind(book_id)
-            .fetch_one(&mut *connection)
-            .await?;
+                                WHERE transaction_id = ?1 AND account_id = ?2 AND book_id = ?3)",
+                &params![transaction_id, link.account_id, book_id],
+            )?;
             if !on_account {
                 return Err(invalid(NOT_ON_LINKED_ACCOUNT));
             }
-            if linked_elsewhere(connection, link, transaction_id, &row).await? {
+            if linked_elsewhere(sql, link, transaction_id, &row)? {
                 return Err(invalid(LINKED_ELSEWHERE));
             }
-            mark_matched(connection, book_id, transaction_id, &row, now, actor).await?;
-            resolve_row(connection, &row, "matched", Some(transaction_id), now).await?;
+            mark_matched(sql, access, transaction_id, &row, now, actor)?;
+            relink(sql, access, &row, transaction_id, now, actor)?;
+            resolve_row(sql, &row, "matched", Some(transaction_id), now)?;
         }
         Action::MatchUpdateAmount => {
             let transaction_id = body_id(input.transaction().map_err(invalid)?)?;
-            let splits: Vec<(i32, i32)> = sqlx::query_as(
+            let splits: Vec<(i32, i32)> = sql.query(
                 "SELECT id, account_id FROM transaction_splits
-                 WHERE transaction_id = $1 AND book_id = $2 ORDER BY id",
-            )
-            .bind(transaction_id)
-            .bind(book_id)
-            .fetch_all(&mut *connection)
-            .await?;
+                 WHERE transaction_id = ?1 AND book_id = ?2 ORDER BY id",
+                &params![transaction_id, book_id],
+            )?;
             if !splits
                 .iter()
                 .any(|(_, account)| *account == link.account_id)
@@ -952,20 +949,17 @@ pub(crate) async fn apply(
                     "Amount update is only supported for transactions with exactly 2 splits",
                 ));
             }
-            let investment: bool = sqlx::query_scalar(
+            let investment: bool = sql.query_row(
                 "SELECT EXISTS (SELECT 1 FROM investment_splits
-                                WHERE transaction_id = $1 AND book_id = $2)",
-            )
-            .bind(transaction_id)
-            .bind(book_id)
-            .fetch_one(&mut *connection)
-            .await?;
+                                WHERE transaction_id = ?1 AND book_id = ?2)",
+                &params![transaction_id, book_id],
+            )?;
             if investment {
                 return Err(invalid(
                     "Amount update is not supported for investment transactions",
                 ));
             }
-            if linked_elsewhere(connection, link, transaction_id, &row).await? {
+            if linked_elsewhere(sql, link, transaction_id, &row)? {
                 return Err(invalid(LINKED_ELSEWHERE));
             }
             let linked = splits
@@ -979,17 +973,14 @@ pub(crate) async fn apply(
                     invalid("Transaction has no counterpart split on a different account")
                 })?;
             for (split_id, split_amount) in [(linked.0, -amount), (counter.0, amount)] {
-                sqlx::query(
-                    "UPDATE transaction_splits SET amount = $3 WHERE id = $1 AND book_id = $2",
-                )
-                .bind(split_id)
-                .bind(book_id)
-                .bind(split_amount)
-                .execute(&mut *connection)
-                .await?;
+                sql.execute(
+                    "UPDATE transaction_splits SET amount = ?3 WHERE id = ?1 AND book_id = ?2",
+                    &params![split_id, book_id, split_amount],
+                )?;
             }
-            mark_matched(connection, book_id, transaction_id, &row, now, actor).await?;
-            resolve_row(connection, &row, "matched", Some(transaction_id), now).await?;
+            mark_matched(sql, access, transaction_id, &row, now, actor)?;
+            relink(sql, access, &row, transaction_id, now, actor)?;
+            resolve_row(sql, &row, "matched", Some(transaction_id), now)?;
         }
         Action::Create => {
             let counter_account_id = input.counter_account().map_err(invalid)?;
@@ -999,13 +990,10 @@ pub(crate) async fn apply(
                 ));
             }
             let counter_account_id = body_id(counter_account_id)?;
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1 AND book_id = $2)",
-            )
-            .bind(counter_account_id)
-            .bind(book_id)
-            .fetch_one(&mut *connection)
-            .await?;
+            let exists: bool = sql.query_row(
+                "SELECT EXISTS (SELECT 1 FROM accounts WHERE id = ?1 AND book_id = ?2)",
+                &params![counter_account_id, book_id],
+            )?;
             if !exists {
                 return Err(invalid("Counter account not found"));
             }
@@ -1013,89 +1001,60 @@ pub(crate) async fn apply(
                 Some(Value::String(name)) => name.clone(),
                 _ => row.merchant().to_owned(),
             };
-            let payee_id = resolve_payee(connection, book_id, &payee_source).await?;
-            let transaction_id: i32 = sqlx::query_scalar(
+            let payee_id = resolve_payee(sql, access, &payee_source)?;
+            let transaction_id: i32 = sql.query_row(
                 "INSERT INTO transactions (date, description, payee_id, is_reconciled, updated_at,
-                                           book_id, created_by, updated_by, created_at)
-                 VALUES ($1, $2, $3, true, $4, $5, $6, $6, $7) RETURNING id",
-            )
-            .bind(row.bank_date())
-            .bind(&row.name)
-            .bind(payee_id)
-            .bind(now)
-            .bind(book_id)
-            .bind(actor)
-            .bind(now_millis())
-            .fetch_one(&mut *connection)
-            .await?;
-            sqlx::query(
+                                           book_id, created_by, updated_by, created_at,
+                                           description_fold)
+                 VALUES (?1, ?2, ?3, true, ?4, ?5, ?6, ?6, ?7, ?8) RETURNING id",
+                &params![
+                    row.bank_date(),
+                    &row.name,
+                    payee_id,
+                    now,
+                    book_id,
+                    actor,
+                    now_millis(),
+                    ledger_db::folds::fold(&row.name)
+                ],
+            )?;
+            sql.execute(
                 "INSERT INTO transaction_splits (transaction_id, account_id, amount, book_id)
-                 VALUES ($1, $2, $3, $5), ($1, $4, $6, $5)",
-            )
-            .bind(transaction_id)
-            .bind(link.account_id)
-            .bind(-amount)
-            .bind(counter_account_id)
-            .bind(book_id)
-            .bind(amount)
-            .execute(&mut *connection)
-            .await?;
-            resolve_row(connection, &row, "created", Some(transaction_id), now).await?;
+                 VALUES (?1, ?2, ?3, ?5), (?1, ?4, ?6, ?5)",
+                &params![
+                    transaction_id,
+                    link.account_id,
+                    -amount,
+                    counter_account_id,
+                    book_id,
+                    amount
+                ],
+            )?;
+            relink(sql, access, &row, transaction_id, now, actor)?;
+            resolve_row(sql, &row, "created", Some(transaction_id), now)?;
         }
         Action::Ignore => {
-            resolve_row(connection, &row, "ignored", None, now).await?;
+            resolve_row(sql, &row, "ignored", None, now)?;
         }
         Action::KeepLocal => {
-            sqlx::query(
+            sql.execute(
                 "UPDATE plaid_transaction_reconciliation
-                 SET review_reason = NULL, review_metadata_json = NULL, updated_at = $3
-                 WHERE id = $1 AND book_id = $2",
-            )
-            .bind(row.id)
-            .bind(book_id)
-            .bind(now)
-            .execute(&mut *connection)
-            .await?;
+                 SET review_reason = NULL, review_metadata_json = NULL, updated_at = ?3
+                 WHERE id = ?1 AND book_id = ?2",
+                &params![row.id, book_id, now],
+            )?;
         }
         Action::Unlink => {
-            sqlx::query(
+            sql.execute(
                 "UPDATE plaid_transaction_reconciliation
                  SET resolution_status = 'pending', matched_transaction_id = NULL,
                      review_reason = NULL, review_metadata_json = NULL, resolved_at = NULL,
-                     updated_at = $3
-                 WHERE id = $1 AND book_id = $2",
-            )
-            .bind(row.id)
-            .bind(book_id)
-            .bind(now)
-            .execute(&mut *connection)
-            .await?;
-            // A transfer is matched on both of its links. Its reconciled flag
-            // is cleared only when no other staged row still matches it.
+                     updated_at = ?3
+                 WHERE id = ?1 AND book_id = ?2",
+                &params![row.id, book_id, now],
+            )?;
             if let Some(previous) = row.matched_transaction_id {
-                let still_linked: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM plaid_transaction_reconciliation
-                                    WHERE matched_transaction_id = $1 AND book_id = $2
-                                      AND id <> $3)",
-                )
-                .bind(previous)
-                .bind(book_id)
-                .bind(row.id)
-                .fetch_one(&mut *connection)
-                .await?;
-                if !still_linked {
-                    sqlx::query(
-                        "UPDATE transactions SET is_reconciled = false, updated_at = $3,
-                                updated_by = $4
-                         WHERE id = $1 AND book_id = $2",
-                    )
-                    .bind(previous)
-                    .bind(book_id)
-                    .bind(now)
-                    .bind(actor)
-                    .execute(&mut *connection)
-                    .await?;
-                }
+                release_previous(sql, access, previous, &row, now, actor)?;
             }
         }
     }
@@ -1104,32 +1063,19 @@ pub(crate) async fn apply(
 
 /// `resolveReconciliation`: applies one decision and returns the row as it
 /// now stands, with its candidates.
-pub(crate) async fn resolve(
-    pool: &DbPool,
-    book_id: i32,
+pub(crate) fn resolve(
+    database: &Database,
+    access: &BookAccess<'_, Write>,
     link: Link,
     input: &ReconcileInput,
     actor: i32,
 ) -> Result<Value, ReconcileError> {
+    let book_id = access.book_id();
     let now = now_millis();
-    let mut transaction = ledger_db::locks::begin_pool(pool).await?;
-    let row_id = match apply(transaction.as_mut(), book_id, link, input, actor, now).await {
-        Ok(row_id) => {
-            transaction.commit().await?;
-            row_id
-        }
-        Err(cause) => {
-            if let Err(rollback) = transaction.rollback().await {
-                tracing::error!(error = %rollback, "Reconciliation rollback failed");
-            }
-            return Err(cause);
-        }
-    };
-    let mut connection = pool.acquire().await?;
-    let row = load_row(&mut connection, link.link_id, row_id, book_id, false)
-        .await?
+    let row_id = database.transaction(|tx| apply(tx, access, link, input, actor, now))?;
+    let row = load_row(database, link.link_id, row_id, book_id, false)?
         .ok_or(ReconcileError::NotFound("Updated row not found"))?;
-    load_item(&mut connection, &row, link.account_id, book_id).await
+    load_item(database, &row, link.account_id, book_id)
 }
 
 /// POST `sync/accounts/[id]/reconcile`. The link is checked before the body
@@ -1142,27 +1088,25 @@ pub(crate) async fn resolve_route(
     body: Bytes,
 ) -> ApiResult {
     const FAILURE: &str = "Failed to resolve reconciliation";
-    let action_started_at = Utc::now().naive_utc();
+    let action_started_at = platform::timestamp();
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
+    let access = book.write()?;
     let link_id = database_id(finite_path_id(&raw_id, INVALID_LINK_ID)?, FAILURE)?;
-    let link = reconcilable_link(&state.pool, book.book_id(), link_id)
-        .await
+    let link = reconcilable_link(&state.database, book.book_id(), link_id)
         .map_err(|cause| cause.into_api(FAILURE))?;
     let body = parse_json_body(&body, FAILURE)?;
     let input = validate_reconcile(&body)?;
-    let item = resolve(&state.pool, book.book_id(), link, &input, book.user_id())
-        .await
+    let item = resolve(&state.database, &access, link, &input, book.user_id())
         .map_err(|cause| cause.into_api(FAILURE))?;
     let observation = Observation::parse(body.get("typesafe"));
     record_decision(
-        &state.pool,
-        book.book_id(),
+        &state.database,
+        &access,
         &input,
         &observation,
         action_started_at,
-    )
-    .await;
+    );
     state.analytics.capture_event(
         book.user_id(),
         input.action.event_name(),

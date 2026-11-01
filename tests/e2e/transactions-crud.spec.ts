@@ -71,7 +71,7 @@ test.describe("transaction CRUD", () => {
     await expect(page.getByRole("table", { name: "Transactions" }).locator("tbody tr").first()).toBeVisible();
 
     // Date input uses MM/DD/YYYY text format — use today's date so it appears at top
-    const dateInput = page.locator("#date");
+    const dateInput = page.getByLabel("Date", { exact: true });
     await dateInput.click();
     await dateInput.fill(todayMDY);
     // Click elsewhere to close any calendar popup

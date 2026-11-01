@@ -17,13 +17,24 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::{auth::principal_with, routes::routes, state::AppState, validation::js_number_string};
+use crate::{
+    auth::principal_with,
+    book_auth::{AccessLevel, AuthenticatedBook, Membership, book_membership},
+    book_scope::{BookAccess, Write},
+    routes::routes,
+    state::AppState,
+    validation::js_number_string,
+};
 
 tokio::task_local! {
     /// Set while a tool's request runs through the router. Only the
     /// dispatcher sets it, and no header can, so an HTTP client cannot forge
     /// it. The value is true when the tool runs for `/api/mcp`, where an
     /// OAuth access token is good.
+    ///
+    /// A task-local needs no tokio runtime: `scope` sets it each time the
+    /// future is polled, whatever polls it, so it holds on Workers too. Work
+    /// that a route hands to `platform::spawn` does not see it.
     static TOOL_CALL: bool;
 }
 
@@ -96,21 +107,22 @@ pub(crate) enum Level {
     Owner,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Role {
-    Owner,
-    Editor,
-    Viewer,
-}
-
-impl Role {
-    fn satisfies(self, level: Level) -> bool {
-        match level {
-            Level::Read => true,
-            Level::Write => self != Self::Viewer,
-            Level::Owner => self == Self::Owner,
+impl Level {
+    fn access_level(self) -> AccessLevel {
+        match self {
+            Self::Read => AccessLevel::Read,
+            Self::Write => AccessLevel::Write,
+            Self::Owner => AccessLevel::Owner,
         }
     }
+}
+
+/// The write proof of a book that [`Caller::book`] accepted. A tool that
+/// calls a write helper directly, not through a route, uses it. The refusal
+/// is the refusal of the gate at `Level::Write`.
+pub(crate) fn write_access(book: &AuthenticatedBook) -> ToolResult<BookAccess<'_, Write>> {
+    book.write()
+        .map_err(|_| compact_error(access_denied(Level::Write)).into())
 }
 
 /// The message of `accessDeniedMessage(level)` in `lib/book-roles.ts`.
@@ -181,31 +193,26 @@ impl Caller {
         }
     }
 
-    /// `requireBookAuth(bookId, level)`: the user, and their role in the book.
-    pub(crate) async fn book(&self, book_id: i64, level: Level) -> ToolResult<(i32, Role)> {
+    /// `requireBookAuth(bookId, level)`: the user and their role in the book,
+    /// as the proof that `authenticate_book` also gives.
+    pub(crate) async fn book(&self, book_id: i64, level: Level) -> ToolResult<AuthenticatedBook> {
         let user_id = self.user().await?;
-        let role: Option<String> = match i32::try_from(book_id) {
-            Ok(book_id) => sqlx::query_scalar(
-                "SELECT role FROM book_members WHERE book_id = $1 AND user_id = $2",
-            )
-            .bind(book_id)
-            .bind(user_id)
-            .fetch_optional(&self.state.pool)
-            .await
-            .map_err(|cause| thrown(&cause.to_string()))?,
-            Err(_) => None,
+        let membership = match i32::try_from(book_id) {
+            Ok(book_id) => book_membership(&*self.state.database, user_id, book_id)
+                .map_err(|cause| thrown(&cause.to_string()))?,
+            Err(_) => Membership::None,
         };
-        let role = match role.as_deref() {
-            None => return Err(compact_error(BOOK_ACCESS_ERROR).into()),
-            Some("owner") => Role::Owner,
-            Some("editor") => Role::Editor,
-            Some("viewer") => Role::Viewer,
-            Some(other) => return Err(thrown(&format!("Unknown book role: {other}")).into()),
+        let book = match membership {
+            Membership::None => return Err(compact_error(BOOK_ACCESS_ERROR).into()),
+            Membership::Member(book) => book,
+            Membership::UnknownRole(other) => {
+                return Err(thrown(&format!("Unknown book role: {other}")).into());
+            }
         };
-        if !role.satisfies(level) {
+        if !book.role().satisfies(level.access_level()) {
             return Err(compact_error(access_denied(level)).into());
         }
-        Ok((user_id, role))
+        Ok(book)
     }
 
     /// Sends one request through the router. A 2xx response gives its JSON
@@ -396,11 +403,12 @@ mod tests {
 
     #[test]
     fn roles_satisfy_the_access_levels() {
-        assert!(Role::Viewer.satisfies(Level::Read));
-        assert!(!Role::Viewer.satisfies(Level::Write));
-        assert!(Role::Editor.satisfies(Level::Write));
-        assert!(!Role::Editor.satisfies(Level::Owner));
-        assert!(Role::Owner.satisfies(Level::Owner));
+        use crate::book_auth::BookRole;
+        assert!(BookRole::Viewer.satisfies(Level::Read.access_level()));
+        assert!(!BookRole::Viewer.satisfies(Level::Write.access_level()));
+        assert!(BookRole::Editor.satisfies(Level::Write.access_level()));
+        assert!(!BookRole::Editor.satisfies(Level::Owner.access_level()));
+        assert!(BookRole::Owner.satisfies(Level::Owner.access_level()));
     }
 
     #[test]
@@ -420,6 +428,33 @@ mod tests {
         assert!(TOOL_CALL.scope(false, async { in_tool_call() }).await);
         assert!(!TOOL_CALL.scope(false, async { in_oauth_tool_call() }).await);
         assert!(TOOL_CALL.scope(true, async { in_oauth_tool_call() }).await);
+    }
+
+    /// The OAuth check rests on this value, and Workers polls futures
+    /// without a tokio runtime. A plain poll with no runtime still sees it,
+    /// and only inside the scope.
+    #[test]
+    fn the_tool_call_flag_needs_no_tokio_runtime() {
+        use std::{
+            future::Future,
+            pin::pin,
+            task::{Context, Poll, Waker},
+        };
+        let poll = |future: &mut std::pin::Pin<&mut dyn Future<Output = bool>>| match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("the future is ready at once"),
+        };
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        assert!(poll(&mut pin!(
+            TOOL_CALL.scope(true, async { in_oauth_tool_call() })
+        )));
+        assert!(!poll(&mut pin!(
+            TOOL_CALL.scope(false, async { in_oauth_tool_call() })
+        )));
+        assert!(!poll(&mut pin!(async { in_tool_call() })));
     }
 
     #[test]

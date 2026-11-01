@@ -162,3 +162,26 @@ describe("typeSafeReport on SQLite", () => {
     expect(missing.stderr).toMatch(/No database at/);
   });
 });
+
+describe("typeSafeReport entry records", () => {
+  beforeAll(async () => { await setupTestDatabase(); });
+  beforeEach(async () => { await resetTestDatabase(); });
+
+  it("adds the entry evaluations and outcomes of the book", async () => {
+    const other = await createBook({ name: "Other" });
+    const at = new Date("2026-10-01T10:00:00Z");
+    for (const [bookId, fingerprint] of [[1, "a"], [other.id, "b"]] as const) {
+      await insert("typesafe_entry_evaluations", {
+        bookId, accountId: 1, payeeId: 1, revision: 0, fingerprint, attempt: "x", snapshot: {},
+        status: "ready", choice: "11:in", baselineKey: "10:in", startedAt: at,
+      });
+    }
+    await insert("typesafe_entry_outcomes", {
+      bookId: 1, evaluationId: null, outcome: "changed_accounts", source: "history", chipVisible: false, decidedAt: at,
+    });
+    expect(report(1).counts).toEqual({
+      entry_evaluations: 1, entry_status_ready: 1, entry_choice: 1, entry_differs_from_baseline: 1,
+      entry_outcome_history_changed_accounts: 1,
+    });
+  });
+});

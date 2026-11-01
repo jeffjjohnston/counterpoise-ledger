@@ -53,7 +53,7 @@ pub(super) struct Operation {
     pub(super) body: Option<&'static str>,
     /// The component name of the 200 response. Several names document a
     /// route whose response shape depends on a query parameter: the document
-    /// writes `oneOf`.
+    /// writes `oneOf`. None documents a WebSocket: a 101 response.
     pub(super) response: &'static [&'static str],
     /// Error statuses that a client must handle as a different case, with
     /// their description. Each carries an `ApiError` body. Every operation
@@ -450,6 +450,21 @@ pub(super) const OPERATIONS: &[Operation] = &[
         errors: &[(
             410,
             "The cursor is not usable: it is newer than the change log, the database was restored from a snapshot after the cursor was given, or more than 5000 transactions changed after it. Download all transactions again in full mode.",
+        )],
+    },
+    Operation {
+        method: HttpMethod::Get,
+        path: "/api/b/{bookId}/socket",
+        operation_id: "openBookSocket",
+        summary: "Live updates: a WebSocket that names the tables of the book that change. A generated client cannot use it; read it with a WebSocket client.",
+        tag: "live",
+        security: Security::BearerOrCookie,
+        query: &[],
+        body: None,
+        response: &[],
+        errors: &[(
+            403,
+            "A cookie sent from another origin (\"Cross-origin request rejected\").",
         )],
     },
     Operation {

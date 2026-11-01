@@ -1,8 +1,10 @@
-use ledger_db::engine::DbPool;
+use crate::platform;
+use crate::platform::Instant;
+use ledger_db::store::{self, Sql, params};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::OnceCell;
 
@@ -63,11 +65,11 @@ impl ApiKeyCache {
 
     /// A cached digest still needs a database select on every hit. Revocation
     /// must take effect on the next request, just as it does in Node.
-    pub(crate) async fn verified(
+    pub(crate) fn verified(
         &self,
         digest: KeyDigest,
-        pool: &DbPool,
-    ) -> Result<Option<ApiKeyPrincipal>, sqlx::Error> {
+        sql: &impl Sql,
+    ) -> Result<Option<ApiKeyPrincipal>, store::Error> {
         let cached = {
             let mut state = self.state.lock().expect("API key cache mutex poisoned");
             match state.verified.get(&digest).copied() {
@@ -82,10 +84,10 @@ impl ApiKeyCache {
         let Some(cached) = cached else {
             return Ok(None);
         };
-        let still_exists: Option<i32> = sqlx::query_scalar("SELECT id FROM api_keys WHERE id = $1")
-            .bind(cached.principal.key_id)
-            .fetch_optional(pool)
-            .await?;
+        let still_exists: Option<i32> = sql.query_optional(
+            "SELECT id FROM api_keys WHERE id = ?1",
+            &params![cached.principal.key_id],
+        )?;
         if still_exists.is_none() {
             let mut state = self.state.lock().expect("API key cache mutex poisoned");
             if state
@@ -109,7 +111,7 @@ impl ApiKeyCache {
             digest,
             Cached {
                 principal,
-                verified_at: Instant::now(),
+                verified_at: platform::instant(),
                 stamped_at: None,
             },
         );
@@ -128,7 +130,7 @@ impl ApiKeyCache {
         {
             return false;
         }
-        entry.stamped_at = Some(Instant::now());
+        entry.stamped_at = Some(platform::instant());
         true
     }
 }

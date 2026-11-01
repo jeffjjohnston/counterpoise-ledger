@@ -1,0 +1,83 @@
+name: Worker release
+
+# A RELEASE MERGE INTO MAIN DEPLOYS THE PRODUCTION WORKER. When main moves,
+# scripts/release-tag.sh compares the version in package.json with the one
+# before the merge. A changed version is a release: the job publishes tag
+# vX.Y.Z at the merge commit, and worker-deploy.yml deploys that commit to
+# the production Worker and probes it. A change to main that keeps the
+# version is not a release, and deploys nothing. A tag is published once and
+# never moved, as in deploy.sh. deploy.sh with
+# COUNTERPOISE_DEPLOY_TARGET=worker publishes nothing: it finds this run at
+# the merge commit and waits for it.
+#
+# ONLY WHILE PRODUCTION IS ON THE WORKER. The jobs run only when the
+# repository variables say so: WORKER_DEPLOY is "true" and WORKER_TAG_TARGET
+# is "production". On the Docker target, deploy.sh publishes the tag, and
+# this workflow does nothing.
+#
+# THE TAG STARTS NOTHING. A tag that this job pushes with GITHUB_TOKEN starts
+# no workflow, so the tag trigger of worker-deploy.yml does not deploy the
+# release a second time.
+#
+# THE GATE. The release PR merges only after CI and the release review. To
+# also approve each production deploy, add a required reviewer to the
+# `worker` environment: the deploy job then waits for the approval.
+#
+# A manual run (on main) does the same for the commit at the tip of main: use
+# it when the run of a push is lost.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One release at a time, and none cancelled: the tag and the deploy of one
+# release finish before the next one starts. `queue: max` is what makes "none
+# cancelled" true: with the default, `single`, a newly queued run replaces the
+# run that waits, whatever `cancel-in-progress` says, and that release would
+# get no tag and no deploy.
+concurrency:
+  group: worker-release
+  cancel-in-progress: false
+  queue: max
+
+permissions: {}
+
+jobs:
+  tag:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      vars.WORKER_DEPLOY == 'true' &&
+      vars.WORKER_TAG_TARGET == 'production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      deploy: ${{ steps.tag.outputs.deploy }}
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      # All of the history: the script compares the commit with its first
+      # parent and checks that main holds it.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Publish the version tag
+        id: tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash scripts/release-tag.sh "$GITHUB_SHA"
+
+  deploy:
+    needs: tag
+    if: needs.tag.outputs.deploy == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/worker-deploy.yml
+    with:
+      ref: ${{ github.sha }}
+      target: production

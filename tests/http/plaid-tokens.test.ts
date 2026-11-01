@@ -7,6 +7,7 @@ import {
   createPlaidToken, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { expectSealed } from "../helpers/plaid-tokens";
 import { exec, rows } from "../helpers/sql";
 
 function json(method: string, body: unknown): RequestInit {
@@ -147,7 +148,8 @@ describe("Plaid connection HTTP parity", () => {
       financialInstitution: "  Chase ", itemId: "\titem-1\n", accessToken: " access-sandbox-123456789 ", bookId: 7,
     }));
     const [stored] = await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id");
-    expect(stored).toMatchObject({ bookId: 1, financialInstitution: "Chase", itemId: "item-1", accessToken: "access-sandbox-123456789", isDemo: false });
+    expect(stored).toMatchObject({ bookId: 1, financialInstitution: "Chase", itemId: "item-1", isDemo: false });
+    expectSealed(stored, "access-sandbox-123456789");
     expect(created).toEqual({
       id: stored.id, financialInstitution: "Chase", itemId: "item-1",
       accessTokenMasked: "acce****************6789",
@@ -184,7 +186,10 @@ describe("Plaid connection HTTP parity", () => {
 
     const kept = await ok(client, path, json("PUT", { financialInstitution: " New Bank ", itemId: "item-new", accessToken: "  " }));
     let [stored] = await rows<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
-    expect(stored).toMatchObject({ financialInstitution: "New Bank", itemId: "item-new", accessToken: "old-access-token" });
+    // This row was written after the server started, so it is still the
+    // plaintext of a row from before the key; a kept token stays as it is.
+    expect(stored).toMatchObject({ financialInstitution: "New Bank", itemId: "item-new", accessToken: "old-access-token", accessTokenKey: null });
+    const sealedBefore = stored.accessToken;
     expect(kept).toEqual({
       id: token.id, financialInstitution: "New Bank", itemId: "item-new", accessTokenMasked: "old-********oken",
       createdAt: token.createdAt.toISOString(), updatedAt: stored.updatedAt.toISOString(), isDemo: false,
@@ -194,9 +199,12 @@ describe("Plaid connection HTTP parity", () => {
     for (const accessToken of [5, null, ""]) {
       await ok(client, path, json("PUT", { financialInstitution: "New Bank", itemId: "item-new", accessToken }));
     }
-    await ok(client, path, json("PUT", { financialInstitution: "New Bank", itemId: "item-new", accessToken: " replaced-token " }));
     [stored] = await rows<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
-    expect(stored.accessToken).toBe("replaced-token");
+    expect(stored.accessToken).toBe(sealedBefore);
+    const replaced = await ok(client, path, json("PUT", { financialInstitution: "New Bank", itemId: "item-new", accessToken: " replaced-token " }));
+    [stored] = await rows<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
+    expectSealed(stored, "replaced-token");
+    expect(replaced.accessTokenMasked).toBe("repl********oken");
 
     await expectError(client, path, json("PUT", { financialInstitution: "A", itemId: "item-b" }), 409, "A token with this itemId already exists");
     const required = "financialInstitution and itemId are required";
@@ -241,10 +249,9 @@ describe("Plaid connection HTTP parity", () => {
       await expectError(client, `${base}/${token.id}`, json("PUT", { financialInstitution: "A", itemId: "b" }), 403, owner);
       await expectError(client, `${base}/${token.id}`, { method: "DELETE" }, 403, owner);
       await expectError(client, `${base}/${token.id}/accounts`, json("PUT", { assignments: [] }), 403, owner);
-      // The refresh is a GET, so the route authenticates at Read; the owner
-      // check is by hand. It rewrites the mappings and calls Plaid with the
-      // owner's token, so it must not run for anyone else.
-      await expectError(client, `${base}/${token.id}/accounts?refresh=true`, {}, 403, owner);
+      // The refresh rewrites the mappings and calls Plaid with the owner's
+      // token, so it must not run for anyone else.
+      await expectError(client, `${base}/${token.id}/accounts/refresh`, { method: "POST" }, 403, owner);
       expect(plaid.requests).toEqual([]);
       expect(await ok(client, base)).toHaveLength(1);
       expect(await ok(client, `${base}/${token.id}/accounts`)).toEqual([]);
@@ -265,10 +272,12 @@ describe("Plaid connection HTTP parity", () => {
       { plaidAccountId: "remove", name: "Old Savings", officialName: null, mask: null, type: "depository", subtype: "savings", counterpoiseAccountId: null },
     ];
     expect(await ok(client, path)).toEqual(cached);
-    expect(await ok(client, `${path}?refresh=TRUE&refresh=true`)).toEqual(cached);
+    // The GET never calls Plaid, also with the refresh flag that it used to
+    // accept: another site can make a browser send a GET.
+    expect(await ok(client, `${path}?refresh=true`)).toEqual(cached);
     expect(plaid.requests).toEqual([]);
 
-    expect(await ok(client, `${path}?refresh=true`)).toEqual([
+    expect(await ok(client, `${path}/refresh`, { method: "POST" })).toEqual([
       { plaidAccountId: "keep", name: "Checking Updated", officialName: null, mask: "1111", type: "depository", subtype: "checking", counterpoiseAccountId: checking.id },
       { plaidAccountId: "new", name: "Savings", officialName: "Plaid Savings", mask: "22", type: "depository", subtype: null, counterpoiseAccountId: null },
     ]);
@@ -280,11 +289,12 @@ describe("Plaid connection HTTP parity", () => {
     expect(stored.map((row) => [row.plaidAccountId, row.bookId, row.tokenId])).toEqual([["keep", 1, token.id], ["new", 1, token.id]]);
 
     await exec("UPDATE plaid_tokens SET access_token = $1 WHERE id = $2", ["access-empty", token.id]);
-    expect(await ok(client, `${path}?refresh=true`)).toEqual([]);
+    expect(await ok(client, `${path}/refresh`, { method: "POST" })).toEqual([]);
 
     const other = await createBook({ name: "Other" });
     const foreign = await createPlaidToken({ financialInstitution: "F", itemId: "item-f", accessToken: "access-refresh", bookId: other.id });
-    await expectError(client, `/api/b/1/sync/tokens/${foreign.id}/accounts?refresh=true`, {}, 404, "Token not found");
+    await expectError(client, `/api/b/1/sync/tokens/${foreign.id}/accounts/refresh`, { method: "POST" }, 404, "Token not found");
+    await expectError(client, "/api/b/1/sync/tokens/none/accounts/refresh", { method: "POST" }, 400, "Invalid token id");
     await expectError(client, "/api/b/1/sync/tokens/none/accounts", {}, 400, "Invalid token id");
     await expectError(client, "/api/b/1/sync/tokens/3000000000/accounts", {}, 500, "Failed to fetch token Plaid accounts");
   });
@@ -292,7 +302,7 @@ describe("Plaid connection HTTP parity", () => {
   it("reports a failed refresh as Plaid's and keeps the stored accounts", async () => {
     const token = await createPlaidToken({ financialInstitution: "Chase", itemId: "item-fail", accessToken: "access-plaid-error" });
     await createPlaidAccount({ tokenId: token.id, plaidAccountId: "stays", name: "Checking", type: "depository" });
-    const path = `/api/b/1/sync/tokens/${token.id}/accounts?refresh=true`;
+    const path = `/api/b/1/sync/tokens/${token.id}/accounts/refresh`;
     for (const [accessToken, error] of [
       ["access-plaid-error", "Plaid /accounts/get request failed: invalid access token (INVALID_ACCESS_TOKEN)"],
       ["access-no-message", "Plaid /accounts/get request failed"],
@@ -305,9 +315,20 @@ describe("Plaid connection HTTP parity", () => {
       ["access-null-name", "A database error stopped the operation. The server log has the cause."],
     ]) {
       await exec("UPDATE plaid_tokens SET access_token = $1 WHERE id = $2", [accessToken, token.id]);
-      await expectError(client, path, {}, 502, error);
+      await expectError(client, path, { method: "POST" }, 502, error);
     }
     expect((await rows<PlaidAccount>("SELECT * FROM plaid_accounts ORDER BY id")).map((row) => row.plaidAccountId)).toEqual(["stays"]);
+  });
+
+  it("refuses a refresh that another site sends, before it calls Plaid", async () => {
+    const token = await createPlaidToken({ financialInstitution: "Chase", itemId: "item-cross", accessToken: "access-refresh" });
+    const response = await client.request(`/api/b/1/sync/tokens/${token.id}/accounts/refresh`, {
+      method: "POST",
+      headers: { origin: "https://evil.example" },
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "Cross-origin request rejected" });
+    expect(plaid.requests).toEqual([]);
   });
 
   it("maps the accounts of a connection, swaps two mappings, and clears one", async () => {
@@ -454,7 +475,51 @@ describe("Plaid account refresh without a usable Plaid", () => {
       await resetTestDatabase();
       const client = await sessionHttpClient(baseUrl);
       const token = await createPlaidToken({ financialInstitution: "Chase", itemId: "item-env", accessToken: "t" });
-      await expectError(client, `/api/b/1/sync/tokens/${token.id}/accounts?refresh=true`, {}, status, error);
+      await expectError(client, `/api/b/1/sync/tokens/${token.id}/accounts/refresh`, { method: "POST" }, status, error);
+    } finally {
+      await stop();
+    }
+  }, 120_000);
+});
+
+describe("Plaid access tokens at rest", () => {
+  it("encrypts the plaintext tokens on file when the server starts", async () => {
+    await resetTestDatabase();
+    const token = await createPlaidToken({ financialInstitution: "Chase", itemId: "item-start", accessToken: "access-refresh" });
+    const plaid = await startPlaidMock();
+    const { baseUrl, stop } = await startHttpTestServer({ ...PLAID, PLAID_API_URL: plaid.url });
+    try {
+      const [stored] = await rows<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]);
+      expectSealed(stored, "access-refresh");
+      const client = await sessionHttpClient(baseUrl);
+      const [item] = await ok(client, "/api/b/1/sync/tokens");
+      expect(item.accessTokenMasked).toBe("acce********resh");
+      // Plaid gets the plaintext: the mock answers only the real token.
+      await ok(client, `/api/b/1/sync/tokens/${token.id}/accounts/refresh`, { method: "POST" });
+      expect(plaid.requests).toEqual([{ path: "/accounts/get", body: expect.objectContaining({ access_token: "access-refresh" }) }]);
+    } finally {
+      await stop();
+      await new Promise((resolveClosed) => plaid.server.close(resolveClosed));
+    }
+  }, 120_000);
+
+  it("stores no token and starts no link session without a key", async () => {
+    // Sealed rows on file would stop a start without a key.
+    await resetTestDatabase();
+    const { baseUrl, stop } = await startHttpTestServer({ ...PLAID, PLAID_TOKEN_KEY: "" });
+    try {
+      const client = await sessionHttpClient(baseUrl);
+      const missing = "PLAID_TOKEN_KEY environment variable not configured";
+      await expectError(client, "/api/b/1/sync/tokens", json("POST", { financialInstitution: "A", itemId: "item-a", accessToken: "t" }), 500, missing);
+      await expectError(client, "/api/b/1/sync/link-sessions", json("POST", {}), 500, missing);
+      expect(await rows("SELECT * FROM plaid_tokens")).toHaveLength(0);
+      // A plaintext row from before the key still reads, and a reconnect,
+      // which stores no token, gets past the key check to Plaid.
+      const old = await createPlaidToken({ financialInstitution: "Old", itemId: "item-old", accessToken: "plaintext-token" });
+      const [item] = await ok(client, "/api/b/1/sync/tokens");
+      expect(item.accessTokenMasked).toBe("plai********oken");
+      const reconnect = await client.request("/api/b/1/sync/link-sessions", json("POST", { tokenId: old.id }));
+      expect(await reconnect.json()).not.toEqual({ error: missing });
     } finally {
       await stop();
     }

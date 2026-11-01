@@ -48,7 +48,10 @@ export function TypeSafeSettings({
       window.removeEventListener("focus", load);
     };
   }, [bookId, url]);
-  async function save(enabled: boolean, clear = false) {
+  async function save(
+    change: Partial<Pick<Settings, "enabled" | "entrySuggestionsEnabled">>,
+    clear = false,
+  ) {
     savePending.current = true;
     requestVersion.current++;
     setSaving(true);
@@ -56,7 +59,7 @@ export function TypeSafeSettings({
     try {
       const value = await apiFetch<Settings>(
         url,
-        clear ? { method: "DELETE" } : { method: "PATCH", body: { enabled } },
+        clear ? { method: "DELETE" } : { method: "PATCH", body: change },
       );
       setSettings(value);
       setClearing(false);
@@ -88,7 +91,7 @@ export function TypeSafeSettings({
           disabled={
             !settings || saving || (!settings.configured && !settings.enabled)
           }
-          onChange={(e) => void save(e.target.checked)}
+          onChange={(e) => void save({ enabled: e.target.checked })}
           className="mt-1"
         />
         Suggest Plaid transaction matches
@@ -97,6 +100,28 @@ export function TypeSafeSettings({
         Sends merchant descriptions, amounts, dates, and candidate payee names
         to TypeSafe to suggest an existing transaction. You confirm every match.
         Turn this off to stop new requests and hide suggestions.
+      </p>
+      <label className="flex items-start gap-2 text-sm text-fg">
+        <input
+          type="checkbox"
+          checked={settings?.entrySuggestionsEnabled ?? false}
+          disabled={
+            !settings ||
+            saving ||
+            (!settings.configured && !settings.entrySuggestionsEnabled)
+          }
+          onChange={(e) =>
+            void save({ entrySuggestionsEnabled: e.target.checked })
+          }
+          className="mt-1"
+        />
+        Suggest entries for new transactions
+      </label>
+      <p className="text-xs text-fg-secondary">
+        When you pick a payee in a new transaction, TypeSafe chooses among the
+        payee&apos;s earlier patterns in this account. The payee name, the
+        dates, the amounts and the income and expense account names are sent;
+        memos and asset account names are not.
       </p>
       {settings && !settings.configured && (
         <p className="text-xs text-fg-tertiary">
@@ -128,7 +153,7 @@ export function TypeSafeSettings({
               size="sm"
               variant="secondary"
               disabled={saving}
-              onClick={() => void save(false, true)}
+              onClick={() => void save({}, true)}
             >
               Disable and clear
             </Button>

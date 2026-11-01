@@ -188,7 +188,7 @@ const DAY_MS = 24 * HOUR_MS;
  * wrote the timestamp and the browser reading it — clamps to "just now" rather
  * than rendering a future age. A non-finite age (an unparseable timestamp
  * reaching Date.parse) renders the same em dash the UI already uses for "no
- * usable timestamp", so a bad status file can never produce "NaN days ago".
+ * usable timestamp", so a bad status record can never produce "NaN days ago".
  */
 export function formatRelativeAge(ms: number): string {
   if (!Number.isFinite(ms)) return "—";

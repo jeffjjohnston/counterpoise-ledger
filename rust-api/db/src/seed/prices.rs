@@ -1,11 +1,10 @@
 //! Security prices.
 
 use chrono::NaiveDate;
-use sqlx::QueryBuilder;
 
 use super::window::{Window, format_date};
 use super::{SeedError, SeedResult, Seeder, js_round};
-use crate::engine::Db;
+use crate::store::{Sql, params};
 
 // Month-end prices in cents, oldest first. A window of N months uses the
 // last N values.
@@ -98,8 +97,8 @@ pub(super) fn limit_ira(year: i32) -> i64 {
     }
 }
 
-pub(super) async fn seed_prices(
-    seeder: &mut Seeder<'_>,
+pub(super) fn seed_prices(
+    seeder: &mut Seeder<'_, impl Sql>,
     securities: &[Security],
     window: Window,
 ) -> SeedResult<()> {
@@ -117,18 +116,10 @@ pub(super) async fn seed_prices(
             rows.push((security.id, format_date(price_date), price_cents * 10_000));
         }
     }
-    let book_id = seeder.book_id;
-    let mut insert = QueryBuilder::<Db>::new(
-        "INSERT INTO security_prices (book_id, security_id, price_date, price_micros, source) ",
-    );
-    insert.push_values(&rows, |mut row, (security_id, price_date, price_micros)| {
-        row.push_bind(book_id)
-            .push_bind(*security_id)
-            .push_bind(price_date.clone())
-            .push_bind(*price_micros)
-            .push_bind("seed");
-    });
-    insert.build().execute(&mut *seeder.connection).await?;
+    seeder.sql.execute(&format!(
+        "INSERT INTO security_prices (book_id, security_id, price_date, price_micros, source) {}",
+        crate::sql::json_rows(&["?1", "#0", "#1", "#2", "'seed'"], "?2")
+    ), &params![seeder.book_id, crate::sql::json_array(&rows)])?;
     Ok(())
 }
 

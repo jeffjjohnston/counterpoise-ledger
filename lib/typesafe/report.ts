@@ -210,6 +210,47 @@ function unlinkedAfter(outcomes: Decision[], first: Decision): boolean {
   );
 }
 
+export type EntryEvaluation = {
+  status: string;
+  choice: string | null;
+  baselineKey: string;
+  latencyMs: number | null;
+  errorCode: string | null;
+};
+export type EntryOutcome = { outcome: string; source: string; chipVisible: boolean };
+
+/**
+ * The counts of entry evaluations and entry outcomes, as `summarize_entries`
+ * in rust-api/server/src/typesafe.rs: the same keys in the same order.
+ */
+export function summarizeEntries(evaluations: EntryEvaluation[], outcomes: EntryOutcome[]): Counts {
+  const counts: Counts = {};
+  const add: Add = (key, n = 1) => {
+    counts[key] = (counts[key] ?? 0) + n;
+  };
+  for (const row of evaluations) {
+    add("entry_evaluations");
+    add(`entry_status_${row.status}`);
+    if (row.errorCode !== null) add(`entry_error_${row.errorCode}`);
+    if (row.status === "ready") {
+      if (row.choice === null) add("entry_none");
+      else {
+        add("entry_choice");
+        add(row.choice === row.baselineKey ? "entry_agrees_with_baseline" : "entry_differs_from_baseline");
+      }
+    }
+    if (row.latencyMs !== null) {
+      add("entry_latency_samples");
+      add("entry_latency_total_ms", row.latencyMs);
+    }
+  }
+  for (const row of outcomes) {
+    add(`entry_outcome_${row.source}_${row.outcome}`);
+    if (row.chipVisible) add("entry_chip_visible");
+  }
+  return counts;
+}
+
 /** The database file that the server uses: `DATABASE_PATH`, default `data/counterpoise.db`. */
 export function reportDatabasePath(env: Record<string, string | undefined> = process.env): string {
   return env.DATABASE_PATH || "data/counterpoise.db";
@@ -310,6 +351,31 @@ export function typeSafeReport(db: DatabaseSync, bookId: number) {
       merge(counts, summarizeTypeSafe(rows, decisions));
       after = rows[rows.length - 1].id;
     }
+    const entryEvaluations = (
+      db
+        .prepare(
+          "SELECT status, choice, baseline_key, latency_ms, error_code FROM typesafe_entry_evaluations WHERE book_id = ? ORDER BY id",
+        )
+        .all(bookId) as RawRow[]
+    ).map((row) => ({
+      status: String(row.status),
+      choice: row.choice === null ? null : String(row.choice),
+      baselineKey: String(row.baseline_key),
+      latencyMs: row.latency_ms === null ? null : Number(row.latency_ms),
+      errorCode: row.error_code === null ? null : String(row.error_code),
+    }));
+    const entryOutcomes = (
+      db
+        .prepare(
+          "SELECT outcome, source, chip_visible FROM typesafe_entry_outcomes WHERE book_id = ? ORDER BY id",
+        )
+        .all(bookId) as RawRow[]
+    ).map((row) => ({
+      outcome: String(row.outcome),
+      source: String(row.source),
+      chipVisible: Number(row.chip_visible) === 1,
+    }));
+    merge(counts, summarizeEntries(entryEvaluations, entryOutcomes));
     return {
       bookId,
       counts,

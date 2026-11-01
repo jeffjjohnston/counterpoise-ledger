@@ -19,6 +19,7 @@ export async function rustSeed(...args: string[]) {
       DATABASE_PATH: workerDatabasePath(),
       DATABASE_URL: "",
       TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      APP_TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
     },
   });
 }

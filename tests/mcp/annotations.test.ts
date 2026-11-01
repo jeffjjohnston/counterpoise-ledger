@@ -101,6 +101,7 @@ const EXPECTED_ANNOTATIONS: Record<string, ToolAnnotations> = {
   get_transaction_plaid_link: READ,
   unlink_plaid_transaction: UPDATE,
   get_reconcile_candidates: READ,
+  get_weekly_review: READ,
   reconcile_plaid_transaction: DESTRUCTIVE_NONIDEMPOTENT,
 };
 

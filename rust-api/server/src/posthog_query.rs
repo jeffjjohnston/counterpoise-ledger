@@ -14,23 +14,21 @@ use serde_json::{Value, json};
 /// The `results` rows of a HogQL query. Each row is one array of columns.
 pub(crate) type Rows = Vec<Value>;
 
+/// How long a HogQL query may take.
+const TIMEOUT: Duration = Duration::from_secs(60);
+
 fn client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("HTTP client")
-    })
+    CLIENT.get_or_init(crate::platform::http_client)
 }
 
 /// `getPostHogQueryConfig()`: the host and the personal API key. An empty
 /// variable counts as missing.
 fn config() -> Option<(String, String)> {
-    let key = std::env::var("POSTHOG_PERSONAL_API_KEY")
+    let key = ledger_db::env::var("POSTHOG_PERSONAL_API_KEY")
         .ok()
         .filter(|value| !value.is_empty())?;
-    let host = std::env::var("NEXT_PUBLIC_POSTHOG_HOST")
+    let host = ledger_db::env::var("NEXT_PUBLIC_POSTHOG_HOST")
         .ok()
         .filter(|value| !value.is_empty())?;
     Some((host, key))
@@ -52,36 +50,40 @@ pub(crate) fn parse_properties(value: &Value) -> Value {
 
 /// `runHogQLQuery()`. The error is the message of the TypeScript error.
 pub(crate) async fn run(query: &str) -> Result<Rows, String> {
-    let (host, key) = config().ok_or_else(|| {
-        "PostHog not configured (POSTHOG_PERSONAL_API_KEY, NEXT_PUBLIC_POSTHOG_HOST)".to_owned()
-    })?;
-    let response = client()
-        .post(format!("{host}/api/projects/@current/query/"))
-        .bearer_auth(key)
-        .json(&json!({ "query": { "kind": "HogQLQuery", "query": query } }))
-        .send()
-        .await
-        .map_err(|cause| cause.to_string())?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(500).collect();
-        let snippet = if snippet.is_empty() {
-            String::new()
-        } else {
-            format!(" {snippet}")
-        };
-        return Err(format!(
-            "PostHog API error: {} {}{snippet}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or_default()
-        ));
-    }
-    let data: Value = response.json().await.map_err(|cause| cause.to_string())?;
-    Ok(match data.get("results") {
-        Some(Value::Array(rows)) => rows.clone(),
-        _ => Vec::new(),
+    crate::platform::outbound(async {
+        let (host, key) = config().ok_or_else(|| {
+            "PostHog not configured (POSTHOG_PERSONAL_API_KEY, NEXT_PUBLIC_POSTHOG_HOST)".to_owned()
+        })?;
+        let response = client()
+            .post(format!("{host}/api/projects/@current/query/"))
+            .timeout(TIMEOUT)
+            .bearer_auth(key)
+            .json(&json!({ "query": { "kind": "HogQLQuery", "query": query } }))
+            .send()
+            .await
+            .map_err(|cause| cause.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(500).collect();
+            let snippet = if snippet.is_empty() {
+                String::new()
+            } else {
+                format!(" {snippet}")
+            };
+            return Err(format!(
+                "PostHog API error: {} {}{snippet}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or_default()
+            ));
+        }
+        let data: Value = response.json().await.map_err(|cause| cause.to_string())?;
+        Ok(match data.get("results") {
+            Some(Value::Array(rows)) => rows.clone(),
+            _ => Vec::new(),
+        })
     })
+    .await
 }
 
 #[cfg(test)]

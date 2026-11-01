@@ -22,6 +22,7 @@ use super::{
 };
 use crate::state::AppState;
 use chrono::NaiveDateTime;
+use ledger_db::{Sql, store::params};
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -47,17 +48,17 @@ const POLICY: Policy = Policy {
 pub(super) async fn client(state: &AppState, client_id: &str) -> Result<Client, Lookup> {
     let url =
         valid_client_id(client_id, POLICY).map_err(|reason| Lookup::Invalid(reason.to_owned()))?;
-    let cached: Option<(i32, String, String, Option<NaiveDateTime>)> = sqlx::query_as(
-        "SELECT id, client_name, redirect_uris, fetched_at FROM oauth_clients
-         WHERE client_id = $1 AND metadata_document = 1",
-    )
-    .bind(client_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|cause| {
-        tracing::error!(error = %cause, "Could not read an OAuth client");
-        Lookup::Invalid("The server could not read the client".to_owned())
-    })?;
+    let cached: Option<(i32, String, String, Option<NaiveDateTime>)> = state
+        .database
+        .query_optional(
+            "SELECT id, client_name, redirect_uris, fetched_at FROM oauth_clients
+         WHERE client_id = ?1 AND metadata_document = 1",
+            &params![client_id],
+        )
+        .map_err(|cause| {
+            tracing::error!(error = %cause, "Could not read an OAuth client");
+            Lookup::Invalid("The server could not read the client".to_owned())
+        })?;
     let now = now();
     let age = |fetched_at: Option<NaiveDateTime>| {
         fetched_at.map_or(i64::MAX, |at| (now - at).num_seconds())
@@ -87,26 +88,23 @@ pub(super) async fn client(state: &AppState, client_id: &str) -> Result<Client, 
     };
     let (name, redirect_uris) =
         check_document(&document, client_id, &url).map_err(Lookup::Invalid)?;
-    let id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_clients
+    let id: i32 = state
+        .database
+        .query_row(
+            "INSERT INTO oauth_clients
              (client_id, client_name, redirect_uris, metadata_document, fetched_at, created_at)
-         VALUES ($1, $2, $3, 1, $4, $4)
+         VALUES (?1, ?2, ?3, 1, ?4, ?4)
          ON CONFLICT (client_id) DO UPDATE SET
              client_name = excluded.client_name,
              redirect_uris = excluded.redirect_uris,
              fetched_at = excluded.fetched_at
          RETURNING id",
-    )
-    .bind(client_id)
-    .bind(&name)
-    .bind(json!(redirect_uris).to_string())
-    .bind(now)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|cause| {
-        tracing::error!(error = %cause, "Could not keep a client metadata document");
-        Lookup::Invalid("The server could not keep the client".to_owned())
-    })?;
+            &params![client_id, &name, json!(redirect_uris).to_string(), now],
+        )
+        .map_err(|cause| {
+            tracing::error!(error = %cause, "Could not keep a client metadata document");
+            Lookup::Invalid("The server could not keep the client".to_owned())
+        })?;
     Ok(Client {
         id,
         client_id: client_id.to_owned(),
@@ -164,10 +162,16 @@ fn check_document(
     Ok((name, metadata.redirect_uris))
 }
 
-/// True for an address on the public internet. The rest are loopback,
-/// private, link-local, shared, documentation, benchmark, multicast,
-/// reserved and unspecified ranges, and IPv6 forms that hold one of those
-/// IPv4 addresses.
+/// True for an address on the public internet. An IPv4 address must not be
+/// in a loopback, private, link-local, shared, documentation, benchmark,
+/// multicast, reserved or unspecified range. An IPv6 address must be global
+/// unicast (2000::/3), which removes the local, site-local, unique local,
+/// discard, local-use NAT64 and other special ranges. It also must not be in
+/// the special ranges inside 2000::/3: the IETF protocol assignments
+/// (2001::/23, which holds Teredo and benchmarking), the documentation ranges
+/// (2001:db8::/32 and 3fff::/20), and 6to4 (2002::/16), which holds an IPv4
+/// address that can be private. An IPv4-mapped address and a NAT64 address
+/// (64:ff9b::/96) get the check of the IPv4 address that they hold.
 fn is_public(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_public_v4(address),
@@ -183,12 +187,12 @@ fn is_public(address: IpAddr) -> bool {
                     octets[12], octets[13], octets[14], octets[15],
                 ));
             }
-            !(address.is_unspecified()
-                || address.is_loopback()
-                || address.is_multicast()
-                || (segments[0] & 0xfe00) == 0xfc00
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+            let [first, second, ..] = segments;
+            (first & 0xe000) == 0x2000
+                && !(first == 0x2001 && second < 0x0200)
+                && !(first == 0x2001 && second == 0x0db8)
+                && first != 0x2002
+                && !(first == 0x3fff && second < 0x1000)
         }
     }
 }
@@ -212,6 +216,7 @@ fn is_public_v4(address: Ipv4Addr) -> bool {
 /// Reads the JSON document at `url`. Each address of the host must pass
 /// [`is_public`], and the connection goes only to those addresses, so a
 /// second DNS answer cannot change the target.
+#[cfg(feature = "native")]
 async fn fetch(url: &url::Url, policy: Policy) -> Result<Value, String> {
     let host = url.host_str().ok_or("no host")?.to_owned();
     let port = url.port_or_known_default().ok_or("no port")?;
@@ -272,6 +277,53 @@ async fn fetch(url: &url::Url, policy: Policy) -> Result<Value, String> {
     serde_json::from_slice(&body).map_err(|_| "the document is not JSON".to_owned())
 }
 
+/// Reads the JSON document at `url` from a Worker. There is no DNS lookup
+/// to pin: a Worker's `fetch` leaves from Cloudflare's network, which
+/// reaches only public addresses, so a host name cannot lead to a private
+/// one. A host given as an address must still be public. The request
+/// follows no redirect, stops after [`TIMEOUT`], and reads at most
+/// [`MAX_DOCUMENT_BYTES`].
+#[cfg(all(not(feature = "native"), target_arch = "wasm32"))]
+async fn fetch(url: &url::Url, policy: Policy) -> Result<Value, String> {
+    let address = match url.host() {
+        Some(url::Host::Ipv4(address)) => Some(IpAddr::V4(address)),
+        Some(url::Host::Ipv6(address)) => Some(IpAddr::V6(address)),
+        _ => None,
+    };
+    if !policy.allow_private && address.is_some_and(|address| !is_public(address)) {
+        return Err("the host has an address that is not public".to_owned());
+    }
+    let answer = crate::platform::get_without_redirects(
+        url.as_str(),
+        &[
+            ("accept", "application/json"),
+            (
+                "user-agent",
+                concat!("Counterpoise/", env!("CARGO_PKG_VERSION")),
+            ),
+        ],
+        TIMEOUT,
+        MAX_DOCUMENT_BYTES,
+    )
+    .await
+    .map_err(|failure| match failure {
+        crate::platform::GetFailure::Failed => "the request failed".to_owned(),
+        crate::platform::GetFailure::TooLarge => {
+            format!("the document is larger than {MAX_DOCUMENT_BYTES} bytes")
+        }
+    })?;
+    if answer.status != 200 {
+        return Err(format!("the server answered {}", answer.status));
+    }
+    serde_json::from_slice(&answer.body).map_err(|_| "the document is not JSON".to_owned())
+}
+
+/// A build with neither the native server nor a Worker has no fetch.
+#[cfg(all(not(feature = "native"), not(target_arch = "wasm32")))]
+async fn fetch(_url: &url::Url, _policy: Policy) -> Result<Value, String> {
+    Err("reading a client metadata document needs the native server or a Worker".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,10 +358,34 @@ mod tests {
             "::ffff:10.0.0.1",
             "64:ff9b::7f00:1",
             "64:ff9b::a00:1",
+            // Local-use NAT64, site-local, discard, IPv4-compatible, SRv6.
+            "64:ff9b:1::1",
+            "fec0::1",
+            "100::1",
+            "::7f00:1",
+            "5f00::1",
+            // Special ranges inside 2000::/3: Teredo, benchmarking, the
+            // IETF assignments, 6to4 and documentation.
+            "2001::1",
+            "2001:2::1",
+            "2001:1ff:ffff::1",
+            "2002:7f00:1::1",
+            "2002:5db8:d822::1",
+            "3fff::1",
+            "3fff:fff::1",
         ] {
             assert!(!is_public(private.parse().unwrap()), "{private}");
         }
         assert!(is_public("64:ff9b::5db8:d822".parse().unwrap()));
+        // The first addresses after the special ranges are public.
+        for public in [
+            "2001:200::1",
+            "2003::1",
+            "3fff:1000::1",
+            "2a00:1450:4001::1",
+        ] {
+            assert!(is_public(public.parse().unwrap()), "{public}");
+        }
     }
 
     #[test]

@@ -54,3 +54,35 @@ for (const width of [390, 1440]) {
     expect(scrollHeight).toBeLessThanOrEqual(800);
   });
 }
+
+// The "usually $x–$y" hint of a payee whose amount varies sits directly below
+// the empty Amount field, inside its column, and clear of the "Filled from" chip.
+for (const width of [1024, 1440]) {
+  test(`Simple form's amount range hint sits below the Amount field at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/b/1");
+    await page.getByRole("link", { name: "Checking", exact: true }).first().click();
+    await page.getByRole("button", { name: "Simple", exact: true }).click();
+    await page.getByPlaceholder("Payee", { exact: true }).fill("Whole Foods");
+    const amount = page.getByRole("textbox", { name: "Amount", exact: true });
+    const hint = page.getByText(/^usually \$/);
+    const chip = page.getByRole("button", { name: /^Filled from:/ });
+    await expect(hint).toBeVisible();
+    await expect(amount).toHaveAccessibleDescription(/^usually \$/);
+    const field = (await amount.boundingBox())!;
+    const below = (await hint.boundingBox())!;
+    const filled = (await chip.boundingBox())!;
+    expect(below.y).toBeGreaterThanOrEqual(field.y + field.height);
+    expect(below.y - (field.y + field.height)).toBeLessThanOrEqual(8);
+    // The hint's box carries padding past the field; its text must not.
+    const text = await hint.evaluate((element) => {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      const { x, width } = range.getBoundingClientRect();
+      return { x, width };
+    });
+    expect(text.x).toBeGreaterThanOrEqual(field.x - 0.5);
+    expect(text.x + text.width).toBeLessThanOrEqual(field.x + field.width + 0.5);
+    expect(filled.x + filled.width).toBeLessThanOrEqual(text.x);
+  });
+}

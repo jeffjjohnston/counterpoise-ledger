@@ -9,9 +9,8 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::HeaderMap,
 };
-use ledger_db::engine::{Db, DbPool};
+use ledger_db::store::{self, Builder, Row, Sql, params};
 use serde_json::{Value, json};
-use sqlx::{QueryBuilder, Row};
 use std::collections::HashMap;
 
 fn float_prefix(value: &str) -> Option<f64> {
@@ -79,20 +78,19 @@ fn bucket(items: Vec<Value>, total: i32) -> Value {
     json!({ "items": items, "total": total, "truncated": total > 25 })
 }
 
-async fn transaction_results(
-    pool: &DbPool,
+fn transaction_results(
+    pool: &impl Sql,
     book_id: i32,
     query: &str,
     pattern: &str,
     start: Option<&str>,
     end: Option<&str>,
     today: &str,
-) -> Result<Vec<Value>, sqlx::Error> {
-    let mut ids_query = QueryBuilder::<Db>::new(
-        "WITH matches AS (SELECT DISTINCT t.id, CASE WHEN t.is_floating THEN ",
-    );
+) -> Result<Vec<Value>, store::Error> {
+    let mut ids_query =
+        Builder::new("WITH matches AS (SELECT DISTINCT t.id, CASE WHEN t.is_floating THEN ");
     ids_query
-        .push_bind(today.to_owned())
+        .push_bind(today)
         .push(
             " ELSE t.date END AS date
          FROM transactions t LEFT JOIN payees p ON p.id = t.payee_id
@@ -100,14 +98,15 @@ async fn transaction_results(
          WHERE t.book_id = ",
         )
         .push_bind(book_id)
-        .push(" AND (lower(t.description) LIKE ")
-        .push_bind(pattern.to_owned())
-        .push(" OR lower(t.notes) LIKE ")
-        .push_bind(pattern.to_owned())
-        .push(" OR lower(p.name) LIKE ")
-        .push_bind(pattern.to_owned())
-        .push(" OR lower(t.check_number) LIKE ")
-        .push_bind(pattern.to_owned());
+        .push(" AND (t.description_fold LIKE ")
+        .push_bind(pattern)
+        .push(" ESCAPE '\\' OR t.notes_fold LIKE ")
+        .push_bind(pattern)
+        .push(" ESCAPE '\\' OR p.name_fold LIKE ")
+        .push_bind(pattern)
+        .push(" ESCAPE '\\' OR t.check_number_fold LIKE ")
+        .push_bind(pattern)
+        .push(" ESCAPE '\\'");
     if let Some(amount) = amount_cents(query) {
         ids_query
             .push(" OR s.amount = ")
@@ -117,26 +116,24 @@ async fn transaction_results(
     }
     ids_query.push(")) SELECT id, date FROM matches WHERE TRUE");
     if let Some(start) = start {
-        ids_query.push(" AND date >= ").push_bind(start.to_owned());
+        ids_query.push(" AND date >= ").push_bind(start);
     }
     if let Some(end) = end {
-        ids_query.push(" AND date <= ").push_bind(end.to_owned());
+        ids_query.push(" AND date <= ").push_bind(end);
     }
     ids_query.push(" ORDER BY date DESC, id DESC LIMIT 25");
     let ids: Vec<i32> = ids_query
-        .build()
-        .fetch_all(pool)
-        .await?
-        .iter()
-        .map(|row| row.get::<i32, _>("id"))
+        .query::<(i32, String)>(pool)?
+        .into_iter()
+        .map(|(id, _)| id)
         .collect();
     if ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut details = QueryBuilder::<Db>::new("SELECT t.id, CASE WHEN t.is_floating THEN ");
+    let mut details = Builder::new("SELECT t.id, CASE WHEN t.is_floating THEN ");
     details
-        .push_bind(today.to_owned())
+        .push_bind(today)
         .push(
             " ELSE t.date END AS date,
            t.description, t.notes, t.check_number, p.id AS payee_id, p.name AS payee_name,
@@ -152,43 +149,40 @@ async fn transaction_results(
         .push_bind(book_id)
         .push(" AND a.book_id = ")
         .push_bind(book_id)
-        .push(" AND t.id IN (");
-    for (index, id) in ids.iter().enumerate() {
-        if index > 0 {
-            details.push(", ");
-        }
-        details.push_bind(id);
-    }
-    details.push(") ORDER BY date DESC, t.id DESC, s.id ASC");
+        .push(" AND t.id ")
+        .push_in_integers(&ids)
+        .push(" ORDER BY date DESC, t.id DESC, s.id ASC");
     let mut grouped: HashMap<i32, Value> = HashMap::new();
-    for row in details.build().fetch_all(pool).await? {
-        let id: i32 = row.get("id");
-        let payee_id: Option<i32> = row.get("payee_id");
-        let payee_name: Option<String> = row.get("payee_name");
+    for row in details.query::<Row>(pool)? {
+        let id: i32 = row.column("id")?;
+        let payee_id: Option<i32> = row.column("payee_id")?;
+        let payee_name: Option<String> = row.column("payee_name")?;
         let payee = match (payee_id, payee_name) {
             (Some(id), Some(name)) if !name.is_empty() => json!({ "id": id, "name": name }),
             _ => Value::Null,
         };
-        let transaction = grouped.entry(id).or_insert_with(|| {
-            json!({
-                "id": id, "date": row.get::<String, _>("date"),
-                "description": row.get::<Option<String>, _>("description"),
-                "notes": row.get::<Option<String>, _>("notes"),
-                "checkNumber": row.get::<Option<String>, _>("check_number"),
-                "payee": payee, "splits": [],
-            })
+        let split = json!({
+            "accountId": row.column::<i32>("account_id")?,
+            "accountName": row.column::<String>("account_name")?,
+            "amount": row.column::<i32>("amount")?,
+            "isFavorite": row.column::<bool>("is_favorite")?,
+            "subtype": row.column::<Option<String>>("subtype")?,
+            "isInvestmentCash": row.column::<bool>("is_investment_cash")?,
         });
+        let transaction = match grouped.entry(id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(json!({
+                "id": id, "date": row.column::<String>("date")?,
+                "description": row.column::<Option<String>>("description")?,
+                "notes": row.column::<Option<String>>("notes")?,
+                "checkNumber": row.column::<Option<String>>("check_number")?,
+                "payee": payee, "splits": [],
+            })),
+        };
         transaction["splits"]
             .as_array_mut()
             .expect("splits array")
-            .push(json!({
-                "accountId": row.get::<i32, _>("account_id"),
-                "accountName": row.get::<String, _>("account_name"),
-                "amount": row.get::<i32, _>("amount"),
-                "isFavorite": row.get::<bool, _>("is_favorite"),
-                "subtype": row.get::<Option<String>, _>("subtype"),
-                "isInvestmentCash": row.get::<bool, _>("is_investment_cash"),
-            }));
+            .push(split);
     }
     Ok(ids
         .into_iter()
@@ -203,67 +197,67 @@ enum Kind {
     Rules,
 }
 
-async fn named_bucket(
-    pool: &DbPool,
+fn named_bucket(
+    pool: &impl Sql,
     book_id: i32,
-    lower: &str,
+    folded: &str,
     pattern: &str,
     prefix: &str,
     kind: Kind,
-) -> Result<Value, sqlx::Error> {
+) -> Result<Value, store::Error> {
     let (rows_sql, count_sql) = match kind {
         Kind::Accounts => (
-            "SELECT id, name, type, subtype, is_active, is_favorite FROM accounts
-             WHERE book_id = $1 AND lower(name) LIKE $2
-             ORDER BY CASE WHEN lower(name) = $3 THEN 0 WHEN lower(name) LIKE $4 THEN 1 ELSE 2 END,
-                      lower(name), id DESC LIMIT 25",
-            "SELECT CAST(COUNT(*) AS integer) FROM accounts WHERE book_id = $1 AND lower(name) LIKE $2",
+            r"SELECT id, name, type, subtype, is_active, is_favorite FROM accounts
+             WHERE book_id = ?1 AND name_fold LIKE ?2 ESCAPE '\'
+             ORDER BY CASE WHEN name_fold = ?3 THEN 0 WHEN name_fold LIKE ?4 ESCAPE '\' THEN 1 ELSE 2 END,
+                      name_fold, id DESC LIMIT 25",
+            r"SELECT CAST(COUNT(*) AS integer) FROM accounts
+             WHERE book_id = ?1 AND name_fold LIKE ?2 ESCAPE '\'",
         ),
         Kind::Payees => (
-            "SELECT id, name FROM payees WHERE book_id = $1 AND lower(name) LIKE $2
-             ORDER BY CASE WHEN lower(name) = $3 THEN 0 WHEN lower(name) LIKE $4 THEN 1 ELSE 2 END,
-                      lower(name), id DESC LIMIT 25",
-            "SELECT CAST(COUNT(*) AS integer) FROM payees WHERE book_id = $1 AND lower(name) LIKE $2",
+            r"SELECT id, name FROM payees WHERE book_id = ?1 AND name_fold LIKE ?2 ESCAPE '\'
+             ORDER BY CASE WHEN name_fold = ?3 THEN 0 WHEN name_fold LIKE ?4 ESCAPE '\' THEN 1 ELSE 2 END,
+                      name_fold, id DESC LIMIT 25",
+            r"SELECT CAST(COUNT(*) AS integer) FROM payees
+             WHERE book_id = ?1 AND name_fold LIKE ?2 ESCAPE '\'",
         ),
         Kind::Rules => (
-            "SELECT id, name, frequency, next_date, business_days_only, is_active FROM recurring_rules
-             WHERE book_id = $1 AND (lower(name) LIKE $2 OR lower(template_description) LIKE $2)
-             ORDER BY CASE WHEN lower(name) = $3 THEN 0 WHEN lower(name) LIKE $4 THEN 1 ELSE 2 END,
-                      lower(name), id DESC LIMIT 25",
-            "SELECT CAST(COUNT(*) AS integer) FROM recurring_rules
-             WHERE book_id = $1 AND (lower(name) LIKE $2 OR lower(template_description) LIKE $2)",
+            r"SELECT id, name, frequency, next_date, business_days_only, is_active FROM recurring_rules
+             WHERE book_id = ?1
+               AND (name_fold LIKE ?2 ESCAPE '\' OR template_description_fold LIKE ?2 ESCAPE '\')
+             ORDER BY CASE WHEN name_fold = ?3 THEN 0 WHEN name_fold LIKE ?4 ESCAPE '\' THEN 1 ELSE 2 END,
+                      name_fold, id DESC LIMIT 25",
+            r"SELECT CAST(COUNT(*) AS integer) FROM recurring_rules
+             WHERE book_id = ?1
+               AND (name_fold LIKE ?2 ESCAPE '\' OR template_description_fold LIKE ?2 ESCAPE '\')",
         ),
     };
-    let (rows, total): (_, i32) = tokio::try_join!(
-        sqlx::query(rows_sql)
-            .bind(book_id)
-            .bind(pattern)
-            .bind(lower)
-            .bind(prefix)
-            .fetch_all(pool),
-        sqlx::query_scalar(count_sql)
-            .bind(book_id)
-            .bind(pattern)
-            .fetch_one(pool),
-    )?;
-    let items = rows.into_iter().map(|row| match kind {
-        Kind::Accounts => json!({
-            "id": row.get::<i32, _>("id"), "name": row.get::<String, _>("name"),
-            "type": row.get::<String, _>("type"), "subtype": row.get::<Option<String>, _>("subtype"),
-            "isActive": row.get::<bool, _>("is_active"),
-            "isFavorite": row.get::<bool, _>("is_favorite"),
-        }),
-        Kind::Payees => json!({
-            "id": row.get::<i32, _>("id"), "name": row.get::<String, _>("name"),
-        }),
-        Kind::Rules => json!({
-            "id": row.get::<i32, _>("id"), "name": row.get::<String, _>("name"),
-            "frequency": row.get::<String, _>("frequency"),
-            "nextDate": row.get::<String, _>("next_date"),
-            "businessDaysOnly": row.get::<bool, _>("business_days_only"),
-            "isActive": row.get::<bool, _>("is_active"),
-        }),
-    }).collect();
+    let rows: Vec<Row> = pool.query(rows_sql, &params![book_id, pattern, folded, prefix])?;
+    let total: i32 = pool.query_row(count_sql, &params![book_id, pattern])?;
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            Ok(match kind {
+                Kind::Accounts => json!({
+                    "id": row.column::<i32>("id")?, "name": row.column::<String>("name")?,
+                    "type": row.column::<String>("type")?,
+                    "subtype": row.column::<Option<String>>("subtype")?,
+                    "isActive": row.column::<bool>("is_active")?,
+                    "isFavorite": row.column::<bool>("is_favorite")?,
+                }),
+                Kind::Payees => json!({
+                    "id": row.column::<i32>("id")?, "name": row.column::<String>("name")?,
+                }),
+                Kind::Rules => json!({
+                    "id": row.column::<i32>("id")?, "name": row.column::<String>("name")?,
+                    "frequency": row.column::<String>("frequency")?,
+                    "nextDate": row.column::<String>("next_date")?,
+                    "businessDaysOnly": row.column::<bool>("business_days_only")?,
+                    "isActive": row.column::<bool>("is_active")?,
+                }),
+            })
+        })
+        .collect::<Result<_, store::Error>>()?;
     Ok(bucket(items, total))
 }
 
@@ -286,13 +280,12 @@ pub(crate) async fn search(
     let end = query_date_param(&params, "endDate")?;
     let query = params.get("q").map_or("", String::as_str);
     let mut results = search_book(
-        &state.pool,
+        &*state.database,
         book.book_id(),
         query,
         start.as_deref(),
         end.as_deref(),
     )
-    .await
     .map_err(|cause| internal_error(cause, "Failed to search"))?;
     // The route sends neither a transaction's notes nor an account's active
     // flag. The MCP tool sends both.
@@ -317,28 +310,30 @@ pub(crate) async fn search(
 /// check number contains the query, or whose split has the query's amount,
 /// and the accounts, payees and recurring rules whose name contains it.
 /// The query is trimmed; an empty one finds nothing.
-pub(crate) async fn search_book(
-    pool: &DbPool,
+pub(crate) fn search_book(
+    pool: &impl Sql,
     book_id: i32,
     query: &str,
     start: Option<&str>,
     end: Option<&str>,
-) -> Result<Value, sqlx::Error> {
+) -> Result<Value, store::Error> {
     let query = query.trim();
     if query.is_empty() {
         return Ok(json!({ "transactions": [], "accounts": empty_bucket(),
             "payees": empty_bucket(), "recurringRules": empty_bucket() }));
     }
-    let lower = query.to_lowercase();
-    let pattern = format!("%{lower}%");
-    let prefix = format!("{lower}%");
+    // The query is a LIKE pattern on the folded columns, as it was on
+    // PostgreSQL: `%` and `_` match any text and `\` escapes. Both sides are
+    // folded, so the built-in LIKE, which folds ASCII case only, compares
+    // them as a case-sensitive LIKE would.
+    let folded = ledger_db::folds::fold(query);
+    let pattern = format!("%{folded}%");
+    let prefix = format!("{folded}%");
     let today = local_today();
-    let txns = transaction_results(pool, book_id, query, &pattern, start, end, &today).await?;
-    let (accounts, payees, rules) = tokio::try_join!(
-        named_bucket(pool, book_id, &lower, &pattern, &prefix, Kind::Accounts),
-        named_bucket(pool, book_id, &lower, &pattern, &prefix, Kind::Payees),
-        named_bucket(pool, book_id, &lower, &pattern, &prefix, Kind::Rules),
-    )?;
+    let txns = transaction_results(pool, book_id, query, &pattern, start, end, &today)?;
+    let accounts = named_bucket(pool, book_id, &folded, &pattern, &prefix, Kind::Accounts)?;
+    let payees = named_bucket(pool, book_id, &folded, &pattern, &prefix, Kind::Payees)?;
+    let rules = named_bucket(pool, book_id, &folded, &pattern, &prefix, Kind::Rules)?;
     Ok(json!({ "transactions": txns, "accounts": accounts,
         "payees": payees, "recurringRules": rules }))
 }

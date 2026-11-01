@@ -21,15 +21,27 @@ pub fn normalize_payee_name(input: &str) -> String {
         .collect()
 }
 
+/// The case fold that the `*_fold` columns hold and that a lookup or search
+/// compares with: Unicode lowercase, as JavaScript's `toLowerCase()`. Never
+/// SQLite's `lower()`, which folds ASCII only.
+pub fn fold(text: &str) -> String {
+    text.to_lowercase()
+}
+
 /// `normalizePayeeName(merchant ?? name).toLowerCase()`: the key of the
 /// learned payee map of a staged Plaid row.
 pub fn merchant_key(merchant_name: Option<&str>, name: &str) -> String {
-    normalize_payee_name(merchant_name.unwrap_or(name)).to_lowercase()
+    fold(&normalize_payee_name(merchant_name.unwrap_or(name)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folds_unicode_case() {
+        assert_eq!(fold("ÉCOLE Straße ΣΑΣ"), "école straße σας");
+    }
 
     #[test]
     fn normalizes_whitespace_and_quotes_but_not_case() {

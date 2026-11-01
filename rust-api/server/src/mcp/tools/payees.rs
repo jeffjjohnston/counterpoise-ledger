@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     mcp::call::{
         Caller, Level, ToolResult, fail, integer, invalid_arguments, ok, thrown, with_query,
+        write_access,
     },
     routes::payees::{create_exact, normalize_name},
 };
@@ -47,9 +48,9 @@ pub(super) async fn get(
     Ok(ok(&payee))
 }
 
-/// Unlike `POST /payees`, the tool does not return a case variant that
-/// already exists: "Ikea" after "IKEA" creates a second payee. An exact
-/// repeat fails, because the book allows one payee for each exact name.
+/// Unlike `POST /payees`, the tool does not return a payee that already
+/// exists: it fails and names it. A name matches without letter case, so
+/// "Ikea" after "IKEA" fails as an exact repeat does.
 pub(super) async fn create(
     caller: &Caller,
     arguments: &Map<String, Value>,
@@ -69,12 +70,13 @@ pub(super) async fn create(
             invalid_arguments("create_payee", &["name: Name is required".to_owned()]).into(),
         );
     }
-    caller.book(book_id, Level::Write).await?;
-    let book_id = i32::try_from(book_id).map_err(|cause| thrown(&cause.to_string()))?;
-    match create_exact(&caller.state().pool, book_id, &name).await {
-        Ok(Some(payee)) => Ok(ok(&payee)),
-        Ok(None) => Err(fail(&format!(
-            "A payee named \"{name}\" already exists in this book"
+    let book = caller.book(book_id, Level::Write).await?;
+    let access = write_access(&book)?;
+    match create_exact(&caller.state().database, &access, &name) {
+        Ok(Ok(payee)) => Ok(ok(&payee)),
+        Ok(Err(existing)) => Err(fail(&format!(
+            "A payee named \"{}\" already exists in this book",
+            existing["name"].as_str().unwrap_or(&name)
         ))
         .into()),
         Err(cause) => Err(thrown(&cause.to_string()).into()),

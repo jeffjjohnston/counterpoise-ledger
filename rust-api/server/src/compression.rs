@@ -29,8 +29,8 @@
 //!
 //! The layer does not compress these responses:
 //!
-//! - Server-sent events (`text/event-stream`): the book change stream. Each
-//!   hint must go out at once, as the route writes it. A compressor, or a
+//! - Server-sent events (`text/event-stream`). No route sends them now, but
+//!   each event of such a stream must go out at once. A compressor, or a
 //!   proxy that reads a compressed stream, can hold bytes back until it has
 //!   more of them. The default predicate of tower-http refuses this content
 //!   type. A test below holds this rule.
@@ -112,8 +112,8 @@ mod tests {
         json!({ "transactions": rows })
     }
 
-    /// An event stream like the book change stream (`routes/events.rs`). It
-    /// sends the second frame only after `release` is notified. Thus the test
+    /// An event stream. It sends the second frame only after `release` is
+    /// notified. Thus the test
     /// can read the first frame while the stream is open.
     fn event_stream(release: Arc<Notify>) -> Response {
         let frames = futures_util::stream::unfold(0, move |sent| {

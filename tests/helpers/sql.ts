@@ -15,6 +15,7 @@
  * Playwright setup, calls `setDatabasePath` first.
  */
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { normalizePayeeName } from "../../lib/payees";
 
 export type Row = Record<string, unknown>;
 
@@ -48,6 +49,38 @@ const NOW_COLUMNS: Record<string, string[]> = {
   plaid_transaction_reconciliation: ["first_seen_at", "last_seen_at", "created_at", "updated_at"],
   typesafe_evaluations: ["started_at"],
   typesafe_decisions: ["decided_at"],
+};
+
+const fold = (value: unknown) => (typeof value === "string" ? value.toLowerCase() : null);
+
+interface Derived {
+  sources: string[];
+  compute: (values: unknown[]) => string | null;
+}
+const folded = (source: string): Derived => ({ sources: [source], compute: ([value]) => fold(value) });
+
+/**
+ * The derived columns of `ledger_db::folds`, by table: the folds (migration
+ * 0012) and the merchant key of a staged Plaid row (0013). The app writes a
+ * fold with Rust's `to_lowercase()`, which is JavaScript's `toLowerCase()`.
+ */
+const FOLD_COLUMNS: Record<string, Record<string, Derived>> = {
+  transactions: {
+    description_fold: folded("description"), notes_fold: folded("notes"), check_number_fold: folded("check_number"),
+  },
+  payees: { name_fold: folded("name") },
+  accounts: { name_fold: folded("name") },
+  securities: { symbol_fold: folded("symbol") },
+  recurring_rules: { name_fold: folded("name"), template_description_fold: folded("template_description") },
+  plaid_transaction_reconciliation: {
+    merchant_key: {
+      sources: ["merchant_name", "name"],
+      compute: ([merchant, name]) =>
+        typeof name === "string"
+          ? normalizePayeeName(typeof merchant === "string" ? merchant : name).toLowerCase()
+          : null,
+    },
+  },
 };
 
 let database: DatabaseSync | undefined;
@@ -112,10 +145,16 @@ function convert(column: string, value: unknown): unknown {
   return value;
 }
 
-/** A row with camelCase keys and converted values. */
+/**
+ * A row with camelCase keys and converted values. The `*_fold` columns and
+ * `merchant_key` are left out: they are derived state that no API returns,
+ * and the after-test check (`staleFolds`) covers them.
+ */
 export function toRow<T = Row>(raw: Record<string, unknown>): T {
   const row: Row = {};
-  for (const [column, value] of Object.entries(raw)) row[camelCase(column)] = convert(column, value);
+  for (const [column, value] of Object.entries(raw)) {
+    if (!column.endsWith("_fold") && column !== "merchant_key") row[camelCase(column)] = convert(column, value);
+  }
   return row as T;
 }
 
@@ -186,6 +225,12 @@ const api: Sql = {
       for (const [key, item] of Object.entries(value)) {
         if (item !== undefined) record[snakeCase(key)] = item;
       }
+      // As the app writes them, unless the fixture names a fold itself.
+      for (const [foldColumn, derived] of Object.entries(FOLD_COLUMNS[table] ?? {})) {
+        if (derived.sources.some((source) => source in record) && !(foldColumn in record)) {
+          record[foldColumn] = derived.compute(derived.sources.map((source) => record[source] ?? null));
+        }
+      }
       return record;
     });
     const columns = [...new Set(records.flatMap((record) => Object.keys(record)))];
@@ -232,7 +277,7 @@ export async function tableColumns(): Promise<Array<{ table: string; column: str
   const result = run(
     `SELECT m.name AS table_name, p.name AS column_name
      FROM sqlite_master m JOIN pragma_table_info(m.name) p
-     WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND m.name <> '_sqlx_migrations'
+     WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT IN ('_sqlx_migrations', 'schema_migrations')
      ORDER BY m.name, p.cid`,
     [],
   ).rows;
@@ -241,4 +286,26 @@ export async function tableColumns(): Promise<Array<{ table: string; column: str
     column: String(raw.column_name),
     timestamp: String(raw.column_name).endsWith("_at"),
   }));
+}
+
+/**
+ * The folds that differ from their column, as `ledger_db::folds::check` finds
+ * them. Every write path of the app stores the fold beside its column, so a
+ * test that ends with one has found a write path that does not.
+ */
+export function staleFolds(): Array<{ table: string; column: string; id: number }> {
+  // Only a test that opened the database has rows to check.
+  if (!database) return [];
+  const stale: Array<{ table: string; column: string; id: number }> = [];
+  for (const [table, folds] of Object.entries(FOLD_COLUMNS)) {
+    for (const [foldColumn, derived] of Object.entries(folds)) {
+      const sources = derived.sources.map((source) => `"${source}"`).join(", ");
+      const rows = run(`SELECT id, "${foldColumn}" AS fold, ${sources} FROM ${table}`, []).rows;
+      for (const row of rows) {
+        const expected = derived.compute(derived.sources.map((source) => row[source]));
+        if (row.fold !== expected) stale.push({ table, column: foldColumn, id: Number(row.id) });
+      }
+    }
+  }
+  return stale;
 }

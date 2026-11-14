@@ -199,7 +199,7 @@ fn matches_generated_typescript_corpus() {
     let corpus: Corpus = serde_json::from_str(include_str!("../fixtures/core.json")).unwrap();
     assert_eq!(corpus.version, 1);
     assert!(
-        corpus.cases.len() >= 375,
+        corpus.cases.len() >= 689,
         "fixture coverage fell unexpectedly"
     );
     let mut failures = Vec::new();

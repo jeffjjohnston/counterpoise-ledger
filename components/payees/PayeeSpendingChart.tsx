@@ -62,7 +62,8 @@ function PayeeSpendingBars({ bookId, payeeId, refreshKey }: { bookId: string; pa
     [loaded],
   );
 
-  if (failed) return <p className="text-sm text-fg-danger">Could not load spending by month.</p>;
+  // A failed refresh keeps the bars that the chart shows.
+  if (failed && loaded === null) return <p className="text-sm text-fg-danger">Could not load spending by month.</p>;
   if (loaded === null) {
     return <div data-testid="payee-spending-placeholder" className="animate-pulse rounded bg-surface-tertiary" style={{ height }} />;
   }

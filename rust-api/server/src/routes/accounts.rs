@@ -253,15 +253,6 @@ pub(crate) async fn create_account(
         Ok(account)
     })?;
 
-    state.analytics.capture_event(
-        book.user_id(),
-        "account_created",
-        Some(json!({
-            "bookId": book.book_id(),
-            "type": account.account_type,
-            "subtype": account.subtype,
-        })),
-    );
     Ok(Json(
         serde_json::to_value(AccountNode {
             account,

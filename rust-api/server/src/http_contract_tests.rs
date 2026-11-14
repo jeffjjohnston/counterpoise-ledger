@@ -3,7 +3,6 @@
 //! will call, through Axum and a real SQLite database (migrated, in memory).
 
 use crate::{
-    analytics::PostHogCapture,
     book_auth::{AccessLevel, authenticate_book},
     cron_auth::require_cron_secret,
     error::{ApiError, error, internal_error},
@@ -126,15 +125,6 @@ async fn lock_probe(
             "A sync is already running for this connection",
         ))
     }
-}
-
-async fn analytics_probe(State(capture): State<PostHogCapture>) -> StatusCode {
-    capture.capture_event(
-        42,
-        "account_created",
-        Some(json!({"bookId":7,"type":"asset"})),
-    );
-    StatusCode::OK
 }
 
 async fn spawn(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -373,43 +363,4 @@ async fn advisory_lock_busy_maps_to_the_node_conflict_body() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     server.abort();
-}
-
-#[tokio::test]
-async fn analytics_backend_error_does_not_change_http_success() {
-    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(1);
-    let receiver = Router::new().route(
-        "/batch/",
-        post(move |Json(body): Json<Value>| {
-            let seen_tx = seen_tx.clone();
-            async move {
-                seen_tx.send(body).await.unwrap();
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        }),
-    );
-    let (host, receiver_server) = spawn(receiver).await;
-    let capture = PostHogCapture::new(Some("project-key".into()), Some(host));
-    let (base, app_server) = spawn(
-        Router::new()
-            .route("/account", post(analytics_probe))
-            .with_state(capture),
-    )
-    .await;
-    let response = reqwest::Client::new()
-        .post(format!("{base}/account"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        event["batch"][0],
-        json!({"distinct_id":"42","event":"account_created","properties":{"bookId":7,"type":"asset"}})
-    );
-    app_server.abort();
-    receiver_server.abort();
 }

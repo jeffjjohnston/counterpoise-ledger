@@ -1,7 +1,7 @@
 "use client";
 
 import { Link, useParams } from "@/lib/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { Tabs } from "@/components/ui/Tabs";
@@ -14,7 +14,9 @@ import { formatCurrency, formatDate } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
-import { apiGet, apiPut, apiDelete, toMessage } from "@/lib/api-client";
+import { useLiveReload } from "@/components/BookChangesProvider";
+import { useLatestRequest } from "@/hooks/useLatestRequest";
+import { ApiError, apiGet, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { Security } from "@/types/db";
 
@@ -55,7 +57,42 @@ type SecurityPriceHistoryRow = {
 };
 
 const PAGE_SIZE = 50;
+// The most rows that one request can get. A reload that keeps a longer
+// loaded list sends more than one request.
+const MAX_PRICES_PER_REQUEST = 5000;
+const MAX_SPLITS_PER_REQUEST = 200;
 const MICROS_PER_SHARE = 1_000_000;
+
+// The tables that each part of the page reads. The header, the cards and the
+// positions read the security, its latest price, its investment splits with
+// their transactions and accounts, and its lots (the cost basis).
+const DETAIL_TABLES = [
+  "securities", "security_prices", "investment_splits", "investment_lots", "transactions", "accounts",
+];
+// The price table and the price chart.
+const PRICE_TABLES = ["securities", "security_prices"];
+// The transaction table. The income amounts come from the cash splits.
+const SPLIT_TABLES = ["securities", "investment_splits", "transactions", "transaction_splits", "accounts"];
+// The open lots and the names of their accounts.
+const LOT_TABLES = ["securities", "investment_lots", "accounts"];
+
+// Gets `count` rows from `offset`, in requests of at most `max` rows.
+async function getPages<T>(
+  fetchPage: (limit: number, offset: number) => Promise<{ rows?: T[]; totalCount?: number }>,
+  offset: number,
+  count: number,
+  max: number
+): Promise<{ rows: T[]; totalCount: number | undefined }> {
+  const requests: Promise<{ rows?: T[]; totalCount?: number }>[] = [];
+  for (let start = offset; start < offset + count; start += max) {
+    requests.push(fetchPage(Math.min(max, offset + count - start), start));
+  }
+  const pages = await Promise.all(requests);
+  return {
+    rows: pages.flatMap((page) => (Array.isArray(page.rows) ? page.rows : [])),
+    totalCount: pages[pages.length - 1]?.totalCount,
+  };
+}
 
 const securityTypeLabels: Record<Security["securityType"], string> = {
   stock: "Stock",
@@ -113,6 +150,48 @@ const calculateAmount = (split: SecuritySplit): number | null => {
   return sharesValueCents + split.feesCents;
 };
 
+/**
+ * The requests of one list with "load more". A live reload replaces the list
+ * from offset 0, and "load more" appends the rows after the list on the
+ * screen. An append must not cancel a replacement, and the rows of an append
+ * that a replacement overtook belong to the old list. Thus an append that
+ * starts during a replacement waits for it and publishes nothing (the next
+ * "load more" uses the new list), and a replacement that starts during an
+ * append makes that append publish nothing.
+ */
+function usePagedList() {
+  const replaceRequest = useLatestRequest();
+  const state = useRef({ generation: 0, replacing: 0, settled: Promise.resolve() });
+  return useMemo(() => ({
+    replace() {
+      const isLatest = replaceRequest();
+      const current = state.current;
+      current.generation++;
+      current.replacing++;
+      let finish = () => {};
+      current.settled = new Promise<void>((resolve) => { finish = resolve; });
+      let open = true;
+      return {
+        isLatest,
+        done() {
+          if (!open) return;
+          open = false;
+          current.replacing--;
+          finish();
+        },
+      };
+    },
+    /** Null while a replacement is in flight: then wait for `settled()`. */
+    append(): (() => boolean) | null {
+      const current = state.current;
+      if (current.replacing > 0) return null;
+      const generation = current.generation;
+      return () => generation === current.generation;
+    },
+    settled: () => state.current.settled,
+  }), [replaceRequest]);
+}
+
 export default function SecurityDetailPage() {
   const bookId = useBookId();
   const { canWrite } = useBookRole();
@@ -139,58 +218,151 @@ export default function SecurityDetailPage() {
   const loadMorePricesRef = useRef<HTMLDivElement>(null);
   const loadMoreSplitsRef = useRef<HTMLDivElement>(null);
 
+  // A live update can start a reload while another is in flight, and the
+  // answers can arrive in either order. Only the latest request of each part
+  // may publish its answer. A request that a later one replaced resolves and
+  // publishes nothing. A request that is still the latest rejects on failure.
+  const detailRequest = useLatestRequest();
+  const pricesRequest = usePagedList();
+  const splitsRequest = usePagedList();
+  const lotsRequest = useLatestRequest();
+  // Whether the security has rendered. A live reload can overtake the first
+  // load, so the first answer, not the first request, decides between the
+  // full-page error and a quiet failure.
+  const detailShown = useRef(false);
+
   const fetchSecurityDetail = useCallback(async () => {
-    const data = await apiGet<{
-      security: SecurityDetail;
-      positionsByAccount?: PositionByAccount[];
-    }>(`/api/b/${bookId}/securities/${securityId}/detail`);
+    const isLatest = detailRequest();
+    let data: { security: SecurityDetail; positionsByAccount?: PositionByAccount[] };
+    try {
+      data = await apiGet<typeof data>(`/api/b/${bookId}/securities/${securityId}/detail`);
+    } catch (fetchError) {
+      if (isLatest()) throw fetchError;
+      return;
+    }
+    if (!isLatest()) return;
 
     setSecurity(data.security);
     setPositionsByAccount(data.positionsByAccount ?? []);
-  }, [bookId, securityId]);
+    detailShown.current = true;
+  }, [bookId, securityId, detailRequest]);
 
+  // `count` is the number of rows to get. A live reload gets as many rows as
+  // the list shows, so that the list does not become shorter.
   const fetchPriceHistory = useCallback(
-    async (offset: number, append: boolean) => {
-      const data = await apiGet<{
-        prices?: SecurityPriceHistoryRow[];
-        totalCount?: number;
-      }>(
-        `/api/b/${bookId}/securities/${securityId}/prices?limit=${PAGE_SIZE}&offset=${offset}`
-      );
+    async (offset: number, append: boolean, count = PAGE_SIZE) => {
+      let isLatest: () => boolean;
+      let done = () => {};
+      if (append) {
+        const current = pricesRequest.append();
+        if (!current) {
+          await pricesRequest.settled();
+          return;
+        }
+        isLatest = current;
+      } else {
+        ({ isLatest, done } = pricesRequest.replace());
+      }
+      let data: { rows: SecurityPriceHistoryRow[]; totalCount: number | undefined };
+      try {
+        data = await getPages(
+          async (limit, start) => {
+            const page = await apiGet<{ prices?: SecurityPriceHistoryRow[]; totalCount?: number }>(
+              `/api/b/${bookId}/securities/${securityId}/prices?limit=${limit}&offset=${start}`
+            );
+            return { rows: page.prices, totalCount: page.totalCount };
+          },
+          offset,
+          count,
+          MAX_PRICES_PER_REQUEST
+        );
+      } catch (fetchError) {
+        if (isLatest()) throw fetchError;
+        return;
+      } finally {
+        done();
+      }
+      if (!isLatest()) return;
 
-      const nextPrices: SecurityPriceHistoryRow[] = Array.isArray(data.prices)
-        ? data.prices
-        : [];
-
+      const nextPrices = data.rows;
       setPriceHistory((current) => (append ? [...current, ...nextPrices] : nextPrices));
       setTotalPriceCount(data.totalCount ?? nextPrices.length);
     },
-    [bookId, securityId]
+    [bookId, securityId, pricesRequest]
   );
 
   const fetchSplits = useCallback(
-    async (offset: number, append: boolean) => {
-      const data = await apiGet<{
-        splits?: SecuritySplit[];
-        totalCount?: number;
-      }>(
-        `/api/b/${bookId}/securities/${securityId}/splits?limit=${PAGE_SIZE}&offset=${offset}`
-      );
+    async (offset: number, append: boolean, count = PAGE_SIZE) => {
+      let isLatest: () => boolean;
+      let done = () => {};
+      if (append) {
+        const current = splitsRequest.append();
+        if (!current) {
+          await splitsRequest.settled();
+          return;
+        }
+        isLatest = current;
+      } else {
+        ({ isLatest, done } = splitsRequest.replace());
+      }
+      let data: { rows: SecuritySplit[]; totalCount: number | undefined };
+      try {
+        data = await getPages(
+          async (limit, start) => {
+            const page = await apiGet<{ splits?: SecuritySplit[]; totalCount?: number }>(
+              `/api/b/${bookId}/securities/${securityId}/splits?limit=${limit}&offset=${start}`
+            );
+            return { rows: page.splits, totalCount: page.totalCount };
+          },
+          offset,
+          count,
+          MAX_SPLITS_PER_REQUEST
+        );
+      } catch (fetchError) {
+        if (isLatest()) throw fetchError;
+        return;
+      } finally {
+        done();
+      }
+      if (!isLatest()) return;
 
-      const nextSplits: SecuritySplit[] = Array.isArray(data.splits)
-        ? data.splits
-        : [];
-
+      const nextSplits = data.rows;
       setSplits((current) => (append ? [...current, ...nextSplits] : nextSplits));
       setTotalSplitsCount(data.totalCount ?? nextSplits.length);
     },
-    [bookId, securityId]
+    [bookId, securityId, splitsRequest]
   );
 
   const fetchLots = useCallback(async () => {
-    const data = await apiGet<OpenLot[]>(`/api/b/${bookId}/securities/${securityId}/lots`);
+    const isLatest = lotsRequest();
+    let data: OpenLot[];
+    try {
+      data = await apiGet<OpenLot[]>(`/api/b/${bookId}/securities/${securityId}/lots`);
+    } catch (fetchError) {
+      if (isLatest()) throw fetchError;
+      return;
+    }
+    if (!isLatest()) return;
     setLots(Array.isArray(data) ? data : []);
-  }, [bookId, securityId]);
+  }, [bookId, securityId, lotsRequest]);
+
+  // Before the security has rendered, a failure shows the full-page error.
+  // A security that another client deleted shows the not-found state. After
+  // that, a failed reload keeps the data on the screen: only a failure of
+  // the header (`notify`) shows a toast, so that one failure does not show
+  // four toasts.
+  const loadFailed = useCallback(
+    (fetchError: unknown, notify: boolean) => {
+      if (!detailShown.current || (fetchError instanceof ApiError && fetchError.status === 404)) {
+        console.error("Error loading security detail:", fetchError);
+        setError(toMessage(fetchError, "Failed to load security"));
+        setLoading(false);
+      } else if (notify) {
+        toast.error("Could not refresh security.");
+      }
+    },
+    [toast]
+  );
 
   useEffect(() => {
     if (!Number.isFinite(securityId)) {
@@ -199,38 +371,52 @@ export default function SecurityDetailPage() {
       return;
     }
 
-    let isMounted = true;
-    const fetchAll = async () => {
-      setLoading(true);
-      setError(null);
-
-      try {
-        await Promise.all([
-          fetchSecurityDetail(),
-          fetchPriceHistory(0, false),
-          fetchSplits(0, false),
-          fetchLots(),
-        ]);
-      } catch (fetchError) {
-        console.error("Error loading security detail:", fetchError);
-        if (isMounted) {
-          setError(toMessage(fetchError, "Failed to load security"));
-        }
-      } finally {
-        if (isMounted) {
-          setLoading(false);
-        }
+    detailShown.current = false;
+    setLoading(true);
+    setError(null);
+    // Each loader publishes its own answer. A live reload can replace the
+    // first request for the header. Then the loading state stays until the
+    // answer of that reload.
+    Promise.all([
+      fetchSecurityDetail(),
+      fetchPriceHistory(0, false),
+      fetchSplits(0, false),
+      fetchLots(),
+    ]).then(
+      () => { if (detailShown.current) setLoading(false); },
+      (fetchError: unknown) => {
+        // The header can be on the screen when another part of the first
+        // load fails. The first load is then complete: end the loading state.
+        if (detailShown.current) setLoading(false);
+        loadFailed(fetchError, true);
       }
-    };
+    );
+  }, [securityId, fetchSecurityDetail, fetchPriceHistory, fetchSplits, fetchLots, loadFailed]);
 
-    // fetchAll already catches every failure into `error` and resolves
-    // `loading` in its finally, so it cannot reject.
-    void fetchAll();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [securityId, fetchSecurityDetail, fetchPriceHistory, fetchSplits, fetchLots]);
+  // Another client (an MCP tool, another tab, a scheduled job) changed the
+  // book. Each part reloads when a table that it reads changes. The edit
+  // forms take their fields from the loaded rows, so while one is open the
+  // reloads wait until it closes. A reload keeps the active tab and as many
+  // rows as each list shows.
+  const editorOpen = showEditModal || editingSplit !== null || editingPrice !== null;
+  useLiveReload(DETAIL_TABLES, () => {
+    fetchSecurityDetail().then(
+      () => { if (detailShown.current) setLoading(false); },
+      (fetchError: unknown) => loadFailed(fetchError, true)
+    );
+  }, { paused: editorOpen });
+  useLiveReload(PRICE_TABLES, () => {
+    setChartRefreshKey((key) => key + 1);
+    fetchPriceHistory(0, false, Math.max(PAGE_SIZE, priceHistory.length))
+      .catch((fetchError: unknown) => loadFailed(fetchError, false));
+  }, { paused: editorOpen });
+  useLiveReload(SPLIT_TABLES, () => {
+    fetchSplits(0, false, Math.max(PAGE_SIZE, splits.length))
+      .catch((fetchError: unknown) => loadFailed(fetchError, false));
+  }, { paused: editorOpen });
+  useLiveReload(LOT_TABLES, () => {
+    fetchLots().catch((fetchError: unknown) => loadFailed(fetchError, false));
+  }, { paused: editorOpen });
 
   const hasMorePrices = priceHistory.length < totalPriceCount;
   const hasMoreSplits = splits.length < totalSplitsCount;

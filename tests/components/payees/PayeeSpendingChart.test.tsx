@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { PayeeSpendingChart } from "@/components/payees/PayeeSpendingChart";
 import type { ReportSplit } from "@/lib/reports";
 import { stubResizeObserver } from "@/tests/helpers/resize-observer";
@@ -96,6 +96,20 @@ describe("PayeeSpendingChart", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     // The old bars stay on screen until the new splits come.
     expect(screen.getByRole("img")).toBeInTheDocument();
+  });
+
+  it("keeps the bars when a refresh fails", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => body })
+      .mockResolvedValue({ ok: false, status: 500, json: async () => ({ error: "down" }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const { rerender } = render(<PayeeSpendingChart bookId="1" payeeId={7} refreshKey={0} />);
+    await screen.findByRole("img");
+    rerender(<PayeeSpendingChart bookId="1" payeeId={7} refreshKey={1} />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    expect(screen.getByRole("img")).toBeInTheDocument();
+    expect(screen.queryByText("Could not load spending by month.")).not.toBeInTheDocument();
   });
 
   it("moves the window to the new month when a refresh comes after a month boundary", async () => {

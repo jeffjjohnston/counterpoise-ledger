@@ -57,8 +57,21 @@ function Fixture() {
 function source() { return FakeWebSocket.instances[FakeWebSocket.instances.length - 1]; }
 async function change(table = "transactions") {
   act(() => { source().emit("change", { tables: [table] }); });
-  // Wait for the provider's bounded coalescing window, through a visible result
-  // in each test, rather than assigning an assumed fetch completion delay.
+  // The caller moves the fake clock through the windows below.
+}
+// These values come from the source. If the source changes one, change it here.
+// BookChangesProvider holds socket hints for 100 ms, then sends one change.
+const BATCH_MS = 100;
+// useTransactionsPageData (REFRESH_COALESCE_MS) waits 400 ms before a snapshot
+// that is not immediate.
+const COALESCE_MS = 400;
+// A change hint starts a background snapshot after the two windows.
+const HINT_TO_FETCH_MS = BATCH_MS + COALESCE_MS;
+// The fake clock runs requestAnimationFrame callbacks on 16 ms frames.
+const FRAME_MS = 16;
+/** Move the fake clock and let React apply the results. Use with vi.useFakeTimers(). */
+async function advance(ms: number) {
+  await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 }
 beforeEach(() => {
   unstableRenders = -1;
@@ -86,13 +99,18 @@ afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("transaction live refresh", () => {
   it("updates all projections and retains loaded extent without scrolling", async () => {
+    vi.useFakeTimers();
     render(<BookChangesProvider><Fixture /></BookChangesProvider>);
-    await screen.findByText("v1-account1");
+    await advance(0);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
     fireEvent.click(screen.getByText("Load more"));
-    await waitFor(() => expect(screen.getByLabelText("rows")).toHaveTextContent("100"));
-    await waitFor(() => expect(scroll).toHaveBeenCalled());
+    await advance(FRAME_MS);
+    expect(screen.getByLabelText("rows")).toHaveTextContent("100");
+    expect(scroll).toHaveBeenCalled();
     scroll.mockClear(); version = 2; await change("books");
-    await screen.findByText("v2-account1");
+    // One more frame, so that a scroll request from the refresh has time to run.
+    await advance(HINT_TO_FETCH_MS + FRAME_MS);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v2-account1");
     expect(screen.getByLabelText("projected")).toHaveTextContent("v2");
     expect(screen.getByLabelText("pending")).toHaveTextContent("v2");
     expect(screen.getByLabelText("rows")).toHaveTextContent("100");
@@ -101,36 +119,47 @@ describe("transaction live refresh", () => {
   });
 
   it("defers during editing and runs a trailing refresh for an event during a fetch", async () => {
+    vi.useFakeTimers();
     render(<BookChangesProvider><Fixture /></BookChangesProvider>);
-    await screen.findByText("v1-account1");
+    await advance(0);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
     fireEvent.click(screen.getByText("Edit"));
     fireEvent.change(screen.getByLabelText("Draft"), { target: { value: "unsaved draft" } });
+    // Wait past the time at which a refresh would start if the editor did not defer it.
     version = 2; await change();
-    await waitFor(() => expect(notified).toHaveBeenCalledTimes(1));
+    await advance(HINT_TO_FETCH_MS);
+    expect(notified).toHaveBeenCalledTimes(1);
     expect(getCount).toBe(1);
     expect(screen.getByLabelText("Draft")).toHaveValue("unsaved draft");
     let release!: () => void;
     hold = new Promise<void>((resolve) => { release = resolve; });
     fireEvent.click(screen.getByText("Close editor"));
-    await waitFor(() => expect(getCount).toBe(2));
+    await advance(COALESCE_MS);
+    expect(getCount).toBe(2);
     version = 3; await change();
-    await waitFor(() => expect(notified).toHaveBeenCalledTimes(2));
+    await advance(HINT_TO_FETCH_MS);
+    expect(notified).toHaveBeenCalledTimes(2);
     expect(getCount).toBe(2);
     hold = undefined; await act(async () => release());
-    await screen.findByText("v3-account1");
+    await advance(COALESCE_MS);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v3-account1");
     expect(getCount).toBe(3);
   });
 
   it("discards an old account response even when transport ignores abort", async () => {
+    vi.useFakeTimers();
     render(<BookChangesProvider><Fixture /></BookChangesProvider>);
-    await screen.findByText("v1-account1");
+    await advance(0);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
     let release!: () => void;
     hold = new Promise<void>((resolve) => { release = resolve; });
     version = 2; await change();
-    await waitFor(() => expect(getCount).toBe(2));
+    await advance(HINT_TO_FETCH_MS);
+    expect(getCount).toBe(2);
     hold = undefined; version = 3;
     fireEvent.click(screen.getByText("Other account"));
-    await screen.findByText("v3-account2");
+    await advance(0);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v3-account2");
     await act(async () => release());
     expect(screen.getByLabelText("register")).toHaveTextContent("v3-account2");
   });
@@ -179,33 +208,42 @@ describe("transaction live refresh", () => {
 describe("review regressions", () => {
   it.each(["/investments/account-values", "/payees", "/recurring/projected", "/sync/pending-transactions"])(
     "loads and refreshes core rows when %s fails", async (path) => {
+      vi.useFakeTimers();
       failPath = path;
       render(<BookChangesProvider><Fixture /></BookChangesProvider>);
-      await screen.findByText("v1-account1");
+      await advance(0);
+      expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
       expect(screen.getByLabelText("error")).toBeEmptyDOMElement();
       version = 2; await change();
-      await screen.findByText("v2-account1");
+      await advance(HINT_TO_FETCH_MS);
+      expect(screen.getByLabelText("register")).toHaveTextContent("v2-account1");
       expect(screen.getByLabelText("positions")).toHaveTextContent("2");
       expect(toast.error).not.toHaveBeenCalled();
     });
 
   it.each(["/investments/account-values", "/payees", "/recurring/projected", "/sync/pending-transactions"])(
     "keeps refreshing core rows if %s becomes unavailable", async (path) => {
+      vi.useFakeTimers();
       render(<BookChangesProvider><Fixture /></BookChangesProvider>);
-      await screen.findByText("v1-account1");
+      await advance(0);
+      expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
       failPath = path; version = 2;
       await change();
-      await screen.findByText("v2-account1");
+      await advance(HINT_TO_FETCH_MS);
+      expect(screen.getByLabelText("register")).toHaveTextContent("v2-account1");
       expect(screen.getByLabelText("error")).toBeEmptyDOMElement();
       expect(toast.error).not.toHaveBeenCalled();
     });
 
   it("keeps rendered rows and reports a core refresh failure", async () => {
+    vi.useFakeTimers();
     render(<BookChangesProvider><Fixture /></BookChangesProvider>);
-    await screen.findByText("v1-account1");
+    await advance(0);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
     failPath = "/transactions"; version = 2;
     await change();
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Could not refresh transactions."));
+    await advance(HINT_TO_FETCH_MS);
+    expect(toast.error).toHaveBeenCalledWith("Could not refresh transactions.");
     expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
     expect(screen.getByLabelText("error")).toBeEmptyDOMElement();
   });
@@ -290,9 +328,12 @@ describe("unstable callbacks", () => {
   beforeEach(() => { unstableRenders = 0; });
 
   it("fetches once for a new scroll callback and toast on each render", async () => {
+    vi.useFakeTimers();
     render(<BookChangesProvider><UnstableFixture /></BookChangesProvider>);
-    await screen.findByText("v1-account1");
-    await act(async () => { await new Promise((resume) => setTimeout(resume, 100)); });
+    await advance(0);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
+    // Give a render loop time to start. The render cap stops a loop that starts.
+    await advance(100);
     expect(unstableRenders).toBeLessThan(RENDER_CAP);
     expect(getCount).toBe(1);
   });

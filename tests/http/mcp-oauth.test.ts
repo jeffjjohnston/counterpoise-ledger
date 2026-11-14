@@ -428,6 +428,28 @@ describe("MCP OAuth", () => {
       expect((await refresh(next.refresh_token)).status).toBe(400);
     });
 
+    it("refuses the previous access token after a refresh", async () => {
+      const { clientId, access_token, refresh_token } = await connect();
+      expect((await mcp(access_token)).status).toBe(200);
+      const rotated = await token({ grant_type: "refresh_token", refresh_token, client_id: clientId });
+      expect(rotated.status).toBe(200);
+      const next = (await rotated.json()) as { access_token: string };
+      // The grant has one access token at a time: the new one.
+      expect((await mcp(access_token)).status).toBe(401);
+      expect((await mcp(next.access_token)).status).toBe(200);
+      expect(await count("oauth_tokens", "kind = 'access'")).toBe(1);
+      // The used refresh token stays, for the detection of a replay.
+      expect(await count("oauth_tokens", "kind = 'refresh' AND used_at IS NOT NULL")).toBe(1);
+    });
+
+    it("keeps the access tokens of another grant after a refresh", async () => {
+      const other = await connect();
+      const { clientId, refresh_token } = await connect();
+      const rotated = await token({ grant_type: "refresh_token", refresh_token, client_id: clientId });
+      expect(rotated.status).toBe(200);
+      expect((await mcp(other.access_token)).status).toBe(200);
+    });
+
     it("revokes the grant when two exchanges of one refresh token run at the same time", async () => {
       const { clientId, refresh_token } = await connect();
       const refresh = () => token({ grant_type: "refresh_token", refresh_token, client_id: clientId });
@@ -545,7 +567,7 @@ describe("MCP OAuth", () => {
     const client = new Client({ name: "sdk", version: "1" });
     await client.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: provider }));
     const tools = await client.listTools();
-    expect(tools.tools.length).toBe(64);
+    expect(tools.tools.length).toBe(63);
     await client.close();
   });
 });

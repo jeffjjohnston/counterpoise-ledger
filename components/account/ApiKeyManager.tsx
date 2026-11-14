@@ -93,10 +93,7 @@ export function ApiKeyManager() {
       )}
 
       {newKeyValue && (
-        // ph-no-capture keeps the key out of PostHog autocapture, dead-click
-        // and copy capture, and masks it in session replay, should an
-        // operator turn any of those on in the PostHog project.
-        <div className="ph-no-capture bg-warning-subtle border border-border px-4 py-3 rounded-lg text-sm space-y-2">
+        <div className="bg-warning-subtle border border-border px-4 py-3 rounded-lg text-sm space-y-2">
           <p className="font-medium text-fg">
             Copy your API key now. It will not be shown again.
           </p>

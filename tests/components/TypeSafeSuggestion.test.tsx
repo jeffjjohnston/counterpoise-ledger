@@ -186,10 +186,10 @@ describe("TypeSafe suggestions", () => {
       />,
     );
     expect(
-      screen.getByText("TypeSafe has no suggestion for this transaction."),
+      screen.getByText("Clef has no suggestion for this transaction."),
     ).toBeVisible();
     expect(
-      screen.queryByText("TypeSafe found no clear match among these candidates."),
+      screen.queryByText("Clef found no clear match among these candidates."),
     ).toBeNull();
     expect(screen.queryByRole("button", { name: "Create transaction" })).toBeNull();
   });
@@ -225,7 +225,7 @@ describe("TypeSafe suggestions", () => {
       />,
     );
     expect(
-      screen.getByText("TypeSafe found no clear match among these candidates."),
+      screen.getByText("Clef found no clear match among these candidates."),
     ).toBeVisible();
     expect(screen.queryByRole("button", { name: "Create transaction" })).toBeNull();
   });

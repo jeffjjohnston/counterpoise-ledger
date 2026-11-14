@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { act, render, screen, fireEvent } from "@testing-library/react";
 import { SecurityForm } from "@/components/securities/SecurityForm";
 import type { Security } from "@/types/db";
 
@@ -182,5 +182,30 @@ describe("SecurityForm", () => {
 
     expect(handleSubmit).not.toHaveBeenCalled();
     expect(screen.getByText("Enter a price above zero, or untick Fixed price.")).toBeInTheDocument();
+  });
+  it("sends one submit when the user submits again during the save", async () => {
+    let finish: () => void = () => undefined;
+    const handleSubmit = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    render(<SecurityForm onSubmit={handleSubmit} onCancel={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Security Name"), { target: { value: "Apple Inc." } });
+    fireEvent.change(screen.getByLabelText("Symbol"), { target: { value: "AAPL" } });
+    const button = screen.getByRole("button", { name: "Add Security" });
+    const form = button.closest("form")!;
+
+    fireEvent.submit(form);
+    fireEvent.submit(form);
+
+    expect(handleSubmit).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    // The fields take no input during the save. A success closes the form,
+    // and text typed during the save would be lost.
+    expect(screen.getByLabelText("Security Name")).toBeDisabled();
+
+    // A failed save leaves the form open, so the button must work again.
+    await act(async () => finish());
+    expect(button).toBeEnabled();
+    expect(screen.getByLabelText("Security Name")).toBeEnabled();
+    fireEvent.submit(form);
+    expect(handleSubmit).toHaveBeenCalledTimes(2);
   });
 });

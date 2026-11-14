@@ -3,7 +3,7 @@
   "info": {
     "title": "Counterpoise API",
     "description": "The routes a native client uses. Money is integer cents. Shares and prices are integer micros, except that fetchTiingoPrices returns prices as decimal dollars. Dates are YYYY-MM-DD strings.",
-    "version": "1.60.2",
+    "version": "1.65.0",
     "x-api-contract": 1
   },
   "servers": [

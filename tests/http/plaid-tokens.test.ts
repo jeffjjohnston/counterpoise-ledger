@@ -226,6 +226,26 @@ describe("Plaid connection HTTP parity", () => {
     await expectError(client, `/api/b/1/sync/tokens/${"9".repeat(400)}`, valid, 400, "Invalid token id");
   });
 
+  // A cursor belongs to one Item. An edit that changed the
+  // Item or its access token kept the cursor of the old one.
+  it("resets the sync cursor when the Item or the access token changes", async () => {
+    const token = await createPlaidToken({ financialInstitution: "Bank", itemId: "item-1", accessToken: "access-token-1", syncCursor: "cursor-1" });
+    const path = `/api/b/1/sync/tokens/${token.id}`;
+    const cursor = async () => (await rows<PlaidToken>("SELECT * FROM plaid_tokens WHERE id = $1", [token.id]))[0].syncCursor;
+
+    // A new name, or the same Item and the same access token, keeps it.
+    await ok(client, path, json("PUT", { financialInstitution: "Renamed", itemId: "item-1" }));
+    await ok(client, path, json("PUT", { financialInstitution: "Renamed", itemId: " item-1 ", accessToken: "access-token-1" }));
+    expect(await cursor()).toBe("cursor-1");
+
+    await ok(client, path, json("PUT", { financialInstitution: "Renamed", itemId: "item-1", accessToken: "access-token-2" }));
+    expect(await cursor()).toBeNull();
+
+    await exec("UPDATE plaid_tokens SET sync_cursor = $1 WHERE id = $2", ["cursor-2", token.id]);
+    await ok(client, path, json("PUT", { financialInstitution: "Renamed", itemId: "item-2" }));
+    expect(await cursor()).toBeNull();
+  });
+
   it("deletes a connection with its account mappings", async () => {
     const token = await createPlaidToken({ financialInstitution: "AmEx", itemId: "item-456", accessToken: "access-token" });
     const link = await createPlaidAccount({ tokenId: token.id, plaidAccountId: "pa-1", name: "Card", type: "credit" });

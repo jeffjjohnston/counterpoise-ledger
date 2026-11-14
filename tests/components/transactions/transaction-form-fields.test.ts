@@ -254,6 +254,14 @@ describe("buildSimpleEntry", () => {
   it("refuses a zero amount", () => {
     expect(buildSimpleEntry("0", 3, 4)).toEqual({ error: "Please enter an amount" });
   });
+
+  it("refuses the same account in From and To", () => {
+    // The two splits would cancel on one account. The Mac client gives the
+    // same message.
+    expect(buildSimpleEntry("12.34", 3, 3)).toEqual({
+      error: "From and To must be different accounts.",
+    });
+  });
 });
 
 describe("reconciledEditChanges", () => {

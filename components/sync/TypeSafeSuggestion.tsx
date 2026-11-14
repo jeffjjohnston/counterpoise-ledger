@@ -26,7 +26,7 @@ export function TypeSafeSuggestion({
   if (loading)
     return (
       <p role="status" className="text-xs text-fg-tertiary">
-        Checking for a TypeSafe suggestion…
+        Checking for an AI suggestion…
       </p>
     );
   if (!result || result.status === "disabled" || result.status === "skipped")
@@ -35,7 +35,7 @@ export function TypeSafeSuggestion({
     return (
       <div className="text-xs text-fg-tertiary">
         <p>
-          TypeSafe suggestions are{" "}
+          AI suggestions are{" "}
           {result.status === "busy"
             ? "being checked in another request"
             : result.status === "limited"
@@ -57,10 +57,10 @@ export function TypeSafeSuggestion({
   return (
     <div
       className="rounded-lg border border-border bg-surface-secondary p-3 space-y-2"
-      aria-label="TypeSafe suggestion"
+      aria-label="AI suggestion"
     >
       <p className="text-sm font-semibold text-fg">
-        TypeSafe suggestion{" "}
+        AI suggestion{" "}
         <span className="font-normal text-fg-tertiary">· Experimental</span>
       </p>
       {result.transactionId === null && result.proposal ? (
@@ -101,14 +101,14 @@ export function TypeSafeSuggestion({
       ) : result.transactionId === null ? (
         <p className="text-sm text-fg-secondary">
           {candidates.length
-            ? "TypeSafe found no clear match among these candidates."
-            : "TypeSafe has no suggestion for this transaction."}
+            ? "Clef found no clear match among these candidates."
+            : "Clef has no suggestion for this transaction."}
         </p>
       ) : candidate ? (
         <>
           {isBest ? (
             <p className="text-sm text-fg-secondary">
-              TypeSafe also suggests the best match shown below.
+              Clef also suggests the best match shown below.
             </p>
           ) : (
             <p className="text-sm text-fg-secondary">

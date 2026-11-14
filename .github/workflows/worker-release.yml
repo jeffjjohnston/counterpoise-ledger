@@ -60,7 +60,7 @@ jobs:
     steps:
       # All of the history: the script compares the commit with its first
       # parent and checks that main holds it.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -78,6 +78,13 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/worker-deploy.yml
+    # NEEDED FOR THE ENVIRONMENT SECRETS. The called job sets `environment:
+    # worker`, and still got every secret of that environment empty without
+    # this line: the first release through this workflow (v1.60.2, run
+    # 41329225253) failed in `wrangler deploy` with no CLOUDFLARE_API_TOKEN.
+    # The environment variables did arrive. A direct run of worker-deploy.yml
+    # (a tag or a manual run) needs nothing of the kind.
+    secrets: inherit
     with:
       ref: ${{ github.sha }}
       target: production

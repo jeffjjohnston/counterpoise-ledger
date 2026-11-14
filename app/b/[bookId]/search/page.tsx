@@ -8,6 +8,14 @@ import { formatCurrency, formatDate } from "@/lib/wasm-client";
 import { getOccurrenceDate } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { apiGet } from "@/lib/api-client";
+import { useLiveReload } from "@/components/BookChangesProvider";
+import { useLatestRequest } from "@/hooks/useLatestRequest";
+
+// The tables that a search reads: the transactions with their splits and
+// payees, and the accounts, payees and recurring rules that match by name.
+const SEARCH_TABLES = [
+  "transactions", "transaction_splits", "payees", "accounts", "recurring_rules",
+];
 
 type SearchSplit = {
   accountId: number;
@@ -105,10 +113,25 @@ function SearchPageInner() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // A live update can start a search while another is in flight. Only the
+  // latest request may publish.
+  const latestRequest = useLatestRequest();
+  // The last search that the user started, which a live reload runs again.
+  // Null when the query is empty.
+  const lastSearch = useRef<{ q: string; sd: string; ed: string } | null>(null);
 
+  // `background` is true for a live reload. It runs the same search again,
+  // and keeps the results and the scroll position: it does not show
+  // "Searching...", and it does not change the URL.
   const doSearch = useCallback(
-    async (q: string, sd: string, ed: string) => {
+    async (q: string, sd: string, ed: string, background = false) => {
       const trimmed = q.trim();
+
+      if (background) {
+        if (!trimmed) return;
+      } else {
+        lastSearch.current = trimmed ? { q: trimmed, sd, ed } : null;
+      }
 
       // Update URL
       const params = new URLSearchParams();
@@ -116,23 +139,31 @@ function SearchPageInner() {
       if (sd) params.set("startDate", sd);
       if (ed) params.set("endDate", ed);
       const qs = params.toString();
-      router.replace(`${prefix}/search${qs ? `?${qs}` : ""}`, {
-        scroll: false,
-      });
+      if (!background) {
+        router.replace(`${prefix}/search${qs ? `?${qs}` : ""}`, {
+          scroll: false,
+        });
+      }
+
+      // Cancel previous request
+      abortRef.current?.abort();
+      const isLatest = latestRequest();
 
       if (!trimmed) {
+        abortRef.current = null;
+        setLoading(false);
         setResults(null);
         setHasSearched(false);
         return;
       }
 
-      // Cancel previous request
-      abortRef.current?.abort();
       const controller = new AbortController();
       abortRef.current = controller;
 
-      setLoading(true);
-      setHasSearched(true);
+      if (!background) {
+        setLoading(true);
+        setHasSearched(true);
+      }
       try {
         const searchParams = new URLSearchParams({ q: trimmed });
         if (sd) searchParams.set("startDate", sd);
@@ -142,6 +173,7 @@ function SearchPageInner() {
           `/api/b/${bookId}/search?${searchParams.toString()}`,
           { signal: controller.signal }
         );
+        if (!isLatest()) return;
         setResults(data);
       } catch (e) {
         // The controller's own signal is the authoritative answer to "was this
@@ -149,12 +181,23 @@ function SearchPageInner() {
         // truncated mid-stream, both of which reject with TypeError.
         if (controller.signal.aborted) return;
         if (e instanceof DOMException && e.name === "AbortError") return;
+        // Another failure keeps the results that are on the screen.
       } finally {
-        setLoading(false);
+        // A later request owns the loading state.
+        if (isLatest()) setLoading(false);
       }
     },
-    [bookId, prefix, router]
+    [bookId, latestRequest, prefix, router]
   );
+
+  // Another client (an MCP tool, another tab, a scheduled job) changed the
+  // book. Run the last search again. The query and the date range in the
+  // fields stay as the user left them.
+  const reload = useCallback(() => {
+    const last = lastSearch.current;
+    if (last) void doSearch(last.q, last.sd, last.ed, true);
+  }, [doSearch]);
+  useLiveReload(SEARCH_TABLES, reload);
 
   // Debounced search on query/date changes
   useEffect(() => {

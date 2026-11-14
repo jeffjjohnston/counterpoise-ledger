@@ -35,7 +35,7 @@ const FAILURE: &str = "Tool execution failed";
 /// agree.
 ///
 /// Scope: the page is already pinned to one book. Book management, the
-/// Counterpoise issue tracker, PostHog analytics, background-job health, and
+/// Counterpoise issue tracker, background-job health, and
 /// Plaid connection administration are not work an agent on a ledger page
 /// should do. Granting or changing another user's access to a book is the
 /// same kind of operation. The member tools are withheld for that reason,
@@ -58,7 +58,6 @@ const WEB_EXCLUDED_TOOLS: &[&str] = &[
     "add_book_member",
     "update_book_member",
     "remove_book_member",
-    "analyze_usage",
     "get_system_status",
     "create_issue_report",
     "list_issue_reports",

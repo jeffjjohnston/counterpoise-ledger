@@ -36,14 +36,15 @@ use self::{
     account_balance::account_balance_history,
     accounts::{create_account, delete_account, get_account, list_accounts, update_account},
     auth::{
-        change_password, create_key, delete_key, list_keys, login, logout, me, register,
-        registration_status,
+        change_password, change_username, create_key, delete_key, list_keys, login, logout, me,
+        register, registration_status,
     },
     books::{
         create_book, create_demo_book, delete_book, list_books, list_demo_datasets, update_book,
     },
     cron::{
-        plaid_sync as plaid_sync_cron, price_sync as price_sync_cron, recurring as recurring_cron,
+        backup as backup_cron, plaid_sync as plaid_sync_cron, price_sync as price_sync_cron,
+        recurring as recurring_cron,
     },
     entry_suggestion::{get_entry_patterns, record_entry_outcome, request_entry_suggestion},
     investments::{account_values, get_positions},
@@ -285,6 +286,9 @@ pub(crate) fn routes() -> Router<AppState> {
             }
             ("GET", "/api/cron/recurring", "cron.recurring") => {
                 router.route(&route.path, get(recurring_cron))
+            }
+            ("GET", "/api/cron/backup", "cron.backup") => {
+                router.route(&route.path, get(backup_cron))
             }
             ("GET", "/api/cron/weekly-review", "weeklyreview.cron") => {
                 router.route(&route.path, get(weekly_review_cron))
@@ -576,6 +580,9 @@ pub(crate) fn routes() -> Router<AppState> {
             ("GET", "/api/auth/me", "auth.me") => router.route(&route.path, get(me)),
             ("PUT", "/api/auth/password", "auth.password") => {
                 router.route(&route.path, axum::routing::put(change_password))
+            }
+            ("PUT", "/api/auth/username", "auth.username") => {
+                router.route(&route.path, axum::routing::put(change_username))
             }
             ("GET", "/api/auth/api-keys", "auth.keys") => router.route(&route.path, get(list_keys)),
             ("POST", "/api/auth/api-keys", "auth.create") => {

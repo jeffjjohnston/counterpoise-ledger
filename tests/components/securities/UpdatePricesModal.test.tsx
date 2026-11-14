@@ -341,4 +341,131 @@ describe("UpdatePricesModal", () => {
 
     expect(await screen.findByText("Failed to fetch prices", { exact: false })).toBeInTheDocument();
   });
+  describe("state while the modal is open", () => {
+    const modal = (list: typeof securities, onClose = vi.fn(), isOpen = true) => (
+      <ToastProvider>
+        <UpdatePricesModal isOpen={isOpen} onClose={onClose} securities={list} onUpdate={vi.fn()} />
+      </ToastProvider>
+    );
+
+    /** Answers each request to `path` only when the test calls the function it returns. */
+    function holdRequest(path: string) {
+      const held: Array<{ resolve: (response: unknown) => void }> = [];
+      const holding = vi.fn((input: RequestInfo | URL) =>
+        String(input).startsWith(path)
+          ? new Promise<unknown>((resolve) => {
+              held.push({ resolve });
+            })
+          : Promise.resolve({ ok: true, json: async () => ({}) })
+      );
+      global.fetch = holding as typeof global.fetch;
+      return held;
+    }
+
+    it("keeps the typed prices and dates when the page gives a new array of the same securities", async () => {
+      const view = render(modal(securities));
+      const priceInputs = await screen.findAllByPlaceholderText("0.00");
+      fireEvent.change(priceInputs[0], { target: { value: "251.75" } });
+      const dateInput = priceInputs[0].closest("tr")!.querySelector('input[type="date"]')!;
+      fireEvent.change(dateInput, { target: { value: "2024-02-02" } });
+
+      // The securities page filters its list on each render, so each render
+      // gives the modal a new array.
+      view.rerender(modal(securities.map((security) => ({ ...security }))));
+
+      expect(screen.getAllByPlaceholderText("0.00")[0]).toHaveValue("251.75");
+      expect(dateInput).toHaveValue("2024-02-02");
+    });
+
+    it("starts empty again when the modal is closed and opened", async () => {
+      const view = render(modal(securities));
+      fireEvent.change((await screen.findAllByPlaceholderText("0.00"))[0], { target: { value: "251.75" } });
+
+      view.rerender(modal(securities, vi.fn(), false));
+      view.rerender(modal(securities));
+
+      expect(screen.getAllByPlaceholderText("0.00")[0]).toHaveValue("");
+    });
+
+    it("saves a price typed for a security that arrived while the modal was open", async () => {
+      const view = render(modal([securities[0]]));
+      await screen.findAllByPlaceholderText("0.00");
+
+      view.rerender(modal(securities));
+      const priceInputs = screen.getAllByPlaceholderText("0.00");
+      const dateInput = priceInputs[1].closest("tr")!.querySelector<HTMLInputElement>('input[type="date"]')!;
+      fireEvent.change(priceInputs[1], { target: { value: "190" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith("/api/b/1/security-prices/bulk", expect.anything())
+      );
+      const call = fetchMock.mock.calls.find(([url]) => url === "/api/b/1/security-prices/bulk")!;
+      expect(JSON.parse(call[1].body as string)).toEqual({
+        priceUpdates: [{ securityId: 2, priceMicros: 190_000_000, priceDate: dateInput.value }],
+      });
+    });
+
+    it("does not close from Escape, the backdrop or the X while the save is in flight", async () => {
+      const held = holdRequest("/api/b/1/security-prices/bulk");
+      const onClose = vi.fn();
+      render(modal(securities, onClose));
+      fireEvent.change((await screen.findAllByPlaceholderText("0.00"))[0], { target: { value: "251.75" } });
+
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(held).toHaveLength(1));
+
+      // The rows take no input during the save. The modal closes after it,
+      // and a price typed during the save would be lost.
+      for (const input of screen.getAllByPlaceholderText("0.00")) expect(input).toBeDisabled();
+      for (const checkbox of screen.getAllByRole("checkbox")) expect(checkbox).toBeDisabled();
+
+      fireEvent.keyDown(document, { key: "Escape" });
+      // The title bar holds the title and the X. The backdrop is the parent
+      // of the panel that holds the title bar.
+      const titleBar = screen.getByRole("heading", { name: "Update Security Prices" }).parentElement!;
+      fireEvent.click(titleBar.parentElement!.parentElement!);
+      fireEvent.click(titleBar.querySelector("button")!);
+      expect(onClose).not.toHaveBeenCalled();
+
+      // The modal closes itself when the save is done.
+      held[0].resolve({ ok: true, json: async () => ({}) });
+      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    });
+
+    it("does not close from Escape while prices are retrieved", async () => {
+      const held = holdRequest("/api/b/1/security-prices/tiingo");
+      const onClose = vi.fn();
+      render(modal(securities, onClose));
+      await screen.findAllByPlaceholderText("0.00");
+
+      fireEvent.click(screen.getByRole("button", { name: "Retrieve Latest Prices" }));
+      await waitFor(() => expect(held).toHaveLength(1));
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(onClose).not.toHaveBeenCalled();
+
+      held[0].resolve({ ok: true, json: async () => ({ prices: [], errors: [] }) });
+      await waitFor(() => expect(screen.getByRole("button", { name: "Retrieve Latest Prices" })).toBeEnabled());
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("sends one fetch preference at a time, and restores the saved value when the write fails", async () => {
+      const held = holdRequest("/api/b/1/securities/2");
+      render(modal(securities));
+      const checkbox = (await screen.findAllByRole("checkbox"))[1];
+      expect(checkbox).toBeChecked();
+
+      fireEvent.click(checkbox);
+      // A second toggle before the answer would race the first write.
+      fireEvent.click(checkbox);
+      expect(held).toHaveLength(1);
+
+      held[0].resolve({ ok: false, status: 500, json: async () => ({ error: "Internal error" }) });
+
+      expect(await screen.findByText("Internal error")).toBeInTheDocument();
+      expect(checkbox).toBeChecked();
+      expect(checkbox).toBeEnabled();
+    });
+  });
 });

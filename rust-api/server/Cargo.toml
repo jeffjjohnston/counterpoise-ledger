@@ -2,6 +2,10 @@
 name = "counterpoise-rust-api"
 version = "0.1.0"
 edition = "2024"
+# Not on crates.io. cargo-deny (deny.toml) treats a private crate as the
+# workspace's own code: it needs no license field, and its path
+# dependencies need no version.
+publish = false
 
 [lib]
 name = "counterpoise_rust_api"
@@ -38,7 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # (routes/socket.rs), which a Durable Object serves with its own API.
 axum = { version = "0.8", default-features = false, features = ["form", "json", "matched-path", "original-uri", "query", "tracing"] }
 # The S256 PKCE digest of the OAuth token endpoint (oauth/token.rs).
-base64 = "0.22"
+base64 = "0.23"
 chrono = "0.4"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hex = "0.4"
@@ -49,7 +53,7 @@ iana-time-zone = "0.1"
 libc = { version = "0.2", optional = true }
 # The raw function only: the default `simple` API brings a random source
 # that does not build for wasm32.
-scrypt = { version = "0.11", default-features = false }
+scrypt = { version = "0.12", default-features = false }
 percent-encoding = "2"
 # The asset-path and bearer-header patterns of the page gate (security.rs).
 regex = "1"
@@ -59,7 +63,9 @@ serde = { version = "1", features = ["derive"] }
 # Keep object keys in the order they were read, as a JavaScript object does,
 # so that a JSON.stringify port writes the same text.
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
-sha2 = "0.10"
+sha2 = "0.11"
+# The signature of the S3 copy of the daily dump (scheduler/offsite.rs).
+hmac = "0.13"
 subtle = "2"
 # What wasm32 supports. `native` adds the rest.
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
@@ -76,12 +82,12 @@ rmcp = { version = "3.4.1", features = ["server"] }
 tower = { version = "0.5", features = ["util"] }
 # Serves the client build (static_pages.rs) and compresses responses
 # (compression.rs) with gzip or br. Each browser sends gzip, and br on HTTPS.
-tower-http = { version = "0.6", features = ["compression-gzip", "compression-br"] }
-jsonschema = { version = "0.58.1", default-features = false }
+tower-http = { version = "0.7", features = ["compression-gzip", "compression-br"] }
+jsonschema = { version = "0.60.2", default-features = false }
 # The OpenAPI document model. The two features keep the component and path
 # order that the source gives, so the committed file does not reorder.
 utoipa = { version = "6.0.0", features = ["preserve_order", "preserve_path_order"] }
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 
 # The random source of wasm32 is `crypto.getRandomValues`: getrandom 0.4
 # (platform.rs), getrandom 0.3 (ahash, under jsonschema) and uuid (under
@@ -103,7 +109,7 @@ wasm-bindgen-futures = "0.4"
 tokio = { version = "1", features = ["test-util"] }
 # Decode the compressed bodies in the tests of compression.rs. tower-http
 # uses these crates already, so they add nothing to the build.
-brotli-decompressor = "5"
+brotli-decompressor = "6"
 flate2 = "1"
 # A local HTTPS server with a certificate made at test time, for the test that
 # the outbound client refuses a certificate it does not trust (platform.rs).

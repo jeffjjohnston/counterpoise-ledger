@@ -421,7 +421,7 @@ mod tests {
         scrypt::scrypt(
             key.as_bytes(),
             salt.as_bytes(),
-            &scrypt::Params::new(14, 8, 1, 32).unwrap(),
+            &scrypt::Params::new(14, 8, 1).unwrap(),
             &mut derived,
         )
         .unwrap();

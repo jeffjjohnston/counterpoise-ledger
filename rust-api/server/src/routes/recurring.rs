@@ -560,11 +560,6 @@ pub(crate) async fn create_rule(
     let created = load_rule(&state.database, book.book_id(), id)
         .map_err(database_error(FAILURE))?
         .ok_or_else(|| failed(FAILURE))?;
-    state.analytics.capture_event(
-        book.user_id(),
-        "recurring_rule_created",
-        Some(json!({ "bookId": book.book_id() })),
-    );
     Ok(Json(rule_json(&created)))
 }
 

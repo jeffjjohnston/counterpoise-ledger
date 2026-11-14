@@ -9,8 +9,10 @@ import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
 import { flattenAccounts } from "@/lib/wasm-client";
 import { useBookId } from "@/hooks/useBookId";
+import { useLatestRequest, useReloadsInFlight } from "@/hooks/useLatestRequest";
+import { useLiveReload } from "@/components/BookChangesProvider";
 import { useBookRole } from "@/components/BookRoleProvider";
-import { apiGet, apiDelete, toMessage } from "@/lib/api-client";
+import { ApiError, apiGet, apiDelete, toMessage } from "@/lib/api-client";
 import {
   putTransaction,
   deleteTransactionRequest,
@@ -32,6 +34,13 @@ type PayeeDetail = {
 };
 
 const PAGE_SIZE = 50;
+
+// The tables whose rows the page shows: the payee and its count, its
+// transactions with their splits, accounts and securities, and the account
+// list of the editor. The chart reads the same tables.
+const PAYEE_TABLES = new Set([
+  "payees", "transactions", "transaction_splits", "accounts", "investment_splits", "securities",
+]);
 
 export default function PayeeDetailPage() {
   const bookId = useBookId();
@@ -57,12 +66,24 @@ export default function PayeeDetailPage() {
   // page-0 refresh (refreshData) and at the start of the next attempt.
   const [loadMoreFailed, setLoadMoreFailed] = useState(false);
   const loadMoreRef = useRef<HTMLDivElement>(null);
+  // A live update can start a reload while another is in flight. Only the
+  // latest reload may publish its answer.
+  const nextRequest = useLatestRequest();
+  // Counts the reloads. A "load more" page that started before a reload
+  // belongs to the old list, so it must not go on the end of the new list.
+  const reloads = useRef(0);
+  // Whether a reload is in flight. A "load more" waits for it.
+  const inFlight = useReloadsInFlight();
+  // Whether this payee has rendered. A live reload can overtake the first
+  // load, so the first answer, not the first request, decides between the
+  // full-page error and a quiet failure.
+  const shown = useRef(false);
 
   const fetchTransactionsPage = useCallback(
-    async (pageOffset: number, append: boolean) => {
+    async (pageOffset: number, limit: number = PAGE_SIZE) => {
       const params = new URLSearchParams({
         payeeId: payeeId.toString(),
-        limit: PAGE_SIZE.toString(),
+        limit: limit.toString(),
         offset: pageOffset.toString(),
         includeMeta: "true",
       });
@@ -77,21 +98,28 @@ export default function PayeeDetailPage() {
         totalCount?: number;
       }>(`/api/b/${bookId}/transactions?${params.toString()}`);
       const pageTransactions: TransactionWithSplits[] = transactionsData.transactions ?? [];
-      setTransactions((prev) =>
-        append ? [...prev, ...pageTransactions] : pageTransactions
-      );
-      setTotalCount(transactionsData.totalCount || pageTransactions.length);
+      return {
+        transactions: pageTransactions,
+        totalCount: transactionsData.totalCount || pageTransactions.length,
+      };
     },
     [bookId, payeeId]
   );
 
-  const refreshData = useCallback(async (showLoading: boolean) => {
+  // `limit` is the number of transactions to load from the start. A live
+  // reload gives the number that the list shows, so that the list keeps its
+  // length and the scroll position stays.
+  const refreshData = useCallback(async (showLoading: boolean, limit: number = PAGE_SIZE) => {
     if (!Number.isFinite(payeeId)) {
       setLoading(false);
       return;
     }
 
+    const isLatest = nextRequest();
+    reloads.current += 1;
+    const end = inFlight.begin();
     if (showLoading) {
+      shown.current = false;
       setLoading(true);
     }
 
@@ -103,20 +131,35 @@ export default function PayeeDetailPage() {
       // into the full-page error state fetchTransactionsPage below is
       // allowed to trigger.
       const [payeeData, accountsData] = await Promise.all([
-        apiGet<PayeeDetail>(`/api/b/${bookId}/payees/${payeeId}`).catch(() => null),
+        apiGet<PayeeDetail>(`/api/b/${bookId}/payees/${payeeId}`).catch((e: unknown) => {
+          // After the first answer, only a 404 means "not found" (for
+          // example, another client deleted the payee). A failure of another
+          // kind then keeps the payee on the screen.
+          if (!shown.current || (e instanceof ApiError && e.status === 404)) return null;
+          throw e;
+        }),
         apiGet<AccountWithBalance[]>(`/api/b/${bookId}/accounts?includeInactive=true`).catch(
           () => null
         ),
       ]);
 
+      // The transaction list refuses the id of a payee that does not exist,
+      // so do not ask for it. The page then shows its not-found state.
+      const page = payeeData
+        ? await fetchTransactionsPage(0, limit)
+        : { transactions: [], totalCount: 0 };
+      if (!isLatest()) return;
       setPayee(payeeData);
       setAccounts(accountsData ? flattenAccounts(accountsData) : []);
-
-      await fetchTransactionsPage(0, false);
+      setTransactions(page.transactions);
+      setTotalCount(page.totalCount);
       setLoadMoreFailed(false);
       setError(null);
+      shown.current = true;
+      setLoading(false);
     } catch {
-      if (showLoading) {
+      if (!isLatest()) return;
+      if (!shown.current) {
         // Nothing has rendered yet — the full-page error state is correct.
         setError("Could not load payee.");
       } else {
@@ -128,24 +171,37 @@ export default function PayeeDetailPage() {
         console.error("Could not refresh payee data.");
       }
     } finally {
-      if (showLoading) {
-        setLoading(false);
-      }
+      end();
     }
-  }, [bookId, fetchTransactionsPage, payeeId]);
+  }, [bookId, fetchTransactionsPage, inFlight, nextRequest, payeeId]);
 
   const handleLoadMore = useCallback(async () => {
     if (loadingMore || transactions.length >= totalCount) {
       return;
     }
 
+    // A reload is in flight: its list replaces the list on the screen. Wait
+    // for it, and add nothing. The end of the wait changes `loadingMore`, so
+    // the observer below tries again with the new list.
+    const reload = inFlight.settled();
+    if (reload) {
+      setLoadingMore(true);
+      await reload;
+      setLoadingMore(false);
+      return;
+    }
     setLoadingMore(true);
     // Clear any prior failure as this new attempt begins — whether it was
     // triggered automatically or via the "Try again" control.
     setLoadMoreFailed(false);
+    const started = reloads.current;
     try {
-      await fetchTransactionsPage(transactions.length, true);
+      const page = await fetchTransactionsPage(transactions.length);
+      if (reloads.current !== started) return;
+      setTransactions((prev) => [...prev, ...page.transactions]);
+      setTotalCount(page.totalCount);
     } catch {
+      if (reloads.current !== started) return;
       // A failed "load more" leaves the already-rendered list intact; this
       // page has no toast system, so log it. It also sets loadMoreFailed,
       // which the observer effect below checks before auto-triggering
@@ -159,7 +215,7 @@ export default function PayeeDetailPage() {
     } finally {
       setLoadingMore(false);
     }
-  }, [fetchTransactionsPage, loadingMore, totalCount, transactions.length]);
+  }, [fetchTransactionsPage, inFlight, loadingMore, totalCount, transactions.length]);
 
   useEffect(() => {
     const fetchPayee = async () => {
@@ -206,6 +262,18 @@ export default function PayeeDetailPage() {
       }
     };
   }, [handleLoadMore, loadingMore, loadMoreFailed, totalCount, transactions.length]);
+
+  // Another client (an MCP tool, another tab, a scheduled job) changed the
+  // book. While the editor is open, the reload waits until it closes, so that
+  // the reload does not replace the draft.
+  useLiveReload(
+    PAYEE_TABLES,
+    () => {
+      setChartVersion((version) => version + 1);
+      void refreshData(false, Math.max(PAGE_SIZE, transactions.length));
+    },
+    { paused: editingTransaction !== null },
+  );
 
   // A save or a delete changes the monthly totals, so the chart fetches them again.
   const refreshAfterChange = async () => {

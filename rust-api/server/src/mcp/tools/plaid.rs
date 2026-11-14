@@ -254,9 +254,7 @@ pub(super) async fn set_token_accounts(
     .await?))
 }
 
-/// The sync runs outside the route, so that the auto-match events that
-/// the sync records reach PostHog. A route that runs for a tool records
-/// nothing.
+/// The sync runs outside the route: the tool calls `sync_token` directly.
 pub(super) async fn sync(
     caller: &Caller,
     arguments: &Map<String, Value>,

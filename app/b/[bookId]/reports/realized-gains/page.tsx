@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useBookId } from "@/hooks/useBookId";
+import { useLiveReload } from "@/components/BookChangesProvider";
 import { Button } from "@/components/ui/Button";
 import { RealizedGainsChart } from "@/components/reports/RealizedGainsChart";
 import { DateInput } from "@/components/ui/DateInput";
@@ -12,6 +13,15 @@ import { csvEscape, datedCsvFilename, triggerDownload } from "@/lib/csv";
 import { cn } from "@/lib/utils";
 import { apiGet } from "@/lib/api-client";
 import type { AccountWithBalance } from "@/types";
+
+// The tables that the report reads: the sales (investment splits and their
+// transactions), the lots and their allocations (which change with the lots),
+// the securities and the accounts.
+const GAINS_TABLES = new Set([
+  "investment_splits", "investment_lots", "transactions", "securities", "accounts",
+]);
+// The investment accounts of the Account filter.
+const ACCOUNT_TABLES = new Set(["accounts"]);
 
 type Term = "short" | "long" | "unknown";
 
@@ -80,6 +90,19 @@ export default function RealizedGainsPage() {
   const [result, setResult] = useState<RealizedGainsResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Each live update adds one. The request of each kind runs again on a change.
+  const [gainsRevision, setGainsRevision] = useState(0);
+  const [accountsRevision, setAccountsRevision] = useState(0);
+  // The filters (book, dates and account) of the result on the screen. A
+  // request for the same filters is a background reload: it does not show the
+  // loading state, and if it fails, the old result stays.
+  const shownFilters = useRef<string | null>(null);
+
+  // Another client (an MCP tool, another tab, a scheduled job) changed the
+  // book. The reload keeps the dates and the account filter. The abort on
+  // the cleanup of each effect below makes the latest request win.
+  useLiveReload(GAINS_TABLES, () => setGainsRevision((revision) => revision + 1));
+  useLiveReload(ACCOUNT_TABLES, () => setAccountsRevision((revision) => revision + 1));
 
   // Investment accounts only — lots exist nowhere else, so offering any other
   // account would be an option guaranteed to return nothing. Inactive accounts
@@ -108,7 +131,7 @@ export default function RealizedGainsPage() {
         console.error("Failed to load accounts for the realized gains filter:", err);
       });
     return () => controller.abort();
-  }, [bookId]);
+  }, [bookId, accountsRevision]);
 
   const accountOptions = useMemo(
     () => [
@@ -131,9 +154,15 @@ export default function RealizedGainsPage() {
     });
     if (accountId) params.set("accountId", accountId);
 
+    const filters = `${bookId}|${params.toString()}`;
+    const background = shownFilters.current === filters;
     const controller = new AbortController();
-    setLoading(true);
-    setError(null);
+    if (!background) {
+      // The result on the screen is now for other filters.
+      shownFilters.current = null;
+      setLoading(true);
+      setError(null);
+    }
     apiGet<RealizedGainsResult>(
       `/api/b/${bookId}/reports/realized-gains?${params.toString()}`,
       { signal: controller.signal }
@@ -141,6 +170,7 @@ export default function RealizedGainsPage() {
       .then((data) => {
         setResult(data);
         setLoading(false);
+        shownFilters.current = filters;
       })
       .catch((err) => {
         // The controller's own signal is the authoritative answer to "was this
@@ -149,13 +179,15 @@ export default function RealizedGainsPage() {
         if (controller.signal.aborted) return;
         if ((err as { name?: string })?.name === "AbortError") return;
         console.error("Failed to load realized gains:", err);
+        // A background reload failed. The result on the screen stays.
+        if (background) return;
         setResult(null);
         setError("Failed to load realized gains. Please try again.");
         setLoading(false);
       });
 
     return () => controller.abort();
-  }, [bookId, range.startDate, range.endDate, accountId]);
+  }, [bookId, range.startDate, range.endDate, accountId, gainsRevision]);
 
   const exportCsv = () => {
     if (!result) return;

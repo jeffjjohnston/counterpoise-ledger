@@ -319,7 +319,8 @@ fn repair_folds() -> CliResult<usize> {
 fn hash_password(password: &str) -> CliResult<String> {
     let mut salt = [0_u8; 32];
     getrandom::fill(&mut salt)?;
-    let params = Params::new(14, 8, 1, 64)?;
+    // scrypt 0.12 takes the output length from the buffer.
+    let params = Params::new(14, 8, 1)?;
     let mut key = [0_u8; 64];
     scrypt(password.as_bytes(), &salt, &params, &mut key)?;
     Ok(format!("{}:{}", hex::encode(salt), hex::encode(key)))

@@ -4,7 +4,8 @@ One of the guides [CLAUDE.md](../CLAUDE.md) points to. Read that file first;
 it carries the rules that apply everywhere and says when to come here.
 
 ## Creating Investment Transactions
-Use builder functions from `lib/accounting.ts`:
+Use the builder functions of `rust-api/core/src/accounting.rs`. The browser
+calls them through `lib/wasm-client.ts`:
 ```typescript
 // Buy 100 shares at $50.00 with $10 fee
 const splits = buildBuySplits({
@@ -164,8 +165,8 @@ basis and realized gains with no error anywhere, which no automated signal
 here can distinguish from a correct one.
 
 Short positions (sell-to-open) are **not** modeled — the `action` enum has no
-open/close discriminator, `lib/investments.ts` skips positions with
-`sharesMicros <= 0` in two places, and short-lot economics invert the normal
+open/close discriminator, `rust-api/core/src/investments.rs` skips positions
+with `sharesMicros <= 0` in two places, and short-lot economics invert the normal
 basis/proceeds relationship. Adding them is not a matter of relaxing that
 filter: the enum, the lot matching and the gain calculation each need a
 direction before any of it means anything.
@@ -192,7 +193,10 @@ from the rebuild alone.
 `rebuild_lots_step()`. The last is the backfill in steps, for a Durable
 Object, whose events have a time limit: the scheduler's lot-rebuild job
 keeps where the next step starts in its slot's cursor, because the guard
-(`lots_missing()`) reads a half-done rebuild as done.
+(`lots_missing()`) reads a half-done rebuild as done. For the same reason,
+a rebuild that the scheduler stopped after 3 failed starts of one step is
+asked for again from its failed status record, not from the guard
+([architecture.md](architecture.md#scheduled-jobs)).
 The rules above apply to each: the caller passes a connection inside a
 `BEGIN IMMEDIATE` transaction, and the backfill is one transaction for every
 book. The rebuild evaluates the effective date with `EFFECTIVE_DATE`, which

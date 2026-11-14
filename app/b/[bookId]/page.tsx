@@ -1,8 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "@/lib/navigation";
 import { useBookId } from "@/hooks/useBookId";
+import { useLatestRequest } from "@/hooks/useLatestRequest";
+import { useLiveReload } from "@/components/BookChangesProvider";
+import { useToast } from "@/components/ui/ToastProvider";
 import { AccountCard } from "@/components/accounts/AccountCard";
 import { NetWorthCard } from "@/components/dashboard/NetWorthCard";
 import { WeeklyReviewCard } from "@/components/dashboard/WeeklyReviewCard";
@@ -14,6 +17,14 @@ import { computeNetWorth, effectiveBalance } from "@/lib/net-worth";
 import { apiGet } from "@/lib/api-client";
 import type { AccountWithBalance, TransactionWithSplits } from "@/types";
 import type { AccountMarketValue } from "@/lib/investments";
+
+// The tables whose rows the dashboard shows: the accounts and their balances
+// (the splits), the recent transactions with their payees, and the market
+// values of investment accounts.
+const DASHBOARD_TABLES = new Set([
+  "accounts", "transactions", "transaction_splits", "payees",
+  "investment_splits", "investment_lots", "securities", "security_prices",
+]);
 
 interface AccountSummary {
   type: string;
@@ -40,8 +51,17 @@ export default function HomePage() {
   const [marketValues, setMarketValues] = useState<AccountMarketValue[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const toast = useToast();
+  // A live update can start a reload while another is in flight. Only the
+  // latest request may publish its answer.
+  const nextRequest = useLatestRequest();
+  // Whether this book's dashboard has rendered. A live reload can overtake
+  // the first load, so the first answer, not the first request, decides
+  // between the full-page error and a toast.
+  const shown = useRef(false);
 
   const fetchDashboardData = useCallback(async () => {
+    const isLatest = nextRequest();
     try {
       const today = toDateString(new Date());
       // apiGet throws on a non-2xx response instead of resolving it, so a
@@ -63,22 +83,38 @@ export default function HomePage() {
         ),
       ]);
 
+      if (!isLatest()) return;
       // Flatten nested accounts
       const flatAccounts = flattenAccounts(accountsData);
       setAccounts(flatAccounts);
       setTransactions(Array.isArray(transactionsData) ? transactionsData : []);
       setMarketValues(Array.isArray(marketValuesData) ? marketValuesData : []);
       setError(null);
-    } catch {
-      setError("Could not load dashboard data.");
-    } finally {
+      shown.current = true;
       setLoading(false);
+    } catch {
+      if (!isLatest()) return;
+      if (!shown.current) {
+        // Nothing has rendered yet, so the full-page error is correct.
+        setError("Could not load dashboard data.");
+        setLoading(false);
+      } else {
+        // A background reload failed. The data on the screen is still
+        // correct, so keep it and tell the user.
+        toast.error("Could not refresh the dashboard.");
+      }
     }
-  }, [bookId]);
+  }, [bookId, nextRequest, toast]);
 
   useEffect(() => {
+    shown.current = false;
     void fetchDashboardData();
   }, [fetchDashboardData]);
+
+  // Another client (an MCP tool, another tab, a scheduled job) changed the
+  // book. The reload keeps the page on the screen: it does not show the
+  // loading skeleton.
+  useLiveReload(DASHBOARD_TABLES, () => void fetchDashboardData());
 
   const activeAccounts = accounts.filter((a) => a.isActive);
 

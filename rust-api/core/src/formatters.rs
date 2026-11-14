@@ -221,3 +221,18 @@ pub fn format_price_micros_input(price_micros: i64) -> String {
         magnitude / 1_000_000
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // JSON cannot carry NaN or an infinity, so the corpus cannot hold these
+    // cases. An unparseable timestamp gives NaN, and the status page must not
+    // show "NaN days ago".
+    #[test]
+    fn a_non_finite_age_shows_a_dash() {
+        assert_eq!(format_relative_age(f64::NAN), "—");
+        assert_eq!(format_relative_age(f64::INFINITY), "—");
+        assert_eq!(format_relative_age(f64::NEG_INFINITY), "—");
+    }
+}

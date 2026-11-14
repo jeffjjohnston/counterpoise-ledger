@@ -111,4 +111,57 @@ describe("AccountPage", () => {
       expect.objectContaining({ method: "PUT" })
     );
   });
+
+  it("submits a username change and shows the new name", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/auth/me") {
+        return { ok: true, json: async () => ({ id: 1, username: "admin" }) } as Response;
+      }
+      if (url === "/api/auth/username" && init?.method === "PUT") {
+        return { ok: true, json: async () => ({ id: 1, username: "jeff" }) } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<AccountPage />);
+    await waitFor(() => {
+      expect(screen.getByText("Signed in as admin")).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText("New username"), { target: { value: "jeff" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "my-password-123" } });
+    fireEvent.click(screen.getByRole("button", { name: "Change username" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Username changed to jeff")).toBeInTheDocument();
+    });
+    const putCall = fetchMock.mock.calls.find(([url, init]) => url === "/api/auth/username" && init?.method === "PUT");
+    expect(putCall?.[1]?.body).toBe(JSON.stringify({ username: "jeff", currentPassword: "my-password-123" }));
+    expect(screen.getByText("Signed in as jeff")).toBeInTheDocument();
+  });
+
+  it("refuses the current username without a request", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/auth/me") {
+        return { ok: true, json: async () => ({ id: 1, username: "admin" }) } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<AccountPage />);
+    await waitFor(() => {
+      expect(screen.getByText("Signed in as admin")).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText("New username"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "my-password-123" } });
+    fireEvent.click(screen.getByRole("button", { name: "Change username" }));
+
+    expect(screen.getByText("New username must be different from current username")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith("/api/auth/username", expect.anything());
+  });
 });

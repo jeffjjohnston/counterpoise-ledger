@@ -47,6 +47,24 @@ fn parse_limit(input: Option<&str>) -> Option<i64> {
         .then_some(value as i64)
 }
 
+/// The payee list, with the count and the last effective date of each
+/// payee's transactions. ?1 is the book, ?2 the folded search text, ?3 today
+/// and ?4 the limit. The join reads only the covering index of migration
+/// 0017: a transaction row is not read.
+const LIST_PAYEES_SQL: &str = "SELECT p.id, p.name,
+                MAX(CASE WHEN t.is_floating THEN ?3 ELSE t.date END) AS last_transaction_date,
+                CAST(COUNT(t.id) AS integer) AS transaction_count
+         FROM payees p
+         LEFT JOIN transactions t ON t.payee_id = p.id
+         WHERE p.book_id = ?1 AND (?2 = '' OR instr(p.name_fold, ?2) > 0)
+         GROUP BY p.id
+         ORDER BY CASE WHEN ?2 = '' THEN 0
+                       WHEN instr(p.name_fold, ?2) = 1 THEN 0
+                       WHEN instr(p.name_fold, ' ' || ?2) > 0 THEN 1
+                       ELSE 2 END,
+                  p.name
+         LIMIT COALESCE(?4, -1)";
+
 pub(crate) async fn list_payees(
     State(state): State<AppState>,
     Path(raw_book_id): Path<String>,
@@ -70,19 +88,7 @@ pub(crate) async fn list_payees(
     let rows: Vec<PayeeListRow> = state
         .database
         .query(
-            "SELECT p.id, p.name,
-                MAX(CASE WHEN t.is_floating THEN ?3 ELSE t.date END) AS last_transaction_date,
-                CAST(COUNT(t.id) AS integer) AS transaction_count
-         FROM payees p
-         LEFT JOIN transactions t ON t.payee_id = p.id
-         WHERE p.book_id = ?1 AND (?2 = '' OR instr(p.name_fold, ?2) > 0)
-         GROUP BY p.id
-         ORDER BY CASE WHEN ?2 = '' THEN 0
-                       WHEN instr(p.name_fold, ?2) = 1 THEN 0
-                       WHEN instr(p.name_fold, ' ' || ?2) > 0 THEN 1
-                       ELSE 2 END,
-                  p.name
-         LIMIT COALESCE(?4, -1)",
+            LIST_PAYEES_SQL,
             &params![book.book_id(), pattern, today, limit],
         )
         .map_err(|cause| internal_error(cause, "Failed to fetch payees"))?;
@@ -320,7 +326,58 @@ pub(crate) async fn last_account(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_name, parse_limit};
+    use super::{LIST_PAYEES_SQL, normalize_name, parse_limit};
+    use ledger_db::Database;
+    use ledger_db::store::{Sql, params};
+
+    /// The payee list reads the transactions only through the covering
+    /// index of migration 0017. Without `is_floating` in the index, each
+    /// transaction of the book was read from the table.
+    #[test]
+    fn payee_list_reads_only_the_covering_index() {
+        let database = Database::open_in_memory().unwrap();
+        ledger_db::migrate(&database).unwrap();
+        let now = crate::platform::timestamp();
+        for sql in [
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES (1, 'u', 'h', ?1)",
+            "INSERT INTO books (id, user_id, name, created_at, updated_at) VALUES (1, 1, 'A', ?1, ?1)",
+            "INSERT INTO payees (id, book_id, name, name_fold, created_at) VALUES
+               (1, 1, 'Shop', 'shop', ?1), (2, 1, 'Cafe', 'cafe', ?1)",
+            "INSERT INTO transactions (id, book_id, date, payee_id, is_floating, created_at, updated_at)
+             VALUES (1, 1, '2025-01-10', 1, 0, ?1, ?1), (2, 1, '2025-02-01', 1, 1, ?1, ?1)",
+        ] {
+            database.execute(sql, &params![now]).unwrap();
+        }
+        let plan: Vec<(i64, i64, i64, String)> = database
+            .query(
+                &format!("EXPLAIN QUERY PLAN {LIST_PAYEES_SQL}"),
+                &params![1, "", "2025-03-01", Option::<i64>::None],
+            )
+            .unwrap();
+        let steps: Vec<&str> = plan
+            .iter()
+            .map(|(_, _, _, detail)| detail.as_str())
+            .collect();
+        assert!(
+            steps.contains(
+                &"SEARCH t USING COVERING INDEX idx_transactions_payee_date_id_floating (payee_id=?) LEFT-JOIN"
+            ),
+            "{steps:?}"
+        );
+        let rows: Vec<(i32, String, Option<String>, i32)> = database
+            .query(
+                LIST_PAYEES_SQL,
+                &params![1, "", "2025-03-01", Option::<i64>::None],
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (2, "Cafe".to_owned(), None, 0),
+                (1, "Shop".to_owned(), Some("2025-03-01".to_owned()), 2)
+            ]
+        );
+    }
 
     #[test]
     fn payee_search_normalizes_names_and_limits() {

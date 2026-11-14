@@ -186,13 +186,6 @@ pub(crate) async fn report_data(
     .map_err(|cause| internal_error(cause, "Failed to fetch report data"))?;
     let accounts: Vec<ReportAccount> = state.database.query("SELECT id, name, type AS account_type, parent_id FROM accounts WHERE book_id = ?1 ORDER BY id",&params![book.book_id()])
     .map_err(|cause| internal_error(cause, "Failed to fetch report data"))?;
-    state.analytics.capture_event(
-        book.user_id(),
-        "report_generated",
-        Some(json!({
-            "bookId": book.book_id(), "reportType": "balance-sheet",
-        })),
-    );
     Ok(Json(
         json!({ "splits": to_value(splits).expect("splits serialize"), "accounts": accounts }),
     ))
@@ -304,13 +297,6 @@ pub(crate) async fn income_statement(
             expense += i64::from(row.balance);
         }
     }
-    state.analytics.capture_event(
-        book.user_id(),
-        "report_generated",
-        Some(json!({
-            "bookId": book.book_id(), "reportType": "income-statement",
-        })),
-    );
     Ok(Json(
         json!({ "accounts": rows, "totals": { "income": income, "expense": expense } }),
     ))

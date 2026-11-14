@@ -17,7 +17,7 @@ function snapshot(overrides: Partial<MatchSnapshot> = {}): MatchSnapshot {
     revision: 1,
     mappedAccountId: 4,
     effectiveDay: "2026-09-22",
-    model: "jev-1.13.0",
+    model: "clef",
     promptVersion: "plaid-match-v2",
     merchantSeenBefore: false,
     bank: {
@@ -207,26 +207,32 @@ describe("buildQuestions", () => {
     expect(String(questions.category.instructions)).toMatch(/bank\.direction/);
   });
 
-  it("asks all three when there are candidates", () => {
+  const candidate = (label: string, transactionId: number) => ({
+    label,
+    transactionId,
+    payee: "Blue Bottle",
+    date: "2026-09-16",
+    amountCents: -1500,
+    counterpartAccounts: [{ name: "Credit Card Rewards", kind: "income" as const }],
+  });
+
+  it("asks nothing when there is exactly one candidate", () => {
+    // The candidate list already shows that candidate first.
+    expect(
+      buildQuestions(snapshot({ candidates: [candidate("candidate_1", 11)] })),
+    ).toEqual({});
+  });
+
+  it("asks all three when there are two or more candidates", () => {
     const questions = buildQuestions(
       snapshot({
-        candidates: [
-          {
-            label: "candidate_1",
-            transactionId: 11,
-            payee: "Blue Bottle",
-            date: "2026-09-16",
-            amountCents: -1500,
-            counterpartAccounts: [
-              { name: "Credit Card Rewards", kind: "income" },
-            ],
-          },
-        ],
+        candidates: [candidate("candidate_1", 11), candidate("candidate_2", 12)],
       }),
     );
     expect(Object.keys(questions)).toEqual(["match", "payee", "category"]);
     expect(Object.keys(questions.match.criteria)).toEqual([
       "candidate_1",
+      "candidate_2",
       "none",
     ]);
     const state = buildState(

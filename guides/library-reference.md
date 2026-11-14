@@ -24,7 +24,7 @@ scripts run.
 
 ### `/lib/wasm-client.ts`
 The synchronous browser adapter for `ledger-core`. Components import the
-shared helpers from here, not from `lib/accounting.ts`. It exports:
+shared helpers from here. It exports:
 - Accounting: `validateSplits()`, `getInvestmentGrossAmountCents()`,
   `buildBuySplits()`, `buildSellSplits()`, `buildDividendSplits()`,
   `buildCapGainSplits()`, `getDisplayBalance()`, `getEffectiveDate()`,
@@ -53,12 +53,18 @@ shared helpers from here, not from `lib/accounting.ts`. It exports:
   `formatCurrencyCompact()` and `compactDecimals()` (in `lib/formatters.ts`
   only: the short label for a chart axis, such as "$1.2k", and the decimals
   that keep two ticks one step apart different)
+- Notes: `noteHtml()`, the HTML of a Markdown transaction note. It is the
+  first filter between a note and the page. The CSP `script-src` is the
+  second: it refuses an inline script or event handler.
+  Put its result into the page as it is, and do not render a note another way
 
-The TypeScript modules `accounting`, `recurring`, `formatters` and
-`expression` give its types.
-`lib/investment-arithmetic.ts` and `lib/formatters.ts` give the fallbacks for
-input that JSON cannot carry to the WASM module, such as a fractional value
-while the user types.
+`lib/accounting.ts`, `lib/recurring.ts` and `lib/formatters.ts` give its
+types: the data types and the signatures (`AccountingCore`, `RecurringCore`,
+`FormattersCore`). They hold no copy of the Rust functions. Do not add one:
+the corpus in `rust-api/core/fixtures/core.json` is where a case goes.
+`lib/investment-arithmetic.ts` and `formatCurrency()` in `lib/formatters.ts`
+give the fallbacks for input that JSON cannot carry to the WASM module, such
+as a fractional value while the user types.
 
 ### `/lib/api-client.ts`
 Every browser request to the API goes through this module:
@@ -127,21 +133,24 @@ enforces every level regardless of what the client shows
   message type). `components/BookChangesProvider.tsx` mounts it
 - `/lib/events.ts` - window event names: `PRICES_SAVED_EVENT`,
   `SYNC_QUEUE_CHANGED_EVENT`, `BOOK_SESSION_ENDED_EVENT`
-- `/lib/formatters.ts` - the TypeScript formatters. Components use the WASM
-  copies in `lib/wasm-client.ts`; this module gives the types and the
-  fallback for input that JSON cannot carry
-- `/lib/expression.ts` - `evaluateExpression()`, the parser for amount inputs
-  (`+`, `-`, `*`, `/`, parentheses; a user can type `12.50 + 3`)
+- `/lib/formatters.ts` - `formatCurrencyCompact()` and `compactDecimals()`
+  for the chart axes, the `formatCurrency()` fallback for input that JSON
+  cannot carry, `toDateString()` (the tests use it for today's date), and
+  `FormattersCore`, the types of the WASM formatters. Components use the
+  formatters in `lib/wasm-client.ts`. `evaluateExpression()` there is the
+  parser for amount inputs (`+`, `-`, `*`, `/`, parentheses; a user can type
+  `12.50 + 3`)
+- `/lib/investments.ts` - the types `PositionSummary` and
+  `AccountMarketValue` of the investment responses. The Rust core calculates
+  them
 - `/lib/save-chord.ts` - the optional chord when the transaction form saves:
   the per-device setting (localStorage) and `prepareSaveChord()`, which makes
   the AudioContext inside the submit gesture and returns the function that
   plays the chord once the save handler reports success. Only
   `TransactionForm` calls it; imports, sync, recurring processing and MCP
   writes stay silent
-- `/lib/recurring.ts` - the recurrence limits and helpers
-  (`MAX_*_INTERVAL_*`, `isValidAutoCreateDaysBefore()`,
-  `parseAutoCreateDaysBefore()`, `addDaysToDateString()`) and the types for
-  the WASM recurrence functions
+- `/lib/recurring.ts` - `RecurringCore`, the types of the WASM recurrence
+  functions. The limits and helpers are in `rust-api/core/src/recurring.rs`
 - `/lib/reports.ts` - report grouping for the report page: `groupSplits()`,
   `computeGrandTotal()`, `buildTopParentMap()`
 - `/lib/report-chart.ts` - `toChartData()`: turns the grouped report rows
@@ -201,8 +210,6 @@ enforces every level regardless of what the client shows
   and `evaluateJobHealth()`. The status page uses it for its empty state; the
   server evaluates in `rust-api/server/src/routes/system.rs`, whose Worker
   table drops the reindex and runs one backup a day
-- `/lib/posthog-client.ts` - `identifyUser()`, `resetUser()`
-- `/lib/posthog-url.ts` - `redactedCaptureUrl()`
 - `/lib/typesafe/events.ts`, `/lib/typesafe/types.ts` - the TypeSafe
   settings event and the suggestion types that the sync page shows
 - `/lib/api-contract.ts` - `API_CONTRACT`, the number a native client
@@ -213,24 +220,17 @@ enforces every level regardless of what the client shows
 ## Modules the Node scripts run (`lib/`)
 
 These run outside the web server. Do not import them from a component.
-- `/lib/accounting.ts` - the TypeScript accounting helpers
-- `/lib/lots.ts` - `replayLots()`, the pure FIFO replay engine (no database)
-- `/lib/investments.ts` - `aggregatePositions()`,
-  `aggregateMarketValuesByAccount()`, and the position types that the pages
-  import as types
 - `/lib/payees.ts` - `normalizePayeeName()`, for the TypeSafe questions
-- `/lib/typesafe/client.ts`, `/lib/typesafe/questions.ts`,
-  `/lib/typesafe/report.ts`, `/lib/typesafe/settings.ts` - the TypeSafe
-  client and the report of `npm run typesafe:report`, which reads the
-  database file with `node:sqlite`. The server's copies are
-  `rust-api/server/src/typesafe_client.rs`, `typesafe_questions.rs` and
-  `typesafe.rs`
-- `/lib/plaid.ts` - the Plaid client of `npm run plaid:link`, the terminal
-  fallback to the in-app Hosted Link flow. The server's copy is
-  `rust-api/server/src/plaid.rs`. `PLAID_API_URL` replaces the Plaid
-  origin for a test mock
-- `/lib/posthog-query.ts` - HogQL queries for `scripts/posthog-export.ts`.
-  The server's copy is `rust-api/server/src/posthog_query.rs`
+- `/lib/typesafe/questions.ts`, `/lib/typesafe/report.ts`,
+  `/lib/typesafe/settings.ts` - the question builders and the report of
+  `npm run typesafe:report`, which reads the database file with
+  `node:sqlite`. The server's copies are
+  `rust-api/server/src/typesafe_questions.rs` and `typesafe.rs`. Only the
+  server calls the model (`typesafe_client.rs`)
+- `/lib/plaid.ts` - `getPlaidConfig()`, the Plaid settings of
+  `npm run plaid:link`, the terminal fallback to the in-app Hosted Link flow.
+  The server's Plaid client is `rust-api/server/src/plaid.rs`.
+  `PLAID_API_URL` replaces the Plaid origin for a test mock
 
 ## Server code (`rust-api/`)
 
@@ -259,6 +259,9 @@ Pure domain code. The server links it, and the browser loads it as WASM
 - `lots.rs` - `replay_lots()`, the FIFO replay engine
 - `formatters.rs`, `expression.rs` - formatting, currency parsing, and the
   amount expression parser
+- `notes.rs` - `note_html()`, Markdown note to HTML with pulldown-cmark
+  (tables, strikethrough, task lists, bare-URL autolinks). It drops raw HTML
+  and keeps a link or image only for an `http`, `https` or `mailto` target
 
 ### `rust-api/db` (`ledger-db`)
 Database code that the server and `ledger-cli` both run:
@@ -304,10 +307,10 @@ Database code that the server and `ledger-cli` both run:
 - `locks.rs` - `FOR_UPDATE` and `FOR_SHARE`, both empty: `BEGIN IMMEDIATE`
   already holds the write lock
 - `jobs.rs` - the job leases (`acquire()`, `renew()`, `release()` and
-  `held()` on `job_leases`), the job runs (`record_run()` and `runs()` on
-  `job_runs`), and the scheduler's slots and requests (`slots()`,
-  `claim()`, `advance()`, `finish()` on `job_slots`; `request()` and
-  `requests()` on `job_requests`)
+  `held()` on `job_leases`), the job runs (`record_run()`, `runs()` and
+  `last_run_failed()` on `job_runs`), and the scheduler's slots and requests
+  (`slots()`, `claim()`, `advance()`, `attempt()`, `finish()` on `job_slots`;
+  `request()` and `requests()` on `job_requests`)
 - `backup.rs` - `snapshot()`: a `VACUUM INTO` copy, checked with
   `PRAGMA integrity_check`; `daily_dump()` and `write_dump()`
 - `dump.rs` - `dump()` and `load()`: the portable JSON dump that moves the
@@ -397,8 +400,6 @@ Shared server modules:
   wake from the time and the job tables
 - `health_probe.rs` - `counterpoise-rust-api health`, the image's
   healthcheck
-- `analytics.rs` - `capture_event()`. A route that runs for an MCP tool
-  records nothing
 - `plaid.rs`, `tiingo.rs` - the Plaid and Tiingo clients
 - `typesafe.rs`, `typesafe_client.rs`, `typesafe_questions.rs` - the
   TypeSafe experiment
@@ -476,8 +477,8 @@ One module per route area. `routes/mod.rs` registers each entry of
 | `/lib/api-client.ts` | Every browser API request |
 | `/scripts/release.sh` | Version bump, release branch, push, and PR creation. Creates no tag |
 | `/scripts/deploy.sh` | Publishes the version tag at one named commit, then builds and restarts. Rebases nothing |
-| `/scripts/posthog-export.ts` | CLI tool for exporting PostHog events |
 | `/hooks/useBookId.ts` | Client hook for the current book ID |
+| `/hooks/useSubmitGuard.ts` | Client hook that lets one save run at a time. `run(save)` drops a submit while a save is in flight; `saving` disables the submit button. `TransactionForm`, `RecurringForm`, `AccountForm` and `SecurityForm` use it. Use it in each new form that sends a write |
 | `/hooks/useRegistrationOpen.ts` | Client hook for the registration gate of the login and register pages. `null` until the Rust server answers, `false` when the request fails or does not answer in five seconds |
 | `/tests/helpers/navigation.tsx` | `mockNavigation(overrides)`: a full mock of `@/lib/navigation` for component tests. It supplies each export, so a test gives only the hooks that it cares about |
 | `/tests/helpers/contract.ts` | `contract(name)`: a strict validator of a response body against a component of `openapi/openapi.json` |

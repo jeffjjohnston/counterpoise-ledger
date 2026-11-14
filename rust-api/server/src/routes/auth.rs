@@ -179,12 +179,20 @@ pub(crate) async fn registration_status(State(state): State<AppState>) -> Respon
     }
 }
 
+/// Stores a session for a user and gives its cookie, or `None` when the
+/// user's stored hash is no longer `password_hash`.
+///
+/// `password_hash` is the hash that the caller verified. Scrypt is slow, so
+/// a password change can commit between the verification and this insert.
+/// The insert thus has the hash as a condition: a login with the old
+/// password gets no session after the change.
 async fn create_session(
     state: &AppState,
     headers: &HeaderMap,
     user_id: i32,
+    password_hash: &str,
     failure: &'static str,
-) -> Result<HeaderValue, ApiError> {
+) -> Result<Option<HeaderValue>, ApiError> {
     let token = random_hex(32).map_err(|cause| {
         tracing::error!(error = %cause, "Could not generate session token");
         error(StatusCode::INTERNAL_SERVER_ERROR, failure)
@@ -197,7 +205,24 @@ async fn create_session(
         )
         .map_err(|cause| db_error(cause, failure))?;
     let expires_at = platform::timestamp() + Duration::seconds(SESSION_SECONDS);
-    state.database.execute("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)", &params![token_hash(&token), user_id, expires_at, platform::timestamp()]).map_err(|cause| db_error(cause, failure))?;
+    let stored = state
+        .database
+        .execute(
+            "INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2 AND password_hash = ?5)",
+            &params![
+                token_hash(&token),
+                user_id,
+                expires_at,
+                platform::timestamp(),
+                password_hash
+            ],
+        )
+        .map_err(|cause| db_error(cause, failure))?;
+    if stored != 1 {
+        return Ok(None);
+    }
     // A Worker is only ever reached through Cloudflare's HTTPS edge, so its
     // cookie is always Secure: a deployment sets no NODE_ENV, and the plain
     // HTTP request the edge redirects would otherwise carry the session.
@@ -233,6 +258,7 @@ async fn create_session(
     let secure_attribute = if secure { "; Secure" } else { "" };
     let expires = expires_at.and_utc().format("%a, %d %b %Y %H:%M:%S GMT");
     HeaderValue::from_str(&format!("counterpoise_session={token}; Path=/; Expires={expires}; Max-Age={SESSION_SECONDS}{secure_attribute}; HttpOnly; SameSite=lax"))
+        .map(Some)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, failure))
 }
 
@@ -276,7 +302,14 @@ async fn login_inner(
             "Invalid username or password",
         ));
     };
-    if !verify_password(&state, password, stored).await {
+    // `None` also when the password changed after the verification: the
+    // password of this request is then the old one.
+    let cookie = if verify_password(&state, password, stored.clone()).await {
+        create_session(&state, &headers, id, &stored, "Failed to log in").await?
+    } else {
+        None
+    };
+    let Some(cookie) = cookie else {
         state
             .rate_limits
             .failure(Scope::Login, &keys, platform::timestamp());
@@ -284,8 +317,7 @@ async fn login_inner(
             StatusCode::UNAUTHORIZED,
             "Invalid username or password",
         ));
-    }
-    let cookie = create_session(&state, &headers, id, "Failed to log in").await?;
+    };
     state.rate_limits.success(Scope::Login, &keys);
     let mut response = json_response(json!({ "id": id, "username": stored_username }));
     response.headers_mut().insert(header::SET_COOKIE, cookie);
@@ -355,7 +387,7 @@ async fn register_inner(
         }
         Ok(Registered::User(tx.query_row(
             "INSERT INTO users (username, password_hash, created_at) VALUES (?1, ?2, ?3) RETURNING id",
-            &params![&username, password_hash, platform::timestamp()],
+            &params![&username, &password_hash, platform::timestamp()],
         )?))
     })
     .map_err(|cause: store::Error| db_error(cause, "Failed to register"))?;
@@ -369,7 +401,16 @@ async fn register_inner(
         }
         Registered::User(id) => id,
     };
-    let cookie = create_session(&state, &headers, id, "Failed to register").await?;
+    // `None` when the new user changed the password or was deleted before
+    // this insert. The account exists, and the user can log in.
+    let Some(cookie) =
+        create_session(&state, &headers, id, &password_hash, "Failed to register").await?
+    else {
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to register",
+        ));
+    };
     let mut response = json_response(json!({ "id": id, "username": username }));
     response.headers_mut().insert(header::SET_COOKIE, cookie);
     Ok(response)
@@ -484,6 +525,129 @@ async fn change_password_inner(
     let Some(stored) = row else {
         return Ok(fail(StatusCode::UNAUTHORIZED, "User not found"));
     };
+    if !verify_password(&state, current, stored.clone()).await {
+        state
+            .rate_limits
+            .failure(Scope::Password, &keys, platform::timestamp());
+        return Ok(fail(
+            StatusCode::UNAUTHORIZED,
+            "Current password is incorrect",
+        ));
+    }
+    state.rate_limits.success(Scope::Password, &keys);
+    // The slow hash comes first. Then one write transaction stores the hash
+    // and deletes the other sessions, so no login with the old password can
+    // get a session between the two steps. `create_session` refuses a login
+    // that verified the old hash before this transaction and stores its
+    // session after it.
+    let hash = hash_password(&state, new, "Failed to update password").await?;
+    let changed = state
+        .database
+        .transaction(|tx| {
+            // The update applies only while the stored hash is the hash that
+            // this request verified. `false` when another password change
+            // was first: its password is now the current one.
+            let updated = tx.execute(
+                "UPDATE users SET password_hash = ?1 WHERE id = ?2 AND password_hash = ?3",
+                &params![hash, user_id, stored],
+            )?;
+            if updated != 1 {
+                return Ok(false);
+            }
+            tx.execute(
+                "DELETE FROM sessions WHERE user_id = ?1 AND id <> ?2",
+                &params![user_id, session_id],
+            )?;
+            Ok(true)
+        })
+        .map_err(|cause: store::Error| db_error(cause, "Failed to update password"))?;
+    if !changed {
+        return Ok(fail(
+            StatusCode::UNAUTHORIZED,
+            "Current password is incorrect",
+        ));
+    }
+    // The sessions are gone from the database before the sockets check
+    // their credentials again.
+    state.revocations.notify();
+    Ok(json_response(json!({ "success": true })))
+}
+
+fn username_payload(body: &Value) -> Result<(String, String), ApiError> {
+    let username = body.get("username");
+    let current = body.get("currentPassword");
+    if !truthy(username) || !truthy(current) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "New username and current password are required",
+        ));
+    }
+    let (Some(username), Some(current)) = (
+        username.and_then(Value::as_str),
+        current.and_then(Value::as_str),
+    ) else {
+        return Err(error(StatusCode::BAD_REQUEST, "Invalid username payload"));
+    };
+    // The same rule as registration.
+    if username.encode_utf16().count() < 3 {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Username must be at least 3 characters",
+        ));
+    }
+    Ok((username.to_owned(), current.to_owned()))
+}
+
+pub(crate) async fn change_username(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    change_username_inner(state, headers, body)
+        .await
+        .unwrap_or_else(|cause| cause.into_response())
+}
+
+/// Changes the username of the signed-in user. The caller must give the
+/// current password, and only the cookie session can do this, as for a
+/// password change. Every other table refers to a user by id, so the rename
+/// changes only this row. The sessions and the API keys stay valid.
+async fn change_username_inner(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let body = parse_json_body(&body, "Failed to update username")?;
+    let (username, current) = username_payload(&body)?;
+    let Some((user_id, _)) = cookie_session(&state, &headers)
+        .await
+        .map_err(|cause| db_error(cause, "Failed to update username"))?
+    else {
+        return Ok(fail(StatusCode::UNAUTHORIZED, "Not authenticated"));
+    };
+    // The password check is the same guess as on the password route, so it
+    // uses the same bucket.
+    let key = format!("uid:{user_id}");
+    let keys = Keys {
+        username: Some(&key),
+        ip: client_ip::from_headers(&headers),
+    };
+    if let Err(denied) = state
+        .rate_limits
+        .enforce(Scope::Password, &keys, platform::timestamp())
+    {
+        return Ok(denied.into_response());
+    }
+    let row: Option<(String, String)> = state
+        .database
+        .query_optional(
+            "SELECT username, password_hash FROM users WHERE id = ?1",
+            &params![user_id],
+        )
+        .map_err(|cause| db_error(cause, "Failed to update username"))?;
+    let Some((stored_username, stored)) = row else {
+        return Ok(fail(StatusCode::UNAUTHORIZED, "User not found"));
+    };
     if !verify_password(&state, current, stored).await {
         state
             .rate_limits
@@ -494,23 +658,37 @@ async fn change_password_inner(
         ));
     }
     state.rate_limits.success(Scope::Password, &keys);
-    state
+    if username == stored_username {
+        return Ok(fail(
+            StatusCode::BAD_REQUEST,
+            "New username must be different from current username",
+        ));
+    }
+    // The check and the update run in one write transaction, so two renames
+    // cannot both take one name.
+    let renamed = state
         .database
-        .execute(
-            "DELETE FROM sessions WHERE user_id = ?1 AND id <> ?2",
-            &params![user_id, session_id],
-        )
-        .map_err(|cause| db_error(cause, "Failed to update password"))?;
-    state.revocations.notify();
-    let hash = hash_password(&state, new, "Failed to update password").await?;
-    state
-        .database
-        .execute(
-            "UPDATE users SET password_hash = ?1 WHERE id = ?2",
-            &params![hash, user_id],
-        )
-        .map_err(|cause| db_error(cause, "Failed to update password"))?;
-    Ok(json_response(json!({ "success": true })))
+        .transaction(|tx| {
+            let existing: Option<i32> = tx.query_optional(
+                "SELECT id FROM users WHERE username = ?1",
+                &params![&username],
+            )?;
+            if existing.is_some() {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE users SET username = ?1 WHERE id = ?2",
+                &params![&username, user_id],
+            )?;
+            Ok(true)
+        })
+        .map_err(|cause: store::Error| db_error(cause, "Failed to update username"))?;
+    if !renamed {
+        return Ok(fail(StatusCode::CONFLICT, "Username already taken"));
+    }
+    Ok(json_response(
+        json!({ "id": user_id, "username": username }),
+    ))
 }
 
 fn iso_timestamp(value: NaiveDateTime) -> String {

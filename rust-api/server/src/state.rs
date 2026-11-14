@@ -1,4 +1,3 @@
-use crate::analytics::PostHogCapture;
 use crate::api_key_cache::ApiKeyCache;
 use crate::book_changes::BookChangeHub;
 use crate::oauth::Issuer;
@@ -16,7 +15,6 @@ pub(crate) struct AppState {
     pub(crate) database: Arc<Database>,
     pub(crate) rate_limits: Arc<RateLimiter>,
     pub(crate) api_keys: Arc<ApiKeyCache>,
-    pub(crate) analytics: PostHogCapture,
     pub(crate) scrypt_slots: Arc<Semaphore>,
     pub(crate) tiingo: Tiingo,
     pub(crate) plaid: Plaid,
@@ -67,7 +65,6 @@ impl AppState {
             rate_limits: Arc::new(RateLimiter::new(database.clone())),
             database,
             api_keys: Arc::new(ApiKeyCache::default()),
-            analytics: PostHogCapture::from_env(),
             scrypt_slots: Arc::new(Semaphore::new(8)),
             tiingo: Tiingo::from_env(),
             plaid: Plaid::from_env(),

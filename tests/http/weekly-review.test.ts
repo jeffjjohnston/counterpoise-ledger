@@ -377,13 +377,13 @@ describe("weekly review routes", () => {
     await enable(client);
     expect((await client.anonymous(CRON)).status).toBe(401);
     const response = await client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
-    expect(await response.json()).toEqual({ success: true, booksReviewed: 1, booksFailed: 0 });
+    expect(await response.json()).toEqual({ success: true, booksReviewed: 1, booksFailed: 0, booksWithoutReview: 0 });
     expect(await rows("SELECT source, status FROM weekly_reviews")).toEqual([{ source: "schedule", status: "complete" }]);
 
     // A second run in the same week (a retried run) does not ask again.
     const calls = mock.requests.length;
     const again = await client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
-    expect(await again.json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 0 });
+    expect(await again.json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 0, booksWithoutReview: 0 });
     expect(mock.requests).toHaveLength(calls);
     expect(await rows("SELECT source, status FROM weekly_reviews")).toEqual([{ source: "schedule", status: "complete" }]);
   });
@@ -392,7 +392,96 @@ describe("weekly review routes", () => {
     await enable(client);
     mock.reply({ status: 500, body: { type: "error" } });
     const response = await client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
-    expect(await response.json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 1 });
+    expect(await response.json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 1, booksWithoutReview: 1 });
+  });
+
+  /** The record of the job that the status page reads. */
+  async function jobRun() {
+    return rows<{ lastOkAt: Date | null; detail: string | null }>(
+      "SELECT last_ok_at, detail FROM job_runs WHERE job = 'weekly-review'",
+    );
+  }
+  const NO_REVIEW = "1 book that opted in has no review of this week";
+
+  it("a later run of the week tries a failed scheduled review again", async () => {
+    await enable(client);
+    const cron = () => client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
+    mock.reply({ status: 500, body: { type: "error" } });
+    expect(await (await cron()).json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 1, booksWithoutReview: 1 });
+    // The status page shows that a book has no review.
+    expect(await jobRun()).toEqual([{ lastOkAt: null, detail: NO_REVIEW }]);
+
+    // The failed review does not count as the review of the week.
+    mock.reply(answer({ summary: "A quiet week.", items: [] }));
+    expect(await (await cron()).json()).toEqual({ success: true, booksReviewed: 1, booksFailed: 0, booksWithoutReview: 0 });
+    expect(await rows("SELECT source, status FROM weekly_reviews ORDER BY id")).toEqual([
+      { source: "schedule", status: "failed" }, { source: "schedule", status: "complete" },
+    ]);
+    const [run] = await jobRun();
+    expect(run.lastOkAt).not.toBeNull();
+    expect(run.detail).toBeNull();
+  });
+
+  it("the cron job stops after three failed scheduled reviews of a week", async () => {
+    await enable(client);
+    const cron = () => client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
+    mock.reply({ status: 500, body: { type: "error" } });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect(await (await cron()).json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 1, booksWithoutReview: 1 });
+    }
+    expect(mock.requests).toHaveLength(3);
+    // The fourth run does not ask Claude, and the job stays failed.
+    expect(await (await cron()).json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 0, booksWithoutReview: 1 });
+    expect(mock.requests).toHaveLength(3);
+    expect(await scalar("SELECT COUNT(*) FROM weekly_reviews WHERE status = 'failed'")).toBe(3);
+    expect(await jobRun()).toEqual([{ lastOkAt: null, detail: NO_REVIEW }]);
+  });
+
+  it("a stale running scheduled review counts as an attempt of the week", async () => {
+    await enable(client);
+    // Two failed scheduled reviews, and a third whose save was lost: it is
+    // still `running` after more than 15 minutes, with no restart.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await exec(`INSERT INTO weekly_reviews (book_id, source, period_start, period_end, status, error, revision, started_at)
+                  VALUES (1, 'schedule', '${day(-7)}', '${day(-1)}', 'failed', 'timeout', 1, '2026-01-01 0${attempt}:00:00')`);
+    }
+    const old = new Date(Date.now() - 60 * 60 * 1000).toISOString().replace("T", " ").slice(0, 19);
+    await exec(`INSERT INTO weekly_reviews (book_id, source, period_start, period_end, status, revision, started_at)
+                VALUES (1, 'schedule', '${day(-7)}', '${day(-1)}', 'running', 1, '${old}')`);
+    const response = await client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
+    // The stale review becomes the third failure. The run starts no fourth
+    // review and makes no paid call.
+    expect(await response.json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 0, booksWithoutReview: 1 });
+    expect(mock.requests).toHaveLength(0);
+    expect(await rows("SELECT status FROM weekly_reviews ORDER BY id")).toEqual([
+      { status: "failed" }, { status: "failed" }, { status: "failed" },
+    ]);
+    expect(await jobRun()).toEqual([{ lastOkAt: null, detail: NO_REVIEW }]);
+  });
+
+  it("a review that a restart stopped does not count as the review of the week", async () => {
+    await enable(client);
+    // The scheduled review of this week, as `mark_interrupted` leaves it.
+    await exec(`INSERT INTO weekly_reviews (book_id, source, period_start, period_end, status, error, revision, started_at)
+                VALUES (1, 'schedule', '${day(-7)}', '${day(-1)}', 'failed', 'interrupted', 1, '2026-01-01 00:00:00')`);
+    const response = await client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
+    expect(await response.json()).toEqual({ success: true, booksReviewed: 1, booksFailed: 0, booksWithoutReview: 0 });
+  });
+
+  it("a manual review that runs does not make the book miss its scheduled review", async () => {
+    await enable(client);
+    const cron = () => client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
+    mock.hold();
+    expect((await client.request(`${REVIEW}/run`, json("POST"))).status).toBe(202);
+    // The scheduled run cannot start a second review of the book. It
+    // reports the book, so the status page shows it.
+    expect(await (await cron()).json()).toEqual({ success: true, booksReviewed: 0, booksFailed: 0, booksWithoutReview: 1 });
+    expect(await jobRun()).toEqual([{ lastOkAt: null, detail: NO_REVIEW }]);
+    mock.release();
+    await settle(client);
+    // A later run of the week reviews the book.
+    expect(await (await cron()).json()).toEqual({ success: true, booksReviewed: 1, booksFailed: 0, booksWithoutReview: 0 });
+    expect((await jobRun())[0].lastOkAt).not.toBeNull();
   });
 
   it("a failed retention cleanup does not turn a complete review into a failure", async () => {
@@ -405,7 +494,7 @@ describe("weekly review routes", () => {
     await exec("CREATE TRIGGER weekly_reviews_no_delete BEFORE DELETE ON weekly_reviews BEGIN SELECT RAISE(ABORT, 'no delete'); END");
     try {
       const response = await client.anonymous(CRON, { headers: { authorization: "Bearer test-cron-secret" } });
-      expect(await response.json()).toEqual({ success: true, booksReviewed: 1, booksFailed: 0 });
+      expect(await response.json()).toEqual({ success: true, booksReviewed: 1, booksFailed: 0, booksWithoutReview: 0 });
     } finally {
       await exec("DROP TRIGGER weekly_reviews_no_delete");
     }

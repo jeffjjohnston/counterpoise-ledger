@@ -1,6 +1,10 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import { vi, describe, it, expect, afterEach } from "vitest";
 import HomePage from "@/app/b/[bookId]/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { ToastProvider } from "@/components/ui/ToastProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
+import { stubResizeObserver } from "@/tests/helpers/resize-observer";
 
 vi.mock("@/lib/navigation", async () =>
   (await import("@/tests/helpers/navigation")).mockNavigation({
@@ -294,5 +298,148 @@ describe("HomePage", () => {
       "href",
       "/b/1/transactions?accountId=4&highlight=22"
     );
+  });
+});
+
+// Another client (an MCP tool, a second tab, a scheduled job) changes the
+// book. The server sends the book socket a hint for each changed table, and
+// the dashboard must show the change without a reload.
+describe("HomePage live updates", () => {
+  const transaction = (id: number, payee: string) => ({
+    id,
+    date: "2026-02-05",
+    description: "",
+    payee: { id, name: payee },
+    splits: [
+      { id: id * 10, amount: 1234, account: { id: 3, name: "Checking", type: "asset" } },
+      { id: id * 10 + 1, amount: -1234, account: { id: 9, name: "Income", type: "income" } },
+    ],
+  });
+
+  function socket() {
+    return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+  }
+
+  function hint(tables: string[]) {
+    act(() => { socket().emit("change", { tables }); });
+  }
+
+  function renderLive() {
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    return render(
+      <ToastProvider>
+        <BookChangesProvider>
+          <HomePage />
+        </BookChangesProvider>
+      </ToastProvider>
+    );
+  }
+
+  /** A fetch mock that answers from the given values, read at each request. */
+  function serve(data: {
+    accounts: () => unknown;
+    transactions: () => unknown;
+    netWorth?: () => unknown;
+  }) {
+    return vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const json = (body: unknown, ok = true) =>
+        ({ ok, status: ok ? 200 : 500, json: async () => body }) as Response;
+      if (url.startsWith("/api/b/1/accounts")) {
+        const body = data.accounts();
+        return body instanceof Error ? json({ error: "down" }, false) : json(body);
+      }
+      if (url.startsWith("/api/b/1/transactions")) return json(data.transactions());
+      if (url.startsWith("/api/b/1/investments/account-values")) return json([]);
+      if (url.startsWith("/api/b/1/reports/net-worth-history")) {
+        return json(data.netWorth ? data.netWorth() : { points: [] });
+      }
+      if (url.startsWith("/api/b/1/weekly-review")) return json({ configured: false });
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+  }
+
+  function accountCalls(fetchMock: ReturnType<typeof serve>) {
+    return fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/b/1/accounts")).length;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("shows a transaction and a balance that another client wrote", async () => {
+    let rows: unknown[] = [transaction(1, "Blue Bottle")];
+    let accounts: unknown = accountsPayload;
+    vi.stubGlobal("fetch", serve({ accounts: () => accounts, transactions: () => rows }));
+
+    renderLive();
+    await screen.findByText("Blue Bottle");
+    expect(screen.queryByText("City Utilities")).not.toBeInTheDocument();
+
+    rows = [transaction(2, "City Utilities"), ...rows];
+    accounts = accountsPayload.map((row) => (row.id === 3 ? { ...row, balance: 987654 } : row));
+    hint(["transactions", "transaction_splits"]);
+
+    expect(await screen.findByText("City Utilities")).toBeInTheDocument();
+    expect((await screen.findAllByText("$9,876.54")).length).toBeGreaterThan(0);
+    // A background reload does not show the loading skeleton.
+    expect(screen.getByText("Blue Bottle")).toBeInTheDocument();
+  });
+
+  it("does not reload for a table that it does not show", async () => {
+    const fetchMock = serve({ accounts: () => accountsPayload, transactions: () => [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderLive();
+    await screen.findByText("Checking");
+    const before = accountCalls(fetchMock);
+
+    hint(["recurring_rules", "plaid_accounts"]);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 250)); });
+
+    expect(accountCalls(fetchMock)).toBe(before);
+  });
+
+  it("keeps the dashboard when a background reload fails", async () => {
+    let accounts: unknown = accountsPayload;
+    const fetchMock = serve({ accounts: () => accounts, transactions: () => [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderLive();
+    await screen.findByText("Checking");
+    const before = accountCalls(fetchMock);
+
+    accounts = new Error("down");
+    hint(["accounts"]);
+
+    expect(await screen.findByText("Could not refresh the dashboard.")).toBeInTheDocument();
+    expect(accountCalls(fetchMock)).toBe(before + 1);
+    expect(screen.getByText("Checking")).toBeInTheDocument();
+    expect(screen.queryByText("Could not load dashboard data.")).not.toBeInTheDocument();
+  });
+
+  it("reloads the net worth chart when another client changes a split", async () => {
+    stubResizeObserver(600);
+    let points = [
+      { date: "2026-08-31", netWorthCents: 111_111 },
+      { date: "2026-09-30", netWorthCents: 222_222 },
+    ];
+    vi.stubGlobal("fetch", serve({
+      accounts: () => accountsPayload,
+      transactions: () => [],
+      netWorth: () => ({ points }),
+    }));
+
+    renderLive();
+    const table = () => screen.getByRole("table", { hidden: true, name: "Net worth by date" });
+    await waitFor(() => expect(within(table()).getByText("$2,222.22")).toBeInTheDocument());
+
+    points = [points[0], { date: "2026-09-30", netWorthCents: 333_333 }];
+    hint(["transaction_splits"]);
+
+    await waitFor(() => expect(within(table()).getByText("$3,333.33")).toBeInTheDocument());
+    expect(screen.queryByTestId("net-worth-placeholder")).not.toBeInTheDocument();
   });
 });

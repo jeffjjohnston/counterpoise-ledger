@@ -53,6 +53,9 @@ extern "C" {
 
     #[wasm_bindgen(js_name = setTimeout)]
     fn set_timeout(handler: &JsValue, delay: i32) -> JsValue;
+
+    #[wasm_bindgen(js_name = clearTimeout)]
+    fn clear_timeout(timer: &JsValue);
 }
 
 /// Resets the object as soon as the current event yields: the next event
@@ -67,6 +70,36 @@ pub fn reset(context: &ObjectContext, reason: &str) {
         .abort_function()
         .bind1(context, &JsValue::from_str(reason));
     set_timeout(abort.as_ref(), 0);
+}
+
+/// A timer whose promise resolves with `undefined` after a time. The timer
+/// stops when the value is dropped, so that it does not keep the object in
+/// memory.
+pub struct Timer {
+    promise: js_sys::Promise,
+    timer: JsValue,
+}
+
+impl Timer {
+    /// Starts a timer of `milliseconds`.
+    pub fn start(milliseconds: i32) -> Self {
+        let mut timer = JsValue::UNDEFINED;
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            timer = set_timeout(resolve.as_ref(), milliseconds);
+        });
+        Self { promise, timer }
+    }
+
+    /// The promise that resolves when the time has elapsed.
+    pub fn elapsed(&self) -> &js_sys::Promise {
+        &self.promise
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        clear_timeout(&self.timer);
+    }
 }
 
 /// `ctx.storage` of `state`.

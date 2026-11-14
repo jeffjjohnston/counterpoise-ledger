@@ -11,7 +11,9 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{cmp::Ordering, collections::HashSet};
 
-pub(crate) const TYPESAFE_MODEL: &str = "jev-1.13.0";
+/// The model selector of the request, and the name that the answer gives.
+/// It has no version: Cloudflare can change the model behind it.
+pub(crate) const CLEF_MODEL: &str = "clef";
 pub(crate) const MATCH_PROMPT_VERSION: &str = "plaid-match-v3";
 
 pub(crate) const UNTRUSTED: &str =
@@ -334,11 +336,19 @@ pub(crate) fn question(criteria: Map<String, Value>, instructions: String) -> Va
     json!({ "criteria": Value::Object(criteria), "instructions": instructions })
 }
 
-/// `buildQuestions`: `match` when there are eligible candidates, `payee` and
-/// `category` when a proposal is possible. The order is the request order.
+/// `buildQuestions`: `match` when there are two or more eligible candidates,
+/// `payee` and `category` when a proposal is possible. The order is the
+/// request order. A row with exactly one eligible candidate gets no question:
+/// the candidate list already shows that candidate first. In production
+/// (2026-10) that candidate was the user's match 27 times out of 27, and Jev
+/// always chose it.
 pub(crate) fn build_questions(input: &Value) -> Result<Vec<(&'static str, Value)>, LoneSurrogate> {
     let mut questions = Vec::new();
-    if let Some(candidates) = non_empty_array(get(Some(input), "candidates")) {
+    let candidates = non_empty_array(get(Some(input), "candidates"));
+    if candidates.is_some_and(|candidates| candidates.len() == 1) {
+        return Ok(questions);
+    }
+    if let Some(candidates) = candidates {
         let mut criteria = Map::new();
         for candidate in candidates {
             let label =
@@ -518,5 +528,29 @@ mod tests {
             [json!({ "label": "payee_1", "payeeId": 8, "name": "Ikea", "source": "existing" })]
         );
         assert!(build_payee_options("   ", None, &[]).is_empty());
+    }
+
+    #[test]
+    fn one_candidate_gets_no_question_and_two_get_all_three() {
+        let input = |count: usize| {
+            json!({
+                "bank": { "merchant": "SQ BLUE BOTTLE", "amountCents": -450 },
+                "candidates": (1..=count)
+                    .map(|n| json!({ "label": format!("candidate_{n}") }))
+                    .collect::<Vec<_>>(),
+                "payeeOptions": [{ "label": "payee_1", "name": "Blue Bottle", "source": "existing" }],
+                "categoryOptions": [{ "label": "category_1", "name": "Food", "kind": "expense" }],
+            })
+        };
+        let names = |count| {
+            build_questions(&input(count))
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(0), ["payee", "category"]);
+        assert!(names(1).is_empty());
+        assert_eq!(names(2), ["match", "payee", "category"]);
     }
 }

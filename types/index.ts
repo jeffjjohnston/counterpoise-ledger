@@ -191,6 +191,22 @@ export type SyncReconciliationItem = {
   lastSeenAt: string;
   candidates: SyncMatchCandidate[];
   suggestedCounterAccountId: number | null;
+  /** On a row flagged `plaid_modified`, the fields that the bank changed. Empty otherwise. */
+  reviewChanges: SyncReviewChange[];
+};
+
+/** One field that the bank changed on a linked row. `amountCents` is in the bank's sign. */
+export type SyncReviewChange = {
+  field:
+    | "date"
+    | "amountCents"
+    | "name"
+    | "merchantName"
+    | "originalDescription"
+    | "categoryPrimary"
+    | "categoryDetailed";
+  previous: string | number | null;
+  incoming: string | number | null;
 };
 
 export type SyncResolveActionPayload =

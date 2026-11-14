@@ -33,7 +33,7 @@ function snapshot(overrides: Partial<MatchSnapshot> = {}): MatchSnapshot {
     revision: 0,
     mappedAccountId: 1,
     effectiveDay: "2026-08-01",
-    model: "jev-1.13.0",
+    model: "clef",
     promptVersion: "plaid-match-v3",
     merchantSeenBefore: false,
     bank: { merchant: "Example", name: "Example", amountCents: -100, authorizedDate: null, postedDate: "2026-08-01", currency: "USD" },
@@ -94,7 +94,7 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
   beforeAll(async () => {
     await setupTestDatabase();
     ({ baseUrl, stop } = await startHttpTestServer({
-      TYPESAFE_ENABLED: "true", TYPESAFE_API_KEY: "test-key", CRON_SECRET: "test-cron-secret",
+      TYPESAFE_ENABLED: "true", TYPESAFE_CLEF_ACCOUNT_ID: "abc123", TYPESAFE_CLEF_API_TOKEN: "test-token", CRON_SECRET: "test-cron-secret",
     }));
   }, 120_000);
 
@@ -169,7 +169,7 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
     for (const id of ["0", "01", "abc", "1.5"]) {
       await expectError(client, `/api/b/${id}/settings/typesafe`, {}, 400, "Invalid book ID");
     }
-    await expectError(client, "/api/b/99999999999/settings/typesafe", {}, 503, "TypeSafe is temporarily unavailable");
+    await expectError(client, "/api/b/99999999999/settings/typesafe", {}, 503, "AI suggestions are temporarily unavailable");
     await expectError(client, SETTINGS, json("PATCH", "{"), 400, "Invalid JSON");
     for (const body of [{ enabled: "yes" }, { enabled: true, extra: 1 }, {}, null, [true]]) {
       await expectError(client, SETTINGS, json("PATCH", body), 400, "Expected enabled or entrySuggestionsEnabled: true or false");
@@ -188,11 +188,11 @@ describe("TypeSafe settings and cleanup HTTP parity", () => {
   });
 
   it("refuses to turn on an installation without a key", async () => {
-    const plain = await startHttpTestServer({ TYPESAFE_ENABLED: "false", TYPESAFE_API_KEY: "" });
+    const plain = await startHttpTestServer({ TYPESAFE_ENABLED: "false", TYPESAFE_CLEF_API_TOKEN: "" });
     try {
       const unconfigured = await sessionHttpClient(plain.baseUrl);
       expect(await (await unconfigured.request(SETTINGS)).json()).toEqual({ enabled: false, entrySuggestionsEnabled: false, revision: 0, configured: false });
-      await expectError(unconfigured, SETTINGS, json("PATCH", { enabled: true }), 409, "TypeSafe is unavailable on this installation");
+      await expectError(unconfigured, SETTINGS, json("PATCH", { enabled: true }), 409, "AI suggestions are unavailable on this installation");
       expect(await (await unconfigured.request(SETTINGS, json("PATCH", { enabled: false }))).json())
         .toEqual({ enabled: false, entrySuggestionsEnabled: false, revision: 0, configured: false });
     } finally {

@@ -1,6 +1,8 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import SyncTokensPage from "@/app/b/[bookId]/sync/tokens/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 
 vi.mock("@/lib/navigation", async () =>
   (await import("@/tests/helpers/navigation")).mockNavigation({
@@ -823,5 +825,129 @@ describe("SyncTokensPage", () => {
       accessToken: "updated-token",
     });
     expect(screen.getByText("Wells Fargo")).toBeInTheDocument();
+  });
+
+  // Another client (another tab, an MCP tool, a scheduled job) changes the
+  // book. The server sends the book socket a hint for each changed table, and
+  // the page must show the change without a reload.
+  describe("live updates", () => {
+    // BookChangesProvider holds socket hints for 100 ms, then sends one change.
+    const AFTER_BATCH_MS = 150;
+    const chase = {
+      id: 1,
+      financialInstitution: "Chase",
+      itemId: "item-1",
+      accessTokenMasked: "acce********1234",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      mappedAccountCount: 1,
+      totalAccountCount: 1,
+    };
+    let tokenRows: unknown[] = [chase];
+    const calls = (url: string) =>
+      vi.mocked(fetch).mock.calls.filter(([input]) => String(input).startsWith(url)).length;
+
+    function hint(tables: string[]) {
+      act(() => { FakeWebSocket.instances[FakeWebSocket.instances.length - 1].emit("change", { tables }); });
+    }
+
+    async function settle() {
+      await act(() => new Promise((resolve) => setTimeout(resolve, AFTER_BATCH_MS)));
+    }
+
+    async function renderLive() {
+      tokenRows = [chase];
+      FakeWebSocket.instances = [];
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/b/1/sync/tokens") {
+          return { ok: true, status: 200, json: async () => tokenRows } as Response;
+        }
+        if (url.startsWith("/api/b/1/accounts")) {
+          return { ok: true, status: 200, json: async () => accountsPayload } as Response;
+        }
+        throw new Error(`Unexpected fetch url: ${url}`);
+      }));
+      render(
+        <BookChangesProvider>
+          <SyncTokensPage />
+        </BookChangesProvider>
+      );
+      await screen.findByText("Chase");
+    }
+
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    it("shows the new account counts when another client changes the Plaid accounts", async () => {
+      await renderLive();
+      expect(screen.getByText(/1 of 1 accounts mapped/)).toBeInTheDocument();
+
+      tokenRows = [{ ...chase, totalAccountCount: 2 }];
+      hint(["plaid_accounts"]);
+
+      expect(await screen.findByText(/1 of 2 accounts mapped/)).toBeInTheDocument();
+    });
+
+    it("does not reload for a table that the page does not read", async () => {
+      await renderLive();
+      const before = vi.mocked(fetch).mock.calls.length;
+
+      hint(["transactions", "payees"]);
+      await settle();
+
+      expect(vi.mocked(fetch).mock.calls.length).toBe(before);
+    });
+
+    it("reloads the token list one time when the user comes back to the tab", async () => {
+      // plaid_tokens sends no hint. The reset on the return to the tab is
+      // what shows a token that another client changed.
+      await renderLive();
+      const before = calls("/api/b/1/sync/tokens");
+
+      tokenRows = [{ ...chase, financialInstitution: "Chase Bank" }];
+      act(() => {
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+
+      expect(await screen.findByText("Chase Bank")).toBeInTheDocument();
+      await settle();
+      expect(calls("/api/b/1/sync/tokens")).toBe(before + 1);
+    });
+
+    it("keeps an open edit form, and reloads when it closes", async () => {
+      await renderLive();
+      fireEvent.click(screen.getByRole("button", { name: "Chase actions" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Edit" }));
+      const name = await screen.findByLabelText("Bank name");
+      fireEvent.change(name, { target: { value: "Chase draft" } });
+      const before = calls("/api/b/1/sync/tokens");
+
+      tokenRows = [{ ...chase, totalAccountCount: 2 }];
+      hint(["plaid_accounts"]);
+      await settle();
+
+      expect(calls("/api/b/1/sync/tokens")).toBe(before);
+      expect(screen.getByLabelText("Bank name")).toHaveValue("Chase draft");
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(await screen.findByText(/1 of 2 accounts mapped/)).toBeInTheDocument();
+      expect(calls("/api/b/1/sync/tokens")).toBe(before + 1);
+    });
+
+    it("keeps the list when a background reload fails", async () => {
+      await renderLive();
+
+      vi.mocked(fetch).mockImplementation(async () =>
+        ({ ok: false, status: 500, json: async () => ({ error: "boom" }) }) as Response
+      );
+      hint(["plaid_accounts"]);
+      await settle();
+      await settle();
+
+      expect(screen.getByText("Chase")).toBeInTheDocument();
+      expect(screen.queryByText("boom")).not.toBeInTheDocument();
+    });
   });
 });

@@ -1,7 +1,9 @@
 // tests/app/search-page.test.tsx
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import SearchPage from "@/app/b/[bookId]/search/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 
 vi.mock("@/lib/navigation", async () =>
   (await import("@/tests/helpers/navigation")).mockNavigation({
@@ -12,9 +14,25 @@ vi.mock("@/lib/navigation", async () =>
   })
 );
 
+// The search page starts a search 300 ms after the last change to the query.
+// This value comes from app/b/[bookId]/search/page.tsx. If the page changes
+// it, change it here.
+const DEBOUNCE_MS = 300;
+
+/** Type a query, then move the fake clock to the end of the debounce. */
+async function search(value: string) {
+  fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
+    target: { value },
+  });
+  await act(async () => { await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); });
+}
+
 describe("SearchPage", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useFakeTimers();
 
     global.fetch = vi.fn().mockResolvedValue(
       new Response(
@@ -38,15 +56,9 @@ describe("SearchPage", () => {
 
   it("shows no results message after search with debounce", async () => {
     render(<SearchPage />);
-    const input = screen.getByPlaceholderText(/Search transactions/);
-    fireEvent.change(input, { target: { value: "nonexistent" } });
+    await search("nonexistent");
 
-    await waitFor(
-      () => {
-        expect(screen.getByText(/No results found/)).toBeInTheDocument();
-      },
-      { timeout: 2000 }
-    );
+    expect(screen.getByText(/No results found/)).toBeInTheDocument();
   });
 
   it("displays transactions when results are returned", async () => {
@@ -81,15 +93,9 @@ describe("SearchPage", () => {
     );
 
     render(<SearchPage />);
-    const input = screen.getByPlaceholderText(/Search transactions/);
-    fireEvent.change(input, { target: { value: "starbucks" } });
+    await search("starbucks");
 
-    await waitFor(
-      () => {
-        expect(screen.getByText("Starbucks")).toBeInTheDocument();
-      },
-      { timeout: 2000 }
-    );
+    expect(screen.getByText("Starbucks")).toBeInTheDocument();
   });
 
   // 2026-08-15 is a Saturday. A businessDaysOnly rule is observed on Monday
@@ -120,16 +126,9 @@ describe("SearchPage", () => {
     );
 
     render(<SearchPage />);
-    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
-      target: { value: "vacation" },
-    });
+    await search("vacation");
 
-    await waitFor(
-      () => {
-        expect(screen.getByText("Vacation Fund Transfer")).toBeInTheDocument();
-      },
-      { timeout: 2000 }
-    );
+    expect(screen.getByText("Vacation Fund Transfer")).toBeInTheDocument();
     expect(screen.getByText("Aug 17, 2026")).toBeInTheDocument();
     expect(screen.queryByText("Aug 15, 2026")).not.toBeInTheDocument();
   });
@@ -160,16 +159,9 @@ describe("SearchPage", () => {
     );
 
     render(<SearchPage />);
-    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
-      target: { value: "vacation" },
-    });
+    await search("vacation");
 
-    await waitFor(
-      () => {
-        expect(screen.getByText("Vacation Fund Transfer")).toBeInTheDocument();
-      },
-      { timeout: 2000 }
-    );
+    expect(screen.getByText("Vacation Fund Transfer")).toBeInTheDocument();
     expect(screen.getByText("Aug 15, 2026")).toBeInTheDocument();
   });
 
@@ -197,16 +189,9 @@ describe("SearchPage", () => {
     );
 
     render(<SearchPage />);
-    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
-      target: { value: "zebra" },
-    });
+    await search("zebra");
 
-    await waitFor(
-      () => {
-        expect(screen.getByText("Payees (2 of 112)")).toBeInTheDocument();
-      },
-      { timeout: 2000 }
-    );
+    expect(screen.getByText("Payees (2 of 112)")).toBeInTheDocument();
     expect(screen.queryByText("Payees (2)")).not.toBeInTheDocument();
   });
 
@@ -230,27 +215,130 @@ describe("SearchPage", () => {
     );
 
     render(<SearchPage />);
-    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), {
-      target: { value: "zebra" },
-    });
+    await search("zebra");
 
-    await waitFor(
-      () => {
-        expect(screen.getByText("Payees (2)")).toBeInTheDocument();
-      },
-      { timeout: 2000 }
-    );
+    expect(screen.getByText("Payees (2)")).toBeInTheDocument();
   });
 
   it("does not call fetch when query is empty", async () => {
-    vi.useFakeTimers();
-    try {
-      render(<SearchPage />);
-      // No input change — simulate debounce window passing; fetch should not be called
-      await vi.advanceTimersByTimeAsync(400);
-      expect(vi.mocked(global.fetch)).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
+    render(<SearchPage />);
+    // No input change. Let the debounce window pass: fetch must not be called.
+    await act(async () => { await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); });
+    expect(vi.mocked(global.fetch)).not.toHaveBeenCalled();
+  });
+});
+
+// Another client (an MCP tool, a second tab, a scheduled job) changes the
+// book. The server sends the book socket a hint for each changed table, and
+// the page must run the search again without a reload.
+describe("SearchPage live updates", () => {
+  const emptyBucket = { items: [], total: 0, truncated: false };
+  const payee = (id: number, name: string) => ({ id, name });
+  let payees: Array<{ id: number; name: string }> = [];
+  // When set, each search waits for the test to release it.
+  let hold: Array<() => void> | null = null;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  function socket() {
+    return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+  }
+
+  function hint(tables: string[]) {
+    act(() => { socket().emit("change", { tables }); });
+  }
+
+  function searches() {
+    return fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/b/1/search"));
+  }
+
+  // The provider sends hints after 100 ms. Wait longer than that before a
+  // test says that no search occurred.
+  async function settle() {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 250)); });
+  }
+
+  beforeEach(() => {
+    payees = [payee(10, "Starbucks")];
+    hold = null;
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    fetchMock = vi.fn(async () => {
+      const answer = {
+        transactions: [],
+        accounts: emptyBucket,
+        payees: { items: payees, total: payees.length, truncated: false },
+        recurringRules: emptyBucket,
+      };
+      if (hold) await new Promise<void>((release) => { hold!.push(release); });
+      return new Response(JSON.stringify(answer));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  function renderLive() {
+    return render(
+      <BookChangesProvider>
+        <SearchPage />
+      </BookChangesProvider>
+    );
+  }
+
+  function type(value: string) {
+    fireEvent.change(screen.getByPlaceholderText(/Search transactions/), { target: { value } });
+  }
+
+  it("runs the same search again when another client adds a payee", async () => {
+    renderLive();
+    type("star");
+    await screen.findByText("Starbucks");
+
+    payees = [payee(10, "Starbucks"), payee(11, "Starbucks Reserve")];
+    hint(["payees"]);
+
+    expect(await screen.findByText("Starbucks Reserve")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/Search transactions/)).toHaveValue("star");
+    const urls = searches().map(([input]) => String(input));
+    expect(urls[urls.length - 1]).toBe("/api/b/1/search?q=star");
+  });
+
+  it("keeps the results on the screen while it searches again", async () => {
+    renderLive();
+    type("star");
+    await screen.findByText("Starbucks");
+
+    hold = [];
+    payees = [payee(10, "Starbucks"), payee(11, "Starbucks Reserve")];
+    hint(["transactions"]);
+    await waitFor(() => expect(hold).toHaveLength(1));
+
+    expect(screen.queryByText("Searching...")).not.toBeInTheDocument();
+    expect(screen.getByText("Starbucks")).toBeInTheDocument();
+
+    await act(async () => { hold![0](); });
+    expect(await screen.findByText("Starbucks Reserve")).toBeInTheDocument();
+  });
+
+  it("does not search for a table that it does not read", async () => {
+    renderLive();
+    type("star");
+    await screen.findByText("Starbucks");
+    const before = searches().length;
+
+    hint(["security_prices"]);
+    await settle();
+
+    expect(searches()).toHaveLength(before);
+  });
+
+  it("does not search when the query is empty", async () => {
+    renderLive();
+    await settle();
+
+    hint(["transactions"]);
+    await settle();
+
+    expect(searches()).toHaveLength(0);
   });
 });

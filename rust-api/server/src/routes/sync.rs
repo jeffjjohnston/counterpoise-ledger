@@ -8,7 +8,8 @@ use crate::{
     plaid::{Plaid, is_configuration_error},
     plaid_token_keys::key_failure,
     platform,
-    routes::plaid_sync::database_failure,
+    routes::plaid_sync::{SYNC_RUNNING, connection_lease, database_failure},
+    routes::reconcile::{UNLINK_SET, unlink_allowed_from},
     routes::transactions::{AccountRow, now_millis, serialize_timestamp},
     state::AppState,
     typesafe::record_unlink,
@@ -287,12 +288,9 @@ pub(crate) async fn update_token(
         .filter(|value| !value.is_empty());
 
     let token_id = database_id(token_id, FAILURE)?;
-    if token_in_book(&state, book.book_id(), token_id, FAILURE)
-        .await?
-        .is_none()
-    {
+    let Some(stored) = token_in_book(&state, book.book_id(), token_id, FAILURE).await? else {
         return Err(error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND));
-    }
+    };
     let duplicate: bool = state.database.query_row("SELECT EXISTS (SELECT 1 FROM plaid_tokens WHERE book_id = ?1 AND item_id = ?2 AND id <> ?3)",&params![book.book_id(), &item_id, token_id])
     .map_err(|cause| internal_error(cause, FAILURE))?;
     if duplicate {
@@ -303,6 +301,16 @@ pub(crate) async fn update_token(
         .transpose()
         .map_err(key_failure)?;
     let (sealed_text, sealed_key) = sealed.map(|sealed| (sealed.text, sealed.key_id)).unzip();
+    // A cursor belongs to one Item, so a new Item or a new access token
+    // starts from no cursor. A stored token that does not open counts as
+    // changed.
+    let new_item = item_id != stored.item_id
+        || access_token
+            .is_some_and(|token| stored.access_token(&state.plaid).ok().as_deref() != Some(token));
+    // The edit can move the cursor, so it does not run during a sync.
+    let _lease = connection_lease(&state.database, token_id)
+        .map_err(|cause| internal_error(cause, FAILURE))?
+        .ok_or_else(|| error(StatusCode::CONFLICT, SYNC_RUNNING))?;
     let token: TokenRow = state
         .database
         .query_row(
@@ -310,6 +318,7 @@ pub(crate) async fn update_token(
                 "UPDATE plaid_tokens SET financial_institution = ?1, item_id = ?2,
                 access_token = COALESCE(?3, access_token),
                 access_token_key = CASE WHEN ?3 IS NULL THEN access_token_key ELSE ?7 END,
+                sync_cursor = CASE WHEN ?8 THEN NULL ELSE sync_cursor END,
                 updated_at = ?4
          WHERE id = ?5 AND book_id = ?6 RETURNING {TOKEN_COLUMNS}"
             ),
@@ -320,7 +329,8 @@ pub(crate) async fn update_token(
                 now_millis(),
                 token_id,
                 book.book_id(),
-                sealed_key
+                sealed_key,
+                new_item
             ],
         )
         .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -328,7 +338,8 @@ pub(crate) async fn update_token(
 }
 
 /// Deletes a connection. The foreign keys cascade to its account mappings
-/// and its staged bank transactions.
+/// and its staged bank transactions. The delete does not run during a sync
+/// of the connection.
 pub(crate) async fn delete_token(
     State(state): State<AppState>,
     Path((raw_book_id, raw_id)): Path<(String, String)>,
@@ -338,6 +349,17 @@ pub(crate) async fn delete_token(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Owner, FAILURE).await?;
     let token_id = database_id(finite_path_id(&raw_id, INVALID_TOKEN_ID)?, FAILURE)?;
+    // The lease name has no book in it, so prove the book first. A member of
+    // another book must not hold the lease of this connection.
+    if token_in_book(&state, book.book_id(), token_id, FAILURE)
+        .await?
+        .is_none()
+    {
+        return Err(error(StatusCode::NOT_FOUND, TOKEN_NOT_FOUND));
+    }
+    let _lease = connection_lease(&state.database, token_id)
+        .map_err(|cause| internal_error(cause, FAILURE))?
+        .ok_or_else(|| error(StatusCode::CONFLICT, SYNC_RUNNING))?;
     let deleted: Option<i32> = state
         .database
         .query_optional(
@@ -354,7 +376,10 @@ pub(crate) async fn delete_token(
 /// `clearSyncData`: discards the staged rows that are still pending and
 /// resets the cursor, so the next sync fetches from the start. Both writes
 /// are in one transaction: staged rows left on a cursor that has moved past
-/// them could not come back.
+/// them could not come back. The reset holds the lease of the connection, so
+/// it does not run during a sync: that sync would save its cursor after the
+/// reset, past the rows that the reset deleted. The caller gets 409 and
+/// tries again after the sync.
 pub(crate) async fn clear_sync_data(
     State(state): State<AppState>,
     Path((raw_book_id, raw_id)): Path<(String, String)>,
@@ -373,6 +398,9 @@ pub(crate) async fn clear_sync_data(
     fn database(cause: impl std::fmt::Display) -> ApiError {
         internal_error(cause, FAILURE)
     }
+    let _lease = connection_lease(&state.database, token_id)
+        .map_err(database)?
+        .ok_or_else(|| error(StatusCode::CONFLICT, SYNC_RUNNING))?;
     write_transaction(&state.database, FAILURE, |tx| {
         tx.execute(
             "DELETE FROM plaid_transaction_reconciliation
@@ -1087,7 +1115,10 @@ pub(crate) async fn transaction_plaid_link(
 }
 
 /// `unlinkPlaidTransaction`: every staged row matched to this transaction
-/// goes back to pending, and the transaction is no longer reconciled.
+/// goes back to pending, and the transaction is no longer reconciled. The
+/// write is the Unlink of the transition table (`reconcile.rs`,
+/// `guides/plaid-sync.md`): it applies only to a matched or created row, and
+/// the flag of a row that the bank removed stays.
 pub(crate) async fn unlink_transaction(
     State(state): State<AppState>,
     Path((raw_book_id, raw_id)): Path<(String, String)>,
@@ -1118,12 +1149,10 @@ pub(crate) async fn unlink_transaction(
     write_transaction(&state.database, FAILURE, |tx| {
         tx.execute(
             &format!(
-                "UPDATE plaid_transaction_reconciliation
-                 SET resolution_status = 'pending', matched_transaction_id = NULL,
-                     review_reason = NULL, review_metadata_json = NULL, resolved_at = NULL,
-                     updated_at = ?3
-                 WHERE id {in1} AND book_id = ?2",
-                in1 = sql::in_integers("?1")
+                "UPDATE plaid_transaction_reconciliation SET {UNLINK_SET}
+                 WHERE id {in1} AND book_id = ?2 AND {allowed}",
+                in1 = sql::in_integers("?1"),
+                allowed = unlink_allowed_from()
             ),
             &params![sql::json_array(&linked), book.book_id(), now],
         )
@@ -1138,11 +1167,6 @@ pub(crate) async fn unlink_transaction(
     })?;
 
     record_unlink(&state.database, &access, transaction_id);
-    state.analytics.capture_event(
-        book.user_id(),
-        "sync_transaction_unlinked",
-        Some(json!({ "bookId": book.book_id() })),
-    );
     Ok(Json(json!({ "success": true })))
 }
 

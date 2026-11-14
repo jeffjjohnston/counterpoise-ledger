@@ -46,10 +46,7 @@ mod tests {
     fn the_bundled_sqlite_runs() {
         let database = Database::open_in_memory().unwrap();
         let version: String = database.query_row("SELECT sqlite_version()", &[]).unwrap();
-        let compiled = std::ffi::CStr::from_bytes_with_nul(super::ffi::SQLITE_VERSION)
-            .unwrap()
-            .to_str()
-            .unwrap();
+        let compiled = super::ffi::SQLITE_VERSION.to_str().unwrap();
         assert_eq!(version, compiled);
     }
 }

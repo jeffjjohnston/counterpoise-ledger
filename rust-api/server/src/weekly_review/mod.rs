@@ -29,6 +29,11 @@ use std::collections::HashSet;
 /// Each book keeps its newest reviews and their items.
 pub(crate) const KEEP_REVIEWS: i64 = 12;
 
+/// How many scheduled reviews of one week a book can fail. The scheduled
+/// job then leaves the book until the next week, and each failed review is
+/// one paid call. `start` applies the limit.
+pub(crate) const SCHEDULED_ATTEMPTS: i64 = 3;
+
 /// A `running` review older than this is dead (see `start`).
 pub(crate) const STALE_RUN: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
@@ -74,9 +79,18 @@ pub(crate) enum Start {
     Running,
     /// The book has not opted in (or does not exist).
     NotEnabled,
+    /// The book has `SCHEDULED_ATTEMPTS` failed scheduled reviews of this
+    /// week. Only a scheduled start gives this.
+    AttemptsUsed,
 }
 
 /// Inserts a `running` review for the 7 days that end yesterday.
+///
+/// A scheduled start (`source` is `schedule`) first counts the failed
+/// scheduled reviews of the week, in the same transaction as the insert and
+/// after the stale reviews became failed. So a book never gets more than
+/// `SCHEDULED_ATTEMPTS` scheduled reviews that fail in one week, in each
+/// order of events.
 pub(crate) fn start(
     database: &Database,
     access: &BookAccess<'_, Write>,
@@ -109,6 +123,20 @@ pub(crate) fn start(
         )?;
         if running {
             return Ok(Start::Running);
+        }
+        if source == "schedule" {
+            let failed: i64 = tx.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM weekly_reviews
+                     WHERE book_id = ?1 AND source = 'schedule' AND status = 'failed'
+                       AND period_start = date({today}, '-7 days')",
+                    today = ledger_db::sql::today_literal()
+                ),
+                &params![book_id],
+            )?;
+            if failed >= SCHEDULED_ATTEMPTS {
+                return Ok(Start::AttemptsUsed);
+            }
         }
         let id: i64 = tx.query_row(
             &format!(

@@ -243,11 +243,7 @@ fn for_each_row(
     each: &mut dyn FnMut(Row) -> Result<ControlFlow<()>, Error>,
 ) -> Result<(), Error> {
     let mut statement = connection.prepare_cached(sql).map_err(sql_error)?;
-    let names: Arc<[String]> = statement
-        .column_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let names: Arc<[String]> = statement.column_names().map(str::to_owned).collect();
     let columns = names.len();
     let mut rows = statement.query(checked(params)?).map_err(sql_error)?;
     while let Some(row) = rows.next().map_err(sql_error)? {

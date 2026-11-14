@@ -39,9 +39,8 @@ tokio::task_local! {
 }
 
 /// True while a route runs for an MCP tool. A route checks this to record no
-/// PostHog event and no TypeSafe decision for a tool: before the tools moved
-/// to Rust they called the library, not the route, and the library records
-/// neither.
+/// TypeSafe decision for a tool: before the tools moved to Rust they called
+/// the library, not the route, and the library records none.
 pub(crate) fn in_tool_call() -> bool {
     TOOL_CALL.try_with(|_| ()).is_ok()
 }

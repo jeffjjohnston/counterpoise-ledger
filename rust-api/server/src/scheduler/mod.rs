@@ -7,7 +7,8 @@
 //! - TypeSafe cleanup: hourly at :15;
 //! - issue sync: hourly at :30, when `ISSUE_SYNC_GITHUB_REPO` and
 //!   `ISSUE_SYNC_GITHUB_TOKEN` are set (guides/issue-sync.md);
-//! - weekly review: Monday 05:00, for each book that opted in;
+//! - weekly review: Monday 05:00, for each book that opted in, and again
+//!   at 06:00 and 07:00 for each book that still has no review;
 //! - backup: hourly from 06:00 to 21:00 (`ledger_db::backup::snapshot` into
 //!   `BACKUP_DIR`, default `/backups`), and the first run of each UTC day
 //!   also writes a portable dump (`ledger_db::backup::daily_dump`);
@@ -15,8 +16,9 @@
 //! - reindex: `VACUUM` at 03:00 on the first of the month. The job keeps
 //!   the name of the PostgreSQL REINDEX that it replaces;
 //! - lot rebuild: never on the schedule. A Durable Object asks for it when
-//!   it starts on a file that has trades and no lots (`crate::hosted`), and
-//!   it rebuilds [`LOT_PAIRS_PER_STEP`] pairs per step.
+//!   it starts on a file that has trades and no lots, or whose last
+//!   rebuild failed ([`request_lot_rebuild`]), and it rebuilds
+//!   [`LOT_PAIRS_PER_STEP`] pairs per step.
 //!
 //! `COUNTERPOISE_SCHEDULER=on` starts it. The binary default is off, so that
 //! a test server or a development server never runs a job on its own. The
@@ -24,20 +26,24 @@
 //!
 //! On a Durable Object the object's alarm runs the jobs instead ([`alarm`]):
 //! each alarm runs one step of one due job, and the object sets the next
-//! alarm from the plan that follows. Reindex needs the native server's
-//! file, so a Durable Object leaves it off its schedule. Its backup is a
-//! daily dump into the export bucket at 03:45 ([`export`]).
+//! alarm from the plan that follows. The plan puts a run that failed to
+//! finish after the other due jobs, so it does not block them. Reindex needs
+//! the native server's file, so a Durable Object leaves it off its schedule.
+//! Its backup is a daily dump into the export bucket at 03:45 ([`export`]).
 //!
 //! At each minute the loop reads the job tables and asks [`plan::plan`]
 //! which jobs are due. A run claims its slot, the scheduled minute that it
 //! serves, in `job_slots` before it starts, and marks it finished when it
 //! ends. So a run that stopped half way (the process died) runs again at a
 //! later wake, and every job must leave things as they are when it runs a
-//! second time. A job that works in steps (the weekly review, one book per
-//! step; the Plaid sync, [`PLAID_TOKENS_PER_STEP`] connections per step)
-//! keeps where its next step starts in the slot's cursor; the loop runs the
-//! steps one after the other. A run asked for outside the schedule waits
-//! in `job_requests`.
+//! second time. The slot counts the starts of its current step. When a step
+//! has started [`MAX_ATTEMPTS`] times and the run is still unfinished, the
+//! scheduler finishes the slot and records a failed run, so a run that
+//! never finishes does not start again without end. A job that works in
+//! steps (the weekly review, one book per step; the Plaid sync,
+//! [`PLAID_TOKENS_PER_STEP`] connections per step) keeps where its next step
+//! starts in the slot's cursor; the loop runs the steps one after the other.
+//! A run asked for outside the schedule waits in `job_requests`.
 //!
 //! A job that is still running when its next time comes is not started
 //! twice: each run holds the job's lease (`crate::leases`); backup, prune
@@ -48,8 +54,10 @@
 //! reads: `job`, `lastRun`, `lastOk`, `verified`, `bytes` and `detail`. A job
 //! that has no secret to work with (Plaid sync, price sync) runs nothing and
 //! records `notConfigured: true`, with the missing setting in `detail`. The
-//! manual `/api/cron/*` routes record a run the same way (`record_run`).
+//! manual `/api/cron/*` routes record a run the same way (`record_run`, and
+//! [`backup_now`] for the backup).
 
+mod offsite;
 mod plan;
 
 use crate::leases;
@@ -84,6 +92,13 @@ const LOT_PAIRS_PER_STEP: usize = 50;
 /// start (another run holds its lease, or the job tables could not be read).
 const RETRY: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
 
+/// How many times the scheduler starts one step of a run. A step that
+/// stops before it returns (an alarm that passed its time limit, a panic, a
+/// crash), or that fails in a job that resumes its failures, starts again
+/// until it has started this many times. The scheduler then finishes the
+/// slot and records a failed run.
+const MAX_ATTEMPTS: u32 = 3;
+
 /// What a run gives for its status record.
 #[derive(Default)]
 struct Report {
@@ -94,12 +109,28 @@ struct Report {
     not_configured: bool,
     /// The job has more steps to run, and the next one starts here.
     more: Option<String>,
+    /// The name of the file or the object that a backup wrote.
+    name: Option<String>,
 }
 
 /// What a route job gives for its status record. A skipped run that names a
 /// missing setting is "not configured". Any other `Ok` is a success.
 fn report_of(result: &crate::error::ApiResult) -> Result<Report, String> {
     match result {
+        // A weekly review run that left a book with no review of the week:
+        // its review failed, or a manual review of the book was running.
+        Ok(body)
+            if body.0["booksWithoutReview"]
+                .as_u64()
+                .is_some_and(|books| books > 0) =>
+        {
+            let books = body.0["booksWithoutReview"].as_u64().unwrap_or_default();
+            Err(if books == 1 {
+                "1 book that opted in has no review of this week".to_owned()
+            } else {
+                format!("{books} books that opted in have no review of this week")
+            })
+        }
         // A price sync that Tiingo stopped with a 429 left prices out.
         Ok(body) if body.0["rateLimited"] == true => Err(format!(
             "Tiingo request limit reached: {} of {} securities have a new price",
@@ -201,6 +232,10 @@ async fn backup_into(state: &AppState, dir: &std::path::Path) -> Result<Report, 
             .reduce(|first, second| format!("{first}; {second}")),
         bytes: Some(snapshot.bytes),
         verified: Some(snapshot.verified),
+        name: snapshot
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
         ..Report::default()
     })
 }
@@ -255,38 +290,166 @@ async fn lot_rebuild(state: &AppState, cursor: Option<String>) -> Result<Report,
 
 /// The backup of a Durable Object, which has no file to copy: the day's
 /// dump (`ledger-cli dump` format) into the export bucket, as
-/// `counterpoise-YYYY-MM-DD.json`. A second run on one day writes the same
-/// name again. The bucket's lifecycle rule deletes a dump after 30 days.
+/// `counterpoise-YYYY-MM-DD.json`, then the same bytes under the same name
+/// into the S3 bucket of `offsite`, when its settings are set. A second run
+/// on one day writes the same names again. The lifecycle rule of each bucket
+/// deletes a dump after 30 days.
 #[cfg(not(feature = "native"))]
 async fn backup(state: &AppState) -> Result<Report, String> {
-    export(&state.database, platform::today(), platform::put_export).await
+    export_as(state, export_name(platform::today())).await
 }
 
-/// Writes the dump of `database` with `put`, which takes the name and the
-/// JSON text. The text is the one copy of the dump in memory.
+/// Exports the dump as `name` into the export bucket, and into the S3
+/// bucket of `offsite` when its settings are set.
+#[cfg(not(feature = "native"))]
+async fn export_as(state: &AppState, name: String) -> Result<Report, String> {
+    let copy = match offsite::Target::from_env() {
+        Ok(None) => Copy::Off,
+        Err(fault) => Copy::Faulty(fault),
+        Ok(Some(target)) => Copy::On(move |name: String, text: Vec<u8>| async move {
+            offsite::put(&target, &name, text).await
+        }),
+    };
+    export(&state.database, name, platform::put_export, copy).await
+}
+
+/// The backup that a manual run makes. The native server makes the copy
+/// that its scheduled run makes: the name of a snapshot has its time, so a
+/// copy never replaces another.
+#[cfg(feature = "native")]
+async fn manual_backup(state: &AppState) -> Result<Report, String> {
+    backup(state).await
+}
+
+/// The backup that a manual run makes. A Durable Object exports the dump
+/// under a name that has the time ([`manual_export_name`]), so the run does
+/// not replace the dump of the day.
+#[cfg(not(feature = "native"))]
+async fn manual_backup(state: &AppState) -> Result<Report, String> {
+    export_as(state, manual_export_name(platform::now())).await
+}
+
+/// Runs the backup now, for `GET /api/cron/backup`. The run waits for the
+/// lease that backup, prune and reindex share, and records its status as a
+/// scheduled run does. The answer gives the name of the file or the object
+/// that the run wrote.
+///
+/// A failure answers 500 with its cause, which is the `detail` that the
+/// status record gets. The caller has the cron secret, and must know, for
+/// example, that a dump is in R2 but not in S3.
+pub(crate) async fn backup_now(state: &AppState) -> crate::error::ApiResult {
+    let running = leases::wait(&state.database, leases::Job::Maintenance.lease_name())
+        .await
+        .map_err(|cause| crate::error::internal_error(cause, "Failed to start the job"))?;
+    let outcome = running
+        .guard(manual_backup(state))
+        .await
+        .unwrap_or_else(|lost| Err(lost.to_string()));
+    record_outcome(&state.database, "backup", &outcome);
+    match outcome {
+        Ok(report) => {
+            let mut body = serde_json::json!({ "success": true });
+            for (key, value) in [
+                ("name", report.name.map(serde_json::Value::from)),
+                ("bytes", report.bytes.map(serde_json::Value::from)),
+                ("verified", report.verified.map(serde_json::Value::from)),
+                ("detail", report.detail.map(serde_json::Value::from)),
+            ] {
+                if let Some(value) = value {
+                    body[key] = value;
+                }
+            }
+            Ok(axum::Json(body))
+        }
+        Err(failure) => {
+            tracing::error!(error = %failure, "Manual backup failed");
+            Err(crate::error::error_owned(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                failure,
+            ))
+        }
+    }
+}
+
+/// The second copy of the dump, outside Cloudflare (`offsite`).
 #[cfg_attr(feature = "native", allow(dead_code))]
-async fn export<F: Future<Output = Result<(), String>>>(
+enum Copy<P> {
+    /// No setting of the copy is set.
+    Off,
+    /// Some settings are set, and the copy cannot run: the fault.
+    Faulty(String),
+    /// Writes the copy: it takes the name and the JSON text.
+    On(P),
+}
+
+/// A [`Copy`] that is never `On`.
+#[cfg(test)]
+type NoCopy = fn(String, Vec<u8>) -> std::future::Ready<Result<(), String>>;
+
+/// Writes the dump of `database` as `name` with `put`, which takes the name
+/// and the JSON text, then with `copy`. A copy that fails, or that cannot
+/// run, makes the run a failure, but the first dump stays stored. Without a
+/// copy the text is the one copy of the dump in memory; with one there are
+/// two.
+#[cfg_attr(feature = "native", allow(dead_code))]
+async fn export<F, G, P>(
     database: &Database,
-    day: chrono::NaiveDate,
+    name: String,
     put: impl FnOnce(String, Vec<u8>) -> F,
-) -> Result<Report, String> {
+    copy: Copy<P>,
+) -> Result<Report, String>
+where
+    F: Future<Output = Result<(), String>>,
+    G: Future<Output = Result<(), String>>,
+    P: FnOnce(String, Vec<u8>) -> G,
+{
     let dump = database
         .read_transaction(|tx| ledger_db::dump::dump_json(tx))
         .map_err(|cause| format!("the dump failed: {cause}"))?;
-    let name = export_name(day);
     let bytes = dump.len() as u64;
+    let copy = match copy {
+        Copy::Off => None,
+        Copy::Faulty(fault) => Some(Err(fault)),
+        Copy::On(put_copy) => Some(Ok((put_copy, dump.clone()))),
+    };
     put(name.clone(), dump)
         .await
         .map_err(|cause| format!("the dump was not stored: {cause}"))?;
     tracing::info!(name, bytes, "Dump exported");
+    let detail = match copy {
+        None => None,
+        Some(copy) => {
+            let (put_copy, text) =
+                copy.map_err(|fault| format!("the dump is in R2 but not in S3: {fault}"))?;
+            put_copy(name.clone(), text)
+                .await
+                .map_err(|cause| format!("the dump is in R2 but not in S3: {cause}"))?;
+            tracing::info!(name, bytes, "Dump copied to S3");
+            Some("stored in R2 and S3".to_owned())
+        }
+    };
     Ok(Report {
         bytes: Some(bytes),
+        detail,
+        name: Some(name),
         ..Report::default()
     })
 }
 
+/// The name of the dump that the scheduled run of `day` exports.
+#[cfg_attr(feature = "native", allow(dead_code))]
 fn export_name(day: chrono::NaiveDate) -> String {
     format!("counterpoise-{day}.json")
+}
+
+/// The name of the dump that a manual run at `now` exports. It has the UTC
+/// time in the form of a native snapshot's name, and the word `manual`, so
+/// it is never the name of a day's dump ([`export_name`]). It starts with
+/// `counterpoise-`, as the lifecycle rule and the write permission of the
+/// S3 bucket need.
+#[cfg_attr(feature = "native", allow(dead_code))]
+fn manual_export_name(now: DateTime<Utc>) -> String {
+    format!("counterpoise-manual-{}.json", now.format("%Y%m%d-%H%M%S"))
 }
 
 /// The prune of a Durable Object, which has no backup folder: the rate
@@ -328,9 +491,10 @@ struct Job {
     /// Whether the job needs the native server's file. A Durable Object
     /// leaves it off its schedule.
     native_only: bool,
-    /// Whether a failed run stays unfinished, so that the next plan goes on
-    /// with it from its cursor. A scheduled job's next slot runs it again; a
-    /// job off the schedule has no next slot.
+    /// Whether a failed step stays unfinished, so that the next plan goes on
+    /// with it from its cursor, until the step has started [`MAX_ATTEMPTS`]
+    /// times. A scheduled job's next slot runs it again; a job off the
+    /// schedule has no next slot.
     resumes_failures: bool,
     due: Schedule,
     lease: leases::Job,
@@ -378,7 +542,11 @@ const JOBS: [Job; 10] = [
         records_status: true,
         native_only: false,
         resumes_failures: false,
-        due: |time| time.minute() == 0 && time.hour() == 5 && time.weekday() == Weekday::Mon,
+        // The runs at 06:00 and 07:00 review the books that the run before
+        // left with no review. They ask nothing when each book has one.
+        due: |time| {
+            time.minute() == 0 && (5..=7).contains(&time.hour()) && time.weekday() == Weekday::Mon
+        },
         lease: leases::Job::WeeklyReview,
         run: |state, cursor| Box::pin(route_steps(cursor, |after| review_books(state, after, 1))),
     },
@@ -429,7 +597,7 @@ const JOBS: [Job; 10] = [
     },
     Job {
         name: "lot-rebuild",
-        records_status: false,
+        records_status: true,
         native_only: false,
         resumes_failures: true,
         due: |_| false,
@@ -486,6 +654,32 @@ pub(crate) fn request(database: &Database, job: &str) -> Result<(), ledger_db::s
     jobs::request(database, job, platform::timestamp())
 }
 
+/// Asks for the lot rebuild when the file needs it, and returns whether it
+/// asked. The file needs it when it has trades and no lots (`lots_absent`),
+/// or when the last rebuild failed: the scheduler stopped that rebuild part
+/// way, so some lots exist and the file does not read as "no lots".
+///
+/// It does not ask while a run is unfinished. The plan resumes that run, and
+/// a request would start a new run with a new count of starts, so a rebuild
+/// that never finishes would never reach [`MAX_ATTEMPTS`].
+pub(crate) fn request_lot_rebuild(
+    database: &Database,
+    lots_absent: bool,
+) -> Result<bool, ledger_db::store::Error> {
+    const JOB: &str = "lot-rebuild";
+    if !lots_absent && !jobs::last_run_failed(database, JOB)? {
+        return Ok(false);
+    }
+    let unfinished = jobs::slots(database)?
+        .iter()
+        .any(|slot| slot.job == JOB && !slot.finished);
+    if unfinished {
+        return Ok(false);
+    }
+    request(database, JOB)?;
+    Ok(true)
+}
+
 /// When a Durable Object's next alarm is due: the plan's next wake, or a
 /// minute from now when the job tables could not be read.
 pub(crate) fn next_wake(database: &Database) -> DateTime<Utc> {
@@ -497,7 +691,9 @@ pub(crate) fn next_wake(database: &Database) -> DateTime<Utc> {
 /// returns when the next alarm is due. That is now when a job ran a step,
 /// so the next alarm plans again at once and takes the next step or the
 /// next due job. Each alarm's step fits in the alarm's time limit (15
-/// minutes): the jobs that work in steps keep their steps short.
+/// minutes): the jobs that work in steps keep their steps short. A step
+/// that does not fit stops with its alarm. The plan then puts its run after
+/// the other due jobs, and [`step`] stops the run at its last attempt.
 pub(crate) async fn alarm(state: &AppState) -> DateTime<Utc> {
     let now = platform::now();
     let Some(plan) = plan_now(&state.database, now) else {
@@ -562,6 +758,7 @@ fn known(
                     at: slot.slot.and_utc(),
                     finished: slot.finished,
                     cursor: slot.cursor.clone(),
+                    attempts: slot.attempts,
                 });
             let known = Known {
                 last,
@@ -640,6 +837,10 @@ enum Step {
 /// Runs one step of the run of `job` for `slot`, under its lease. A step
 /// that leaves more to do keeps its cursor in the slot; the last step marks
 /// the slot finished and records the run.
+///
+/// The slot counts each start before the step runs, because a step that
+/// stops with its alarm or its process cannot count itself. A step that has
+/// used its [`MAX_ATTEMPTS`] starts does not run: the run ends as a failure.
 async fn step(
     state: &AppState,
     job: Job,
@@ -647,6 +848,27 @@ async fn step(
     cursor: Option<String>,
     running: &leases::Held,
 ) -> Step {
+    let attempts = match jobs::attempt(&*state.database, job.name, slot) {
+        Ok(Some(attempts)) => attempts,
+        Ok(None) => {
+            tracing::warn!(
+                job = job.name,
+                "Scheduled job step skipped: a later run has its slot"
+            );
+            return Step::Unfinished;
+        }
+        // Without the count the run has no limit, so the step waits.
+        Err(cause) => {
+            tracing::error!(job = job.name, error = %cause, "Scheduled job step skipped: no count");
+            return Step::Unfinished;
+        }
+    };
+    if attempts > MAX_ATTEMPTS {
+        let stopped = Err(format!(
+            "the run did not finish in {MAX_ATTEMPTS} attempts, and the scheduler stopped it"
+        ));
+        return end(state, job, slot, &stopped);
+    }
     let outcome = match running.guard((job.run)(state, cursor)).await {
         Ok(Ok(Report {
             more: Some(next), ..
@@ -666,26 +888,41 @@ async fn step(
             return Step::Unfinished;
         }
     };
-    if let Err(failure) = &outcome
-        && job.resumes_failures
-    {
-        tracing::error!(job = job.name, error = %failure, "Scheduled job step failed: it runs again");
-        if job.records_status {
-            record_outcome(&state.database, job.name, &outcome);
+    let outcome = match outcome {
+        Err(failure) if job.resumes_failures && attempts < MAX_ATTEMPTS => {
+            tracing::error!(job = job.name, error = %failure, attempts, "Scheduled job step failed: it runs again");
+            if job.records_status {
+                record_outcome(&state.database, job.name, &Err(failure));
+            }
+            return Step::Unfinished;
         }
-        return Step::Unfinished;
-    }
+        Err(failure) if job.resumes_failures => Err(format!(
+            "{failure}; the scheduler stopped the run after {MAX_ATTEMPTS} attempts"
+        )),
+        outcome => outcome,
+    };
+    end(state, job, slot, &outcome)
+}
+
+/// Ends the run of `job` for `slot`: marks the slot finished and records the
+/// run.
+fn end(
+    state: &AppState,
+    job: Job,
+    slot: chrono::NaiveDateTime,
+    outcome: &Result<Report, String>,
+) -> Step {
     if let Err(cause) = jobs::finish(&*state.database, job.name, slot) {
         tracing::warn!(job = job.name, error = %cause, "Could not finish the job's slot");
     }
-    match &outcome {
+    match outcome {
         Ok(_) => tracing::info!(job = job.name, "Scheduled job finished"),
         Err(failure) => {
             tracing::error!(job = job.name, error = %failure, "Scheduled job failed")
         }
     }
     if job.records_status {
-        record_outcome(&state.database, job.name, &outcome);
+        record_outcome(&state.database, job.name, outcome);
     }
     Step::Ended
 }
@@ -845,6 +1082,8 @@ mod tests {
                 slot: due_now(STEPPED).slot.naive_utc(),
                 finished: true,
                 cursor: None,
+                // The last step started one time.
+                attempts: 1,
             }]
         );
         // One record, for the whole run.
@@ -916,6 +1155,210 @@ mod tests {
         assert!(jobs::slots(&*state.database).unwrap()[0].finished);
     }
 
+    /// How many times a step of `HANGS` started.
+    static HANG_STARTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// A job whose step never ends.
+    const HANGS: Job = Job {
+        name: "hangs",
+        records_status: true,
+        native_only: false,
+        resumes_failures: false,
+        due: |_| false,
+        lease: leases::Job::TypesafeCleanup,
+        run: |_, _| {
+            Box::pin(async {
+                HANG_STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending().await
+            })
+        },
+    };
+
+    #[tokio::test]
+    async fn a_run_that_never_finishes_is_stopped_and_recorded_as_failed() {
+        let file = ledger_db::testing::TempDatabase::new();
+        let state = AppState::new(file.path()).unwrap();
+        // Each start stops before its step returns, as when an alarm passes
+        // its time limit or the process stops. The slot stays unfinished and
+        // nothing records the run.
+        let mut due = due_now(HANGS);
+        let mut runs = 0;
+        let stopped = loop {
+            let run = run_due(&state, HANGS, due.clone());
+            if tokio::time::timeout(Duration::from_millis(200), run)
+                .await
+                .is_ok()
+            {
+                break true;
+            }
+            runs += 1;
+            if runs == 10 {
+                break false;
+            }
+            due.resume = true;
+        };
+        assert!(stopped, "the scheduler stops a run that never finishes");
+        assert_eq!(
+            HANG_STARTS.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_ATTEMPTS
+        );
+        // The slot is finished, so the plan has no run to resume.
+        let slots = jobs::slots(&*state.database).unwrap();
+        assert!(slots[0].finished);
+        // The status page shows the failure.
+        let record = read_record(&state.database, "hangs");
+        assert_eq!(record["lastOk"], serde_json::Value::Null);
+        assert_eq!(
+            record["detail"],
+            "the run did not finish in 3 attempts, and the scheduler stopped it"
+        );
+    }
+
+    /// How many times a step of `BROKEN` ran.
+    static BROKEN_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// A job that resumes its failures, whose step fails each time.
+    const BROKEN: Job = Job {
+        name: "broken",
+        records_status: true,
+        native_only: false,
+        resumes_failures: true,
+        due: |_| false,
+        lease: leases::Job::TypesafeCleanup,
+        run: |_, _| {
+            Box::pin(async {
+                BROKEN_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("the storage failed".to_owned())
+            })
+        },
+    };
+
+    #[tokio::test]
+    async fn a_job_that_resumes_its_failures_stops_after_the_last_attempt() {
+        let file = ledger_db::testing::TempDatabase::new();
+        let state = AppState::new(file.path()).unwrap();
+        let mut due = due_now(BROKEN);
+        for _ in 0..10 {
+            run_due(&state, BROKEN, due.clone()).await;
+            if jobs::slots(&*state.database).unwrap()[0].finished {
+                break;
+            }
+            // Each failed step is on record while the run can still go on.
+            let record = read_record(&state.database, "broken");
+            assert_eq!(record["detail"], "the storage failed");
+            due.resume = true;
+        }
+        assert_eq!(
+            BROKEN_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_ATTEMPTS
+        );
+        assert!(jobs::slots(&*state.database).unwrap()[0].finished);
+        let record = read_record(&state.database, "broken");
+        assert_eq!(record["lastOk"], serde_json::Value::Null);
+        assert_eq!(
+            record["detail"],
+            "the storage failed; the scheduler stopped the run after 3 attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lot_rebuild_that_fails_each_time_stops_and_shows_on_the_status_page() {
+        let (_file, state) = unconfigured_state().await;
+        // A cursor that the rebuild cannot read: each step fails.
+        let slot = Utc.with_ymd_and_hms(2026, 11, 9, 10, 0, 0).unwrap();
+        jobs::claim(&state.database, "lot-rebuild", slot.naive_utc()).unwrap();
+        jobs::advance(&*state.database, "lot-rebuild", slot.naive_utc(), "no pair").unwrap();
+        let rebuild = || {
+            jobs::slots(&*state.database)
+                .unwrap()
+                .into_iter()
+                .find(|slot| slot.job == "lot-rebuild")
+                .unwrap()
+        };
+        // A job on the schedule may be due this minute and take an alarm.
+        for _ in 0..20 {
+            if rebuild().finished {
+                break;
+            }
+            alarm(&state).await;
+        }
+        let rebuild = rebuild();
+        assert!(rebuild.finished, "the alarms stop the rebuild");
+        assert_eq!(rebuild.attempts, MAX_ATTEMPTS);
+        let result = crate::routes::system::evaluate_now(&state.database);
+        let job = result["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["job"] == "lot-rebuild")
+            .expect("the status lists the lot rebuild");
+        assert_eq!(job["state"], "failed");
+        assert!(
+            job["detail"]
+                .as_str()
+                .unwrap()
+                .ends_with("the scheduler stopped the run after 3 attempts"),
+            "{job}"
+        );
+        assert_eq!(result["overall"], "attention");
+    }
+
+    #[test]
+    fn a_failed_lot_rebuild_is_asked_for_again_but_not_while_a_run_is_unfinished() {
+        let database = memory();
+        let at = Utc.with_ymd_and_hms(2026, 11, 9, 10, 0, 0).unwrap();
+        let requested = |database: &Database| !jobs::requests(database).unwrap().is_empty();
+        // Lots present and no failed rebuild: nothing to ask for.
+        request_lot_rebuild(&database, false).unwrap();
+        assert!(!requested(&database));
+        // The scheduler stopped a rebuild part way: some lots exist, so the
+        // guard for absent lots reads the file as done.
+        write_status(&database, "lot-rebuild", &Status::default(), at);
+        request_lot_rebuild(&database, false).unwrap();
+        assert!(requested(&database));
+        // An unfinished run keeps its cursor and its count of starts: a
+        // request would start a new run with a count of zero.
+        database.execute("DELETE FROM job_requests", &[]).unwrap();
+        jobs::claim(&database, "lot-rebuild", at.naive_utc()).unwrap();
+        for absent in [false, true] {
+            request_lot_rebuild(&database, absent).unwrap();
+            assert!(!requested(&database));
+        }
+        jobs::finish(&database, "lot-rebuild", at.naive_utc()).unwrap();
+        request_lot_rebuild(&database, true).unwrap();
+        assert!(requested(&database));
+        // A rebuild that succeeded is not asked for again.
+        database.execute("DELETE FROM job_requests", &[]).unwrap();
+        let ok = Status {
+            ok: true,
+            ..Status::default()
+        };
+        write_status(&database, "lot-rebuild", &ok, at);
+        request_lot_rebuild(&database, false).unwrap();
+        assert!(!requested(&database));
+    }
+
+    #[test]
+    fn a_weekly_review_run_that_leaves_a_book_with_no_review_records_a_failure() {
+        let database = memory();
+        let left: crate::error::ApiResult = Ok(axum::Json(json!({
+            "success": true, "booksReviewed": 1, "booksFailed": 1, "booksWithoutReview": 2,
+        })));
+        record_outcome(&database, "weekly-review", &report_of(&left));
+        let record = read_record(&database, "weekly-review");
+        assert_eq!(record["lastOk"], serde_json::Value::Null);
+        assert_eq!(
+            record["detail"],
+            "2 books that opted in have no review of this week"
+        );
+        let done: crate::error::ApiResult = Ok(axum::Json(json!({
+            "success": true, "booksReviewed": 2, "booksFailed": 0, "booksWithoutReview": 0,
+        })));
+        record_outcome(&database, "weekly-review", &report_of(&done));
+        let record = read_record(&database, "weekly-review");
+        assert_eq!(record["lastOk"], record["lastRun"]);
+    }
+
     #[test]
     fn the_plan_reads_the_job_tables() {
         let database = memory();
@@ -939,6 +1382,7 @@ mod tests {
                 at: at(0),
                 finished: false,
                 cursor: None,
+                attempts: 0,
             })
         );
         assert!(known["weekly-review"].requested);
@@ -987,10 +1431,15 @@ mod tests {
         seed_household(&file);
         let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
         let stored = std::sync::Mutex::new(Vec::new());
-        let report = export(file.database(), day, |name, text| {
-            stored.lock().unwrap().push((name, text));
-            async { Ok(()) }
-        })
+        let report = export(
+            file.database(),
+            export_name(day),
+            |name, text| {
+                stored.lock().unwrap().push((name, text));
+                async { Ok(()) }
+            },
+            Copy::<NoCopy>::Off,
+        )
         .await
         .unwrap();
         let (name, text) = stored.into_inner().unwrap().pop().unwrap();
@@ -1014,14 +1463,159 @@ mod tests {
         }
         assert!(loaded.rows > 0, "{loaded:?}");
 
-        let failed = export(file.database(), day, |_, _| async {
-            Err("the bucket said no".to_owned())
-        })
+        assert_eq!(report.detail, None);
+
+        let failed = export(
+            file.database(),
+            export_name(day),
+            |_, _| async { Err("the bucket said no".to_owned()) },
+            Copy::<NoCopy>::Off,
+        )
         .await;
         assert_eq!(
             failed.err().as_deref(),
             Some("the dump was not stored: the bucket said no")
         );
+    }
+
+    #[test]
+    fn a_manual_export_has_a_name_that_no_days_dump_has() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 22, 3, 45, 9).unwrap();
+        let name = manual_export_name(now);
+        assert_eq!(name, "counterpoise-manual-20261022-034509.json");
+        assert_ne!(name, export_name(now.date_naive()));
+        // The lifecycle rule and the write permission of the S3 bucket are
+        // for the names that start with `counterpoise-`.
+        assert!(name.starts_with("counterpoise-"));
+    }
+
+    #[tokio::test]
+    async fn a_manual_export_keeps_the_days_dump_and_loads_into_the_same_data() {
+        let file = ledger_db::testing::TempDatabase::new();
+        seed_household(&file);
+        let now = Utc.with_ymd_and_hms(2026, 10, 22, 14, 30, 0).unwrap();
+        // The bucket: a `put` of a name that is there replaces its object.
+        let bucket = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let put = |name: String, text: Vec<u8>| {
+            bucket.lock().unwrap().insert(name, text);
+            async { Ok(()) }
+        };
+        export(
+            file.database(),
+            export_name(now.date_naive()),
+            put,
+            Copy::<NoCopy>::Off,
+        )
+        .await
+        .unwrap();
+        let daily = bucket.lock().unwrap()["counterpoise-2026-10-22.json"].clone();
+
+        // A write after the scheduled dump, which only the manual dump has.
+        file.database()
+            .exec_batch("UPDATE books SET name = 'After the daily dump' WHERE id = 1")
+            .unwrap();
+        let report = export(
+            file.database(),
+            manual_export_name(now),
+            put,
+            Copy::<NoCopy>::Off,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.name.as_deref(),
+            Some("counterpoise-manual-20261022-143000.json")
+        );
+
+        let bucket = bucket.into_inner().unwrap();
+        assert_eq!(
+            bucket.keys().collect::<Vec<_>>(),
+            [
+                "counterpoise-2026-10-22.json",
+                "counterpoise-manual-20261022-143000.json"
+            ]
+        );
+        assert_eq!(bucket["counterpoise-2026-10-22.json"], daily);
+        let manual = &bucket["counterpoise-manual-20261022-143000.json"];
+        assert_ne!(manual, &daily);
+        assert_eq!(report.bytes, Some(manual.len() as u64));
+
+        // `ledger-cli load` calls `ledger_db::dump::load` on the text.
+        let target = std::env::temp_dir().join(format!(
+            "counterpoise-manual-export-load-{}.db",
+            std::process::id()
+        ));
+        let name = {
+            let loaded = Database::open(&target, true).unwrap();
+            ledger_db::dump::load(&loaded, std::str::from_utf8(manual).unwrap()).unwrap();
+            loaded
+                .query_row::<String>("SELECT name FROM books ORDER BY id LIMIT 1", &[])
+                .unwrap()
+        };
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", target.display()));
+        }
+        assert_eq!(name, "After the daily dump");
+    }
+
+    #[tokio::test]
+    async fn the_export_copies_the_dump_to_s3_and_reports_a_copy_that_fails() {
+        let file = ledger_db::testing::TempDatabase::new();
+        seed_household(&file);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
+        let stored = std::sync::Mutex::new(Vec::new());
+        let copied = std::sync::Mutex::new(Vec::new());
+        let store = |name: String, text: Vec<u8>| {
+            stored.lock().unwrap().push((name, text));
+            async { Ok(()) }
+        };
+
+        // Both copies: the same name and the same bytes.
+        let report = export(
+            file.database(),
+            export_name(day),
+            store,
+            Copy::On(|name: String, text: Vec<u8>| {
+                copied.lock().unwrap().push((name, text));
+                async { Ok(()) }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.detail.as_deref(), Some("stored in R2 and S3"));
+        let first = stored.lock().unwrap().pop().unwrap();
+        let second = copied.lock().unwrap().pop().unwrap();
+        assert_eq!(first.0, "counterpoise-2026-11-04.json");
+        assert_eq!(first, second);
+        assert_eq!(report.bytes, Some(first.1.len() as u64));
+
+        // A copy that fails: the run fails, and the first dump is stored.
+        let failed = export(
+            file.database(),
+            export_name(day),
+            store,
+            Copy::On(|_, _| async { Err("S3 answered 403 (AccessDenied)".to_owned()) }),
+        )
+        .await;
+        assert_eq!(
+            failed.err().as_deref(),
+            Some("the dump is in R2 but not in S3: S3 answered 403 (AccessDenied)")
+        );
+        assert_eq!(stored.lock().unwrap().len(), 1);
+
+        // A copy whose settings are not complete: the same.
+        let faulty = export(
+            file.database(),
+            export_name(day),
+            store,
+            Copy::<NoCopy>::Faulty("BACKUP_S3_REGION is not set".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            faulty.err().as_deref(),
+            Some("the dump is in R2 but not in S3: BACKUP_S3_REGION is not set")
+        );
+        assert_eq!(stored.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1323,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn the_weekly_review_runs_on_monday_at_five() {
+    fn the_weekly_review_runs_on_monday_at_five_and_tries_again_at_six_and_seven() {
         let at = |day: u32, hour: u32, minute: u32| {
             ledger_db::clock::zone()
                 .with_ymd_and_hms(2026, 10, day, hour, minute, 0)
@@ -1333,7 +1927,12 @@ mod tests {
         // 2026-10-12 is a Monday.
         assert!(due("weekly-review", &at(12, 5, 0)));
         assert!(!due("weekly-review", &at(12, 5, 1)));
-        assert!(!due("weekly-review", &at(12, 6, 0)));
         assert!(!due("weekly-review", &at(13, 5, 0)));
+        // The runs at 06:00 and 07:00 try again a book whose review failed.
+        assert!(due("weekly-review", &at(12, 6, 0)));
+        assert!(due("weekly-review", &at(12, 7, 0)));
+        assert!(!due("weekly-review", &at(12, 4, 0)));
+        assert!(!due("weekly-review", &at(12, 8, 0)));
+        assert!(!due("weekly-review", &at(13, 6, 0)));
     }
 }

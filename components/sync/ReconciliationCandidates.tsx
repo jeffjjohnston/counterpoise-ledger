@@ -7,28 +7,67 @@ import type { SyncMatchCandidate } from "@/types";
 
 export type MatchAction = { transactionId: number; action: "match" | "match_update_amount" };
 
+/**
+ * The main action on the transaction that a row the bank changed is still
+ * linked to. Match there would keep the same link, so the choice is between
+ * Keep (keep_local: the flag goes, the transaction does not change) and,
+ * when the bank amount differs and the amount can be rewritten, Update
+ * (match_update_amount: the same link, with the bank amount). Update comes
+ * first then, so the flag cannot go while the amounts disagree. Enter in the
+ * modal does the same action.
+ */
+export function linkedAction(candidate: SyncMatchCandidate): "keep_local" | "match_update_amount" {
+  return candidate.amountDelta !== 0 && candidate.splitCount === 2 ? "match_update_amount" : "keep_local";
+}
+
 type MatchActionsProps = {
   candidate: SyncMatchCandidate;
   submitting: boolean;
   matchingAction: MatchAction | null;
   onMatch: (action: MatchAction) => void;
+  /** The transaction that a row the bank changed is still linked to (see `linkedAction`). */
+  linkedTransactionId: number | null;
+  onKeep: () => void;
   size?: "sm";
 };
 
-function MatchActions({ candidate, submitting, matchingAction, onMatch, size }: MatchActionsProps) {
+function MatchActions({ candidate, submitting, matchingAction, onMatch, linkedTransactionId, onKeep, size }: MatchActionsProps) {
   const disabled = submitting || candidate.alreadyLinked;
   const title = candidate.alreadyLinked ? "Already matched to another synced transaction" : undefined;
   const matching = matchingAction?.transactionId === candidate.transactionId ? matchingAction.action : null;
+  const update = `${formatCurrency(Math.abs(candidate.expectedAmount))}`;
+  if (candidate.transactionId === linkedTransactionId) {
+    const keep = (secondary: boolean) => (
+      <Button size={secondary ? "sm" : size} variant={secondary ? "secondary" : undefined} disabled={submitting}
+        title="Keep the link and leave this transaction as it is" onClick={onKeep}>
+        Keep
+      </Button>
+    );
+    if (linkedAction(candidate) === "keep_local") {
+      return <div className="flex flex-col gap-1.5 shrink-0">{keep(false)}</div>;
+    }
+    return (
+      <div className="flex flex-col gap-1.5 shrink-0">
+        <Button size={size} disabled={submitting} title="Keep the link and change the amount to the bank amount"
+          onClick={() => onMatch({ action: "match_update_amount", transactionId: candidate.transactionId })}>
+          {matching === "match_update_amount" ? "Updating…" : `Update to ${update}`}
+        </Button>
+        {keep(true)}
+      </div>
+    );
+  }
   return (
     <div className="flex flex-col gap-1.5 shrink-0">
-      <Button size={size} disabled={disabled} title={title}
-        onClick={() => onMatch({ action: "match", transactionId: candidate.transactionId })}>
-        {matching === "match" ? "Matching…" : "Match"}
-      </Button>
+      {(
+        <Button size={size} disabled={disabled} title={title}
+          onClick={() => onMatch({ action: "match", transactionId: candidate.transactionId })}>
+          {matching === "match" ? "Matching…" : "Match"}
+        </Button>
+      )}
       {candidate.amountDelta !== 0 && candidate.splitCount === 2 && (
         <Button size="sm" variant="secondary" disabled={disabled} title={title}
           onClick={() => onMatch({ action: "match_update_amount", transactionId: candidate.transactionId })}>
-          {matching === "match_update_amount" ? "Matching…" : `Match & Update ${formatCurrency(Math.abs(candidate.expectedAmount))}`}
+          {matching === "match_update_amount" ? "Matching…" : `Match & Update ${update}`}
         </Button>
       )}
     </div>
@@ -79,8 +118,18 @@ type Props = Omit<MatchActionsProps, "candidate" | "size"> & {
   onToggleOthers: () => void;
 };
 
+/** A chip on the candidate that the row is linked to now. */
+function LinkedChip() {
+  return (
+    <span className="inline-flex items-center rounded-full bg-surface-tertiary px-2 py-0.5 text-xs font-medium text-fg-secondary">
+      linked now
+    </span>
+  );
+}
+
 /** Candidate ranking stays server-owned; disclosure state stays with the selected queue item. */
-export function ReconciliationCandidates({ candidates, showOthers, onToggleOthers, submitting, matchingAction, onMatch }: Props) {
+export function ReconciliationCandidates({ candidates, showOthers, onToggleOthers, submitting, matchingAction, onMatch, linkedTransactionId, onKeep }: Props) {
+  const actions = { submitting, matchingAction, onMatch, linkedTransactionId, onKeep };
   const bestMatch = candidates[0] ?? null;
   const otherCandidates = candidates.slice(1);
   return (
@@ -99,6 +148,7 @@ export function ReconciliationCandidates({ candidates, showOthers, onToggleOther
                 {chip}
               </span>
             ))}
+            {bestMatch.transactionId === linkedTransactionId && <LinkedChip />}
           </div>
           <div className="flex items-center gap-4 p-3.5">
             <div className="min-w-0 flex-1">
@@ -114,7 +164,7 @@ export function ReconciliationCandidates({ candidates, showOthers, onToggleOther
                 <span className="tabular-nums">{formatCurrency(bestMatch.linkedSplitAmount)}</span>
               </p>
             </div>
-            <MatchActions candidate={bestMatch} submitting={submitting} matchingAction={matchingAction} onMatch={onMatch} />
+            <MatchActions candidate={bestMatch} {...actions} />
           </div>
         </div>
       )}
@@ -152,8 +202,11 @@ export function ReconciliationCandidates({ candidates, showOthers, onToggleOther
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0 flex-1">
-                        <p className="text-sm font-semibold text-fg truncate">
-                          {candidate.payeeName || candidate.description || "(No description)"}
+                        <p className="flex items-center gap-2 text-sm font-semibold text-fg">
+                          <span className="truncate">
+                            {candidate.payeeName || candidate.description || "(No description)"}
+                          </span>
+                          {candidate.transactionId === linkedTransactionId && <LinkedChip />}
                         </p>
                         <div className="flex flex-wrap items-center gap-1.5 mt-1.5 text-sm text-fg-secondary">
                           <span>{formatDate(candidate.date)}</span>
@@ -170,7 +223,7 @@ export function ReconciliationCandidates({ candidates, showOthers, onToggleOther
                           </p>
                         )}
                       </div>
-                      <MatchActions candidate={candidate} submitting={submitting} matchingAction={matchingAction} onMatch={onMatch} size="sm" />
+                      <MatchActions candidate={candidate} {...actions} size="sm" />
                     </div>
                     {candidate.alreadyLinked && (
                       <p className="text-xs text-fg-tertiary mt-2">

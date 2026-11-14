@@ -1,22 +1,30 @@
-# TypeSafe reconciliation experiment
+# AI suggestions (the TypeSafe experiment)
 
-TypeSafe suggests an existing transaction for an unresolved Plaid row. When no
-existing transaction matches, it proposes a new transaction: a payee and an
-income or expense category. It never matches or creates automatically. The
-original candidate list and its keyboard shortcuts stay in their original
-order. Separate buttons confirm a match or create the proposed transaction
-through the existing reconciliation resolver. **Edit…** copies a proposal into
-the ordinary Create form.
+Cloudflare's Clef model suggests an existing transaction for an unresolved
+Plaid row. When no existing transaction matches, it proposes a new
+transaction: a payee and an income or expense category. It never matches or
+creates automatically. The original candidate list and its keyboard shortcuts
+stay in their original order. Separate buttons confirm a match or create the
+proposed transaction through the existing reconciliation resolver. **Edit…**
+copies a proposal into the ordinary Create form.
+
+**The name.** The experiment started on TypeSafe's Jev model. Since 2026-11
+Clef is the only provider (see [The provider](#the-provider)). The tables, the
+routes, the modules, the settings (`TYPESAFE_*`) and the report keys (for
+example `jev_agrees_with_user`) keep the first name, because a rename needs a
+migration and a change of the API. In this guide, "TypeSafe" in a name of code
+or data means this feature, and "Jev" in a report key means the model.
 
 ## Enable or disable
 
 1. Run a release whose schema has the TypeSafe tables. The SQLite baseline
    (`rust-api/db/migrations/0001_baseline.sql`) has them.
-2. Set server-only `TYPESAFE_API_KEY` and `TYPESAFE_ENABLED=true` in the relevant
-   deployment's environment, then restart that app. Neither variable is public.
-3. In the current book's **Settings → TypeSafe AI — Experimental**, enable
+2. Set server-only `TYPESAFE_ENABLED=true`, `TYPESAFE_CLEF_ACCOUNT_ID` and
+   `TYPESAFE_CLEF_API_TOKEN` in the relevant deployment's environment, then
+   restart that app. No variable is public.
+3. In the current book's **Settings → AI suggestions — Experimental**, enable
    **Suggest Plaid transaction matches**. Every book starts off; configuring a
-   key never opts a book in. Future features need separate permission.
+   token never opts a book in. Future features need separate permission.
 
 Set `TYPESAFE_ENABLED=false` and restart to disable the integration across the
 installation. A book owner can turn off their feature in Settings without a
@@ -25,17 +33,64 @@ suggestions and invalidates results already in flight. Requests that already
 sent data cannot be recalled. Clear experiment data also disables the feature
 and deletes that book's local details/aggregates, retaining today's quota.
 
-No live TypeSafe requests occur in tests. Review the applicable TypeSafe privacy
-terms before enabling a real-data pilot. The public
-[privacy policy](https://typesafe.ai/legal/privacy-policy) does not promise a
-specific zero-retention period; the app's deletion action only deletes local data.
+No test calls Cloudflare. Workers AI states that it does not keep the inputs
+or the outputs of a request and does not train on them
+([data usage](https://developers.cloudflare.com/workers-ai/platform/data-usage/)).
+Read the current terms before a real-data pilot. Do not put an AI Gateway with
+logging in front of the model. The app's deletion action deletes only local
+data.
+
+## The provider
+
+The server sends the questions to the model `clef` through the Workers AI REST
+API. `rust-api/server/src/typesafe_client.rs` holds the request.
+
+- **Settings.** `TYPESAFE_CLEF_ACCOUNT_ID` is the Cloudflare account, and
+  `TYPESAFE_CLEF_API_TOKEN` is an API token that can run Workers AI. Without
+  both, or with an account that is not letters and digits, the integration is
+  not configured. On the Worker, set them with
+  `scripts/wrangler.sh secret put`: a deploy removes a plain variable that is
+  not in `wrangler.toml`.
+- **One code path.** Both targets use the REST API, so the Worker and the
+  Docker image run the same code. The Worker has no AI binding.
+- **The request.** `POST
+  /client/v4/accounts/<account>/ai/run/@cf/cloudflare/clef` with `model`,
+  `state` and `questions`. The answer is in the `result` of the Cloudflare
+  envelope. An answer whose `success` is not `true` is `provider_error`.
+- **No version.** The answer names its model as `clef`. The server refuses an
+  answer of another model, but it cannot see a new version of the same model:
+  Cloudflare can change it.
+- **Rounding.** Clef writes each probability with four decimal places. With
+  255 options the sum can be wrong by 0.013, so the sum check allows 0.00005
+  for each option, plus 0.001.
+- **Options.** A choice question takes at most 255 options. The category
+  question has at most 254 accounts and `none`.
+- **The allowance.** Workers AI gives 10,000 neurons each UTC day for the
+  whole account, about 458,000 input tokens of `clef`. Above it, a Workers
+  Free account gets errors, which the server stores as failed requests.
+- **Tests.** `TYPESAFE_CLEF_API_URL` replaces the Cloudflare origin. The HTTP
+  tests use it with a local mock (`tests/http/clef-provider.test.ts` checks
+  the URL, the token and the envelope).
+
+**Why Clef, and what it cost.** Until 2026-11 the provider was TypeSafe's
+`jev-1.13.0`. On 2026-11-10, 64 stored production requests of 30 days were
+sent again to Clef. On the reconciliation questions Clef chose Jev's payee on
+18 of 18 and Jev's category on 14 of 18, and was right as often on the rows
+with a known result. On the entry question Clef was worse: its best pattern
+was right on 24 of 35 rows, Jev's on 33, and the history fill with no model on
+31; Clef also answered `none` more often (18 of 46, Jev 9). `clef-flash`
+answered `none` on 38 of 46 and is not offered. The owner chose one provider
+with a free allowance over the better entry answers. The prompts were written
+for Jev and were not changed. The snapshot holds the name of the model, so no
+stored answer of Jev is reused; the report counts the answers of both models
+together until the old ones are 30 days old.
 
 ## Request and mutation boundaries
 
 - Requests are triggered only for the selected reconciliation row in an opted-in
   browser and, for entry suggestions, from the transaction form (see "Entry
   suggestions" below). Plaid sync, cron sync, queue GETs, and MCP do not call
-  TypeSafe.
+  the model.
   The weekly review ([weekly-review.md](weekly-review.md)) is a separate
   feature with its own opt-in, and it calls Claude from a scheduled job.
 - It skips demo tokens, bank-pending rows, resolved rows, and modification/removal
@@ -46,14 +101,18 @@ specific zero-retention period; the app's deletion action only deletes local dat
   amount); and `payee` and `category`, which state the premise "suppose this is
   recorded as a new transaction". Code reads payee and category only when match
   is `none` or was not asked. A row with no eligible candidate is asked only
-  payee and category. A row is skipped only when no question applies.
+  payee and category. A row with exactly one eligible candidate is skipped:
+  the candidate list already shows that candidate first. In production (book
+  2, October 2026) that candidate was the user's match 27 times out of 27, and
+  the model (then Jev) chose it every time. `match` is therefore asked only with two or more
+  eligible candidates. A row is also skipped when no question applies.
 - Payee options come from code: the payee that earlier matches linked to this
   merchant, up to 15 existing payees that share words with the merchant, and
   the bank's own merchant text, with whitespace and quote marks normalized, as
   a new payee (left out when an existing payee has the same name, ignoring
-  case). Jev picks; it never writes a name. A one-click create, or an Edit
+  case). The model picks; it never writes a name. A one-click create, or an Edit
   that keeps the proposed payee, writes that new payee to the ledger as the
-  bank sent it, not the redacted text sent to TypeSafe. Category options are
+  bank sent it, not the redacted text sent to the model. Category options are
   the book's active income and expense accounts (at most 254).
 - It sends bounded merchant/name strings, amounts in cents, a code-computed
   money-in/money-out direction, dates, currency, candidate payee names,
@@ -64,15 +123,24 @@ specific zero-retention period; the app's deletion action only deletes local dat
   of the payee that earlier matches linked to this merchant, and up to three
   income or expense accounts that payee used, with a count for each. Long
   numeric references and email addresses are redacted from every string sent
-  to TypeSafe, including the payee shortlist names; this redaction never
+  to the model, including the payee shortlist names; this redaction never
   reaches the ledger or the stored snapshot. Original bank descriptions, local
   transaction notes, asset and liability account names, account numbers, and
   Plaid IDs/tokens are omitted. Request
   bodies never enter logs or analytics.
-- The direct [HTTP adapter](https://docs.typesafe.ai/api) pins `jev-1.13.0` and
+- The HTTP adapter sends the model `clef` and the prompt
   `plaid-match-v3`, validates the complete Choice distribution of every answer,
   allows `none`, and times out after five seconds without automatic retry. A
-  returned score is not displayed as a percentage of proven accuracy.
+  returned score is not displayed as a percentage of proven accuracy. Each
+  refused answer has its own error code: `invalid_response_json` (the body
+  is not JSON), `invalid_response_model` (another model answered),
+  `invalid_response_schema` (an answer or the usage has the wrong shape),
+  `invalid_response_missing` (an asked question has no answer),
+  `invalid_response_options` (the probabilities do not name exactly the asked
+  options), `invalid_response_sum` (they do not sum to 1) and
+  `invalid_response_choice` (the choice is not an option, or not the most
+  probable one). Before 2026-11, one code, `invalid_response`, covered all of
+  them; older records keep it.
 - A book-row lock serializes claims and a persisted UTC-day quota limits attempts
   to 100/day/book. Successful input snapshots are cached. Only one evaluation can
   be active per book. The lease expires after 30 seconds; a new attempt UUID
@@ -87,7 +155,7 @@ specific zero-retention period; the app's deletion action only deletes local dat
 
 ## Entry suggestions
 
-The second TypeSafe feature, with its own opt-in: **Suggest entries for new
+The second feature, with its own opt-in: **Suggest entries for new
 transactions** (`books.typesafe_entry_enabled`, the field
 `entrySuggestionsEnabled` of `settings/typesafe`). It starts off. Both features
 share `typesafe_revision`, so a change of either setting fences the requests
@@ -119,7 +187,7 @@ principal and interest change), and the hint shows the range. When the payee cha
 the user did not touch go back to the empty entry. With no patterns, or when they
 cannot load, the form keeps the earlier last-account fill.
 
-**The TypeSafe pick, for an opted-in book.** With 2 or more patterns the form
+**The model's pick, for an opted-in book.** With 2 or more patterns the form
 calls `POST /api/b/{bookId}/entry-suggestion` (Write) with exactly
 `{ accountId, payeeId, date, amount }`. The server computes the patterns again,
 and asks one Choice question (`pattern`, prompt `entry-pattern-v1`, options
@@ -140,9 +208,14 @@ settings revision are the same; else it drops it. The form waits 400 ms before t
 typed past (an exact match on the way to a longer name) makes no call.
 
 **The chip.** Under the payee: "Filled from: Groceries · $42.10 (history)",
-"(TypeSafe)", "(TypeSafe was not sure)" for `none`, or "(your pick)". The chip
-and the outcome name the fill that the form shows: a dropped TypeSafe answer
-changes neither. A click lists the patterns; a pick fills the form again, over
+"(Clef)", "(Clef was not sure)" for `none`, or "(your pick)". The chip
+and the outcome name the fill that the form shows: a dropped answer of the model
+changes neither. Beside the chip, "or" and up to two buttons show the next
+patterns (`QUICK_PICKS` in `EntryPatternChip.tsx`): one click picks one. They
+were added because in production the right pattern was often offered but not
+filled, and the user changed the accounts by hand; the list behind the chip
+was never used. A click on the chip lists all the patterns. A pick, from a
+button or from the list, fills the form again, over
 edits, but keeps a typed amount when the picked pattern has none (in journal
 mode, on this account's line). Choosing the pattern already shown is not a
 pick. A mode change
@@ -150,7 +223,8 @@ and a new expense account count as edits.
 
 **Records.** `typesafe_entry_evaluations` (one per book and fingerprint) and
 `typesafe_entry_outcomes`. After a save that the page reports as successful
-(`onSubmit` resolves `true`), the form posts
+(`onSubmit` resolves `true`, or the saved transaction's id, which the outcome
+then carries as `transactionId`), the form posts
 `POST /api/b/{bookId}/entry-suggestion/outcome` (Write; only for an opted-in
 book): `kept`, `changed_amount`, `picked_other`, `changed_accounts`, or
 `abandoned` when the form closes with a fill and no save (Cancel, the sheet's
@@ -207,13 +281,13 @@ file.
 `GET /api/cron/typesafe-cleanup`, protected by `CRON_SECRET`, archives counts and
 deletes details older than 30 days in batches of at most 1,000 evaluations.
 The server runs the same job hourly at :15 (`rust-api/server/src/scheduler/mod.rs`),
-even with TypeSafe disabled. The retention window is therefore 30 days plus
+even with the integration disabled. The retention window is therefore 30 days plus
 the next cleanup; a large backlog may need more than one batch. A server with
 `COUNTERPOISE_SCHEDULER` off must have something else call the endpoint on an
 equivalent schedule. Book deletion cascades through experiment
 tables. Existing database backups retain their normal independent lifecycle.
 
-For the first 100–200 decisions, compare cases where Jev differs from the
+For the first 100–200 decisions, compare cases where the model differs from the
 baseline, check a blinded sample, and inspect latency and corrections. Acceptance
 is assisted-use evidence, not independent accuracy. Low candidate coverage
 suggests improving retrieval; it cannot be fixed by confidence thresholds.
@@ -227,7 +301,7 @@ remains beside them:
 | --- | --- | --- |
 | `routes/typesafe_suggestion.rs` | the snapshot, the claim, the lease, the quota, display, and confirmation | none |
 | `typesafe_questions.rs` | redaction, payee options, state, and questions | `lib/typesafe/questions.ts` |
-| `typesafe_client.rs` | the request and the response checks | `lib/typesafe/client.ts` |
+| `typesafe_client.rs` | the request and the response checks | none |
 | `typesafe.rs` | decision records, the summary, and the cleanup | `lib/typesafe/report.ts` |
 | `routes/typesafe.rs` | the settings and the cleanup route | none |
 | `entry_patterns.rs` | the entry patterns, snapshot and question | none |
@@ -249,12 +323,12 @@ Two rules cover records that the server does not write (owner decision of
   not fail on it: a chosen candidate counts as `differs_from_baseline`, and a
   manual match does not count as `baseline_agrees_with_user`.
 
-The MCP tools do not call TypeSafe. The fingerprint is the SHA-256 of `JSON.stringify(snapshot)`, so the
+The MCP tools do not call the model. The fingerprint is the SHA-256 of `JSON.stringify(snapshot)`, so the
 Rust snapshot keeps the key order that the Node object literal had, and stored
 fingerprints stay valid. The state and the questions are built from the
 snapshot as the database returns it: the JSON columns are read as text, so
 the key order is the stored order.
-`TYPESAFE_API_URL` replaces the TypeSafe origin, so the HTTP tests use a local
+`TYPESAFE_CLEF_API_URL` replaces the Cloudflare origin, so the HTTP tests use a local
 mock. `tests/http/typesafe-suggestion.test.ts` checks the request body against
 a snapshot. It also displays and confirms, through the Rust routes, an
 evaluation that the server made, and checks that display recomputes the same

@@ -27,8 +27,8 @@ use crate::{
     typesafe::{Observation, is_configured, property, proposal, record_decision, strict_equal},
     typesafe_client::evaluate,
     typesafe_questions::{
-        LoneSurrogate, MATCH_PROMPT_VERSION, Payee, TYPESAFE_MODEL, build_payee_options,
-        build_questions, build_state, fingerprint, js_cmp, merchant_text,
+        LoneSurrogate, MATCH_PROMPT_VERSION, Payee, build_payee_options, build_questions,
+        build_state, fingerprint, js_cmp, merchant_text,
     },
     validation::{js_number, js_stringify},
 };
@@ -50,9 +50,8 @@ const RETRY: TimeDelta = TimeDelta::seconds(60);
 const DAILY_ATTEMPTS: i32 = 100;
 const MAX_CANDIDATE_COUNTERPART_ACCOUNTS: usize = 5;
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-const UNAVAILABLE: &str = "TypeSafe is temporarily unavailable";
-const STALE_REVIEW: &str =
-    "This TypeSafe suggestion is stale. Refresh and review the transaction again.";
+const UNAVAILABLE: &str = "AI suggestions are temporarily unavailable";
+const STALE_REVIEW: &str = "This AI suggestion is stale. Refresh and review the transaction again.";
 
 /// The errors of `typeSafeHttpError`.
 enum Failure {
@@ -328,7 +327,7 @@ fn snapshot(
         "revision": revision,
         "mappedAccountId": link.account_id,
         "effectiveDay": day,
-        "model": TYPESAFE_MODEL,
+        "model": crate::typesafe_questions::CLEF_MODEL,
         "promptVersion": MATCH_PROMPT_VERSION,
         "merchantSeenBefore": seen_before.is_some(),
         "bank": {
@@ -838,7 +837,7 @@ fn confirm(
             &params![column(evaluation_id)?, book_id, column(link_id)?],
         )?;
         let record = Evaluation::read(record.ok_or(stale(
-            "This TypeSafe suggestion is stale. Refresh and review again.",
+            "This AI suggestion is stale. Refresh and review again.",
         ))?)?;
         lock_confirmation(sql, link_id, &record)?;
         let valid = valid_evaluation(sql, book_id, link_id, evaluation_id)?;
@@ -855,7 +854,7 @@ fn confirm(
             Kind::Match => {
                 let candidate = valid
                     .chosen()?
-                    .ok_or(stale("This TypeSafe suggestion is stale or has no match."))?;
+                    .ok_or(stale("This AI suggestion is stale or has no match."))?;
                 ReconcileInput {
                     reconciliation_id,
                     action: Action::Match,
@@ -866,7 +865,7 @@ fn confirm(
             }
             Kind::Create => {
                 let proposal = valid.proposal()?.ok_or(stale(
-                    "This TypeSafe suggestion has no new transaction to create.",
+                    "This AI suggestion has no new transaction to create.",
                 ))?;
                 ReconcileInput {
                     reconciliation_id,

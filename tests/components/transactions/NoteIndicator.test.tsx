@@ -1,14 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
-vi.mock("react-markdown", () => ({
-  default: ({ children }: { children: string }) => <div>{children}</div>,
-}));
-
-vi.mock("remark-gfm", () => ({
-  default: {},
-}));
-
 import { NoteIndicator, placeNoteTooltip } from "@/components/transactions/NoteIndicator";
 
 describe("NoteIndicator", () => {
@@ -109,7 +101,7 @@ describe("NoteIndicator popup after the note changes size", () => {
       return this.getAttribute("role") === "tooltip" ? noteHeight : 0;
     });
 
-    render(<NoteIndicator notes="![receipt](receipt.png)" />);
+    render(<NoteIndicator notes="![receipt](https://example.com/receipt.png)" />);
     fireEvent.mouseEnter(screen.getByLabelText("Has notes").closest("span")!);
     expect(screen.getByRole("tooltip")).toHaveAttribute("data-placement", "above");
 
@@ -122,5 +114,45 @@ describe("NoteIndicator popup after the note changes size", () => {
     const tooltip = screen.getByRole("tooltip");
     expect(tooltip).toHaveAttribute("data-placement", "below");
     expect(tooltip.style.top).toBe(`${166 + 8}px`);
+  });
+});
+
+describe("NoteIndicator Markdown", () => {
+  const open = (notes: string) => {
+    render(<NoteIndicator notes={notes} />);
+    fireEvent.mouseEnter(screen.getByLabelText("Has notes").closest("span")!);
+    return screen.getByRole("tooltip");
+  };
+
+  it("renders Markdown emphasis", () => {
+    const tooltip = open("Paid **twice**");
+    expect(tooltip.querySelector("strong")).toHaveTextContent("twice");
+  });
+
+  it("does not add raw HTML to the page", () => {
+    const tooltip = open('<img src=x onerror="alert(1)"> <script>alert(2)</script> <b>bold</b>');
+    expect(tooltip.querySelector("img, script, b")).toBeNull();
+    expect(tooltip.innerHTML).not.toContain("onerror");
+  });
+
+  it("keeps the text of a javascript: link but not the link", () => {
+    const tooltip = open("[click me](javascript:alert(1))");
+    expect(tooltip.querySelector("a")).toBeNull();
+    expect(tooltip).toHaveTextContent("click me");
+  });
+
+  it("renders an https link", () => {
+    const tooltip = open("[site](https://example.com)");
+    expect(tooltip.querySelector("a")).toHaveAttribute("href", "https://example.com");
+  });
+
+  it("renders a table, strikethrough, a task list and a bare URL", () => {
+    const tooltip = open(
+      "| Item | Cost |\n| --- | --- |\n| Lamp | $20 |\n\n~~old~~\n\n- [x] filed\n\nSee https://example.com/r"
+    );
+    expect(tooltip.querySelector("td")).toHaveTextContent("Lamp");
+    expect(tooltip.querySelector("del")).toHaveTextContent("old");
+    expect(tooltip.querySelector('input[type="checkbox"]')).toBeChecked();
+    expect(tooltip.querySelector("a")).toHaveAttribute("href", "https://example.com/r");
   });
 });

@@ -45,39 +45,9 @@
     }
   },
   {
-    "name": "analyze_usage",
-    "title": "Analyze Usage",
-    "description": "Query this server's PostHog project for usage events in the last `days` days. Returns totalEvents, eventCounts (each event name with its count, highest first) and recentEvents (the 20 newest events with their properties). eventType limits both to one event name, such as '$pageview' or 'transaction_created'. The data covers only the events of the calling user, across every book they use. The tool does not group by page or session; read page paths from the recentEvents properties.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "days": {
-          "default": 7,
-          "description": "Number of days to look back",
-          "type": "number",
-          "minimum": 1,
-          "maximum": 90
-        },
-        "eventType": {
-          "description": "Filter to specific event type (e.g., 'transaction_created', '$pageview')",
-          "type": "string"
-        }
-      },
-      "$schema": "http://json-schema.org/draft-07/schema#"
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "openWorldHint": true
-    },
-    "execution": {
-      "taskSupport": "forbidden"
-    }
-  },
-  {
     "name": "clear_plaid_sync_data",
     "title": "Clear Plaid Sync Data",
-    "description": "Discard every staged transaction for a connection and reset its sync cursor, so the next sync re-fetches from the beginning. Local transactions already reconciled are not affected. This touches only this database and never calls Plaid.",
+    "description": "Discard every staged transaction for a connection and reset its sync cursor, so the next sync re-fetches from the beginning. Local transactions already reconciled are not affected. This touches only this database and never calls Plaid. Refused while a sync of the connection runs.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -807,7 +777,7 @@
   {
     "name": "delete_plaid_token",
     "title": "Delete Plaid Token",
-    "description": "Delete a bank connection and its entire reconciliation history. This removes the account mappings, every staged transaction still awaiting review, AND every already-resolved row — the matched, created and ignored ones. Local transactions are not deleted, but those that were matched lose their link to the bank transaction that confirmed them, and the matched history that payee-based auto-matching learns from is gone, so future syncs on a re-added connection will match less well. To discard only the pending queue and re-fetch from scratch, use clear_plaid_sync_data instead. This cannot be undone.",
+    "description": "Delete a bank connection and its entire reconciliation history. This removes the account mappings, every staged transaction still awaiting review, AND every already-resolved row — the matched, created and ignored ones. Local transactions are not deleted, but those that were matched lose their link to the bank transaction that confirmed them, and the matched history that payee-based auto-matching learns from is gone, so future syncs on a re-added connection will match less well. To discard only the pending queue and re-fetch from scratch, use clear_plaid_sync_data instead. Refused while a sync of the connection runs. This cannot be undone.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2058,7 +2028,7 @@
   {
     "name": "reconcile_plaid_transaction",
     "title": "Reconcile Plaid Transaction",
-    "description": "Resolve one staged bank transaction from the reconciliation queue. Six actions: 'match' links it to a transaction you already entered and marks that transaction reconciled; 'match_update_amount' does the same and rewrites the transaction's two splits to the bank's amount (two-split, non-investment transactions only); 'create' writes a new two-split transaction from the bank's data; 'ignore' dismisses the bank transaction; 'keep_local' clears a review flag and keeps what you already have; 'unlink' returns a resolved row to the pending queue and stops its transaction being reconciled, unless another bank row still matches that transaction (a transfer seen on both sides). Matching or creating against a bank row that is already linked is refused — unlink it first. Matching a floating transaction also settles it, clearing its floating flag and stamping the bank's date. Get the reconciliationId and its candidate matches from get_reconcile_candidates first.",
+    "description": "Resolve one staged bank transaction from the reconciliation queue. Six actions: 'match' links it to a transaction you already entered and marks that transaction reconciled; 'match_update_amount' does the same and rewrites the transaction's two splits to the bank's amount (two-split, non-investment transactions only); 'create' writes a new two-split transaction from the bank's data; 'ignore' dismisses the bank transaction; 'keep_local' clears the review flag of a row the bank changed (reviewReason plaid_modified only) and keeps what you already have; 'unlink' returns a matched or created row to the pending queue and stops its transaction being reconciled, unless another bank row still matches that transaction (a transfer seen on both sides). Matching, creating or ignoring a linked row with no review flag is refused — unlink it first. An ignored row takes no action. Matching a floating transaction also settles it, clearing its floating flag and stamping the bank's date. Get the reconciliationId and its candidate matches from get_reconcile_candidates first.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2090,7 +2060,7 @@
             "keep_local",
             "unlink"
           ],
-          "description": "What to do with this bank transaction. 'match' links it to an existing transaction; 'match_update_amount' links it and rewrites that transaction's two splits to the bank's amount; 'create' writes a new two-split transaction from it; 'ignore' dismisses it; 'keep_local' clears a review flag and keeps what you already have; 'unlink' returns an already-resolved row to the pending queue."
+          "description": "What to do with this bank transaction. The tool description says what each action does and when it is refused."
         },
         "transactionId": {
           "description": "The existing transaction to link to. Required for 'match' and 'match_update_amount', ignored otherwise.",
@@ -2613,7 +2583,7 @@
   {
     "name": "update_plaid_token",
     "title": "Update Plaid Token",
-    "description": "Replace a bank connection's institution name and item id. This is a full replace, not a patch: financialInstitution and itemId are both required on every call. Rotating the connection's access token is not available through this interface — that credential can only be re-obtained through the Plaid Link browser flow, and this tool does not accept one.",
+    "description": "Replace a bank connection's institution name and item id. This is a full replace, not a patch: financialInstitution and itemId are both required on every call. A new itemId resets the sync cursor. Refused while a sync of the connection runs. Rotating the connection's access token is not available through this interface — that credential can only be re-obtained through the Plaid Link browser flow, and this tool does not accept one.",
     "inputSchema": {
       "type": "object",
       "properties": {

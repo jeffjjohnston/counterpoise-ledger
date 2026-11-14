@@ -161,4 +161,40 @@ describe("IncomeStatementCharts", () => {
     );
     expect(container).toBeEmptyDOMElement();
   });
+
+  it("loads the monthly chart again on a new revision, and keeps it on the screen", async () => {
+    let body: unknown = twoMonths;
+    let fail = false;
+    const fetchMock = vi.fn(async () => {
+      if (fail) throw new Error("offline");
+      return { ok: true, status: 200, json: async () => body } as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const range = { startDate: "2026-01-01", endDate: "2026-02-28" };
+    const view = render(
+      <IncomeStatementCharts bookId="1" monthlyRange={range} revision={0}
+        expenseRows={rows} accounts={accounts} activeAccountIds={active} />,
+    );
+    expect(await screen.findByRole("cell", { name: "$3,000.00" })).toBeInTheDocument();
+
+    body = { splits: [...twoMonths.splits, split("2026-02-20", -100_000, "income")] };
+    view.rerender(
+      <IncomeStatementCharts bookId="1" monthlyRange={range} revision={1}
+        expenseRows={rows} accounts={accounts} activeAccountIds={active} />,
+    );
+    // The old chart stays while the reload is in flight.
+    expect(screen.queryByTestId("income-monthly-placeholder")).not.toBeInTheDocument();
+    // February now has $1,000.00 of income, so its net is $600.00.
+    expect(await screen.findByRole("cell", { name: "$600.00" })).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    fail = true;
+    view.rerender(
+      <IncomeStatementCharts bookId="1" monthlyRange={range} revision={2}
+        expenseRows={rows} accounts={accounts} activeAccountIds={active} />,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole("cell", { name: "$600.00" })).toBeInTheDocument();
+    expect(screen.queryByText("Could not load income and expense.")).not.toBeInTheDocument();
+  });
 });

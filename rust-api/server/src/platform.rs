@@ -10,7 +10,7 @@
 //!
 //! The functions are free functions rather than methods of a value in
 //! `AppState`, because many callers hold no state (the lease renewal, the
-//! change hub, the PostHog capture) and none of them needs one: on Workers
+//! change hub) and none of them needs one: on Workers
 //! the clock, the timer and `waitUntil` belong to the isolate, not to a
 //! request.
 //!

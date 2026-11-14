@@ -32,8 +32,8 @@ target a release goes to (see
 | Database | A file, `/data/counterpoise.db`, on the volume `counterpoise_data` | The object's own SQLite storage. There is no file |
 | Client build | The server serves it (`COUNTERPOISE_STATIC_DIR`) | The Worker serves it as static assets |
 | Migrations | At start, before the server listens. A failure stops the process | At the object's start. A failure answers each request with 503 |
-| Scheduled jobs | The scheduler loop, each minute (`COUNTERPOISE_SCHEDULER=on`) | The object's alarm |
-| Backups | Hourly `VACUUM INTO` snapshots and a daily dump in `backups/` | A daily dump in an R2 bucket at 03:45, and 30 days of point-in-time recovery |
+| Scheduled jobs | The scheduler loop, each minute (`COUNTERPOISE_SCHEDULER=on`) | The object's alarm, unless `COUNTERPOISE_SCHEDULER=off` |
+| Backups | Hourly `VACUUM INTO` snapshots and a daily dump in `backups/` | A daily dump in an R2 bucket at 03:45, a copy of it in an S3 bucket when that is set, and 30 days of point-in-time recovery |
 | Live updates | A poller, every 100 ms | After each event of the object, with hibernation |
 | MCP | HTTP and stdio | HTTP only |
 | Deploy | `deploy.sh` builds the image and starts the container | The release merge into `main` runs `.github/workflows/worker-release.yml`, which publishes the tag and calls `worker-deploy.yml` |
@@ -92,10 +92,14 @@ says so with `onWorker`.
   The object starts again after each hibernation, so the start leaves out
   the fold repair, which reads every row: before its first event the object
   repairs the folds once for each build (`BUILD_COMMIT`, kept in the
-  object's storage), and on each start without `BUILD_COMMIT`. The HEAD of
-  the restore marker goes out inside the `blockConcurrencyWhile` that waits
-  for it: the callback holds back the answer to a call sent before it, and
-  the object then waits until the runtime resets it. A start that fails
+  object's storage), and on each start without `BUILD_COMMIT`. The object
+  sends the HEAD of the restore marker before the start, so that the bucket
+  can answer while the start runs, and each event waits for that answer
+  outside `blockConcurrencyWhile`. Never wait inside the callback for a call
+  that was sent before it: the callback holds back the answer, and the
+  object then waits until the runtime resets it, at each start. An earlier
+  version did that and stopped the object on Cloudflare. Only the answer "no marker" skips the callback; see
+  [database-management.md](database-management.md#point-in-time-restore). A start that fails
   answers each request with a 503 that says why, and the next request tries
   again. The object's alarm runs the
   scheduled jobs (see [Scheduled jobs](#scheduled-jobs)). The object holds the
@@ -134,6 +138,12 @@ these checks. `serve()` in `lib.rs` puts them around the router with
    `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`,
    `Permissions-Policy`), and `Strict-Transport-Security` when
    `ENABLE_HSTS=true`. The server reads `ENABLE_HSTS` when it starts.
+   The CSP has `script-src 'self'`, the hash of the inline theme script in
+   `index.html`, and `'wasm-unsafe-eval'` for the shared domain code; and
+   `connect-src 'self'`. So a page runs no inline script and calls no other
+   host. If you change the theme script, a Rust test names the new hash. A
+   new script or request to another host needs a change to
+   `CONTENT_SECURITY_POLICY` in `security.rs`, and a reason.
 2. **Cross-origin write check** on `/api/*`, before every route, with a 403
    when it refuses. The host that the `Origin` must name is `X-Forwarded-Host`
    when a reverse proxy sets it, and `Host` when not. `client_ip::record`
@@ -242,11 +252,8 @@ The client is a static single-page application:
   and Forward restore the position.
 - `lib/navigation.tsx` is the only module that uses the router. See
   [library-reference.md](library-reference.md).
-- `vite.config.ts` puts `NEXT_PUBLIC_POSTHOG_KEY`, `NEXT_PUBLIC_POSTHOG_HOST`,
-  `NEXT_PUBLIC_BUILD_COMMIT` and the app version into the bundle at build
-  time. It reads them from the
-  same `.env` files, with the same names, that the Next build used. A change
-  to one needs a new build.
+- `vite.config.ts` puts `NEXT_PUBLIC_BUILD_COMMIT` and the app version into
+  the bundle at build time. A change to one needs a new build.
 
 `vite build` (`npm run build`) writes the client to `build/`. The Rust server
 serves that folder when `COUNTERPOISE_STATIC_DIR` names it. The page service is
@@ -269,7 +276,7 @@ serves that folder when `COUNTERPOISE_STATIC_DIR` names it. The page service is
 All TypeScript imports use the `@/` prefix, which maps to the project root:
 ```typescript
 import { apiGet } from "@/lib/api-client";
-import { formatCurrency } from "@/lib/formatters";
+import { formatCurrency } from "@/lib/wasm-client";
 ```
 
 ## SQLite Database
@@ -312,8 +319,16 @@ counterpoise.db (SQLite)
 
 The server runs the scheduled jobs itself (`rust-api/server/src/scheduler/mod.rs`)
 when `COUNTERPOISE_SCHEDULER=on`. The Docker image sets it. The default
-is off, so a development or test server never runs a job on its own. The
-times are in `TZ`:
+is off, so a development or test server never runs a job on its own. On
+the Worker the default is on, because the object's alarm is its only
+scheduler: only `COUNTERPOISE_SCHEDULER=off` stops the alarm
+(`alarm_enabled()` in `rust-api/worker/src/lib.rs`). Do not set `off` on a
+deployed Worker: no job runs, the daily export included, and a socket whose
+credential expires stays open until the next event. The Worker tests set it.
+The
+times are in the app's zone (`APP_TZ`, else `TZ`). Workers has no `TZ` and
+its system zone is UTC, so `wrangler.toml` sets `APP_TZ` for each Worker.
+Without it, the jobs run on UTC and today's date changes in the evening:
 
 | Job | When |
 | --- | --- |
@@ -333,14 +348,18 @@ Object's alarm calls it (`scheduler::alarm()`): each alarm runs one step of
 one due job and sets the next alarm, at once when it ran a step, else at the
 plan's next wake. Before that step runs, the other jobs due at the same
 time claim their slots, so a step that outlasts its minute does not lose
-them. `setAlarm` replaces the alarm that is set, so the next
+them. The plan lists a run whose step started and did not end after the
+other due jobs, the most starts last. So a job that never finishes does not
+stay first in the alarm's line and block the jobs after it. `setAlarm`
+replaces the alarm that is set, so the next
 wake always comes from the tables alone. Each new instance of the object
 also sets the alarm from the tables at its first request, unless one is set
 sooner (`needs_alarm()` in `rust-api/worker/src/lib.rs`). An alarm that is
 late by more than a minute counts as not set: the runtime drops an alarm
 after its sixth failed retry, and the storage can still give its time; no
 event comes from it, and no request would set a new one. `VACUUM` needs
-the native server's file and is off the object's schedule. The object's backup is a daily dump into its R2 bucket at 03:45
+the native server's file and is off the object's schedule. The object's backup is a daily dump into its R2 bucket at 03:45,
+and a copy into an S3 bucket outside Cloudflare when its settings are set
 (see [database-management.md](database-management.md#backups-on-the-worker)),
 and its prune job prunes only the rate limits. It walks UTC minutes and reads
 each in the app's zone, so a change to or from daylight saving time needs
@@ -350,16 +369,27 @@ A run claims its slot (the scheduled minute it serves) in `job_slots`
 before it starts and marks it finished at the end. A slot that is not
 finished, with its lease free, is a run that stopped, and the next plan runs
 it again; so every job must leave the data as it is when it runs a second
-time. A late wake still runs a slot up to an hour old; a job with no slot on
-record catches up nothing. The weekly review runs one book per step and the
+time. The slot counts the starts of its current step (`job_slots.attempts`,
+`ledger_db::jobs::attempt()`). The scheduler adds one before the step runs,
+because a step that stops with its alarm or its process cannot count
+itself. A step that keeps its cursor sets the count back to zero. When a
+step has started 3 times (`MAX_ATTEMPTS`) and the run is still unfinished,
+the scheduler does not start it again: it finishes the slot and records a
+failed run, which the status page shows. A late wake still runs a slot up to
+an hour old; a job with no slot on record catches up nothing. The weekly review runs one book per step and the
 Plaid sync three connections per step, keeping where the next step starts
 in the slot's cursor, so that one step fits in an alarm's time (15 minutes).
 A run asked for outside the schedule waits in `job_requests`. The lot
 rebuild is such a job and is never on the schedule: a Durable Object that
 starts on a file with trades and no lots asks for it, and it rebuilds 50
 pairs per step (`ledger_db::lots::rebuild_lots_step()`). Having no next slot,
-it keeps a failed run unfinished, and the next plan goes on from its cursor. The native server
-rebuilds them before it serves instead.
+it keeps a failed step unfinished, and the next plan goes on from its
+cursor. A step that fails 3 times ends the run as a failure. The rebuild
+records its run, and the status page lists it when it has a record ("Lot
+rebuild", "On demand", never stale). An object that starts after a failed
+rebuild asks for the rebuild again (`scheduler::request_lot_rebuild()`), but
+not while a run is unfinished: a request starts a new run with a new count
+of starts. The native server rebuilds them before it serves instead.
 
 A job that still runs when its next time comes is not started twice: each
 run holds the job's lease (`job_leases`), and the new slot starts when the
@@ -368,7 +398,9 @@ run in `job_runs` (`ledger_db::jobs`), which `/api/system/status` reads. The
 status lists the jobs of its own target: a Durable Object shows its daily
 export as the backup, its prune of the rate limits, and no reindex. The
 `/api/cron/*` routes still run a job by hand, all of it in one call;
-`CRON_SECRET` gates them. On Workers such a call runs inside its request,
+`CRON_SECRET` gates them. `/api/cron/backup` runs the backup: on a Durable
+Object it exports a dump under a name of its own, and the day's dump stays
+(see [database-management.md](database-management.md#a-dump-on-demand)). On Workers such a call runs inside its request,
 which keeps the object up. Background work that a response has promised,
 such as the review that `POST .../weekly-review/run` starts with a 202,
 goes through `platform::spawn_to_finish()`, which hands it to the object's

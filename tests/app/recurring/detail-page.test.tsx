@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import RecurringRuleDetailPage from "@/app/b/[bookId]/recurring/[id]/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { ToastProvider } from "@/components/ui/ToastProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 import type { TransactionWithSplits } from "@/types";
 
 const mockPush = vi.fn();
@@ -458,5 +461,210 @@ describe("RecurringRuleDetailPage", () => {
     render(<RecurringRuleDetailPage />);
 
     expect(await screen.findByText("Recurring rule not found.")).toBeInTheDocument();
+  });
+});
+
+// Another client (an MCP tool, a second tab, the scheduled processing)
+// changes the book. The server sends the book socket a hint for each changed
+// table, and the page must show the change without a reload.
+describe("RecurringRuleDetailPage live updates", () => {
+  let rule: unknown = rulePayload;
+  let ruleStatus = 200;
+  let history: TransactionWithSplits[] = [];
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  function socket() {
+    return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+  }
+
+  function hint(tables: string[]) {
+    act(() => { socket().emit("change", { tables }); });
+  }
+
+  function urls() {
+    return fetchMock.mock.calls.map(([input]) => String(input));
+  }
+
+  function ruleReads() {
+    return urls().filter((url) => url === "/api/b/1/recurring/7").length;
+  }
+
+  // The provider sends hints after 100 ms. Wait longer than that before a
+  // test says that no reload occurred.
+  async function settle() {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 250)); });
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-30T12:00:00.000Z"));
+    rule = rulePayload;
+    ruleStatus = 200;
+    history = [];
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/recurring/7") {
+        if (ruleStatus !== 200) {
+          return { ok: false, status: ruleStatus, json: async () => ({ error: "No" }) } as Response;
+        }
+        return { ok: true, status: 200, json: async () => rule } as Response;
+      }
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, status: 200, json: async () => accountPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/payees")) {
+        return { ok: true, status: 200, json: async () => [] } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions?")) {
+        const params = new URL(url, "http://x").searchParams;
+        const offset = Number(params.get("offset"));
+        const limit = Number(params.get("limit"));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            transactions: history.slice(offset, offset + limit),
+            totalCount: history.length,
+          }),
+        } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  async function renderLive() {
+    render(
+      <ToastProvider>
+        <BookChangesProvider>
+          <RecurringRuleDetailPage />
+        </BookChangesProvider>
+      </ToastProvider>
+    );
+    await screen.findByRole("heading", { name: "Monthly Rent" });
+  }
+
+  it("shows a change to the rule that another client made", async () => {
+    await renderLive();
+
+    rule = { ...rulePayload, name: "Monthly Rent (new lease)" };
+    hint(["recurring_rules"]);
+
+    expect(
+      await screen.findByRole("heading", { name: "Monthly Rent (new lease)" })
+    ).toBeInTheDocument();
+  });
+
+  it("shows a transaction that the rule created elsewhere", async () => {
+    history = [buildTransaction(1)];
+    await renderLive();
+    await waitFor(() => {
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("1");
+    });
+
+    history = [buildTransaction(2), buildTransaction(1)];
+    hint(["transactions"]);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("2");
+    });
+  });
+
+  it("keeps the rows from Load more when it reloads", async () => {
+    history = Array.from({ length: 20 }, (_, i) => buildTransaction(i + 1));
+    await renderLive();
+    await waitFor(() => {
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("12");
+    });
+    fireEvent.click(screen.getByRole("button", { name: /load more/i }));
+    await waitFor(() => {
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("20");
+    });
+
+    hint(["transaction_splits"]);
+
+    await waitFor(() => {
+      expect(urls()).toContain(
+        "/api/b/1/transactions?recurringRuleId=7&limit=20&offset=0&includeMeta=true"
+      );
+    });
+    await settle();
+    expect(screen.getByTestId("transaction-count")).toHaveTextContent("20");
+  });
+
+  it("does not reload for a table that it does not read", async () => {
+    await renderLive();
+    const before = ruleReads();
+
+    hint(["security_prices"]);
+    await settle();
+
+    expect(ruleReads()).toBe(before);
+  });
+
+  it("keeps the rule draft, and reloads after the form closes", async () => {
+    await renderLive();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const modal = within(await screen.findByTestId("modal"));
+    fireEvent.change(modal.getByLabelText("Rule Name"), { target: { value: "Draft name" } });
+    const before = ruleReads();
+
+    rule = { ...rulePayload, name: "Renamed elsewhere" };
+    hint(["recurring_rules"]);
+    await settle();
+
+    expect(ruleReads()).toBe(before);
+    expect(modal.getByLabelText("Rule Name")).toHaveValue("Draft name");
+
+    fireEvent.click(modal.getByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByRole("heading", { name: "Renamed elsewhere" })).toBeInTheDocument();
+  });
+
+  it("waits while the transaction editor is open", async () => {
+    history = [buildTransaction(101)];
+    await renderLive();
+    await waitFor(() => {
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("1");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open transaction editor" }));
+    await screen.findByTestId("transaction-form");
+    const before = ruleReads();
+
+    rule = { ...rulePayload, name: "Renamed elsewhere" };
+    hint(["transactions"]);
+    await settle();
+
+    expect(ruleReads()).toBe(before);
+    expect(screen.getByTestId("transaction-form")).toHaveTextContent("Editing transaction 101");
+  });
+
+  it("says that the rule is not found when another client deletes it", async () => {
+    history = [buildTransaction(1)];
+    await renderLive();
+
+    ruleStatus = 404;
+    hint(["recurring_rules"]);
+
+    expect(await screen.findByText("Recurring rule not found.")).toBeInTheDocument();
+  });
+
+  it("keeps the rule on the screen when a reload fails", async () => {
+    await renderLive();
+
+    ruleStatus = 500;
+    hint(["recurring_rules"]);
+
+    expect(await screen.findByText("Could not refresh this recurring rule.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Monthly Rent" })).toBeInTheDocument();
+    expect(screen.queryByText("Recurring rule not found.")).not.toBeInTheDocument();
   });
 });

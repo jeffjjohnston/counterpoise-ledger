@@ -1012,21 +1012,58 @@ mod tests {
     fn an_older_dump_loads_and_then_migrates() {
         let source = seeded();
         let mut first = source.database().read_transaction(|tx| dump(tx)).unwrap();
-        // The newest migration made the rate limits table; a dump from
-        // before it has neither its row nor its table.
-        let last = MIGRATIONS.last().unwrap();
-        assert!(last.sql.contains("rate_limits"), "{}", last.description);
-        first["migrations"].as_array_mut().unwrap().pop();
+        // Migration 16 made the rate limits table, and 17 replaced an index.
+        // A dump from before 16 has neither their rows nor the table.
+        let rate_limits = MIGRATIONS.iter().find(|m| m.version == 16).unwrap();
+        assert!(
+            rate_limits.sql.contains("rate_limits"),
+            "{}",
+            rate_limits.description
+        );
+        first["migrations"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|migration| migration["version"].as_i64().unwrap() < 16);
         first["tables"]
             .as_array_mut()
             .unwrap()
             .retain(|table| table["name"] != "rate_limits");
+        // Migration 18 added `job_slots.attempts`, the last column. The
+        // older dump does not have it.
+        let slots = first["tables"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|table| table["name"] == "job_slots")
+            .unwrap();
+        assert_eq!(
+            slots["columns"].as_array_mut().unwrap().pop(),
+            Some(json!("attempts"))
+        );
+        for row in slots["rows"].as_array_mut().unwrap() {
+            row.as_array_mut().unwrap().pop();
+        }
         let (target, path) = empty_file();
         load(&target, &first.to_string()).unwrap();
+        let attempts: i64 = target
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('job_slots') WHERE name = 'attempts'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
         let versions: i64 = target
             .query_row("SELECT COUNT(*) FROM schema_migrations", &[])
             .unwrap();
         assert_eq!(versions, MIGRATIONS.len() as i64);
+        let covering: i64 = target
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_transactions_payee_date_id_floating'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(covering, 1);
         drop(target);
         let _ = std::fs::remove_file(path);
     }

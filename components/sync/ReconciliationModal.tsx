@@ -14,7 +14,7 @@ import { SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
 import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useTypeSafeSuggestion } from "@/hooks/useTypeSafeSuggestion";
 import { TypeSafeSuggestion } from "@/components/sync/TypeSafeSuggestion";
-import { DisclosureChevron, ReconciliationCandidates, type MatchAction } from "./ReconciliationCandidates";
+import { DisclosureChevron, ReconciliationCandidates, linkedAction, type MatchAction } from "./ReconciliationCandidates";
 import { cn } from "@/lib/utils";
 import { useRegisterShortcuts } from "@/hooks/useRegisterShortcuts";
 import type { ShortcutDef } from "@/components/KeyboardShortcutProvider";
@@ -22,6 +22,7 @@ import type {
   AccountWithBalance,
   AssignedSyncAccount,
   SyncReconciliationItem,
+  SyncReviewChange,
   TransactionWithSplits,
 } from "@/types";
 
@@ -78,6 +79,24 @@ function queueReason(item: SyncReconciliationItem): { text: string; warn: boolea
   }
   const n = item.candidates.length;
   return { text: `${n} possible ${n === 1 ? "match" : "matches"}`, warn: false };
+}
+
+const REVIEW_FIELD_LABELS: Record<SyncReviewChange["field"], string> = {
+  date: "Date",
+  amountCents: "Amount",
+  name: "Name",
+  merchantName: "Merchant",
+  originalDescription: "Description",
+  categoryPrimary: "Bank category",
+  categoryDetailed: "Bank subcategory",
+};
+
+/** One side of a change, as the queue shows that field. */
+function reviewValue(field: SyncReviewChange["field"], value: string | number | null): string {
+  if (value === null || value === "") return "none";
+  if (field === "amountCents" && typeof value === "number") return formatCurrency(signedAmount(value));
+  if (field === "date" && typeof value === "string") return formatDate(value);
+  return String(value);
 }
 
 // Matches the <kbd> styling already used by KeyboardShortcutOverlay.tsx and
@@ -163,7 +182,12 @@ export function ReconciliationModal({
   );
 
   const bestMatch = selectedItem?.candidates[0] ?? null;
-  const canReview = selectedItem?.reviewReason != null;
+  // The transition table of the server (guides/plaid-sync.md). Keep local
+  // applies only to a row that the bank changed: a row that the bank removed
+  // has nothing to keep. Unlink applies only to a row that is linked. The
+  // server refuses each of them in any other state.
+  const canKeep = selectedItem?.reviewReason === "plaid_modified";
+  const canUnlink = selectedItem != null && selectedItem.resolutionStatus !== "pending";
   const position = items.findIndex((item) => item.id === selectedId) + 1;
   const selectedLinkId = selectedItem?.plaidAccountLinkId ?? null;
   const selectedLink = selectedLinkId === null ? null : linksById.get(selectedLinkId) ?? null;
@@ -176,6 +200,16 @@ export function ReconciliationModal({
   // and Create adds a second transaction for the same bank charge.
   const linkedTransactionId =
     selectedItem?.reviewReason === "plaid_modified" ? selectedItem.matchedTransactionId : null;
+  const linkedCandidate =
+    linkedTransactionId === null
+      ? null
+      : selectedItem?.candidates.find((candidate) => candidate.transactionId === linkedTransactionId) ?? null;
+  const linkedHint =
+    linkedCandidate === null
+      ? "Keep local keeps this link. Match or Create moves it to another transaction."
+      : linkedAction(linkedCandidate) === "match_update_amount"
+        ? "The bank amount is different. Update changes your amount to the bank amount and keeps this link. Keep leaves your amount as it is."
+        : "Keep keeps this link. Match on another transaction, or Create, moves it.";
   const [linkedState, setLinkedState] = useState<{
     id: number;
     transaction: TransactionWithSplits;
@@ -448,6 +482,15 @@ export function ReconciliationModal({
         category: "Sync",
         action: () => {
           if (!bestMatch || bestMatch.alreadyLinked || submitting) return;
+          // On the linked transaction, Enter does its main action (Keep or Update).
+          if (bestMatch.transactionId === linkedTransactionId) {
+            void resolveSelected(
+              linkedAction(bestMatch) === "keep_local"
+                ? { action: "keep_local" }
+                : { action: "match_update_amount", transactionId: bestMatch.transactionId }
+            );
+            return;
+          }
           void resolveSelected({ action: "match", transactionId: bestMatch.transactionId });
         },
       },
@@ -466,7 +509,7 @@ export function ReconciliationModal({
         description: "Keep the local transaction",
         category: "Sync",
         action: () => {
-          if (canReview && !submitting) void resolveSelected({ action: "keep_local" });
+          if (canKeep && !submitting) void resolveSelected({ action: "keep_local" });
         },
       },
       {
@@ -475,7 +518,7 @@ export function ReconciliationModal({
         description: "Unlink this transaction",
         category: "Sync",
         action: () => {
-          if (canReview && !submitting) void resolveSelected({ action: "unlink" });
+          if (canUnlink && !submitting) void resolveSelected({ action: "unlink" });
         },
       },
       {
@@ -486,7 +529,7 @@ export function ReconciliationModal({
         action: () => setShowCreate(true),
       },
     ];
-  }, [bestMatch, canReview, isOpen, moveSelection, pendingCreate, resolveSelected, submitting, setShowCreate]);
+  }, [bestMatch, canKeep, canUnlink, isOpen, linkedTransactionId, moveSelection, pendingCreate, resolveSelected, submitting, setShowCreate]);
 
   useRegisterShortcuts(shortcuts);
 
@@ -667,6 +710,18 @@ export function ReconciliationModal({
                       {selectedItem.reviewReason && (
                         <p className="text-sm text-fg-warning mt-2">{queueReason(selectedItem).text}</p>
                       )}
+                      {selectedItem.reviewReason === "plaid_modified" && selectedItem.reviewChanges.length > 0 && (
+                        <dl data-testid="review-changes" className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs">
+                          {selectedItem.reviewChanges.map((change) => (
+                            <div key={change.field} className="contents">
+                              <dt className="text-fg-tertiary">{REVIEW_FIELD_LABELS[change.field]}</dt>
+                              <dd className="text-fg-secondary break-words">
+                                {reviewValue(change.field, change.previous)} → {reviewValue(change.field, change.incoming)}
+                              </dd>
+                            </div>
+                          ))}
+                        </dl>
+                      )}
                       {linkedTransactionId !== null && (
                         <div
                           data-testid="linked-transaction"
@@ -679,7 +734,7 @@ export function ReconciliationModal({
                               : `transaction #${linkedTransactionId}`}
                           </p>
                           <p className="text-xs text-fg-tertiary mt-1">
-                            Keep local keeps this link. Match or Create moves it to another transaction.
+                            {linkedHint}
                           </p>
                         </div>
                       )}
@@ -705,6 +760,8 @@ export function ReconciliationModal({
                       submitting={submitting}
                       matchingAction={matchingAction}
                       onMatch={(action) => void resolveSelected(action)}
+                      linkedTransactionId={linkedTransactionId}
+                      onKeep={() => void resolveSelected({ action: "keep_local" })}
                     />
 
                     <div>
@@ -769,21 +826,28 @@ export function ReconciliationModal({
                 Ignore
               </Button>
               <Button
-                variant={linkedTransactionId !== null ? "primary" : "secondary"}
-                disabled={submitting || !canReview}
+                // Keep local is the main action on a linked row, except when
+                // the bank amount differs: Update on the candidate leads then.
+                variant={
+                  linkedTransactionId !== null &&
+                  (linkedCandidate === null || linkedAction(linkedCandidate) === "keep_local")
+                    ? "primary"
+                    : "secondary"
+                }
+                disabled={submitting || !canKeep}
                 onClick={() => void resolveSelected({ action: "keep_local" })}
               >
                 Keep local
               </Button>
               <Button
                 variant="secondary"
-                disabled={submitting || !canReview}
+                disabled={submitting || !canUnlink}
                 onClick={() => void resolveSelected({ action: "unlink" })}
               >
                 Unlink
               </Button>
               <span className="ml-auto text-xs text-fg-tertiary">
-                Keep local and Unlink apply to rows the bank changed
+                Keep local applies to rows the bank changed. Unlink applies to linked rows.
               </span>
             </div>
           </div>

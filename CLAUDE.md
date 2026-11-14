@@ -44,18 +44,17 @@ Counterpoise is a multi-book personal finance accounting application with true d
 | [guides/securities-and-prices.md](guides/securities-and-prices.md) | Change price fetching, fixed-price securities, or the price entry pill |
 | [guides/recurring-transactions.md](guides/recurring-transactions.md) | Change recurring rules, their processing, or business-day shifts |
 | [guides/plaid-sync.md](guides/plaid-sync.md) | Change bank sync, auto-match, or reconciliation |
-| [guides/mcp-server.md](guides/mcp-server.md) | Add or change an MCP tool, or connect an MCP client. Lists all 64 tools |
+| [guides/mcp-server.md](guides/mcp-server.md) | Add or change an MCP tool, or connect an MCP client. Lists all 63 tools |
 | [guides/components-and-ui.md](guides/components-and-ui.md) | Build or change UI |
 | [guides/testing.md](guides/testing.md) | Write a test, or claim that work is done |
 | [guides/database-management.md](guides/database-management.md) | Change the schema, add a migration, or touch the production database |
 | [guides/patterns-and-gotchas.md](guides/patterns-and-gotchas.md) | Write a payee, date, or split helper |
 | [guides/moneydance-import.md](guides/moneydance-import.md) | Change the importer |
-| [guides/posthog-analytics.md](guides/posthog-analytics.md) | Add or query an analytics event |
 | [guides/release-and-deploy.md](guides/release-and-deploy.md) | Release, deploy, or change CI |
 | [guides/worktrees.md](guides/worktrees.md) | Work in a git worktree |
 | [guides/upgrade-to-sqlite.md](guides/upgrade-to-sqlite.md) | Upgrade an install from PostgreSQL, or restore a snapshot |
 | [guides/debugging.md](guides/debugging.md) | Debug a query, an unbalanced transaction, or a wrong position |
-| [guides/typesafe-experiment.md](guides/typesafe-experiment.md) | Change TypeSafe suggestions, their settings, the data sent, or retention |
+| [guides/typesafe-experiment.md](guides/typesafe-experiment.md) | Change the AI suggestions (Clef; the code says TypeSafe), their settings, the data sent, or retention |
 | [guides/weekly-review.md](guides/weekly-review.md) | Change the weekly review, the data it sends to Claude, or its schedule |
 | [guides/issue-sync.md](guides/issue-sync.md) | Change the issue sync to GitHub, its settings, the data it posts, or the workflow that fixes and merges its issues |
 
@@ -114,8 +113,8 @@ docker exec -i -e COUNTERPOISE_API_KEY=cpk_... counterpoise-rust-api-1 counterpo
 
 ### Running Individual Tests
 ```bash
-npx vitest run tests/lib/accounting.test.ts           # Run specific test file
-npx vitest tests/lib/accounting.test.ts -t "validateSplits"  # Run specific test
+npx vitest run tests/lib/payees.test.ts               # Run specific test file
+npx vitest tests/lib/payees.test.ts -t "normalizePayeeName"  # Run specific test
 ```
 
 ### Import Scripts

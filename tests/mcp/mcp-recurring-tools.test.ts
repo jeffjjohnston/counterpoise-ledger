@@ -9,8 +9,8 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { count, row, rows } from "@/tests/helpers/sql";
-import type { RecurringRule, Transaction } from "@/types/db";
+import { row, rows } from "@/tests/helpers/sql";
+import type { RecurringRule } from "@/types/db";
 
 let mcp: McpTestClient;
 
@@ -62,33 +62,6 @@ describe("MCP Recurring Tools", () => {
   }
 
   describe("list_recurring_rules", () => {
-    it("returns rules with payee and template splits, active first", async () => {
-      const { checking, rent } = await fixture();
-      const inactive = await createRecurringRule({
-        name: "Old", frequency: "monthly", startDate: "2025-01-01",
-        nextDate: "2025-02-01", isActive: false, bookId,
-        templateSplits: [
-          { accountId: rent.id, amount: 100 },
-          { accountId: checking.id, amount: -100 },
-        ],
-      });
-      const active = await createRecurringRule({
-        name: "Rent", frequency: "monthly", startDate: "2026-01-15",
-        nextDate: "2026-09-15", bookId,
-        templateSplits: [
-          { accountId: rent.id, amount: 150000 },
-          { accountId: checking.id, amount: -150000 },
-        ],
-      });
-
-      const { data, isError } = await callTool("list_recurring_rules", { bookId });
-
-      expect(isError).toBe(false);
-      expect(data.map((r: { id: number }) => r.id)).toEqual([active.id, inactive.id]);
-      expect(data[0].templateSplits).toHaveLength(2);
-      expect(data[0].templateSplits[0].account.name).toBeDefined();
-    });
-
     it("returns an empty list for a book with no rules", async () => {
       const { data, isError } = await callTool("list_recurring_rules", { bookId });
       expect(isError).toBe(false);
@@ -97,30 +70,6 @@ describe("MCP Recurring Tools", () => {
   });
 
   describe("create_recurring_rule", () => {
-    it("creates a rule and computes nextDate from startDate", async () => {
-      const { checking, rent } = await fixture();
-
-      const { data, isError } = await callTool("create_recurring_rule", {
-        bookId,
-        name: "Rent",
-        frequency: "monthly",
-        startDate: "2020-01-15",
-        templateDescription: "Rent payment",
-        templateSplits: [
-          { accountId: rent.id, amount: 150000 },
-          { accountId: checking.id, amount: -150000 },
-        ],
-      });
-
-      expect(isError).toBe(false);
-      expect(data.name).toBe("Rent");
-      expect(data.startDate).toBe("2020-01-15");
-      // advanceNextDateToFuture walks past today, so a long-past startDate
-      // does not land the rule instantly overdue.
-      expect(data.nextDate > "2020-01-15").toBe(true);
-      expect(data.templateSplits).toHaveLength(2);
-    });
-
     it("returns isError when the template splits do not sum to zero", async () => {
       const { checking, rent } = await fixture();
 
@@ -175,30 +124,6 @@ describe("MCP Recurring Tools", () => {
   });
 
   describe("update_recurring_rule", () => {
-    it("replaces every template split it is given", async () => {
-      const { rule, checking } = await seedRule();
-      const groceries = await createAccount({
-        name: "Groceries", type: "expense", subtype: "other", bookId,
-      });
-
-      const { data, isError } = await callTool("update_recurring_rule", {
-        bookId,
-        ruleId: rule.id,
-        templateSplits: [
-          { accountId: groceries.id, amount: 250 },
-          { accountId: checking.id, amount: -250 },
-        ],
-      });
-
-      expect(isError).toBe(false);
-      expect(data.templateSplits).toHaveLength(2);
-      expect(
-        data.templateSplits.map((s: { accountId: number }) => s.accountId).sort()
-      ).toEqual([groceries.id, checking.id].sort());
-
-      expect(await count("recurring_template_splits", "recurring_rule_id = $1", [rule.id])).toBe(2);
-    });
-
     it("errors on another book's rule AND leaves that rule unchanged", async () => {
       const otherBook = await createBook({ name: "Other" });
       const a = await createAccount({
@@ -247,27 +172,6 @@ describe("MCP Recurring Tools", () => {
   });
 
   describe("delete_recurring_rule", () => {
-    it("deletes the rule and keeps the transactions it created", async () => {
-      const { rule, checking, rent } = await seedRule();
-      const created = await createTransactionWithSplits({
-        bookId, date: "2026-08-15", description: "Rent", recurringRuleId: rule.id,
-        splits: [
-          { accountId: rent.id, amount: 150000 },
-          { accountId: checking.id, amount: -150000 },
-        ],
-      });
-
-      const { isError } = await callTool("delete_recurring_rule", { bookId, ruleId: rule.id });
-
-      expect(isError).toBe(false);
-      const rules = await rows<RecurringRule>("SELECT * FROM recurring_rules WHERE id = $1", [rule.id]);
-      expect(rules).toEqual([]);
-
-      const [tx] = await rows<Transaction>("SELECT * FROM transactions WHERE id = $1", [created.id]);
-      expect(tx).toBeDefined();
-      expect(tx.recurringRuleId).toBeNull();
-    });
-
     it("returns isError for an unknown rule id", async () => {
       const { data, isError } = await callTool("delete_recurring_rule", {
         bookId,
@@ -380,20 +284,6 @@ describe("MCP Recurring Tools", () => {
         skipped: [],
       });
       expect(await rows("SELECT * FROM transactions")).toEqual([]);
-    });
-
-    it("creates due transactions with processAll, and a repeat call creates none", async () => {
-      // nextDate in the past, so the rule is overdue and gets caught up.
-      await seedRule({ nextDate: "2026-01-15" });
-
-      const first = await callTool("process_recurring_rules", { bookId, processAll: true });
-      expect(first.isError).toBe(false);
-      expect(first.data.transactionsCreated).toBeGreaterThan(0);
-      const afterFirst = await rows("SELECT * FROM transactions");
-
-      const second = await callTool("process_recurring_rules", { bookId, processAll: true });
-      expect(second.data.transactionsCreated).toBe(0);
-      expect(await rows("SELECT * FROM transactions")).toHaveLength(afterFirst.length);
     });
 
     it("forces an occurrence with ruleId even when the rule is not due", async () => {

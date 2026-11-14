@@ -127,11 +127,6 @@ pub(crate) async fn create_report(
             ],
         )
         .map_err(|cause| internal_error(cause, "Failed to create issue report"))?;
-    state.analytics.capture_event(
-        user_id,
-        "issue_report_created",
-        Some(json!({"type": report_type, "page": page})),
-    );
     Ok(Json(report_json(row)))
 }
 

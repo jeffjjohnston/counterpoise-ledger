@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 /// `typeSafeHttpError` for an error that is not a TypeSafe or reconcile
 /// error: the database or anything else that throws.
-const UNAVAILABLE: &str = "TypeSafe is temporarily unavailable";
+const UNAVAILABLE: &str = "AI suggestions are temporarily unavailable";
 
 /// Node logs no cause here, so that no request data can reach the log.
 fn unavailable(_cause: store::Error) -> ApiError {
@@ -180,7 +180,7 @@ fn set_settings(
         if (change.reconciliation == Some(true) || change.entry == Some(true)) && !is_configured() {
             return Err(error(
                 StatusCode::CONFLICT,
-                "TypeSafe is unavailable on this installation",
+                "AI suggestions are unavailable on this installation",
             ));
         }
         let next = (

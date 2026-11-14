@@ -19,6 +19,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The token can only read the repository. No job pushes, comments or reads
+# another API. Without this block, the token gets the default scope of the
+# repository.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -29,25 +35,33 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
       - name: Install WASM bindings generator
-        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
 
       - name: Install WASM optimizer
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 26
           cache: npm
 
       - run: npm ci
+
+      # Advisories (RustSec), licenses and sources of every crate in
+      # Cargo.lock: see rust-api/deny.toml. The version is pinned; a runner
+      # that already has it skips the build.
+      - name: Check the crates with cargo-deny
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo deny --manifest-path rust-api/Cargo.toml --locked check
 
       - name: Check Rust formatting
         run: cargo fmt --all --check --manifest-path rust-api/Cargo.toml
@@ -95,25 +109,30 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 26
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           targets: wasm32-unknown-unknown
 
       - name: Install WASM build tools
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
           sudo apt-get update && sudo apt-get install -y binaryen
 
       - run: npm ci
 
       - run: npm run core:wasm:build
+
+      # A known high or critical vulnerability in an npm package that the
+      # client ships. The dev-only packages do not reach the build output.
+      - name: Check the npm production packages for advisories
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Lint
         run: npm run lint
@@ -129,20 +148,20 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 26
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           targets: wasm32-unknown-unknown
 
       - name: Install WASM build tools
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
           sudo apt-get update && sudo apt-get install -y binaryen
 
       - run: npm ci
@@ -161,7 +180,7 @@ jobs:
         run: node scripts/coverage-summary.mjs >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep the coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-report
           path: coverage/

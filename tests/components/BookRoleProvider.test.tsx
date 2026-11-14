@@ -85,16 +85,47 @@ describe("BookRoleProvider", () => {
     expect(screen.getByTestId("status")).toHaveTextContent("error");
   });
 
-  it("drops an owner to least privilege when a later load fails", async () => {
+  it("keeps the last good role when a later load fails", async () => {
+    // One failed refresh must not hide the write controls: the pages unmount
+    // the entry form and close their dialogs when canWrite becomes false.
     stub("owner");
     renderProvider();
     await waitFor(() => expect(screen.getByText("owner|true|true|2")).toBeInTheDocument());
 
-    vi.stubGlobal("fetch", vi.fn(async () => failure()));
+    const failing = vi.fn(async () => failure());
+    vi.stubGlobal("fetch", failing);
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
+    // The members request fails too, and its toast shows that the refresh ran.
+    expect(await screen.findByText(/Could not load the members of this book/)).toBeInTheDocument();
+    expect(failing).toHaveBeenCalledWith("/api/books", expect.anything());
+    expect(screen.getByText("owner|true|true|2")).toBeInTheDocument();
+    expect(screen.getByTestId("status")).toHaveTextContent("ready");
+    expect(screen.queryByText(/Could not load your role in this book/)).not.toBeInTheDocument();
+  });
+
+  it("takes a lower role from a later load that succeeds", async () => {
+    stub("owner");
+    renderProvider();
+    await waitFor(() => expect(screen.getByText("owner|true|true|2")).toBeInTheDocument());
+
+    stub("viewer");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => expect(screen.getByText("viewer|false|false|2")).toBeInTheDocument());
+  });
+
+  it("gives the role after a failed first load when a later load succeeds", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => failure()));
+    renderProvider();
     expect(await screen.findByText(/Could not load your role in this book/)).toBeInTheDocument();
     expect(screen.getByText(/^viewer\|false\|false\|/)).toBeInTheDocument();
+
+    stub("editor");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => expect(screen.getByText("editor|true|false|2")).toBeInTheDocument());
+    expect(screen.getByTestId("status")).toHaveTextContent("ready");
   });
 
   it("shows an error when the members do not load", async () => {

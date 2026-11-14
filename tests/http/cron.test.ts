@@ -1,5 +1,8 @@
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { toDateString } from "../../lib/formatters";
 import type { PlaidToken, RecurringRule, SecurityPrice } from "../../types/db";
@@ -7,8 +10,9 @@ import {
   createAccount, createBook, createInvestmentSplit, createPlaidAccount, createPlaidToken, createRecurringRule,
   createSecurity, createSecurityPrice, createTransactionWithSplits, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
-import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
+import { onWorker, sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { count, row, rows } from "../helpers/sql";
+import { ledgerCli } from "../helpers/test-database";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 type Reply = { status: number; body?: unknown; raw?: string };
@@ -518,6 +522,86 @@ describe("cron routes HTTP parity", () => {
     // Nothing is due on the second run.
     expect(await cron(client, "/api/cron/recurring")).toEqual({
       success: true, booksProcessed: 2, transactionsCreated: 0, transactionIds: [],
+    });
+  });
+});
+
+describe("the manual backup", () => {
+  const PATH = "/api/cron/backup";
+  // The native server writes its backups here. The Worker does not read it.
+  const backups = mkdtempSync(join(tmpdir(), "counterpoise-cron-backup-"));
+  let baseUrl: string;
+  let stop: () => Promise<void>;
+  let client: Client;
+
+  const backupRun = () => row<{ lastRunAt: Date; lastOkAt: Date | null; detail: string | null; bytes: number | null }>(
+    "SELECT last_run_at, last_ok_at, detail, bytes FROM job_runs WHERE job = 'backup'",
+  );
+
+  beforeAll(async () => {
+    ({ baseUrl, stop } = await startHttpTestServer({ ...UNCONFIGURED, BACKUP_DIR: backups }));
+  }, 120_000);
+  beforeEach(async () => {
+    await resetTestDatabase();
+    client = await sessionHttpClient(baseUrl);
+  });
+  afterAll(async () => {
+    await stop?.();
+    rmSync(backups, { recursive: true, force: true });
+  });
+
+  it("requires the cron secret before it writes a backup", async () => {
+    const denied = [{}, { authorization: "Bearer wrong" }, { authorization: `bearer ${CRON_SECRET}` }, { authorization: CRON_SECRET }];
+    for (const headers of denied as Record<string, string>[]) {
+      const response = await client.anonymous(PATH, { headers });
+      expect(response.status, JSON.stringify(headers)).toBe(401);
+      expect(await response.json()).toEqual({ error: "Unauthorized" });
+    }
+    // A session is not the cron secret.
+    expect((await client.request(PATH)).status).toBe(401);
+    expect(readdirSync(backups)).toEqual([]);
+    expect(await count("job_runs")).toBe(0);
+  });
+
+  it.skipIf(onWorker)("writes a new snapshot on each run, and the day's dump loads", async () => {
+    await createBook({ name: "Rollback" });
+    const first = await cron(client, PATH);
+    expect(first).toEqual({
+      success: true, name: expect.stringMatching(/^counterpoise-\d{8}-\d{6}\.db$/), bytes: expect.any(Number), verified: true,
+    });
+    expect(statSync(join(backups, first.name)).size).toBe(first.bytes);
+    const run = await backupRun();
+    expect(run).toMatchObject({ bytes: first.bytes, detail: null });
+    expect(run!.lastOkAt).toEqual(run!.lastRunAt);
+
+    // The first backup of a UTC day also writes the dump, and
+    // `ledger-cli load` makes a database from it.
+    const dump = readdirSync(backups).find((name) => name.endsWith(".json"));
+    expect(dump).toMatch(/^counterpoise-\d{8}-\d{6}\.json$/);
+    const loaded = join(backups, "loaded.db");
+    ledgerCli(["load", join(backups, dump!)], loaded);
+    expect(ledgerCli(["list-books"], loaded)).toContain("Rollback");
+
+    // The name of a snapshot has its second. A second run writes a second
+    // file and does not change the first.
+    const before = readFileSync(join(backups, first.name));
+    await new Promise((resolveLater) => setTimeout(resolveLater, 1100));
+    const second = await cron(client, PATH);
+    expect(second.name).not.toBe(first.name);
+    expect(readdirSync(backups).filter((name) => name.endsWith(".db") && name !== "loaded.db").sort())
+      .toEqual([first.name, second.name].sort());
+    expect(readFileSync(join(backups, first.name)).equals(before)).toBe(true);
+  });
+
+  // The test Worker has no export bucket (`startWorkerOnce` binds none), so
+  // the run reaches the export and fails there. The scheduler's unit tests
+  // prove the object's name and that the day's dump stays.
+  it.runIf(onWorker)("answers with the cause when the Worker cannot store the dump", async () => {
+    const response = await client.anonymous(PATH, AUTHORIZED);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "the dump was not stored: the object has no export bucket" });
+    expect(await backupRun()).toMatchObject({
+      lastOkAt: null, detail: "the dump was not stored: the object has no export bucket",
     });
   });
 });

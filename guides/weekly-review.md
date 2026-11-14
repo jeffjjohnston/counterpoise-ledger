@@ -71,8 +71,9 @@ raw HTTP: Anthropic has no Rust SDK.
   `fallbacks: "default"`: when the model declines, the API runs the same
   request on a fallback model in the same call. The review stores the model
   that answered.
-- A 5-minute timeout, one try, no retry. The next week, or "Try again", is the
-  retry.
+- A 5-minute timeout, one try, no retry in the call. A later run of the
+  scheduled job on the same Monday, or "Try again", is the retry (see
+  [Schedule](#schedule)).
 - No request body and no response body go to a log. A log line has the error
   code, the book ID and the review ID. An error status also logs its number.
 - `ANTHROPIC_API_KEY` is read on every use. `ANTHROPIC_API_URL` replaces
@@ -135,16 +136,33 @@ review until its next load, and a test that waits for the end of a run saw
 
 ## Schedule
 
-The scheduler job `weekly-review` runs on Monday at 05:00 in `TZ`
-(`scheduler/mod.rs`). It reviews each book that opted in, one book per
-step, so that one step fits in a Workers alarm; the failure of one book does
-not stop the others. A book that already has a scheduled review of this week
-(`source = 'schedule'` with this `period_start`) is left out, so a run that
-starts again does not ask Claude twice. Without the key it records "not
+The scheduler job `weekly-review` runs on Monday at 05:00 in `TZ`, and
+again at 06:00 and 07:00 (`scheduler/mod.rs`). It reviews each book that
+opted in, one book per step, so that one step fits in a Workers alarm; the
+failure of one book does not stop the others. A book that already has a
+complete scheduled review of this week (`source = 'schedule'`, `status =
+'complete'`, this `period_start`) is left out, so a run that starts again
+does not ask Claude twice, and the runs at 06:00 and 07:00 ask nothing when
+each book has its review.
+
+A failed scheduled review does not count as the review of the week. That
+includes a review that a restart or a Worker eviction stopped
+(`interrupted`). A later run tries the book again, until the book has 3
+failed scheduled reviews of the week (`SCHEDULED_ATTEMPTS`); each one is a
+paid call. `start()` applies the limit in its transaction, after it marks a
+stale `running` review `interrupted`, so that review counts as an attempt. A book whose manual review runs at that time is not reviewed in
+that run, and a later run tries it again. All the runs are on the Monday,
+because the period of a review comes from the day on which it starts.
+
+The last step of a run counts the books that opted in and have no complete
+scheduled review of the week (`booksWithoutReview`). When that count is not
+zero, the scheduler records the run as failed ("1 book that opted in has no
+review of this week"), and the System page shows the job as failed until a
+later run leaves no such book. Without the key the job records "not
 configured". `GET /api/cron/weekly-review` runs the same job, every book in
 one call, and requires `CRON_SECRET`; its answer counts `booksReviewed`
-(complete) and `booksFailed` (a failed start or a failed review). The System page marks the
-job stale after 8 days.
+(complete), `booksFailed` (a failed start or a failed review) and
+`booksWithoutReview`. The System page marks the job stale after 8 days.
 
 ## Routes and MCP
 
@@ -192,6 +210,7 @@ No test calls the real API.
 - `tests/http/weekly-review.test.ts` starts an Anthropic mock and points
   `ANTHROPIC_API_URL` at it. It covers a run, the request body, failures,
   409s, the revision check, a clear during a run, a restart, dismissals,
-  retention, access levels and the cron route.
+  retention, access levels and the cron route, with its retries of a failed
+  scheduled review and their limit.
 - `tests/db/weekly-review-schema.test.ts`, the component tests, and
   `tests/mcp/mcp-weekly-review-tools.test.ts`.

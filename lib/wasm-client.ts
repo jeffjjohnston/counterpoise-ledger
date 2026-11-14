@@ -1,14 +1,18 @@
-/** Synchronous browser adapter for ledger-core. Keep server imports on lib/*.ts. */
+/**
+ * Synchronous browser adapter for ledger-core. lib/accounting.ts,
+ * lib/recurring.ts and lib/formatters.ts give the signatures of the functions.
+ */
 import { initSync, invoke } from "@/lib/wasm/generated/ledger_core";
 import { CORE_WASM_BASE64 } from "@/lib/wasm/generated/core-bytes";
 import type * as accounting from "@/lib/accounting";
-import type * as recurring from "@/lib/recurring";
-import type * as formatters from "@/lib/formatters";
-import type * as expression from "@/lib/expression";
+import type { RecurringCore } from "@/lib/recurring";
+import type { FormattersCore } from "@/lib/formatters";
 import { getInvestmentGrossAmountCents as grossAmountFallback } from "@/lib/investment-arithmetic";
 import { formatCurrency as formatCurrencyFallback } from "@/lib/formatters";
 
 export type { RecurrenceConfig } from "@/lib/accounting";
+
+type Accounting = accounting.AccountingCore;
 
 // The binary is part of the client chunk. Initialization happens before the
 // first component render, so amount-field validation never waits for a fetch.
@@ -27,9 +31,9 @@ function call<T>(operation: string, args: unknown[]): T {
 
 const wrap = (operation: string) => (...args: unknown[]) => call(operation, args);
 
-export const validateSplits = wrap("validateSplits") as typeof accounting.validateSplits;
+export const validateSplits = wrap("validateSplits") as Accounting["validateSplits"];
 const MAX_I64 = 9_223_372_036_854_775_807n;
-export const getInvestmentGrossAmountCents: typeof accounting.getInvestmentGrossAmountCents = (shares, price) => {
+export const getInvestmentGrossAmountCents: Accounting["getInvestmentGrossAmountCents"] = (shares, price) => {
   // JSON/i64 cannot carry fractional or out-of-range values. The input form can
   // produce both while the user types, so use the exact JavaScript calculation there.
   if (!Number.isFinite(shares) || !Number.isFinite(price)) return 0;
@@ -42,10 +46,10 @@ export const getInvestmentGrossAmountCents: typeof accounting.getInvestmentGross
   }
   return call("getInvestmentGrossAmountCents", [shares, price]);
 };
-export const buildDividendSplits = wrap("buildDividendSplits") as typeof accounting.buildDividendSplits;
-export const buildCapGainSplits = wrap("buildCapGainSplits") as typeof accounting.buildCapGainSplits;
-export const buildBuySplits = wrap("buildBuySplits") as typeof accounting.buildBuySplits;
-export const buildSellSplits = wrap("buildSellSplits") as typeof accounting.buildSellSplits;
+export const buildDividendSplits = wrap("buildDividendSplits") as Accounting["buildDividendSplits"];
+export const buildCapGainSplits = wrap("buildCapGainSplits") as Accounting["buildCapGainSplits"];
+export const buildBuySplits = wrap("buildBuySplits") as Accounting["buildBuySplits"];
+export const buildSellSplits = wrap("buildSellSplits") as Accounting["buildSellSplits"];
 
 /** The input of `buildReinvestSplits`: a dividend `D` that buys shares and pays a fee. */
 export type ReinvestBuilderInput = {
@@ -77,35 +81,35 @@ export const buildReinvestSplits = wrap("buildReinvestSplits") as (input: Reinve
 export const reinvestPriceMicros = wrap("reinvestPriceMicros") as (
   dividendCents: number, feesCents: number, sharesMicros: number
 ) => number | null;
-export const getNextBusinessDay = wrap("getNextBusinessDay") as typeof accounting.getNextBusinessDay;
-export const getNextDate = wrap("getNextDate") as typeof accounting.getNextDate;
-export const getDisplayBalance = wrap("getDisplayBalance") as typeof accounting.getDisplayBalance;
-export const describeRecurrence = wrap("describeRecurrence") as typeof accounting.describeRecurrence;
-export const buildAccountTree = wrap("buildAccountTree") as typeof accounting.buildAccountTree;
-export const flattenAccounts = wrap("flattenAccounts") as typeof accounting.flattenAccounts;
-export const isDescendantOf = wrap("isDescendantOf") as typeof accounting.isDescendantOf;
-export const buildAccountHierarchyName = wrap("buildAccountHierarchyName") as typeof accounting.buildAccountHierarchyName;
-export function descendantAccountIds(ancestorId: number, accounts: Parameters<typeof accounting.isDescendantOf>[2]): Set<number> {
+export const getNextBusinessDay = wrap("getNextBusinessDay") as Accounting["getNextBusinessDay"];
+export const getNextDate = wrap("getNextDate") as Accounting["getNextDate"];
+export const getDisplayBalance = wrap("getDisplayBalance") as Accounting["getDisplayBalance"];
+export const describeRecurrence = wrap("describeRecurrence") as Accounting["describeRecurrence"];
+export const buildAccountTree = wrap("buildAccountTree") as Accounting["buildAccountTree"];
+export const flattenAccounts = wrap("flattenAccounts") as Accounting["flattenAccounts"];
+export const isDescendantOf = wrap("isDescendantOf") as Accounting["isDescendantOf"];
+export const buildAccountHierarchyName = wrap("buildAccountHierarchyName") as Accounting["buildAccountHierarchyName"];
+export function descendantAccountIds(ancestorId: number, accounts: Parameters<Accounting["isDescendantOf"]>[2]): Set<number> {
   return new Set(call<number[]>("descendantAccountIds", [ancestorId, accounts]));
 }
-export function accountHierarchyNames(accounts: Parameters<typeof accounting.buildAccountHierarchyName>[1]): Map<number, string> {
+export function accountHierarchyNames(accounts: Parameters<Accounting["buildAccountHierarchyName"]>[1]): Map<number, string> {
   const names = call<Record<string, string>>("accountHierarchyNames", [accounts]);
   return new Map(Object.entries(names).map(([id, name]) => [Number(id), name]));
 }
-export const resolveAccountIconSource = wrap("resolveAccountIconSource") as typeof accounting.resolveAccountIconSource;
+export const resolveAccountIconSource = wrap("resolveAccountIconSource") as Accounting["resolveAccountIconSource"];
 export function buildCategoryLabelMap(
-  accounts: Parameters<typeof accounting.buildCategoryLabelMap>[0]
-): ReturnType<typeof accounting.buildCategoryLabelMap> {
+  accounts: Parameters<Accounting["buildCategoryLabelMap"]>[0]
+): ReturnType<Accounting["buildCategoryLabelMap"]> {
   const labels = call<Record<string, accounting.CategoryLabel>>("buildCategoryLabelMap", [accounts]);
   return new Map(Object.entries(labels).map(([id, label]) => [Number(id), label]));
 }
 
-export const ACCOUNT_TYPE_LABELS = call<typeof accounting.ACCOUNT_TYPE_LABELS>("accountTypeLabels", []);
-export const ACCOUNT_SUBTYPE_LABELS = call<typeof accounting.ACCOUNT_SUBTYPE_LABELS>("accountSubtypeLabels", []);
-export const ACCOUNT_TYPE_ORDER = call<typeof accounting.ACCOUNT_TYPE_ORDER>("accountTypeOrder", []);
-export const BALANCE_SHEET_TYPES = call<typeof accounting.BALANCE_SHEET_TYPES>("balanceSheetTypes", []);
+export const ACCOUNT_TYPE_LABELS = call<Record<string, string>>("accountTypeLabels", []);
+export const ACCOUNT_SUBTYPE_LABELS = call<Record<string, string>>("accountSubtypeLabels", []);
+export const ACCOUNT_TYPE_ORDER = call<string[]>("accountTypeOrder", []);
+export const BALANCE_SHEET_TYPES = call<string[]>("balanceSheetTypes", []);
 
-export function getEffectiveDate(transaction: Parameters<typeof accounting.getEffectiveDate>[0]): string {
+export function getEffectiveDate(transaction: Parameters<Accounting["getEffectiveDate"]>[0]): string {
   if (!transaction.isFloating) return transaction.date;
   const now = new Date();
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
@@ -113,7 +117,7 @@ export function getEffectiveDate(transaction: Parameters<typeof accounting.getEf
 }
 
 export function flattenAccountTreeWithDepth(
-  accounts: Parameters<typeof accounting.flattenAccountTreeWithDepth>[0],
+  accounts: Parameters<Accounting["flattenAccountTreeWithDepth"]>[0],
   depth = 0,
   rows: accounting.AccountDepthRow[] = []
 ): accounting.AccountDepthRow[] {
@@ -121,33 +125,40 @@ export function flattenAccountTreeWithDepth(
   return rows;
 }
 
-export const buildRuleRecurrenceConfig = wrap("buildRuleRecurrenceConfig") as typeof recurring.buildRuleRecurrenceConfig;
+export const buildRuleRecurrenceConfig = wrap("buildRuleRecurrenceConfig") as RecurringCore["buildRuleRecurrenceConfig"];
 export function getOccurrenceDate(
   scheduledDate: string,
   businessDaysOnly: boolean
 ): string {
   return call("getOccurrenceDate", [scheduledDate, Boolean(businessDaysOnly)]);
 }
-export const isRecurringRuleDue = wrap("isRecurringRuleDue") as typeof recurring.isRecurringRuleDue;
-export const maxIntervalFor = wrap("maxIntervalFor") as typeof recurring.maxIntervalFor;
-export const scheduleKey = wrap("scheduleKey") as typeof recurring.scheduleKey;
+export const isRecurringRuleDue = wrap("isRecurringRuleDue") as RecurringCore["isRecurringRuleDue"];
+export const maxIntervalFor = wrap("maxIntervalFor") as RecurringCore["maxIntervalFor"];
+export const scheduleKey = wrap("scheduleKey") as RecurringCore["scheduleKey"];
 export const MAX_AUTO_CREATE_DAYS_BEFORE = call<number>("maxAutoCreateDaysBefore", []);
 
-export function previewOccurrences(input: Parameters<typeof recurring.previewOccurrences>[0]): string[] {
+export function previewOccurrences(input: Parameters<RecurringCore["previewOccurrences"]>[0]): string[] {
   return call("previewOccurrences", [{ ...input, today: input.today ?? toDateString(new Date()) }]);
 }
 
-export const formatCurrency: typeof formatters.formatCurrency = (cents) =>
+export const formatCurrency: FormattersCore["formatCurrency"] = (cents) =>
   Number.isSafeInteger(cents) ? call("formatCurrency", [cents]) : formatCurrencyFallback(cents);
-export const formatDate = wrap("formatDate") as typeof formatters.formatDate;
-export const formatDateShort = wrap("formatDateShort") as typeof formatters.formatDateShort;
-export const isValidDateString = wrap("isValidDateString") as typeof formatters.isValidDateString;
-export const parseStrictCurrency = wrap("parseStrictCurrency") as typeof formatters.parseStrictCurrency;
-export const resolveAmountOnBlur = wrap("resolveAmountOnBlur") as typeof formatters.resolveAmountOnBlur;
-export const getAccountShortName = wrap("getAccountShortName") as typeof formatters.getAccountShortName;
-export const formatRelativeAge = wrap("formatRelativeAge") as typeof formatters.formatRelativeAge;
-export const formatPriceMicrosInput = wrap("formatPriceMicrosInput") as typeof formatters.formatPriceMicrosInput;
-export const evaluateExpression = wrap("evaluateExpression") as typeof expression.evaluateExpression;
+export const formatDate = wrap("formatDate") as FormattersCore["formatDate"];
+export const formatDateShort = wrap("formatDateShort") as FormattersCore["formatDateShort"];
+export const isValidDateString = wrap("isValidDateString") as FormattersCore["isValidDateString"];
+export const parseStrictCurrency = wrap("parseStrictCurrency") as FormattersCore["parseStrictCurrency"];
+export const resolveAmountOnBlur = wrap("resolveAmountOnBlur") as FormattersCore["resolveAmountOnBlur"];
+export const getAccountShortName = wrap("getAccountShortName") as FormattersCore["getAccountShortName"];
+export const formatRelativeAge = wrap("formatRelativeAge") as FormattersCore["formatRelativeAge"];
+export const formatPriceMicrosInput = wrap("formatPriceMicrosInput") as FormattersCore["formatPriceMicrosInput"];
+export const evaluateExpression = wrap("evaluateExpression") as FormattersCore["evaluateExpression"];
+
+/**
+ * The HTML of a Markdown transaction note (`note_html` in
+ * rust-api/core/src/notes.rs). The function drops raw HTML and keeps only
+ * http, https and mailto links, so the result is safe to put into the page.
+ */
+export const noteHtml = wrap("noteHtml") as (markdown: string) => string;
 
 export function toDateString(date: Date): string {
   if (Number.isNaN(date.getTime())) throw new RangeError("Invalid date passed to toDateString");

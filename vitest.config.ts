@@ -32,8 +32,21 @@ const rustMcpStdioTests = [
   "tests/mcp/mcp-book-access.test.ts",
   "tests/mcp/mcp-transports.test.ts",
 ];
+// The Worker run has the same cut as the stdio run, for the same reason. The
+// Worker runs the same dispatcher and the same route handlers, and the HTTP
+// suites already run against the Worker. So only the suites that cross its
+// MCP adapter run there: the HTTP gate, the tool list, the book roles and one
+// call of each result kind. The Worker has no stdio transport.
+const rustMcpWorkerTests = [
+  "tests/mcp/manifest.test.ts",
+  "tests/mcp/mcp-book-access.test.ts",
+  "tests/mcp/mcp-transports.test.ts",
+  "tests/mcp/rust-transport.test.ts",
+];
 const rustMcpTests =
-  process.env.COUNTERPOISE_MCP_TRANSPORT === "stdio" ? rustMcpStdioTests : rustMcpHttpTests;
+  process.env.COUNTERPOISE_MCP_TRANSPORT === "stdio" ? rustMcpStdioTests
+  : process.env.COUNTERPOISE_HTTP_SERVER === "worker" ? rustMcpWorkerTests
+  : rustMcpHttpTests;
 // Every Rust MCP suite, for the node project to leave out: a plain `npm test`
 // runs none of them, whatever the transport lists hold.
 const allRustMcpTests = [...rustMcpHttpTests, ...rustMcpStdioTests];
@@ -61,8 +74,14 @@ const notOnWorker = process.env.COUNTERPOISE_HTTP_SERVER === "worker" ? [
   // Cloudflare compresses at its edge, so the object never compresses, and
   // `wrangler dev` streams a response without a Content-Length.
   "tests/http/compression.test.ts",
+  // These suites run `ledger-cli` on the database file and start no server,
+  // so the Worker run would only repeat the native run.
+  "tests/http/merge-payee-case.test.ts",
+  "tests/http/moneydance-import.test.ts",
+  "tests/http/rebuild-lots.test.ts",
+  "tests/http/seed.test.ts",
 ] : [];
-const domTests = ["tests/**/*.test.tsx", "tests/lib/utils.test.ts", "tests/lib/posthog-client.test.ts"];
+const domTests = ["tests/**/*.test.tsx", "tests/lib/utils.test.ts"];
 
 export default defineConfig({
   plugins: [react()],
@@ -72,15 +91,17 @@ export default defineConfig({
     env: { COUNTERPOISE_TEST_RUN_ID: testRunId },
     pool: "forks",
     // ONE WORKER COUNT FOR EVERY ENVIRONMENT, automation included. This used
-    // to branch, so the arm that ran in CI was not the arm that ran locally —
-    // and that difference is what hid a contention bug rather than any single
-    // number being wrong. The suite's process helpers share one database, and
-    // more workers meant lock waits long enough to time a case out, in the one
-    // configuration automation never exercised.
+    // to branch, so the arm that ran in CI was not the arm that ran locally,
+    // and that difference hid a contention bug.
     //
-    // So the arms are joined rather than the local one retuned. Raising this
-    // is a change to what has actually been proven green; move both or neither.
-    maxWorkers: 2,
+    // FOUR, NOT MORE. The old limit of two came from one shared database that
+    // the process helpers opened; that helper is gone, and each worker has its
+    // own SQLite file. Measured on 2026-11-04 with `vitest run --coverage`
+    // (the CI command), summed RSS of the process tree: 2 workers 158 s and a
+    // peak of 0.9 GB; 4 workers 104 s and 1.2 GB; 8 workers 97 s and 2.2 GB.
+    // The three CI runners share 10 GB, and this job can run beside the e2e
+    // and worker jobs, so the last 7 s are not worth 1 GB.
+    maxWorkers: 4,
     testTimeout: 30_000,
     hookTimeout: 30_000,
     setupFiles: ["./tests/setup.ts"],

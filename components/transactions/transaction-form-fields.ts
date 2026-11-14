@@ -250,6 +250,9 @@ export function buildSimpleEntry(
 ): EntryResult {
   const amount = parseStrictCurrency(amountInput);
   if (!fromAccountId || !toAccountId) return { error: "Please select both accounts" };
+  // The two splits would cancel on the one account. The Mac client refuses
+  // this entry with the same message.
+  if (fromAccountId === toAccountId) return { error: "From and To must be different accounts." };
   if (amount === null) return { error: "Please enter a valid amount" };
   if (amount <= 0) return { error: "Please enter an amount" };
 

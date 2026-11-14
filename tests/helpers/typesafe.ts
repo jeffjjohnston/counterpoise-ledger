@@ -1,7 +1,7 @@
 type Picks = Partial<Record<"match" | "payee" | "category" | "pattern", string>>;
 
 /**
- * A valid TypeSafe reply for every question in the request that `init` sent.
+ * A valid Clef reply, in the envelope of the Cloudflare API, for every question in the request that `init` sent.
  * Tests use it instead of a live call. The reply puts all probability on one
  * option per question, so the client accepts it.
  */
@@ -37,9 +37,14 @@ export function typesafeReply(init: RequestInit | undefined, picks: Picks = {}) 
   );
   return new Response(
     JSON.stringify({
-      model: "jev-1.13.0",
-      answers,
-      usage: { input_tokens: 100, output_tokens: 3 },
+      result: {
+        model: "clef",
+        answers,
+        usage: { input_tokens: 100, output_tokens: 3 },
+      },
+      success: true,
+      errors: [],
+      messages: [],
     }),
   );
 }

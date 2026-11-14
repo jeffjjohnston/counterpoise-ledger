@@ -172,7 +172,12 @@ problem that squash-merging a long-running branch produces:
   step, so the short checks share one machine and one setup. The build step was
   added when a page that queried the database at build time passed E2E (which
   has one) and failed `docker build` (which does not). The back-merge PR targets `dev`, so it is
-  checked exactly as a feature PR is.
+  checked as a feature PR is, with one difference. Its head is the release
+  merge on `main`, so it also shows the checks of the `worker-release.yml`
+  run on that commit. The back-merge does not count those checks: that run
+  deploys and does not test the merge into `dev`. On v1.60.2 its failed
+  deploy blocked a back-merge whose CI passed. A CI job that only the release
+  run reports is missing, and a missing job still refuses.
 - **CI keeps its build output and downloads on the CI machine.** The CI
   machines keep their home directory from job to job. Each job that runs Cargo
   links `rust-api/target` to a directory there, keyed by machine, toolchain and
@@ -184,6 +189,19 @@ problem that squash-merging a long-running branch produces:
   longer, but runs the same checks. The fork example
   (`.github/workflows/ci.yml.example`) runs on hosted machines that start empty, so it keeps
   `cache: npm`.
+- **Third-party code changes only through a reviewed commit.** Each `uses:`
+  in a workflow names a commit SHA, with the version as a comment, because a
+  tag or a branch can move to new code. Each image in the `Dockerfile`,
+  and its `# syntax=` frontend, names a digest. Dependabot updates the SHAs and
+  the digests, after a 7-day cooldown. `dtolnay/rust-toolchain` is the
+  exception: Dependabot ignores it, so when you change the Rust version, take
+  the SHA of its version branch by hand. The
+  `rust-workspace` job runs `cargo deny` (`rust-api/deny.toml`: RustSec
+  advisories, crates.io as the only source, and a license allow list). The
+  `static-checks` job runs `npm audit --omit=dev --audit-level=high`. A new
+  advisory can therefore fail a pull request that did not change a
+  dependency. Update the crate, or add the advisory ID to `ignore` in
+  `deny.toml` with the reason and the date.
 - **Why dev is a CI branch too**: dev is where day-to-day work lands and what
   releases are cut from, so CI on dev checks work before it reaches the release path. dev gets the **same
   jobs** main gets; no *job* is conditioned on the target branch, so adding a job
@@ -299,6 +317,17 @@ deploys it:
   workflow runs only when `WORKER_DEPLOY` is `true` and `WORKER_TAG_TARGET`
   is `production`. A manual run of it (on `main`) does the same for the tip
   of `main`.
+- **The call passes `secrets: inherit`.** Without it, the called deploy job
+  got every secret of the `worker` environment empty, although it sets
+  `environment:`. The environment variables did arrive. The first release
+  through the workflow, v1.60.2, failed in `wrangler deploy` for this reason.
+- **A run that fails because of the workflow file cannot be fixed by a
+  re-run.** A re-run reads the workflow file of the merge commit again. Deploy
+  that release with a manual run of `worker-deploy.yml` (`target:
+  production`, `ref:` the merge commit), fix the file on `dev`, and the next
+  release carries the fix. `deploy.sh` then reports the failed run; record
+  the deploy from the manual run, and go on with the back-merge. The failed
+  release run does not block the back-merge PR (see CI above).
 - **The tag that the workflow pushes starts nothing.** It is pushed with
   `GITHUB_TOKEN`, and a push with that token starts no workflow. So the tag
   trigger of `worker-deploy.yml` does not deploy the release a second time.
@@ -368,9 +397,7 @@ deploys it:
   `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` and `WORKER_DOMAIN` (the
   custom domain the Worker serves), the Access service
   token `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET` when Access is in
-  front. Each also holds the variables `NEXT_PUBLIC_POSTHOG_KEY` and
-  `NEXT_PUBLIC_POSTHOG_HOST` for the client build, as the Docker build
-  arguments do; without them the client sends no analytics. The Worker's own secrets (`CRON_SECRET`, the Plaid and other integration keys)
+  front. The Worker's own secrets (`CRON_SECRET`, the Plaid and other integration keys)
   are set once with `scripts/wrangler.sh secret put` (adding `--env staging` for
   the staging Worker); a deploy keeps them.
 - **The deploy does not attach the custom domain.** The domain, its DNS
@@ -395,15 +422,23 @@ deploys it:
   replaces the plain variables set in the dashboard, and the hostname must
   stay out of `wrangler.toml`.
 - **A probe stands in for `up --wait`.** The deploy sets the Worker's
-  variable `BUILD_COMMIT` to the commit, and the Worker names it on `/health`
-  in `x-build-commit`. `scripts/worker-probe.sh` retries `/health`
+  variable `BUILD_COMMIT` to the commit, and the Durable Object names it on
+  `/health` in `x-build-commit`. `scripts/worker-probe.sh` retries `/health`
   until it answers 200 from that commit, which means the new version's
   object opened its database, then `/api/version` until it names the version
   in `package.json`. Commits between releases share a version, so the
-  commit is what tells the new deploy from the one before it. A probe
-  that runs out of retries fails the job. The previous version keeps serving
-  until the new one is live, so a failed probe needs a fix and a new deploy,
-  or a rollback of the Worker that failed, in `rust-api/worker/`:
+  commit is what tells the new deploy from the one before it. The object
+  adds the header, not the front Worker, because the two can run different
+  versions after a deploy. In v1.63.0 (2026-11-07) the front Worker named
+  the new commit at once, while the object answered from the old code for
+  the full two minutes. The header then came from the front Worker, so
+  `/health` passed and only `/api/version` showed the old code. A re-run
+  of the failed job deployed again, and the object ran the new code at
+  once. A probe that runs out of retries fails the job. The previous version
+  keeps serving until the new one is live, so a failed probe needs a re-run
+  of the failed job (when the object still runs the old build, as above), a
+  fix and a new deploy, or a rollback of the Worker that failed, in
+  `rust-api/worker/`:
   `../../scripts/wrangler.sh rollback --env staging` for staging, and
   `../../scripts/wrangler.sh rollback` for production. Without `--env
   staging` the command rolls back production, at once.

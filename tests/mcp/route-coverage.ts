@@ -116,12 +116,14 @@ export const ROUTE_WAIVERS: Record<string, string> = {
   "GET /auth/registration-open": "Public browser presentation gate; registration remains an HTTP-only human action.",
   "GET /auth/me": "Session identity. MCP identity comes from the API key.",
   "PUT /auth/password": "Credential change. Out of scope by decision.",
+  "PUT /auth/username": "Credential change. Out of scope by decision.",
   "GET /auth/api-keys": "A tool that reads API keys is privilege escalation.",
   "POST /auth/api-keys": "A tool that mints API keys is privilege escalation.",
   "DELETE /auth/api-keys/[id]": "Credential management. Out of scope by decision.",
   "GET /cron/plaid-sync": "CRON_SECRET machine endpoint, not a user capability.",
   "GET /cron/price-sync": "CRON_SECRET machine endpoint, not a user capability.",
   "GET /cron/recurring": "CRON_SECRET machine endpoint, not a user capability.",
+  "GET /cron/backup": "CRON_SECRET machine endpoint, not a user capability.",
   "GET /health": "Infrastructure probe.",
   "GET /version": "Public contract probe for native clients. Not a user capability.",
   "POST /b/[bookId]/sync/tokens":
@@ -151,5 +153,4 @@ export const ROUTE_WAIVERS: Record<string, string> = {
 /** Tools with no HTTP counterpart. Not drift. */
 export const TOOLS_WITHOUT_ROUTES: string[] = [
   "get_account_balance_history",
-  "analyze_usage",
 ];

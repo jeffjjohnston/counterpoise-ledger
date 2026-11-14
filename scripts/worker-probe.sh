@@ -7,7 +7,9 @@
 #
 # Commits between releases share a version, so a deploy also names its
 # commit (the Worker's BUILD_COMMIT variable), and /health must carry it in
-# x-build-commit before the probe believes the new version answered.
+# x-build-commit before the probe believes the new version answered. The
+# Durable Object adds that header, so it names the code that the object
+# runs: the front Worker can run the new version before the object does.
 #
 # A new version takes a few seconds to reach every location, so each check is
 # retried for up to two minutes. When ACCESS_CLIENT_ID and
@@ -31,7 +33,7 @@ if [[ -n "${ACCESS_CLIENT_ID:-}" && -n "${ACCESS_CLIENT_SECRET:-}" ]]; then
 fi
 
 get() {
-  curl --silent --show-error --max-time 20 "${headers[@]}" "$@"
+  curl --silent --show-error --max-time 20 ${headers[@]+"${headers[@]}"} "$@"
 }
 
 head=$(mktemp)
@@ -49,7 +51,7 @@ if [[ "$status" != 200 ]]; then
   exit 1
 fi
 if [[ -n "$commit" && "$build" != "$commit" ]]; then
-  echo "The Worker's /health names build ${build:-none}, not $commit" >&2
+  echo "The Worker's object answers /health from build ${build:-none}, not $commit" >&2
   exit 1
 fi
 echo "/health answered 200${commit:+ from build $commit}"

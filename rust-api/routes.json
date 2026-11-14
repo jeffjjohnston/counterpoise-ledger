@@ -39,6 +39,7 @@
   { "method": "GET", "path": "/api/cron/plaid-sync", "handler": "cron.plaidsync" },
   { "method": "GET", "path": "/api/cron/price-sync", "handler": "cron.pricesync" },
   { "method": "GET", "path": "/api/cron/recurring", "handler": "cron.recurring" },
+  { "method": "GET", "path": "/api/cron/backup", "handler": "cron.backup" },
   { "method": "GET", "path": "/api/cron/weekly-review", "handler": "weeklyreview.cron" },
   { "method": "GET", "path": "/api/b/[bookId]/sync/pending-count", "handler": "sync.pendingcount" },
   { "method": "GET", "path": "/api/b/[bookId]/sync/tokens", "handler": "sync.tokens" },
@@ -109,6 +110,7 @@
   { "method": "POST", "path": "/api/auth/logout", "handler": "auth.logout" },
   { "method": "GET", "path": "/api/auth/me", "handler": "auth.me" },
   { "method": "PUT", "path": "/api/auth/password", "handler": "auth.password" },
+  { "method": "PUT", "path": "/api/auth/username", "handler": "auth.username" },
   { "method": "GET", "path": "/api/auth/api-keys", "handler": "auth.keys" },
   { "method": "POST", "path": "/api/auth/api-keys", "handler": "auth.create" },
   { "method": "DELETE", "path": "/api/auth/api-keys/[id]", "handler": "auth.delete" }

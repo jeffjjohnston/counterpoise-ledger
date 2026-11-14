@@ -361,6 +361,8 @@ pub(crate) async fn run_weekly_review_now(
             StatusCode::CONFLICT,
             "A review of this book is running",
         )),
+        // Only a scheduled start has a limit.
+        Start::AttemptsUsed => Err(failed("a manual review met the scheduled limit")),
         Start::Started(id) => {
             let (database, access) = (state.database.clone(), access.detach());
             platform::spawn_to_finish(async move {
@@ -467,9 +469,19 @@ pub(crate) async fn run_weekly_review(state: &AppState) -> ApiResult {
 /// reviews one book per step, so one step fits in the time that a Workers
 /// alarm has.
 ///
-/// A book that already has a scheduled review of this week is left out, so
-/// a second run of the job (a retried alarm, or a run that stopped and
-/// starts again) does not ask Claude again.
+/// A book that already has a complete scheduled review of this week is left
+/// out, so a second run of the job (a retried alarm, a run that stopped and
+/// starts again, or the later runs of the Monday) does not ask Claude again.
+/// A failed scheduled review does not count as the review of the week: a
+/// later run tries the book again, until the book has
+/// `SCHEDULED_ATTEMPTS` failed scheduled reviews of the week. The selection
+/// leaves such a book out, and `weekly_review::start` applies the limit
+/// again in its transaction, after a stale `running` review became failed.
+///
+/// The last step of a run counts the books that opted in and have no
+/// complete scheduled review of the week (`booksWithoutReview`): a review
+/// failed, or a manual review of the book was running. The scheduler records
+/// a run with such a book as failed, so the status page shows it.
 pub(crate) async fn review_books(
     state: &AppState,
     after: Option<i32>,
@@ -491,12 +503,20 @@ pub(crate) async fn review_books(
     let mut books: Vec<i32> = state
         .database
         .query(
-            "SELECT b.id FROM books b
-             WHERE b.weekly_review_enabled = 1 AND b.id > ?1
-               AND NOT EXISTS (SELECT 1 FROM weekly_reviews r
-                 WHERE r.book_id = b.id AND r.source = 'schedule' AND r.period_start = ?2)
-             ORDER BY b.id",
-            &params![after.unwrap_or(i32::MIN), period_start],
+            &format!(
+                "SELECT b.id FROM books b
+                 WHERE b.weekly_review_enabled = 1 AND b.id > ?1 AND {no_review}
+                   AND (SELECT COUNT(*) FROM weekly_reviews r
+                     WHERE r.book_id = b.id AND r.source = 'schedule' AND r.period_start = ?2
+                       AND r.status = 'failed') < ?3
+                 ORDER BY b.id",
+                no_review = no_review_of_the_week("?2")
+            ),
+            &params![
+                after.unwrap_or(i32::MIN),
+                period_start,
+                weekly_review::SCHEDULED_ATTEMPTS
+            ],
         )
         .map_err(failed)?;
     let more = books.len() > limit;
@@ -513,15 +533,49 @@ pub(crate) async fn review_books(
                     failures += 1;
                 }
             }
-            Ok(Start::Running | Start::NotEnabled) => {}
+            // A manual review of the book is running. The book keeps no
+            // scheduled review of the week, so a later run tries it again.
+            Ok(Start::Running) => {
+                tracing::warn!(
+                    book_id,
+                    "A review of the book is running: a later run tries again"
+                );
+            }
+            // `AttemptsUsed`: a stale review became the last failure that
+            // the week allows, after the selection counted the failures.
+            // The count below reports the book.
+            Ok(Start::NotEnabled | Start::AttemptsUsed) => {}
             Err(cause) => {
                 tracing::error!(book_id, error = %cause, "Could not start a weekly review");
                 failures += 1;
             }
         }
     }
-    Ok((
-        Json(json!({ "success": true, "booksReviewed": reviewed, "booksFailed": failures })),
-        next,
-    ))
+    let mut body = json!({ "success": true, "booksReviewed": reviewed, "booksFailed": failures });
+    if next.is_none() {
+        let without: i64 = state
+            .database
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM books b
+                     WHERE b.weekly_review_enabled = 1 AND {no_review}",
+                    no_review = no_review_of_the_week("?1")
+                ),
+                &params![period_start],
+            )
+            .map_err(failed)?;
+        body["booksWithoutReview"] = json!(without);
+    }
+    Ok((Json(body), next))
+}
+
+/// The SQL condition that the book `b` has no complete scheduled review of
+/// the week. `period_start` is the parameter that holds the first day of the
+/// week.
+fn no_review_of_the_week(period_start: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM weekly_reviews r
+           WHERE r.book_id = b.id AND r.source = 'schedule' AND r.status = 'complete'
+             AND r.period_start = {period_start})"
+    )
 }

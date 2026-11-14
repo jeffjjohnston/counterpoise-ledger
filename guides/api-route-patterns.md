@@ -195,8 +195,7 @@ are in `rust-api/server/src/routes/{accounts,payees,reports,search,sync}.rs`.
 Each asks for `AccessLevel::Read`. Report and search date filters use the
 effective date: a floating transaction uses today's local calendar date,
 bound from Rust, while a settled transaction uses its stored date. Report
-aggregates cast to integer JSON values. Both report handlers emit the existing
-`report_generated` PostHog event with their original report types.
+aggregates cast to integer JSON values.
 `tests/http/` covers these contracts.
 
 The account and payee writes are also in Rust: `POST /accounts`,
@@ -366,8 +365,8 @@ form does not send:
   `schedule does not advance`.
 
 `tests/http/recurring.test.ts` compares full bodies with snapshots. A result
-that depends on today is compared with the value that the TypeScript
-recurrence helpers in `lib/recurring.ts` and `lib/accounting.ts` compute.
+that depends on today is compared with the value that `expectedNextDate()` in
+that test computes from the Rust core, through `lib/wasm-client.ts`.
 
 The Plaid connection routes and the sync reads are in
 `rust-api/server/src/routes/sync.rs`: `sync/tokens` GET and POST,
@@ -504,8 +503,7 @@ live-update stream of the book to prove that a Rust write sends a hint.
 `/api/books` CRUD, `POST /api/books/demo`, and `/api/issue-reports` use the
 authenticated principal without a book scope. The Rust demo route runs the seed
 in a spawned task, so it commits when the client leaves before the response. Book lists join `book_members`, so a shared book includes
-the caller's role. Issue reports filter every read and write by user ID, and
-creation sends `issue_report_created` through the shared PostHog helper.
+the caller's role. Issue reports filter every read and write by user ID.
 
 `/api/health` is public and returns only `{ ok, db }`, with a 503 response
 when the database probe fails. The deploy check reads it. `/health` answers
@@ -517,7 +515,9 @@ every job is `unknown` and `overall` is `unknown`, so the navbar shows
 nothing; a database error also gives every job the state `unknown`.
 A Plaid sync or price sync with no secret writes `notConfigured: true` and the
 missing setting in `detail`. `evaluate` gives that job the state
-`not_configured`. It does not cause `overall: "attention"`. A manual
+`not_configured`. It does not cause `overall: "attention"`. The lot rebuild
+has no schedule, so the status lists it (`lot-rebuild`, after the other
+jobs) only when it has a record, and never as `stale` or `missing`. A manual
 `/api/cron/*` run writes the same record as a scheduled run.
 `ledger-cli backup` writes the record only when the backup goes to the
 scheduler's own backup directory. That means no `--dir`, or the same directory
@@ -700,7 +700,7 @@ login and register pages, while registration itself checks the gate again
 inside a `BEGIN IMMEDIATE` transaction, so two first registrations cannot
 both see no user.
 
-### Rust cron auth, analytics, and database scopes
+### Rust cron auth and database scopes
 
 `rust-api/server/src/cron_auth.rs` checks the entire `Authorization` header
 against `Bearer ${CRON_SECRET}` using fixed-width SHA-256 digests and a
@@ -708,10 +708,19 @@ constant-time comparison. `require_cron_secret` returns the existing 401
 `{ "error": "Unauthorized" }` response. An unset or empty secret always
 denies. Every cron route uses it.
 
-All four cron routes run in Rust: `rust-api/server/src/routes/cron.rs` serves
-`plaid-sync`, `price-sync`, and `recurring`, and
-`rust-api/server/src/routes/typesafe.rs` serves `typesafe-cleanup`. Each one
-writes on every call.
+All the cron routes run in Rust: `rust-api/server/src/routes/cron.rs` serves
+`plaid-sync`, `price-sync`, `recurring` and `backup`,
+`rust-api/server/src/routes/typesafe.rs` serves `typesafe-cleanup`, and
+`rust-api/server/src/routes/weekly_review.rs` serves `weekly-review`. Each
+one writes on every call.
+
+`GET /api/cron/backup` runs the backup of its target: a snapshot into
+`BACKUP_DIR` on the native server, and on the Worker a dump into the export
+bucket under a name that does not replace the day's dump
+([database-management.md](database-management.md#a-dump-on-demand)). The
+backup has no HTTP body of its own, so `scheduler::backup_now` takes the
+lease, records the run and makes the answer. Its failure answers 500 with
+the cause, which is the `detail` of the status record.
 
 The server runs these jobs on their schedule (`rust-api/server/src/scheduler/mod.rs`);
 a route runs one now. One lease per job (`leases::Job` in
@@ -720,16 +729,13 @@ job apart, also across processes. A scheduled run does not start a job whose
 lease is held, and starts it at a later wake once the lease is free; a manual
 run waits for it. A job reports a failure of one token, symbol, or book in
 its body and still succeeds, as the Node route did, so such a failure does not
-mark the job failed. A scheduled run writes a status record. A manual
+mark the job failed. The weekly review is the exception: a run that leaves a
+book with no review of the week (`booksWithoutReview` in its body) still
+answers 200, but its status record is a failure
+([weekly-review.md](weekly-review.md#schedule)). A scheduled run writes a status record. A manual
 `/api/cron/*` run writes the same record. `ledger-cli backup` writes it only
 into the scheduler's backup directory. `GET /api/system/status` reads the
 records in `rust-api/server/src/routes/system.rs`.
-
-`rust-api/server/src/analytics.rs` is the server capture helper. It is a no-op
-without `NEXT_PUBLIC_POSTHOG_KEY`; otherwise it sends the user ID as the
-PostHog distinct ID, the unchanged event name, and the route's property object.
-Call it after a successful write as the Node handler does. Analytics failures
-are logged and do not change the route response.
 
 A lease (`rust-api/server/src/leases.rs`) is the scope of a long run. `try_take`
 takes a lease without waiting, and `wait` retries until it is free. The
@@ -755,7 +761,6 @@ the same origin.
 ## Transaction Creation Pattern
 The transaction routes in `routes/transactions.rs` hold the write path: the
 validation in `transaction_input.rs`, the one database transaction that writes
-the transaction, its splits, its investment splits and its lots, and the
-analytics event. The MCP transaction tools send their writes through these
+the transaction, its splits, its investment splits and its lots. The MCP transaction tools send their writes through these
 routes, so both surfaces get the same rules. Put creation logic in the route
 module, not in a tool.

@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import { Link, useRouter, useSearchParams } from "@/lib/navigation";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
-import { identifyUser } from "@/lib/posthog-client";
 import { apiPost, toMessage } from "@/lib/api-client";
 import { useRegistrationOpen } from "@/hooks/useRegistrationOpen";
 
@@ -39,8 +38,7 @@ export function LoginForm() {
     setLoading(true);
 
     try {
-      const data = await apiPost<{ id: number }>("/api/auth/login", { username, password });
-      identifyUser(data.id);
+      await apiPost("/api/auth/login", { username, password });
       router.push(returnPath(next));
     } catch (err) {
       setError(toMessage(err, "An error occurred. Please try again."));

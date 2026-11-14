@@ -13,7 +13,6 @@ mod reports;
 mod securities;
 mod security_prices;
 mod transactions;
-mod usage;
 mod weekly_review;
 
 use rmcp::model::CallToolResult;
@@ -29,7 +28,6 @@ pub(crate) use plaid::{
 /// until every tool in the manifest has a Rust handler.
 pub(crate) const IMPLEMENTED: &[&str] = &[
     "add_book_member",
-    "analyze_usage",
     "clear_plaid_sync_data",
     "create_account",
     "create_book",
@@ -152,7 +150,6 @@ pub(crate) async fn call(
         "update_issue_report" => issue_reports::update(caller, arguments).await,
         "delete_issue_report" => issue_reports::delete(caller, arguments).await,
         "get_system_status" => issue_reports::system_status(caller).await,
-        "analyze_usage" => usage::analyze(caller, arguments).await,
         "list_recurring_rules" => recurring::list(caller, arguments).await,
         "create_recurring_rule" => recurring::create(caller, arguments).await,
         "update_recurring_rule" => recurring::update(caller, arguments).await,

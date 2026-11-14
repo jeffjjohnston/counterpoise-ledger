@@ -33,7 +33,11 @@ export type JobEntry = {
 };
 
 export type JobHealth = {
-  job: JobName;
+  /**
+   * The server also lists "lot-rebuild" when that job has a record. It has
+   * no schedule, so it is not a `JobName`.
+   */
+  job: JobName | "lot-rebuild";
   label: string;
   schedule: string;
   state: JobState;
@@ -97,12 +101,12 @@ export const JOB_SCHEDULES: Record<
     label: "Reindex",
     schedule: "Monthly, 1st 3am",
   },
-  // Mondays 5am
+  // Mondays 5am. The runs at 6am and 7am try a failed review again.
   "weekly-review": {
     maxGapMs: 7 * DAY,
     staleAfterMs: 8 * DAY,
     label: "Weekly review",
-    schedule: "Mondays 5am",
+    schedule: "Mondays 5am, retries 6am and 7am",
   },
   // hourly at :30
   "issue-sync": {

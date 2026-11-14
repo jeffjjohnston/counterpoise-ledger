@@ -1,7 +1,7 @@
 //! The scheduled jobs. `crate::scheduler` runs them in this process on their
-//! schedule. The routes `/api/cron/plaid-sync`, `/api/cron/price-sync` and
-//! `/api/cron/recurring` run one now, for a caller with
-//! `Bearer $CRON_SECRET`. One run of a job waits for another run of the same
+//! schedule. The routes `/api/cron/plaid-sync`, `/api/cron/price-sync`,
+//! `/api/cron/recurring` and `/api/cron/backup` run one now, for a caller
+//! with `Bearer $CRON_SECRET`. One run of a job waits for another run of the same
 //! job to finish: each run holds the job's lease (`crate::leases`).
 //!
 //! A manual run records its status as a scheduled run does
@@ -37,6 +37,18 @@ const PRICE_SCALE: f64 = 1_000_000.0;
 
 fn cron_secret() -> Option<String> {
     ledger_db::env::var("CRON_SECRET").ok()
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/cron/backup
+// ---------------------------------------------------------------------------
+
+/// Runs the backup of this target now (`scheduler::backup_now`). The native
+/// server writes a snapshot, as `ledger-cli backup` does. A Durable Object
+/// exports a dump under a name that does not replace the dump of the day.
+pub(crate) async fn backup(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
+    require_cron_secret(&headers, cron_secret().as_deref())?;
+    crate::scheduler::backup_now(&state).await
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { ApiKeyManager } from "@/components/account/ApiKeyManager";
 import { ConnectedApps } from "@/components/account/ConnectedApps";
+import { ChangeUsernameForm } from "@/components/account/ChangeUsernameForm";
 import { apiGet, apiPut, toMessage } from "@/lib/api-client";
 
 type User = {
@@ -137,6 +138,17 @@ export default function AccountPage() {
               {isSaving ? "Updating..." : "Change password"}
             </Button>
           </form>
+        </div>
+
+        <div className="bg-surface rounded-lg border border-border shadow-soft p-6 sm:p-8 mt-6">
+          <h2 className="text-xl font-bold text-fg">Username</h2>
+          <p className="text-sm text-fg-tertiary mt-1">
+            Change the name that you sign in with. You stay signed in, and your API keys and
+            connected apps continue to work.
+          </p>
+          <div className="mt-4">
+            <ChangeUsernameForm currentUsername={user?.username ?? null} onChanged={setUser} />
+          </div>
         </div>
 
         <div className="bg-surface rounded-lg border border-border shadow-soft p-6 sm:p-8 mt-6">

@@ -1,11 +1,15 @@
 import { normalizePayeeName } from "@/lib/payees";
-import type { ChoiceQuestion } from "./client";
 import type {
   MatchSnapshot,
   PayeeOption,
   Proposal,
   TypeSafeAnswers,
 } from "./types";
+
+export type ChoiceQuestion = {
+  instructions: unknown;
+  criteria: Record<string, unknown>;
+};
 
 // Pure builders for the TypeSafe request. They have no I/O, so the tests can
 // check the exact state and questions without a database.
@@ -180,12 +184,15 @@ function matchQuestion(labels: string[]): ChoiceQuestion {
 }
 
 /**
- * The questions for one request. match is asked when there are eligible
- * candidates. payee and category are asked when a proposal is possible. Code
- * reads payee and category only when match is none or was not asked.
+ * The questions for one request. match is asked when there are two or more
+ * eligible candidates. payee and category are asked when a proposal is
+ * possible. Code reads payee and category only when match is none or was not
+ * asked. A row with exactly one eligible candidate gets no question, as in
+ * `build_questions` in rust-api/server/src/typesafe_questions.rs.
  */
 export function buildQuestions(input: MatchSnapshot) {
   const questions: Record<string, ChoiceQuestion> = {};
+  if (input.candidates.length === 1) return questions;
   if (input.candidates.length)
     questions.match = matchQuestion(input.candidates.map((c) => c.label));
   const payees = input.payeeOptions ?? [];

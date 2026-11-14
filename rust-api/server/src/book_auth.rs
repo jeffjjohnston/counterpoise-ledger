@@ -196,8 +196,8 @@ pub(crate) fn book_membership(
     })
 }
 
-/// Carries the identity and role a write handler needs for auditing and
-/// analytics without a second authentication query.
+/// Carries the identity and role a write handler needs for auditing
+/// without a second authentication query.
 ///
 /// The fields are private. Only this module makes the value, so a value
 /// is proof that `authenticate_book` or `book_membership` found the caller

@@ -12,6 +12,7 @@ pub mod js;
 pub mod lots;
 pub mod names;
 pub mod net_worth;
+pub mod notes;
 pub mod recurring;
 
 #[cfg(feature = "wasm")]

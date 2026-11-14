@@ -81,8 +81,7 @@ export function dropUnusedWasmAsset(): Plugin {
 }
 
 export default defineConfig(({ mode }) => {
-  // The same `.env` files and names as the Next build used, so that the
-  // production checkout and the Docker build arguments do not change.
+  // The `.env` files and the name that the deploy uses for the build commit.
   const env = loadEnv(mode, process.cwd(), "NEXT_PUBLIC_");
   const inline = (value: string | undefined) => (value ? JSON.stringify(value) : "undefined");
 
@@ -90,8 +89,6 @@ export default defineConfig(({ mode }) => {
     plugins: [react(), tailwindcss(), devPageGate(), dropUnusedWasmAsset()],
     resolve: { alias: { "@": path.resolve(import.meta.dirname, ".") } },
     define: {
-      "process.env.NEXT_PUBLIC_POSTHOG_KEY": inline(env.NEXT_PUBLIC_POSTHOG_KEY),
-      "process.env.NEXT_PUBLIC_POSTHOG_HOST": inline(env.NEXT_PUBLIC_POSTHOG_HOST),
       "process.env.NEXT_PUBLIC_APP_VERSION": JSON.stringify(packageJson.version),
       // The deploy sets it, so that an open page sees a new commit of the
       // same version (client/version-check.ts).

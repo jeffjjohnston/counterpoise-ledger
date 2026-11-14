@@ -65,7 +65,8 @@ pub(crate) async fn run_scrypt(
         .expect("scrypt semaphore remains open");
     platform::blocking(move || {
         let _permit = permit;
-        let params = Params::new(14, 8, 1, length).map_err(|_| ())?;
+        // scrypt 0.12 takes the output length from `derived`.
+        let params = Params::new(14, 8, 1).map_err(|_| ())?;
         let mut derived = vec![0; length];
         scrypt(secret.as_bytes(), &salt, &params, &mut derived).map_err(|_| ())?;
         Ok(derived)
@@ -264,6 +265,26 @@ pub(crate) async fn session_user(
 mod tests {
     use super::*;
 
+    /// Stored password and API key hashes must still verify after a change
+    /// to the scrypt crate. Node's `crypto.scryptSync` (N = 16384, r = 8,
+    /// p = 1) and scrypt 0.11 give these values.
+    #[test]
+    fn scrypt_gives_the_known_answers() {
+        let params = Params::new(14, 8, 1).unwrap();
+        let mut password = [0_u8; 64];
+        scrypt(b"password", b"known-answer-salt", &params, &mut password).unwrap();
+        assert_eq!(
+            hex::encode(password),
+            "eeae34c9671de2203ed4c2cc12164acd85bd7a4d50d59a7f745a63062ebabc927e14aeaa1179548ffc1537ec4539ec9bc844d5098e7c362ac8bf9bc9230948ca"
+        );
+        let mut key = [0_u8; 32];
+        scrypt(b"cpk_known", b"known-answer-salt", &params, &mut key).unwrap();
+        assert_eq!(
+            hex::encode(key),
+            "7b220aa9355456b6ad11585e9c0e46e93019d4a61565eeacad163a351ed4829f"
+        );
+    }
+
     #[test]
     fn cookie_parser_uses_last_valid_decoded_value() {
         let mut headers = HeaderMap::new();
@@ -300,7 +321,7 @@ mod tests {
         scrypt(
             key.as_bytes(),
             salt.as_bytes(),
-            &Params::new(14, 8, 1, 32).unwrap(),
+            &Params::new(14, 8, 1).unwrap(),
             &mut derived,
         )
         .unwrap();

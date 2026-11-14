@@ -24,6 +24,8 @@ pub mod lots;
 pub mod migrations;
 pub mod seed;
 pub mod sql;
+#[cfg(all(test, feature = "native"))]
+mod status_checks_tests;
 pub mod store;
 pub mod sync_floor;
 #[cfg(feature = "native")]

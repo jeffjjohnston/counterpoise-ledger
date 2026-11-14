@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { ThemeProvider, useTheme } from "@/components/ThemeProvider";
-import { ThemeToggle } from "@/components/ui/ThemeToggle";
 
 // Mock window.matchMedia
 Object.defineProperty(window, "matchMedia", {
@@ -72,46 +71,43 @@ describe("ThemeProvider", () => {
     fireEvent.click(screen.getByText("Set Dark"));
     expect(localStorageMock.setItem).toHaveBeenCalledWith("theme", "dark");
   });
-});
 
-describe("ThemeToggle", () => {
-  beforeEach(() => {
-    localStorageMock.clear();
-    vi.clearAllMocks();
-    document.documentElement.classList.remove("dark");
-  });
+  // The settings modal in BookNavbar calls setTheme with each of the three
+  // values. Each value must reach the consumers and the document class.
+  it("applies each theme to consumers and to the document", () => {
+    function SetThemeButtons() {
+      const { setTheme } = useTheme();
+      return (
+        <>
+          <button onClick={() => setTheme("light")}>Light</button>
+          <button onClick={() => setTheme("dark")}>Dark</button>
+          <button onClick={() => setTheme("system")}>System</button>
+        </>
+      );
+    }
 
-  it("renders a button with theme label", () => {
     render(
       <ThemeProvider>
-        <ThemeToggle />
-      </ThemeProvider>
-    );
-    const button = screen.getByRole("button");
-    expect(button).toHaveAttribute("aria-label", expect.stringContaining("Theme:"));
-  });
-
-  it("cycles through themes: system -> light -> dark -> system", () => {
-    render(
-      <ThemeProvider>
-        <ThemeToggle />
+        <SetThemeButtons />
         <ThemeDisplay />
       </ThemeProvider>
     );
+    const root = document.documentElement;
 
-    const button = screen.getByRole("button");
-
-    // Initial: system
-    expect(screen.getByTestId("theme").textContent).toBe("system");
-
-    // Cycle logic in ThemeToggle: light->dark, dark->system, else(system)->light
-    fireEvent.click(button);
+    fireEvent.click(screen.getByText("Light"));
     expect(screen.getByTestId("theme").textContent).toBe("light");
+    expect(screen.getByTestId("resolved").textContent).toBe("light");
+    expect(root).not.toHaveClass("dark");
 
-    fireEvent.click(button);
+    fireEvent.click(screen.getByText("Dark"));
     expect(screen.getByTestId("theme").textContent).toBe("dark");
+    expect(screen.getByTestId("resolved").textContent).toBe("dark");
+    expect(root).toHaveClass("dark");
 
-    fireEvent.click(button);
+    // The matchMedia mock reports a light system preference.
+    fireEvent.click(screen.getByText("System"));
     expect(screen.getByTestId("theme").textContent).toBe("system");
+    expect(screen.getByTestId("resolved").textContent).toBe("light");
+    expect(root).not.toHaveClass("dark");
   });
 });

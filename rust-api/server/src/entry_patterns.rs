@@ -4,7 +4,7 @@
 //! snapshot, the state and the question of a TypeSafe request.
 
 use crate::platform;
-use crate::typesafe_questions::{LoneSurrogate, TYPESAFE_MODEL, UNTRUSTED, question, redact_text};
+use crate::typesafe_questions::{LoneSurrogate, UNTRUSTED, question, redact_text};
 use chrono::{Datelike, NaiveDate};
 use ledger_db::sql::EFFECTIVE_DATE;
 use ledger_db::store::{self, Sql, params};
@@ -266,7 +266,7 @@ pub(crate) fn snapshot(
         .collect();
     json!({
         "prompt": ENTRY_PROMPT_VERSION,
-        "model": TYPESAFE_MODEL,
+        "model": crate::typesafe_questions::CLEF_MODEL,
         "revision": revision,
         "accountId": account_id,
         "payeeId": payee_id,

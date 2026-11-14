@@ -108,6 +108,9 @@ writes their references.
   (`match`, `payee`, `category`); `choice`/`probabilities`/`confidence` keep
   the match answer only. `typesafeDecisions.proposalPayeeKept` and
   `proposalCategoryKept` are set only for a create after a visible proposal.
+  `typesafeEvaluations.status` is `pending`, `ready`, `skipped`, `error` or
+  `stale`. A CHECK constraint (migration 0019) refuses any other value, as
+  the CHECK of `typesafeEntryEvaluations.status` does.
 - **typesafeEntryEvaluations / typesafeEntryOutcomes**: the records of the
   entry suggestions ([TypeSafe experiment](typesafe-experiment.md)). One
   evaluation per book and fingerprint; `baselineKey` is the newest pattern.
@@ -147,6 +150,11 @@ writes their references.
     Plaid reconcile (`routes/reconcile.rs`) and the transaction unlink
     (`routes/sync.rs`) set `updatedBy`, and `createdBy` when they create a
     row.
+  - `idx_transactions_payee_date_id_floating` (payee_id, date, id,
+    is_floating, migration 0017) covers the payee list's count and last
+    effective date. The effective date needs `is_floating`: without it in
+    the index, the list read each transaction row of the book. A test in
+    `routes/payees.rs` asserts the query plan
 
 - **transactionSplits**: Double-entry splits (debits/credits)
   - Positive amounts = debits, negative = credits
@@ -209,6 +217,7 @@ writes their references.
 
 - **issueReports**: In-app issue reports (meta table — scoped to `userId`, not `bookId`)
   - Fields: `userId`, `description`, `type` (`bug`/`improvement`/`other`), `page`, `status` (`new`/`resolved`/`wontfix`), `githubIssueNumber` (nullable)
+  - `status` has a CHECK constraint (migration 0019): only `new`, `resolved` and `wontfix`. `type` has none: the route validates it
   - Written by `ReportIssueModal`; read when triaging reports
   - `githubIssueNumber` is set only by the `issue-sync` job: the issue it opened in the configured GitHub repo. The HTTP and MCP routes do not return it. See [issue-sync.md](issue-sync.md)
 
@@ -217,7 +226,8 @@ writes their references.
   - `plaidAccounts`: Links Plaid accounts to Counterpoise accounts (`counterpoiseAccountId`)
   - `plaidTransactionReconciliation`: Staged Plaid transactions awaiting reconciliation
     - `resolutionStatus`: `pending`, `matched`, `created`, `ignored`
-    - `reviewReason`: `plaid_modified` or `plaid_removed` (flags items needing human review)
+    - `reviewReason`: NULL, `plaid_modified` or `plaid_removed` (flags items needing human review)
+    - CHECK constraints (migration 0019) limit both columns to these values. A write of another value fails with `CHECK constraint failed`. To add a value, add a migration that makes the table again with the new list (see [database-management.md](database-management.md#making-a-table-again)), and change the Rust code that reads the column in the same release
     - `matchedTransactionId`: FK to local transaction when matched (manually or auto-matched)
   - `weeklyReviews` (migration 0007): one run of the weekly review
     ([weekly-review.md](weekly-review.md)). `source` is `schedule` or `manual`

@@ -95,7 +95,7 @@ describe("Plaid reconciliation HTTP parity", () => {
   let client: Client;
 
   beforeAll(async () => {
-    ({ baseUrl, stop } = await startHttpTestServer({ TYPESAFE_ENABLED: "true", TYPESAFE_API_KEY: "test-key" }));
+    ({ baseUrl, stop } = await startHttpTestServer({ TYPESAFE_ENABLED: "true", TYPESAFE_CLEF_ACCOUNT_ID: "abc123", TYPESAFE_CLEF_API_TOKEN: "test-token" }));
   }, 120_000);
   beforeEach(async () => {
     await resetTestDatabase();
@@ -343,6 +343,30 @@ describe("Plaid reconciliation HTTP parity", () => {
     }
   });
 
+  // Ignore removes the link of a row flagged for review too, so it releases
+  // the old transaction under the same rule as Match and Create.
+  it("clears the old transaction when a linked row flagged for review is ignored", async () => {
+    const f = await fixture();
+    const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+    const reconciled = async (id: number) => (await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [id])).isReconciled;
+    await exec("UPDATE transactions SET is_reconciled = true WHERE id = $1", [f.coffeeLater.id]);
+    const item = await ok(client, path, json("POST", { reconciliationId: f.reviewRow.id, action: "ignore" }));
+    expect(item).toMatchObject({ resolutionStatus: "ignored", matchedTransactionId: null, reviewReason: null });
+    expect(await reconciled(f.coffeeLater.id)).toBe(false);
+  });
+
+  it("keeps the old transaction reconciled on Ignore when another row still links it", async () => {
+    const f = await fixture();
+    const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+    const reconciled = async (id: number) => (await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [id])).isReconciled;
+    const savingsLink = await createPlaidAccount({ tokenId: f.token.id, plaidAccountId: "pa-savings", name: "S", type: "depository", counterpoiseAccountId: f.savings.id });
+    await createPlaidReconciliation({ plaidAccountLinkId: savingsLink.id, plaidTransactionId: "in", date: "2025-03-10", amountCents: -5000, name: "in", resolutionStatus: "matched", matchedTransactionId: f.transfer.id });
+    await exec("UPDATE plaid_transaction_reconciliation SET matched_transaction_id = $1 WHERE id = $2", [f.transfer.id, f.reviewRow.id]);
+    await exec("UPDATE transactions SET is_reconciled = true WHERE id = $1", [f.transfer.id]);
+    await ok(client, path, json("POST", { reconciliationId: f.reviewRow.id, action: "ignore" }));
+    expect(await reconciled(f.transfer.id)).toBe(true);
+  });
+
   it("keeps the old transaction reconciled when another row still links it, or when it is linked again", async () => {
     const f = await fixture();
     const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
@@ -359,6 +383,106 @@ describe("Plaid reconciliation HTTP parity", () => {
     await exec("UPDATE plaid_transaction_reconciliation SET review_reason = 'plaid_modified' WHERE id = $1", [f.reviewRow.id]);
     await ok(client, path, json("POST", { reconciliationId: f.reviewRow.id, action: "match", transactionId: f.coffeeSameDay.id }));
     expect(await reconciled(f.coffeeSameDay.id)).toBe(true);
+  });
+
+  // The transition table in guides/plaid-sync.md. Each
+  // refusal here was a decision that the route applied in any state.
+  describe("the transition table", () => {
+    type Fixture = Awaited<ReturnType<typeof fixture>>;
+    const staged = async (id: number) => row<PlaidTransactionReconciliation>("SELECT * FROM plaid_transaction_reconciliation WHERE id = $1", [id]);
+    const idOf = async (plaidTransactionId: string) => Number(await scalar("SELECT id FROM plaid_transaction_reconciliation WHERE plaid_transaction_id = $1", [plaidTransactionId]));
+    const flag = (id: number, reason: string | null) =>
+      exec("UPDATE plaid_transaction_reconciliation SET review_reason = $1, review_metadata_json = $2 WHERE id = $3", [reason, reason && "{\"event\":\"x\"}", id]);
+    const decide = (f: Fixture, reconciliationId: number, body: Record<string, unknown>) =>
+      json("POST", { reconciliationId, ...body });
+    const pathOf = (f: Fixture) => `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+
+    it("refuses Keep local and Unlink on a pending row that the bank removed", async () => {
+      const f = await fixture();
+      await flag(f.coffeeRow.id, "plaid_removed");
+      await expectError(client, pathOf(f), decide(f, f.coffeeRow.id, { action: "keep_local" }), 400, "Keep local does not apply: the bank removed this transaction");
+      await expectError(client, pathOf(f), decide(f, f.coffeeRow.id, { action: "unlink" }), 400, "This bank transaction is not linked to a transaction");
+      // The flag stays, so the auto-matcher does not take a row that the bank deleted.
+      expect(await staged(f.coffeeRow.id)).toMatchObject({ resolutionStatus: "pending", reviewReason: "plaid_removed", reviewMetadataJson: "{\"event\":\"x\"}" });
+      // Ignore is the way out.
+      expect(await ok(client, pathOf(f), decide(f, f.coffeeRow.id, { action: "ignore" }))).toMatchObject({ resolutionStatus: "ignored", reviewReason: null });
+    });
+
+    it("refuses Keep local on a linked row that the bank removed, and Unlink keeps the flag", async () => {
+      const f = await fixture();
+      await flag(f.reviewRow.id, "plaid_removed");
+      await exec("UPDATE transactions SET is_reconciled = true WHERE id = $1", [f.coffeeLater.id]);
+      await expectError(client, pathOf(f), decide(f, f.reviewRow.id, { action: "keep_local" }), 400, "Keep local does not apply: the bank removed this transaction");
+      expect(await staged(f.reviewRow.id)).toMatchObject({ resolutionStatus: "matched", reviewReason: "plaid_removed", matchedTransactionId: f.coffeeLater.id });
+      const unlinked = await ok(client, pathOf(f), decide(f, f.reviewRow.id, { action: "unlink" }));
+      expect(unlinked).toMatchObject({ resolutionStatus: "pending", reviewReason: "plaid_removed", matchedTransactionId: null });
+      expect((await staged(f.reviewRow.id)).reviewMetadataJson).toBe("{\"event\":\"x\"}");
+      expect((await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [f.coffeeLater.id])).isReconciled).toBe(false);
+    });
+
+    it("keeps the removed flag when the transaction route unlinks, and clears a modified flag", async () => {
+      const f = await fixture();
+      const done = await idOf("done");
+      await flag(done, "plaid_removed");
+      await ok(client, `/api/b/1/transactions/${f.coffeeFar.id}/plaid/unlink`, { method: "POST" });
+      expect(await staged(done)).toMatchObject({ resolutionStatus: "pending", reviewReason: "plaid_removed", matchedTransactionId: null, resolvedAt: null });
+      await ok(client, `/api/b/1/transactions/${f.coffeeLater.id}/plaid/unlink`, { method: "POST" });
+      expect(await staged(f.reviewRow.id)).toMatchObject({ resolutionStatus: "pending", reviewReason: null, reviewMetadataJson: null, matchedTransactionId: null });
+    });
+
+    it("refuses every decision on an ignored row", async () => {
+      const f = await fixture();
+      const ignored = await idOf("ignored");
+      const transactions = await count("transactions");
+      const refused = "This bank transaction is ignored and cannot be changed";
+      for (const body of [
+        { action: "match", transactionId: f.coffeeSameDay.id },
+        { action: "match_update_amount", transactionId: f.coffeeSameDay.id },
+        { action: "create", counterAccountId: f.food.id },
+        { action: "ignore" },
+        { action: "keep_local" },
+        { action: "unlink" },
+      ]) {
+        await expectError(client, pathOf(f), decide(f, ignored, body), 400, refused);
+      }
+      expect(await staged(ignored)).toMatchObject({ resolutionStatus: "ignored", matchedTransactionId: null });
+      expect(await count("transactions")).toBe(transactions);
+      expect((await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [f.coffeeSameDay.id])).isReconciled).toBe(false);
+    });
+
+    it("refuses Ignore and Keep local on a linked row with no flag, and allows Unlink", async () => {
+      const f = await fixture();
+      const done = await idOf("done");
+      const linked = `This bank transaction is already linked to transaction #${f.coffeeFar.id} — unlink it first`;
+      await expectError(client, pathOf(f), decide(f, done, { action: "ignore" }), 400, linked);
+      await expectError(client, pathOf(f), decide(f, done, { action: "keep_local" }), 400, "Keep local applies only to a bank transaction that the bank changed");
+      expect(await staged(done)).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: f.coffeeFar.id });
+      expect(await ok(client, pathOf(f), decide(f, done, { action: "unlink" }))).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
+    });
+
+    it("refuses Keep local and Unlink on a pending row with no flag", async () => {
+      const f = await fixture();
+      await expectError(client, pathOf(f), decide(f, f.coffeeRow.id, { action: "keep_local" }), 400, "Keep local applies only to a bank transaction that the bank changed");
+      await expectError(client, pathOf(f), decide(f, f.coffeeRow.id, { action: "unlink" }), 400, "This bank transaction is not linked to a transaction");
+    });
+
+    it("lets Keep local clear the flag of a changed row whose transaction was deleted", async () => {
+      const f = await fixture();
+      // The delete of a linked transaction sets its row to pending and keeps the flag.
+      await ok(client, `/api/b/1/transactions/${f.coffeeLater.id}`, { method: "DELETE" });
+      expect(await staged(f.reviewRow.id)).toMatchObject({ resolutionStatus: "pending", reviewReason: "plaid_modified", matchedTransactionId: null });
+      expect(await ok(client, pathOf(f), decide(f, f.reviewRow.id, { action: "keep_local" }))).toMatchObject({ resolutionStatus: "pending", reviewReason: null });
+    });
+
+    it("cannot store a status that is not one of the four", async () => {
+      const f = await fixture();
+      // The CHECK of migration 0019 refuses the value, so the route never
+      // reads a status that it does not know.
+      await expect(
+        exec("UPDATE plaid_transaction_reconciliation SET resolution_status = $1 WHERE id = $2", ["bogus", f.coffeeRow.id]),
+      ).rejects.toThrow(/CHECK constraint failed/);
+      expect((await staged(f.coffeeRow.id)).resolutionStatus).toBe("pending");
+    });
   });
 
   it("records the TypeSafe observation of a decision", async () => {

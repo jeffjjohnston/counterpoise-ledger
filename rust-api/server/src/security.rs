@@ -39,10 +39,19 @@ use tower::{Layer, Service};
 /// The security headers of every response, `/api/` included, with the values
 /// that the Next server sent.
 ///
-/// The Content-Security-Policy is for pages, but it is correct on JSON too: it
-/// has no `script-src` or `style-src`, and `frame-ancestors 'none'` stops a
-/// page on another site from framing a response. It has no `script-src`
-/// because the theme script in `index.html` is inline.
+/// The Content-Security-Policy is for pages, but it is correct on JSON too:
+/// `frame-ancestors 'none'` stops a page on another site from framing a
+/// response.
+///
+/// - `script-src`: the page runs only the scripts of this origin, the one
+///   inline theme script of `index.html` (by its hash)
+///   and the WASM module of the shared domain code (`'wasm-unsafe-eval'`).
+///   An inline event handler or a script that a Markdown note brings in does
+///   not run.
+/// - `connect-src`: the page calls only this origin, the book socket
+///   included. No script can send data to another host.
+///
+/// It has no `style-src`: React sets inline styles.
 pub const SECURITY_HEADERS: [(&str, &str); 5] = [
     ("x-frame-options", "DENY"),
     ("x-content-type-options", "nosniff"),
@@ -51,11 +60,13 @@ pub const SECURITY_HEADERS: [(&str, &str); 5] = [
         "permissions-policy",
         "camera=(), microphone=(), geolocation=()",
     ),
-    (
-        "content-security-policy",
-        "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'",
-    ),
+    ("content-security-policy", CONTENT_SECURITY_POLICY),
 ];
+
+/// The `sha256-` source is the hash of the inline theme script in
+/// `index.html`. A change to one character of that script needs the new
+/// value here: a test below computes it from the file and names it.
+const CONTENT_SECURITY_POLICY: &str = "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; script-src 'self' 'sha256-jxtKqttDRtcScKTqB1x/g7RPLO4Ed82ESVjBlkUrs3w=' 'wasm-unsafe-eval'; connect-src 'self'";
 
 /// Sent only when `ENABLE_HSTS=true`.
 pub const HSTS: (&str, &str) = (
@@ -843,6 +854,29 @@ mod tests {
 
     // The security headers.
 
+    /// The browser refuses the theme script when its hash is not in the
+    /// policy, and the page then flashes light before it turns dark.
+    #[test]
+    fn the_policy_holds_the_hash_of_the_inline_theme_script() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let page = include_str!("../../../index.html");
+        let inline: Vec<&str> = page
+            .split("<script>")
+            .skip(1)
+            .map(|rest| rest.split("</script>").next().expect("a closed script"))
+            .collect();
+        assert_eq!(inline.len(), 1, "index.html has one inline script");
+        let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(inline[0]));
+        assert!(
+            CONTENT_SECURITY_POLICY.contains(&format!("'sha256-{hash}'")),
+            "put 'sha256-{hash}' in the script-src of CONTENT_SECURITY_POLICY"
+        );
+        // Every other script of the page comes from a file.
+        assert_eq!(page.matches("<script").count(), 2);
+        assert!(page.contains(r#"<script type="module" src="#));
+    }
+
     fn assert_security_headers(response: &Response, hsts: bool) {
         let headers = response.headers();
         assert_eq!(headers["x-frame-options"], "DENY");
@@ -852,10 +886,7 @@ mod tests {
             headers["permissions-policy"],
             "camera=(), microphone=(), geolocation=()"
         );
-        assert_eq!(
-            headers["content-security-policy"],
-            "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
-        );
+        assert_eq!(headers["content-security-policy"], CONTENT_SECURITY_POLICY);
         match hsts {
             true => assert_eq!(
                 headers["strict-transport-security"],

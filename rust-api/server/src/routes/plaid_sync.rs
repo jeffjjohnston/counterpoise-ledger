@@ -2,12 +2,13 @@
 //!
 //! A sync holds the lease of its connection for its whole life, so the
 //! scheduled sync and a manual sync cannot fetch the same Plaid pages twice.
-//! The Plaid calls run between the statements, never inside a transaction.
+//! The reset, the edit and the delete of a connection take the same lease
+//! (`connection_lease`), so none of them runs during a sync. The Plaid calls
+//! run between the statements, never inside a transaction.
 
 use crate::platform;
 use crate::validation::{parse_pg_int4, pg_float8_to_int4};
 use crate::{
-    analytics::PostHogCapture,
     book_auth::{AccessLevel, authenticate_book},
     book_scope::{BookAccess, Write},
     error::{ApiResult, error, error_owned},
@@ -52,6 +53,25 @@ impl SyncError {
             Self::Failed(message) => message.clone(),
         }
     }
+}
+
+/// What a caller reads while another run holds the lease of the connection.
+pub(crate) const SYNC_RUNNING: &str = "A sync is already running for this connection";
+
+/// What a sync answers when its cursor write finds another cursor on file.
+const CONNECTION_CHANGED: &str = "The connection changed during the sync. Sync again.";
+
+/// Takes the lease of one connection (`plaid-sync:<id>`), or gives `None`
+/// at once while another run holds it. The sync holds it for its whole life.
+/// A write that moves the cursor or removes staged rows (the reset, the
+/// edit and the delete of a connection) must hold it too: a reset during a
+/// sync deletes the pending rows, and the sync then saves a cursor that is
+/// past them, so Plaid never sends them again.
+pub(crate) fn connection_lease(
+    database: &std::sync::Arc<Database>,
+    token_id: i32,
+) -> Result<Option<crate::leases::Held>, store::Error> {
+    crate::leases::try_take(database, &crate::leases::plaid_sync(token_id))
 }
 
 /// What a book member reads when a database operation fails. The SQLite
@@ -108,23 +128,13 @@ pub(crate) async fn sync_token(
     token_id: i32,
 ) -> Result<SyncResult, SyncError> {
     // Dropping the lease releases it, also when the caller goes away.
-    let Some(running) =
-        crate::leases::try_take(&state.database, &crate::leases::plaid_sync(token_id))
-            .map_err(|cause| SyncError::Failed(database_failure(cause)))?
+    let Some(running) = connection_lease(&state.database, token_id)
+        .map_err(|cause| SyncError::Failed(database_failure(cause)))?
     else {
-        return Err(SyncError::Refused(
-            StatusCode::CONFLICT,
-            "A sync is already running for this connection",
-        ));
+        return Err(SyncError::Refused(StatusCode::CONFLICT, SYNC_RUNNING));
     };
     running
-        .guard(sync_locked(
-            &state.database,
-            &state.plaid,
-            &state.analytics,
-            access,
-            token_id,
-        ))
+        .guard(sync_locked(&state.database, &state.plaid, access, token_id))
         .await
         .unwrap_or_else(|lost| {
             tracing::error!(token_id, error = %lost, "Plaid sync stopped");
@@ -139,7 +149,6 @@ pub(crate) async fn sync_token(
 async fn sync_locked(
     database: &Database,
     plaid: &Plaid,
-    analytics: &PostHogCapture,
     access: &BookAccess<'_, Write>,
     token_id: i32,
 ) -> Result<SyncResult, SyncError> {
@@ -163,16 +172,7 @@ async fn sync_locked(
     // its `last_error` says why.
     let result = match plaid.open_token(&stored_token, token_key.as_deref()) {
         Ok(access_token) => {
-            sync_steps(
-                database,
-                plaid,
-                analytics,
-                access,
-                token_id,
-                &access_token,
-                cursor,
-            )
-            .await
+            sync_steps(database, plaid, access, token_id, &access_token, cursor).await
         }
         Err(message) => Err(SyncError::Failed(message)),
     };
@@ -268,7 +268,6 @@ fn is_pending(item: &Value) -> bool {
 async fn sync_steps(
     database: &Database,
     plaid: &Plaid,
-    analytics: &PostHogCapture,
     access: &BookAccess<'_, Write>,
     token_id: i32,
     access_token: &str,
@@ -347,16 +346,24 @@ async fn sync_steps(
         }
     }
 
-    database
+    // The cursor moves only from the cursor that this sync started from. The
+    // lease keeps a reset out, but a lease can lapse (`leases.rs`), and a
+    // cursor that moves past rows that a reset deleted loses them for good.
+    // When the compare fails, the stored cursor stays, so the next sync
+    // fetches from it and stages the rows again.
+    let saved = database
         .execute(
             "UPDATE plaid_tokens SET sync_cursor = ?2, last_synced_at = ?3, last_error = NULL,
                     updated_at = ?3
-             WHERE id = ?1",
-            &params![token_id, &next_cursor, now],
+             WHERE id = ?1 AND sync_cursor IS ?4",
+            &params![token_id, &next_cursor, now, &cursor],
         )
         .map_err(failed)?;
+    if saved == 0 {
+        return Err(SyncError::Refused(StatusCode::CONFLICT, CONNECTION_CHANGED));
+    }
 
-    let auto_matched = auto_match(database, analytics, access, &link_ids).map_err(failed)?;
+    let auto_matched = auto_match(database, access, &link_ids).map_err(failed)?;
     let (pending_count, review_count): (i32, i32) = database
         .query_row(
             &format!(
@@ -728,7 +735,8 @@ fn stage_modified(
                 Some(js_stringify(&metadata)),
             )
         } else if existing.resolution_status == "pending" {
-            (None, existing.review_metadata_json)
+            // The flag goes, and its metadata goes with it.
+            (None, None)
         } else {
             (existing.review_reason, existing.review_metadata_json)
         };
@@ -852,7 +860,6 @@ struct PendingRow {
 /// of matches.
 fn auto_match(
     database: &Database,
-    analytics: &PostHogCapture,
     access: &BookAccess<'_, Write>,
     link_ids: &[i32],
 ) -> Result<usize, store::Error> {
@@ -930,13 +937,20 @@ fn auto_match(
         };
         let payee_ids: Vec<i32> = payee_ids.iter().copied().collect();
         // A candidate within one day of the posted date or of the
-        // authorization date. Ordered by date and ID.
+        // authorization date. Ordered by date and ID. A transaction that is
+        // already reconciled is not a candidate: the match would stamp its
+        // date again. The exception is a transaction that a bank row links,
+        // which is a transfer that the other link matched (`already` keeps
+        // out the transactions of this link).
         let candidates: Vec<(i32, String)> = database.query(
             &format!(
                 "SELECT t.id, {} AS date
                  FROM transaction_splits s JOIN transactions t ON s.transaction_id = t.id
                  WHERE s.account_id = ?1 AND s.amount = ?2 AND t.book_id = ?3
                    AND t.payee_id {in4}
+                   AND (t.is_reconciled = false
+                        OR EXISTS (SELECT 1 FROM plaid_transaction_reconciliation l
+                                   WHERE l.matched_transaction_id = t.id AND l.book_id = ?3))
                  ORDER BY 2, t.id",
                 sql::EFFECTIVE_DATE,
                 in4 = sql::in_integers("?4")
@@ -1006,20 +1020,6 @@ fn auto_match(
         }
     }
 
-    if matched > 0 {
-        // A sync has no session user, so the events go to the book owner.
-        let owner: Option<i32> = database
-            .query_optional("SELECT user_id FROM books WHERE id = ?1", &params![book_id])?;
-        if let Some(owner) = owner {
-            for _ in 0..matched {
-                analytics.capture_event(
-                    owner,
-                    "sync_transaction_auto_matched",
-                    Some(json!({ "bookId": book_id })),
-                );
-            }
-        }
-    }
     Ok(matched)
 }
 

@@ -21,6 +21,7 @@ import {
 import { cn } from "@/lib/utils";
 import { apiGet } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
+import { useSubmitGuard } from "@/hooks/useSubmitGuard";
 import type {
   AccountWithBalance,
   RecurringRuleWithSplits,
@@ -143,7 +144,7 @@ export function RecurringForm({
   prefill?: PrefillData;
   accounts: AccountWithBalance[];
   bookId: string;
-  onSubmit: (data: RecurringFormData) => void;
+  onSubmit: (data: RecurringFormData) => void | Promise<unknown>;
   onCancel: () => void;
 }) {
   const toast = useToast();
@@ -316,6 +317,8 @@ export function RecurringForm({
     daysOfMonth: daysOfMonth.length > 0 ? daysOfMonth : null,
   });
 
+  const submitGuard = useSubmitGuard();
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -326,7 +329,8 @@ export function RecurringForm({
 
     const normalizedPayeeName = payeeName.trim();
 
-    onSubmit({
+    // One save at a time: a second submit during the request is dropped.
+    void submitGuard.run(() => onSubmit({
       name,
       frequency,
       // intervalVal is reset to 1 whenever the frequency changes and is only
@@ -349,11 +353,14 @@ export function RecurringForm({
       templateSplits: splits,
       payeeId: normalizedPayeeName ? payeeId : null,
       payeeName: normalizedPayeeName || undefined,
-    });
+    }));
   };
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-3">
+    <form onSubmit={handleSubmit}>
+      {/* The form takes no input during the save. A success closes it, and
+          text typed during the save would be lost. */}
+      <fieldset disabled={submitGuard.saving} className="space-y-3 min-w-0">
       {/* Three jobs, three groups. Nine top-level fields used to share one
           undifferentiated column, which is most of why the card ran ~1170px
           inside a 672px sheet capped at 90vh. */}
@@ -708,8 +715,9 @@ export function RecurringForm({
         <Button type="button" variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button type="submit">{rule ? "Save Changes" : "Create Rule"}</Button>
+        <Button type="submit" disabled={submitGuard.saving}>{rule ? "Save Changes" : "Create Rule"}</Button>
       </div>
+      </fieldset>
     </form>
   );
 }

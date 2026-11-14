@@ -89,6 +89,117 @@ describe("auth HTTP parity", () => {
     expect(newLogin.status).toBe(200);
   });
 
+  // A login with the old password can run while the password changes. A
+  // trigger gives each test that login at an exact moment: SQLite runs the
+  // trigger inside the statement that the route sends.
+  const withTrigger = async (body: string, run: () => Promise<void>) => {
+    await exec(`CREATE TRIGGER test_auth_race ${body}`);
+    try {
+      await run();
+    } finally {
+      await exec("DROP TRIGGER test_auth_race");
+    }
+  };
+
+  it("leaves no session from the old password when the password changes", async () => {
+    const oldHash = await hashPassword("oldpassword");
+    await exec("UPDATE users SET password_hash = $1 WHERE id = $2", [oldHash, 1]);
+    const login = () => request("/api/auth/login", json("POST", { username: "testuser", password: "oldpassword" }));
+    const cookie = (await login()).headers.get("set-cookie")!.split(";")[0];
+    const other = (await login()).headers.get("set-cookie")!.split(";")[0];
+    // The trigger is a login with the old password at the moment when the
+    // route deletes the other sessions. That login gets a session only
+    // while the stored hash is still the old one.
+    await withTrigger(
+      `AFTER DELETE ON sessions BEGIN
+         INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
+         SELECT 'raced', OLD.user_id, '2999-01-01 00:00:00', '2026-01-01 00:00:00'
+         WHERE (SELECT password_hash FROM users WHERE id = OLD.user_id) = '${oldHash}';
+       END`,
+      async () => {
+        const changed = await request("/api/auth/password", json("PUT", { currentPassword: "oldpassword", newPassword: "newpassword" }, cookie));
+        expect(await changed.json()).toEqual({ success: true });
+      }
+    );
+    expect(await count("sessions", "token_hash = 'raced'")).toBe(0);
+    expect(await count("sessions")).toBe(1);
+    expect((await request("/api/auth/me", { headers: { cookie } })).status).toBe(200);
+    expect((await request("/api/auth/me", { headers: { cookie: other } })).status).toBe(401);
+  });
+
+  it("keeps the other sessions when the new password cannot be stored", async () => {
+    await exec("UPDATE users SET password_hash = $1 WHERE id = $2", [await hashPassword("oldpassword"), 1]);
+    const login = () => request("/api/auth/login", json("POST", { username: "testuser", password: "oldpassword" }));
+    const cookie = (await login()).headers.get("set-cookie")!.split(";")[0];
+    const other = (await login()).headers.get("set-cookie")!.split(";")[0];
+    await withTrigger(
+      "BEFORE UPDATE OF password_hash ON users BEGIN SELECT RAISE(ABORT, 'the test refuses the write'); END",
+      async () => {
+        const changed = await request("/api/auth/password", json("PUT", { currentPassword: "oldpassword", newPassword: "newpassword" }, cookie));
+        expect(changed.status).toBe(500);
+      }
+    );
+    // The hash update and the session delete are one transaction: the
+    // failed change removes no session.
+    expect((await request("/api/auth/me", { headers: { cookie: other } })).status).toBe(200);
+    expect((await login()).status).toBe(200);
+  });
+
+  it("gives no session to a login when the password changes during the login", async () => {
+    await exec("UPDATE users SET password_hash = $1 WHERE id = $2", [await hashPassword("oldpassword"), 1]);
+    // The login deletes the expired sessions after it verifies the password
+    // and before it stores its session. The trigger changes the password at
+    // that moment, as a password change in another request does.
+    await exec(
+      "INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES ('expired', 1, '2000-01-01 00:00:00', '2000-01-01 00:00:00')"
+    );
+    await withTrigger(
+      `AFTER DELETE ON sessions WHEN OLD.token_hash = 'expired' BEGIN
+         UPDATE users SET password_hash = 'changed' WHERE id = OLD.user_id;
+       END`,
+      async () => {
+        const login = await request("/api/auth/login", json("POST", { username: "testuser", password: "oldpassword" }));
+        expect([login.status, await login.json()]).toEqual([401, { error: "Invalid username or password" }]);
+        expect(login.headers.get("set-cookie")).toBeNull();
+      }
+    );
+    expect(await scalar<string>("SELECT password_hash FROM users WHERE id = $1", [1])).toBe("changed");
+    expect(await count("sessions")).toBe(0);
+  });
+
+  it("changes the username with the current password and keeps the session and API keys", async () => {
+    await exec("UPDATE users SET password_hash = $1 WHERE id = $2", [await hashPassword("password123"), 1]);
+    await createUser({ username: "taken" });
+    const login = await request("/api/auth/login", json("POST", { username: "testuser", password: "password123" }));
+    const cookie = login.headers.get("set-cookie")!.split(";")[0];
+    const minted = await request("/api/auth/api-keys", json("POST", { name: "Phone" }, cookie));
+    const { key } = await minted.json() as { key: string };
+    const bearer = { authorization: `Bearer ${key}` };
+
+    const rename = (body: unknown, headers?: string) => request("/api/auth/username", json("PUT", body, headers));
+    const refused = async (response: Response) => [response.status, await response.json()];
+    expect(await refused(await rename({ username: "jeff", currentPassword: "password123" }))).toEqual([401, { error: "Not authenticated" }]);
+    // A bearer key is not a cookie session, so it cannot rename the user.
+    const viaKey = await request("/api/auth/username", { method: "PUT", headers: { "content-type": "application/json", ...bearer }, body: JSON.stringify({ username: "jeff", currentPassword: "password123" }) });
+    expect(await refused(viaKey)).toEqual([401, { error: "Not authenticated" }]);
+    expect(await refused(await rename({ username: "jeff" }, cookie))).toEqual([400, { error: "New username and current password are required" }]);
+    expect(await refused(await rename({ username: "ab", currentPassword: "password123" }, cookie))).toEqual([400, { error: "Username must be at least 3 characters" }]);
+    expect(await refused(await rename({ username: "jeff", currentPassword: "wrong-password" }, cookie))).toEqual([401, { error: "Current password is incorrect" }]);
+    expect(await refused(await rename({ username: "testuser", currentPassword: "password123" }, cookie))).toEqual([400, { error: "New username must be different from current username" }]);
+    expect(await refused(await rename({ username: "taken", currentPassword: "password123" }, cookie))).toEqual([409, { error: "Username already taken" }]);
+    expect(await scalar<string>("SELECT username FROM users WHERE id = $1", [1])).toBe("testuser");
+
+    const renamed = await rename({ username: "jeff", currentPassword: "password123" }, cookie);
+    expect([renamed.status, await renamed.json()]).toEqual([200, { id: 1, username: "jeff" }]);
+    expect(await (await request("/api/auth/me", { headers: { cookie } })).json()).toEqual({ id: 1, username: "jeff" });
+    expect(await (await request("/api/auth/me", { headers: bearer })).json()).toEqual({ id: 1, username: "jeff" });
+    expect((await request("/api/b/1/accounts", { headers: { cookie } })).status).toBe(200);
+    const oldName = await request("/api/auth/login", json("POST", { username: "testuser", password: "password123" }));
+    expect(oldName.status).toBe(401);
+    const newName = await request("/api/auth/login", json("POST", { username: "jeff", password: "password123" }));
+    expect([newName.status, await newName.json()]).toEqual([200, { id: 1, username: "jeff" }]);
+  });
+
   it("mints, lists, uses, and revokes an API key", async () => {
     const login = await request("/api/auth/register", json("POST", { username: "alice", password: "password123" }));
     const cookie = login.headers.get("set-cookie")!.split(";")[0];

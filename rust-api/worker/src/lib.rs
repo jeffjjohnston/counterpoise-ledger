@@ -47,6 +47,17 @@ pub fn security_headers(hsts: bool) -> impl Iterator<Item = (&'static str, &'sta
     SECURITY_HEADERS.into_iter().chain(hsts.then_some(HSTS))
 }
 
+/// Whether the object sets its alarm, from the `COUNTERPOISE_SCHEDULER`
+/// setting. Only `off` stops the alarm: a Worker has no other scheduler, so
+/// its default is on. With no alarm, no scheduled job runs, and a socket
+/// whose credential expires stays open until the next event of the object.
+/// The Worker tests use `off`: they write to the object's file on a
+/// connection of their own, and an alarm that writes during such a write
+/// fails with `SQLITE_BUSY`.
+pub fn alarm_enabled(setting: Option<&str>) -> bool {
+    setting != Some("off")
+}
+
 /// How late the runtime can run an alarm: it can delay one by up to a
 /// minute while a failover takes place.
 pub const ALARM_DELAY_MS: i64 = 60_000;
@@ -130,6 +141,15 @@ mod tests {
         set.sort();
         expected.sort();
         assert_eq!(set, expected);
+    }
+
+    #[test]
+    fn only_the_setting_off_stops_the_alarm() {
+        assert!(alarm_enabled(None));
+        assert!(alarm_enabled(Some("on")));
+        assert!(alarm_enabled(Some("")));
+        assert!(alarm_enabled(Some("OFF")));
+        assert!(!alarm_enabled(Some("off")));
     }
 
     #[test]

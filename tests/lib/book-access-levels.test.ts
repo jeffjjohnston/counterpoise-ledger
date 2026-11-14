@@ -163,7 +163,7 @@ const LEVEL_EXCEPTIONS: Record<string, string> = {
 const NO_BOOK_GATE = new Set([
   "list_books", "create_book", "update_book", "delete_book", "create_demo_book",
   "create_issue_report", "list_issue_reports", "update_issue_report", "delete_issue_report",
-  "get_system_status", "analyze_usage",
+  "get_system_status",
 ]);
 
 /** A tool, whether its annotations mark it read-only, and the levels its handler gives. */

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { flattenAccounts } from "@/lib/accounting";
+import { flattenAccounts } from "@/lib/wasm-client";
 import { computeNetWorth } from "@/lib/net-worth";
 import type { AccountWithBalance } from "@/types";
 import { toDateString } from "../../lib/formatters";

@@ -12,6 +12,8 @@
 //!   its grant, also immediately after the first use. A bearer token cannot
 //!   show if the second use is a retry or a thief, so a retry after a timeout
 //!   disconnects the client.
+//! - A grant has one access token at a time: each refresh deletes the
+//!   earlier access token in the transaction that stores the new one.
 //! - Failed exchanges count against a per-address limit.
 
 use super::{
@@ -333,10 +335,21 @@ async fn refresh_token(
 
 /// Stores a new access token and refresh token for a grant, and gives the
 /// token response (RFC 6749 section 5.1).
+///
+/// A grant has one access token at a time. This function deletes the
+/// earlier access tokens of the grant, in the transaction of its caller, so
+/// a token that a refresh replaced stops immediately. A request that is in
+/// flight with the earlier token can thus get 401; the client sends it again
+/// with the new token. The refresh tokens stay: the caller marks the used
+/// one, and a used refresh token is necessary to detect a replay.
 fn issue(tx: &impl Sql, grant_id: i32, now: NaiveDateTime) -> Result<Response, Refused> {
     let unavailable = |_| refused("server_error", "Could not make a token");
     let access = new_secret(ACCESS_TOKEN_PREFIX).map_err(unavailable)?;
     let refresh = new_secret(REFRESH_TOKEN_PREFIX).map_err(unavailable)?;
+    tx.execute(
+        "DELETE FROM oauth_tokens WHERE grant_id = ?1 AND kind = 'access'",
+        &params![grant_id],
+    )?;
     for (secret, kind, expires_at) in [
         (
             &access,

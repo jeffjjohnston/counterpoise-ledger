@@ -24,7 +24,7 @@ A security with a non-null `fixedPriceMicros` is valued at that price forever �
 - The investment entry form prefills Price from the fixed price when the user **picks** the security (`selectSecurity()` in `/components/transactions/useInvestmentEntry.ts`) and labels the field "Price (fixed)". The bare `setSelectedSecurityId()` setter deliberately does not prefill: `restore()` in the same hook uses it when `TransactionForm` opens a saved transaction, which must keep the price it was recorded at. The field stays editable
 - Switching from a fixed-price security to an ordinary one clears the prefill, but **only if the field still holds exactly what was auto-filled** — a price the user typed survives a security change, as it does everywhere else in that form
 - Ticking Fixed price with no usable amount blocks submission rather than sending `null`, which would read as "not fixed" while the box still shows ticked. Unticking the box is the only way to clear a fixed price
-- Prices are written into form fields by `formatPriceMicrosInput()` in `/lib/formatters.ts` — at least cents, never rounded to them. That text is what the form sends back on the next save, so rounding a NAV like 1.0025 there would silently rewrite the security's value
+- Prices are written into form fields by `formatPriceMicrosInput()` (`format_price_micros_input()` in `rust-api/core/src/formatters.rs`, through `lib/wasm-client.ts`) — at least cents, never rounded to them. That text is what the form sends back on the next save, so rounding a NAV like 1.0025 there would silently rewrite the security's value
 
 ## Quick Price Entry Pill
 Manually-priced securities are prompted for via a navbar pill (`/components/layout/PriceEntryPill.tsx`), visible on every book page:

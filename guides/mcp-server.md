@@ -5,7 +5,7 @@ it carries the rules that apply everywhere and says when to come here.
 
 Counterpoise includes a Model Context Protocol (MCP) server that gives AI
 assistants read and write access to accounting data. The Rust server serves
-all 64 tools, over two transports: stdio (`counterpoise-rust-api mcp`) and
+all 63 tools, over two transports: stdio (`counterpoise-rust-api mcp`) and
 Streamable HTTP at `/api/mcp`. The browser gets a subset through WebMCP; see
 [WebMCP (Rust)](#webmcp-rust). The code is in `rust-api/server/src/mcp/`.
 
@@ -114,7 +114,11 @@ https://<host>/api/mcp`, then `/mcp` to sign in.
   the canonical resource, so a change of `COUNTERPOISE_PUBLIC_URL` stops the
   old tokens. A `resource` parameter that names another server gets
   `invalid_target`.
-- **Rotation:** each refresh gives a new refresh token. A second use of a
+- **Rotation:** each refresh gives a new refresh token and a new access
+  token, and deletes the earlier access token of the grant in the same
+  transaction: a grant has one access token at a time. A request that is in
+  flight with the earlier token can get 401; the client sends it again with
+  the new token. A second use of a
   refresh token revokes the grant, also immediately after the first use. A
   bearer token cannot show if the second use is a retry or a thief who won
   the rotation. A client that retries a
@@ -327,12 +331,11 @@ unit test fails when it differs from the manifest.
   double with `js_double()`, so the text is what `JSON.stringify` writes
   (`150`, not `150.0`). A percentage uses `to_fixed_2_js()` from `ledger-core`,
   which rounds an exact tie as `toFixed(2)` does.
-- **Analytics:** a tool records no PostHog event from the routes it calls:
-  before the tools moved to Rust they called the library, not the route, and
-  the contract stayed. `Caller` runs each route request inside the
-  `TOOL_CALL` task-local, and `capture_event` records nothing while it is set.
-  A header cannot set it. Any new analytics sink must check
-  `mcp::in_tool_call()` too.
+- **Tool calls leave no record:** before the tools moved to Rust they called
+  the library, not the route, and the contract stayed. `Caller` runs each
+  route request inside the `TOOL_CALL` task-local. A header cannot set it.
+  Any new sink that records what a person did must check
+  `mcp::in_tool_call()`.
 - **Schema refinements:** the manifest's JSON Schema cannot hold a zod
   transform or refine, and the tools keep the zod rules they had. A zod `.trim()` before `.min(1)` refuses a name of only
   whitespace, and `accountIconSchema` refuses an icon of more than one
@@ -371,10 +374,9 @@ unit test fails when it differs from the manifest.
   key that the tool leaves out on
   purpose (`accessToken` of `update_plaid_token`, `refresh` of
   `list_plaid_token_accounts`, `typesafe` of `reconcile_plaid_transaction`).
-- **TypeSafe:** a tool records no TypeSafe decision. Like
-  `capture_event`, `record_decision` and `record_unlink` record nothing while
-  `in_tool_call()` is true. `sync_plaid_token` calls `sync_token()` outside a
-  route, so the auto-match events reach PostHog, as the library sends them.
+- **TypeSafe:** a tool records no TypeSafe decision. `record_decision` and
+  `record_unlink` record nothing while `in_tool_call()` is true.
+  `sync_plaid_token` calls `sync_token()` outside a route.
 - **Tests:** a tool suite connects through `connectMcpTestClient()` in
   `tests/helpers/mcp-client.ts`, which starts the Rust server. `npm run
   test:mcp:http` runs every suite in `tests/mcp` over HTTP. `npm run
@@ -383,32 +385,44 @@ unit test fails when it differs from the manifest.
   binary (`cargo build -p counterpoise-rust-api`), so a plain `npm test` leaves
   them out, as it leaves out `tests/http`. A new suite named
   `tests/mcp/mcp-*.test.ts` joins them. The Rust server
-  starts once for a suite, so a variable it reads (the PostHog settings, for
+  starts once for a suite, so a variable it reads (the Tiingo settings, for
   example) goes in the `env` option of `connectMcpTestClient()`, not in a
   later change to `process.env`. A suite that calls as another user uses
   `callAs()`, or `callToolAs()` for a plain-text error result. A suite that
   replaces an outside service uses a local HTTP fake, not `vi.mock`, because a
-  mock does not reach the Rust process: `mcp-usage-tools.test.ts` fakes the
-  PostHog Query API. `tests/mcp/rust-transport.test.ts` covers the HTTP gate.
+  mock does not reach the Rust process: `mcp-security-price-tools.test.ts`
+  fakes the Tiingo API. `tests/mcp/rust-transport.test.ts` covers the HTTP gate.
 - **Transport coverage:** both transports reach the same dispatcher,
   `call_tool` in `rust-api/server/src/mcp/mod.rs`. They differ in how a call
   gets its credential (the bearer header of each HTTP request, or the
   `COUNTERPOISE_API_KEY` of the stdio process) and in how a result goes back
   (one HTTP response, or one line on stdout). So the detailed tool behavior
   runs once, over HTTP, and each transport keeps the suites that cross its own
-  adapter. `vitest.config.ts` selects the files for each transport.
+  adapter. `vitest.config.ts` selects the files for each transport. The
+  Worker column is the HTTP transport against the Worker in the `worker` CI
+  job: the tool suites do not run there, because the HTTP suites already run
+  the route handlers that the tools call on the Worker.
 
-  | Suite | HTTP | stdio | What it proves |
-  | --- | --- | --- | --- |
-  | `mcp-*-tools.test.ts`, `mcp-tools.test.ts`, `mcp-income-statement-parity.test.ts` | yes | no | Each tool's arguments, results, errors and book scoping |
-  | `manifest.test.ts` | yes | no | `tools/list` gives `mcp-tools.json` unchanged. Over stdio, `rust-stdio.test.ts` checks the tool names |
-  | `rust-transport.test.ts` | yes | no | The HTTP gate: bearer key, revoked key, no cookie, Origin, protocol versions |
-  | `rust-stdio.test.ts` | no | yes | The stdio key, a missing or unknown key, revocation without a restart, protocol-only stdout |
-  | `mcp-book-access.test.ts` | yes | yes | Owner, editor, viewer and non-member, through each user's own credential |
-  | `mcp-transports.test.ts` | yes | yes | One call of each result kind: a read, a write, a handler refusal, a schema refusal, an unknown tool |
+  | Suite | HTTP | stdio | Worker | What it proves |
+  | --- | --- | --- | --- | --- |
+  | `mcp-*-tools.test.ts`, `mcp-tools.test.ts` | yes | no | no | Each tool's arguments, results, errors and book scoping |
+  | `manifest.test.ts` | yes | no | yes | `tools/list` gives `mcp-tools.json` unchanged. Over stdio, `rust-stdio.test.ts` checks the tool names |
+  | `rust-transport.test.ts` | yes | no | yes | The HTTP gate: bearer key, revoked key, no cookie, Origin, protocol versions |
+  | `rust-stdio.test.ts` | no | yes | no | The stdio key, a missing or unknown key, revocation without a restart, protocol-only stdout |
+  | `mcp-book-access.test.ts` | yes | yes | yes | Owner, editor, viewer and non-member, through each user's own credential |
+  | `mcp-transports.test.ts` | yes | yes | yes | One call of each result kind: a read, a write, a handler refusal, a schema refusal, an unknown tool |
 
   A new tool suite runs over HTTP only. Add a case to `mcp-transports.test.ts`
   only for a new kind of result or credential, not for a new tool.
+
+  Most tools send the call to the route handler, so a tool test of the
+  route's logic is a second copy of a `tests/http` test. A tool suite tests
+  only what the tool itself does: its schema and argument checks, the change
+  of arguments into the route request (a query, a default, a precedence),
+  the result shape it makes, its error results, and its access level. Test
+  the route's logic in `tests/http`. In November 2026, 25 tool tests and
+  `mcp-income-statement-parity.test.ts`, which started a second server, were
+  removed for this reason.
 - **Stdio:** `counterpoise-rust-api mcp` serves the same registry over stdio.
   It reads `DATABASE_PATH`, `TZ` and `COUNTERPOISE_API_KEY`, and sends the key
   as the bearer header of each tool's route requests. A missing or unknown key
@@ -418,8 +432,6 @@ unit test fails when it differs from the manifest.
   warn). `npm run test:mcp:stdio` runs the stdio suites of the table above,
   with one server process for each user; `tests/mcp/rust-stdio.test.ts`
   covers the key and the clean stdout.
-- **`analyze_usage`** has no route. `rust-api/server/src/posthog_query.rs` is
-  the Rust copy of `lib/posthog-query.ts`.
 
 ## WebMCP (Rust)
 
@@ -519,22 +531,19 @@ open book. The Rust server serves its endpoint from the same registry as
 **System:**
 - `get_system_status` — Report the health of Counterpoise's background jobs (backup, pruning, recurring processing, bank sync, security price sync, weekly review, issue sync; the native server adds the monthly database compaction named reindex, and a Worker's backup is its daily export)
 
-**Analytics:**
-- `analyze_usage` — Query PostHog for the caller's own event summaries (requires PostHog env vars)
-
 **Plaid sync** (require `bookId`):
 - `get_plaid_status` — Every bank connection (access token masked), the count of transactions waiting to be reconciled, which accounts hold unmatched manually-entered transactions, and every Plaid account mapped to a Counterpoise account. Folds four separate UI polls into one call
 - `list_plaid_token_accounts` — List a connection's bank accounts and each one's Counterpoise mapping. Local only: the HTTP route takes a `refresh` option and this tool deliberately does not expose it, so the tool stays a plain read
-- `update_plaid_token` — Full replace of a connection's institution name and item id. This tool cannot set the access token: a Plaid access token is re-obtainable only through the Link browser flow, so a hallucinated value would destroy the connection with no way to recover it
-- `delete_plaid_token` — Delete a connection, its account mappings, and its entire reconciliation history — the staged unreconciled transactions **and** every already-resolved row (matched, created, ignored)
+- `update_plaid_token` — Full replace of a connection's institution name and item id. A new item id resets the sync cursor. Refused (409) while a sync of the connection runs. This tool cannot set the access token: a Plaid access token is re-obtainable only through the Link browser flow, so a hallucinated value would destroy the connection with no way to recover it
+- `delete_plaid_token` — Delete a connection, its account mappings, and its entire reconciliation history — the staged unreconciled transactions **and** every already-resolved row (matched, created, ignored). Refused (409) while a sync of the connection runs
 - `set_plaid_token_accounts` — Map a connection's bank accounts to Counterpoise accounts. Pass `counterpoiseAccountId: null` to unmap one
 - `sync_plaid_token` — Fetch new, changed, and removed transactions from Plaid for one connection, stage them, and run auto-match. Reaches Plaid and changes data; a demo connection cannot sync and says so
-- `clear_plaid_sync_data` — Discard a connection's staged transactions and reset its sync cursor, so the next sync starts over. Touches only this database; never calls Plaid
+- `clear_plaid_sync_data` — Discard a connection's staged transactions and reset its sync cursor, so the next sync starts over. Touches only this database; never calls Plaid. Refused (409) while a sync of the connection runs
 - `list_pending_plaid_transactions` — Staged bank transactions nothing has reconciled yet. Their ids are synthetic placeholders — never pass them to `create_transaction`, `update_transaction`, `delete_transaction`, or any other transaction tool
 - `get_transaction_plaid_link` — The staged Plaid row a transaction is matched to, or `null` if the transaction was entered by hand
-- `unlink_plaid_transaction` — Remove a transaction's Plaid link. The bank transaction returns to the pending queue; the local transaction stops being reconciled
+- `unlink_plaid_transaction` — Remove a transaction's Plaid link. The bank transaction returns to the pending queue; the local transaction stops being reconciled.
 - `get_reconcile_candidates` — The reconciliation queue for one linked bank account, or for all of them when no link is given: staged transactions awaiting a decision, each with up to five ranked candidate matches and a suggested counter account
-- `reconcile_plaid_transaction` — Resolve one staged bank transaction: match it to an existing transaction, match and rewrite that transaction's amount, create a new transaction from it, ignore it, keep what you already have, or unlink an already-resolved row (which also un-reconciles its transaction unless another bank row still matches it). Linking a row that is already linked is refused
+- `reconcile_plaid_transaction` — Resolve one staged bank transaction: match it to an existing transaction, match and rewrite that transaction's amount, create a new transaction from it, ignore it, keep what you already have, or unlink an already-resolved row (which also un-reconciles its transaction unless another bank row still matches it). Linking a row that is already linked is refused. The state of the row decides which actions apply: see the transition table in [plaid-sync.md](plaid-sync.md#transition-table)
 
 **Weekly review** (require `bookId`):
 - `get_weekly_review` — The newest weekly review of a book: its summary, the items that are not dismissed, whether the server is configured and the book opted in, a running review, and the newest failure. It cannot start a review: that is a paid AI call that the user starts in the app
@@ -557,7 +566,7 @@ open book. The Rust server serves its endpoint from the same registry as
 
 Every tool in the manifest carries one annotation preset: `READ`, `READ_NETWORK`, `CREATE`, `UPDATE`, `DESTRUCTIVE`, `DESTRUCTIVE_NONIDEMPOTENT`, `WRITE_NETWORK`. A client can tell a query from a write without reading the description.
 
-`WRITE_NETWORK` is for a tool that both changes data and leaves the process to do it. `sync_plaid_token` is currently its only user — distinct from `READ_NETWORK`, which is for a tool that reaches out but changes nothing (`fetch_tiingo_prices`, `analyze_usage`). The presets are defined in `tests/mcp/annotations.test.ts`, which gives each tool its preset and checks the manifest against it. Set every hint explicitly: `destructiveHint` and `openWorldHint` default to true, so an omitted hint claims more about a tool than saying nothing would.
+`WRITE_NETWORK` is for a tool that both changes data and leaves the process to do it. `sync_plaid_token` is currently its only user — distinct from `READ_NETWORK`, which is for a tool that reaches out but changes nothing (`fetch_tiingo_prices`). The presets are defined in `tests/mcp/annotations.test.ts`, which gives each tool its preset and checks the manifest against it. Set every hint explicitly: `destructiveHint` and `openWorldHint` default to true, so an omitted hint claims more about a tool than saying nothing would.
 
 ## Shared Transaction Logic
 

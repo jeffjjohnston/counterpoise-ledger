@@ -27,7 +27,7 @@ const BUDGET = 58_000;
 const EXCLUDED = new Set([
   "list_books", "create_book", "update_book", "create_demo_book", "delete_book",
   "list_book_members", "add_book_member", "update_book_member", "remove_book_member",
-  "analyze_usage", "get_system_status",
+  "get_system_status",
   "create_issue_report", "list_issue_reports", "update_issue_report", "delete_issue_report",
   "list_plaid_token_accounts", "update_plaid_token", "delete_plaid_token",
   "set_plaid_token_accounts", "sync_plaid_token", "clear_plaid_sync_data",
@@ -60,7 +60,6 @@ function forBrowser(tool: ManifestTool) {
 const WITHHELD = [
   "delete_book",
   "create_book",
-  "analyze_usage",
   "delete_plaid_token",
   "create_issue_report",
   "add_book_member",

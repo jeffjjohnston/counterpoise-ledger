@@ -1,9 +1,8 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { noteHtml } from "@/lib/wasm-client";
 
 interface NoteIndicatorProps {
   notes: string;
@@ -68,6 +67,7 @@ export function NoteIndicator({ notes }: NoteIndicatorProps) {
   const anchorRef = useRef<HTMLSpanElement>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const html = useMemo(() => (showTooltip ? noteHtml(notes) : ""), [showTooltip, notes]);
 
   // Measure before the paint, so the popup never shows in the wrong place.
   // Measure again when the note changes size after that: an image in the
@@ -153,9 +153,8 @@ export function NoteIndicator({ notes }: NoteIndicatorProps) {
             }
             onClick={(e) => e.stopPropagation()}
           >
-            <div ref={contentRef}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{notes}</ReactMarkdown>
-            </div>
+            {/* noteHtml drops raw HTML and unsafe link targets. */}
+            <div ref={contentRef} dangerouslySetInnerHTML={{ __html: html }} />
           </div>,
           document.body
         )}

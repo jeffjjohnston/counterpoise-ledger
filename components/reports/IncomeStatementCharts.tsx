@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChartCard } from "@/components/charts/ChartCard";
 import { ReportBars } from "@/components/reports/ReportChart";
 import { useIsMobile } from "@/hooks/useIsMobile";
@@ -23,9 +23,10 @@ const MONTHLY_HEIGHT: [number, number] = [160, 200];
  * The monthly chart and its states. It mounts only while the card shows the
  * chart, so a hidden chart sends no request.
  */
-function MonthlyBars({ bookId, range, activeAccountIds, onTooShort }: {
+function MonthlyBars({ bookId, range, revision, activeAccountIds, onTooShort }: {
   bookId: string;
   range: MonthlyRange;
+  revision: number;
   activeAccountIds: ReadonlySet<number>;
   onTooShort: (tooShort: boolean) => void;
 }) {
@@ -34,25 +35,37 @@ function MonthlyBars({ bookId, range, activeAccountIds, onTooShort }: {
   const isMobile = useIsMobile();
   const height = MONTHLY_HEIGHT[isMobile ? 0 : 1];
   const { startDate, endDate } = range;
+  // The range that the shown splits belong to. A new revision of the same
+  // range is a live reload: the chart stays on the screen while it loads, and
+  // stays if the reload fails.
+  const shownKey = useRef<string | null>(null);
 
   useEffect(() => {
     let current = true;
-    setSplits(null);
-    setFailed(false);
+    const key = `${bookId}|${startDate ?? ""}|${endDate ?? ""}`;
+    const reload = shownKey.current === key;
+    if (!reload) {
+      shownKey.current = null;
+      setSplits(null);
+      setFailed(false);
+    }
     const params = new URLSearchParams({ accountTypes: "income,expense" });
     if (startDate) params.set("startDate", startDate);
     if (endDate) params.set("endDate", endDate);
     apiGet<{ splits?: ReportSplit[] }>(`/api/b/${bookId}/reports/data?${params.toString()}`)
       .then((data) => {
-        if (current) setSplits(Array.isArray(data.splits) ? data.splits : []);
+        if (!current) return;
+        shownKey.current = key;
+        setSplits(Array.isArray(data.splits) ? data.splits : []);
+        setFailed(false);
       })
       .catch(() => {
-        if (current) setFailed(true);
+        if (current && !reload) setFailed(true);
       });
     return () => {
       current = false;
     };
-  }, [bookId, startDate, endDate]);
+  }, [bookId, startDate, endDate, revision]);
 
   // The route also returns the splits of inactive accounts. The page totals leave them out, so the chart does too.
   const data = useMemo(
@@ -110,9 +123,11 @@ function MonthlyBars({ bookId, range, activeAccountIds, onTooShort }: {
  * use. The monthly chart leaves out the splits of all other accounts. The
  * account cards below are the visible table of the category chart.
  */
-export function IncomeStatementCharts({ bookId, monthlyRange, expenseRows, accounts, activeAccountIds }: {
+export function IncomeStatementCharts({ bookId, monthlyRange, revision = 0, expenseRows, accounts, activeAccountIds }: {
   bookId: string;
   monthlyRange: MonthlyRange | null;
+  /** A new value loads the monthly chart again, for example after a change by another client. */
+  revision?: number;
   expenseRows: CategoryRow[];
   accounts: ReportAccount[];
   activeAccountIds: ReadonlySet<number>;
@@ -135,7 +150,7 @@ export function IncomeStatementCharts({ bookId, monthlyRange, expenseRows, accou
     <div className="mb-8 grid grid-cols-1 gap-6">
       {showMonthly && (
         <ChartCard title="Income and expense" storageKey="counterpoise.incomeByMonthChart.hidden">
-          <MonthlyBars bookId={bookId} range={monthlyRange} activeAccountIds={activeAccountIds} onTooShort={onTooShort} />
+          <MonthlyBars bookId={bookId} range={monthlyRange} revision={revision} activeAccountIds={activeAccountIds} onTooShort={onTooShort} />
         </ChartCard>
       )}
       {category && (

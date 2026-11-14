@@ -16,7 +16,9 @@
 //!   `0015_job_schedule.sql`). The scheduled minute that each job's latest
 //!   run serves, whether that run finished, and where its next step starts;
 //!   and the runs asked for outside the schedule. The scheduler reads them
-//!   to find the jobs due now and its next wake.
+//!   to find the jobs due now and its next wake. `attempts` (migration
+//!   `0018_job_slot_attempts.sql`) counts the starts of the current step, so
+//!   that the scheduler can stop a run that never finishes.
 
 use crate::store::{Error, Sql, params};
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
@@ -234,21 +236,24 @@ pub struct Slot {
     pub finished: bool,
     /// Where the next step of an unfinished run starts.
     pub cursor: Option<String>,
+    /// How many times the step at `cursor` started ([`attempt`]).
+    pub attempts: u32,
 }
 
 /// The latest slot of each job.
 pub fn slots(sql: &impl Sql) -> Result<Vec<Slot>, Error> {
-    let rows: Vec<(String, NaiveDateTime, bool, Option<String>)> = sql.query(
-        "SELECT job, slot, finished, cursor FROM job_slots ORDER BY job",
+    let rows: Vec<(String, NaiveDateTime, bool, Option<String>, u32)> = sql.query(
+        "SELECT job, slot, finished, cursor, attempts FROM job_slots ORDER BY job",
         &[],
     )?;
     Ok(rows
         .into_iter()
-        .map(|(job, slot, finished, cursor)| Slot {
+        .map(|(job, slot, finished, cursor, attempts)| Slot {
             job,
             slot,
             finished,
             cursor,
+            attempts,
         })
         .collect())
 }
@@ -263,8 +268,9 @@ pub fn claim(
 ) -> Result<(), Error> {
     database.transaction(|tx| {
         tx.execute(
-            "INSERT INTO job_slots (job, slot, finished, cursor) VALUES (?1, ?2, 0, NULL)
-             ON CONFLICT (job) DO UPDATE SET slot = excluded.slot, finished = 0, cursor = NULL",
+            "INSERT INTO job_slots (job, slot, finished, cursor, attempts) VALUES (?1, ?2, 0, NULL, 0)
+             ON CONFLICT (job) DO UPDATE SET slot = excluded.slot, finished = 0, cursor = NULL,
+               attempts = 0",
             &params![job, slot],
         )?;
         tx.execute("DELETE FROM job_requests WHERE job = ?1", &params![job])?;
@@ -272,14 +278,28 @@ pub fn claim(
     })
 }
 
-/// Keeps where the next step of `job`'s run for `slot` starts. A run of a
-/// later slot has replaced the row when nothing changes.
+/// Keeps where the next step of `job`'s run for `slot` starts. The step is
+/// a new one, so its count of starts is zero. A run of a later slot has
+/// replaced the row when nothing changes.
 pub fn advance(sql: &impl Sql, job: &str, slot: NaiveDateTime, cursor: &str) -> Result<(), Error> {
     sql.execute(
-        "UPDATE job_slots SET cursor = ?3 WHERE job = ?1 AND slot = ?2 AND finished = 0",
+        "UPDATE job_slots SET cursor = ?3, attempts = 0
+         WHERE job = ?1 AND slot = ?2 AND finished = 0",
         &params![job, slot, cursor],
     )?;
     Ok(())
+}
+
+/// Counts one start of the current step of `job`'s run for `slot`, and
+/// returns the new count. The caller counts before the step runs: a step
+/// that stops before it returns cannot count itself. `None` when the run is
+/// finished, or when a run of a later slot has replaced the row.
+pub fn attempt(sql: &impl Sql, job: &str, slot: NaiveDateTime) -> Result<Option<u32>, Error> {
+    sql.query_optional(
+        "UPDATE job_slots SET attempts = attempts + 1
+         WHERE job = ?1 AND slot = ?2 AND finished = 0 RETURNING attempts",
+        &params![job, slot],
+    )
 }
 
 /// Marks `job`'s run for `slot` finished.
@@ -299,6 +319,16 @@ pub fn request(sql: &impl Sql, job: &str, at: NaiveDateTime) -> Result<(), Error
         &params![job, at],
     )?;
     Ok(())
+}
+
+/// Whether the last recorded run of `job` failed. A job with no record did
+/// not fail.
+pub fn last_run_failed(sql: &impl Sql, job: &str) -> Result<bool, Error> {
+    let failed: Option<bool> = sql.query_optional(
+        "SELECT last_ok_at IS NULL FROM job_runs WHERE job = ?1",
+        &params![job],
+    )?;
+    Ok(failed.unwrap_or(false))
 }
 
 /// The jobs that have a request waiting, with the time of each request.
@@ -466,6 +496,7 @@ mod tests {
             slot: at(10),
             finished,
             cursor: cursor.map(str::to_owned),
+            attempts: 0,
         };
         assert_eq!(slots(&database).unwrap(), [slot(false, Some("4"))]);
         finish(&database, "weekly-review", at(10)).unwrap();
@@ -482,6 +513,42 @@ mod tests {
                 ..slot(false, None)
             }]
         );
+    }
+
+    #[test]
+    fn a_slot_counts_the_starts_of_its_current_step() {
+        let database = migrated();
+        // No run to count.
+        assert_eq!(attempt(&database, "plaid-sync", at(0)).unwrap(), None);
+        claim(&database, "plaid-sync", at(0)).unwrap();
+        assert_eq!(attempt(&database, "plaid-sync", at(0)).unwrap(), Some(1));
+        assert_eq!(attempt(&database, "plaid-sync", at(0)).unwrap(), Some(2));
+        assert_eq!(slots(&database).unwrap()[0].attempts, 2);
+        // Another slot is another run.
+        assert_eq!(attempt(&database, "plaid-sync", at(5)).unwrap(), None);
+        // A step that keeps its cursor starts the count of the next step.
+        advance(&database, "plaid-sync", at(0), "3").unwrap();
+        assert_eq!(attempt(&database, "plaid-sync", at(0)).unwrap(), Some(1));
+        // A finished run takes no more starts, and a new claim counts afresh.
+        finish(&database, "plaid-sync", at(0)).unwrap();
+        assert_eq!(attempt(&database, "plaid-sync", at(0)).unwrap(), None);
+        claim(&database, "plaid-sync", at(10)).unwrap();
+        assert_eq!(slots(&database).unwrap()[0].attempts, 0);
+    }
+
+    #[test]
+    fn the_last_run_failed_only_when_its_record_has_no_success() {
+        let database = migrated();
+        let time = Utc.with_ymd_and_hms(2026, 11, 9, 10, 0, 5).unwrap();
+        assert!(!last_run_failed(&database, "lot-rebuild").unwrap());
+        record_run(&database, "lot-rebuild", &Status::default(), time).unwrap();
+        assert!(last_run_failed(&database, "lot-rebuild").unwrap());
+        let ok = Status {
+            ok: true,
+            ..Status::default()
+        };
+        record_run(&database, "lot-rebuild", &ok, time).unwrap();
+        assert!(!last_run_failed(&database, "lot-rebuild").unwrap());
     }
 
     #[test]

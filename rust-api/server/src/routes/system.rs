@@ -86,6 +86,16 @@ struct JobConfig {
     stale_after_ms: i64,
 }
 
+/// The lot rebuild is not on the schedule: a Durable Object asks for it
+/// when its file needs it, and most installs never run it. So the status
+/// lists it only when it has a record, and its last success is never stale.
+const LOT_REBUILD: JobConfig = JobConfig {
+    name: "lot-rebuild",
+    label: "Lot rebuild",
+    schedule: "On demand",
+    stale_after_ms: i64::MAX,
+};
+
 const HOUR: i64 = 60 * 60 * 1000;
 const DAY: i64 = 24 * HOUR;
 /// The native server's jobs: hourly backups into the backup folder, their
@@ -131,7 +141,7 @@ const JOBS: [JobConfig; 8] = [
     JobConfig {
         name: "weekly-review",
         label: "Weekly review",
-        schedule: "Mondays 5am",
+        schedule: "Mondays 5am, retries 6am and 7am",
         stale_after_ms: 8 * DAY,
     },
     JobConfig {
@@ -178,7 +188,7 @@ const JOBS: [JobConfig; 7] = [
     JobConfig {
         name: "weekly-review",
         label: "Weekly review",
-        schedule: "Mondays 5am",
+        schedule: "Mondays 5am, retries 6am and 7am",
         stale_after_ms: 8 * DAY,
     },
     JobConfig {
@@ -206,6 +216,11 @@ fn evaluate(entries: Option<Vec<Value>>, now_ms: i64, unreadable: Option<String>
         .unwrap_or_default();
     let jobs: Vec<Value> = JOBS
         .iter()
+        .chain(
+            by_name
+                .contains_key(LOT_REBUILD.name)
+                .then_some(&LOT_REBUILD),
+        )
         .map(|config| {
             let entry = by_name.get(config.name);
             // A run with no secret is not a success: it did nothing. The
@@ -275,8 +290,13 @@ fn evaluate(entries: Option<Vec<Value>>, now_ms: i64, unreadable: Option<String>
 
 pub(crate) async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     session_user(&state, &headers, "Failed to read job status").await?;
+    Ok(Json(evaluate_now(&state.database)))
+}
+
+/// The status of the jobs now, from the job runs.
+pub(crate) fn evaluate_now(database: &ledger_db::Database) -> Value {
     let now = platform::now().timestamp_millis();
-    let result = match ledger_db::jobs::runs(&*state.database) {
+    match ledger_db::jobs::runs(database) {
         // No run recorded yet: nothing has run here (a new install, or a
         // development server), so there is nothing to report.
         Ok(entries) if entries.is_empty() => evaluate(None, now, None),
@@ -285,8 +305,7 @@ pub(crate) async fn status(State(state): State<AppState>, headers: HeaderMap) ->
             tracing::error!(error = %cause, "Could not read the job runs");
             evaluate(None, now, Some("Job status unreadable".to_owned()))
         }
-    };
-    Ok(Json(result))
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +371,55 @@ mod tests {
             job(&result, "plaid-sync")["detail"],
             "line one line \"two\"\\three"
         );
+    }
+    /// The lot rebuild has no schedule: most installs never run it. The
+    /// status lists it only when it has a record, and never marks it stale.
+    #[tokio::test]
+    async fn the_lot_rebuild_shows_only_when_it_has_run_and_is_never_stale() {
+        use crate::scheduler::write_status;
+        use ledger_db::jobs::Status;
+        let database = memory();
+        let read = || Some(ledger_db::jobs::runs(&database).unwrap());
+        let listed = |result: &serde_json::Value| {
+            result["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|job| job["job"] == "lot-rebuild")
+        };
+        let at = chrono::Utc::now();
+        let now = at.timestamp_millis();
+        let ok = Status {
+            ok: true,
+            ..Status::default()
+        };
+        for config in super::JOBS.iter() {
+            write_status(&database, config.name, &ok, at);
+        }
+        let result = evaluate(read(), now, None);
+        assert!(!listed(&result));
+        assert!(!listed(&evaluate(None, now, None)));
+        assert_eq!(result["overall"], "ok");
+
+        let failed = Status {
+            detail: Some("rebuild the lots: disk I/O error"),
+            ..Status::default()
+        };
+        write_status(&database, "lot-rebuild", &failed, at);
+        let result = evaluate(read(), now, None);
+        let rebuild = job(&result, "lot-rebuild");
+        assert_eq!(rebuild["state"], "failed");
+        assert_eq!(rebuild["label"], "Lot rebuild");
+        assert_eq!(rebuild["schedule"], "On demand");
+        assert_eq!(rebuild["detail"], "rebuild the lots: disk I/O error");
+        assert_eq!(result["overall"], "attention");
+
+        // A rebuild that succeeded a year ago is not stale.
+        let year = chrono::TimeDelta::days(365);
+        write_status(&database, "lot-rebuild", &ok, at - year);
+        let result = evaluate(read(), now, None);
+        assert_eq!(job(&result, "lot-rebuild")["state"], "ok");
+        assert_eq!(result["overall"], "ok");
     }
     use crate::state::AppState;
     use axum::{extract::State, http::StatusCode};

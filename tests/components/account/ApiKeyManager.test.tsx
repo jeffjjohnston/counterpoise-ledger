@@ -160,10 +160,6 @@ describe("ApiKeyManager", () => {
     });
 
     expect(screen.getByText("cpk_newkeyvalue1234567890abcdef")).toBeInTheDocument();
-    // posthog-js leaves an element with this class out of autocapture,
-    // dead-click and copy capture, and masks it in session replay. The key
-    // must not reach PostHog even when an operator turns those on.
-    expect(screen.getByText("cpk_newkeyvalue1234567890abcdef").closest(".ph-no-capture")).not.toBeNull();
 
     // Verify POST was called with correct payload
     const postCall = fetchMock.mock.calls[1];

@@ -24,10 +24,6 @@ services:
   rust-api:
     build:
       context: .
-      args:
-        # Put in the client at build time (vite.config.ts).
-        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
-        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
     ports:
       # Loopback by default so a reverse proxy (Tailscale Serve, Caddy, nginx)
       # is the only ingress. Publishing on 0.0.0.0 lets any LAN device reach the
@@ -56,7 +52,7 @@ services:
     # it in silence. A `docker compose up` run from a deleted worktree's
     # directory still has its pinned project name, so it addresses these
     # containers anyway. Without this refusal it would recreate the server
-    # with none of the Plaid, TypeSafe, Tiingo or PostHog settings, and the
+    # with none of the Plaid, TypeSafe or Tiingo settings, and the
     # jobs that need them would fail until someone looked.
     env_file:
       - path: .env.production.local

@@ -7,7 +7,7 @@ it carries the rules that apply everywhere and says when to come here.
 The splits of a transaction must sum to zero. The Rust transaction routes
 check this before they write, with `validate_splits()` in
 `rust-api/core/src/accounting.rs`. The browser runs the same check through
-the WASM core, and `validateSplits()` in `lib/accounting.ts` is the
+the WASM core: `validateSplits()` in `lib/wasm-client.ts`. There is no
 TypeScript copy.
 
 ## Investment Shares Sign
@@ -17,8 +17,9 @@ Investment split `sharesMicros` is always positive. The `action` field determine
 
 ## Date Formatting
 - Database stores dates as `YYYY-MM-DD` strings
-- Use `toDateString()` from `lib/formatters.ts` to convert Date objects
-- Use `formatDate()` for display formatting
+- Use `toDateString()` from `lib/wasm-client.ts` to convert Date objects
+  (a test can use the copy in `lib/formatters.ts`)
+- Use `formatDate()` from `lib/wasm-client.ts` for display formatting
 
 ## Payee Normalization
 Payees are deduplicated using normalized names. `normalize_name()` in

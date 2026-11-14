@@ -78,7 +78,6 @@ Every screenshot below is the sample data you get from **Add demo book** — no 
 - **MCP Server** - Read/write access to accounting data for AI assistants, over stdio or HTTP (see [guides/mcp-server.md](guides/mcp-server.md))
 - **API Keys** - Per-user `cpk_` keys managed on the Account page, scrypt-hashed at rest
 - **Claude Connectors (OAuth)** - Set `COUNTERPOISE_PUBLIC_URL` to your public `https` origin, then add `https://<host>/api/mcp` as a custom connector in claude.ai, Claude Desktop or Claude Code and approve it on a consent page. The Account page lists the connected apps and disconnects them. The hosted Claude apps reach the server from Anthropic's cloud, so the server must be on public HTTPS (see [guides/mcp-server.md](guides/mcp-server.md#oauth-for-custom-connectors))
-- **Usage Analytics** - Optional PostHog integration for usage events. Custom events carry no financial values, but `$pageview` sends the full URL including its query string, and the search page puts the typed query in `?q=` — see [guides/posthog-analytics.md](guides/posthog-analytics.md)
 
 ### User Experience
 - **Clean Modern UI** - Built with Tailwind CSS for a polished interface
@@ -240,13 +239,6 @@ PLAID_TOKEN_KEY=...  # openssl rand -base64 32; encrypts the stored access token
 
 # Optional — Tiingo security prices
 TIINGO_API_KEY=...
-
-# Optional — PostHog analytics
-# NEXT_PUBLIC_* values are Docker build args. The client build puts them into
-# the JS bundle when the image is built, so a change needs a rebuild.
-NEXT_PUBLIC_POSTHOG_KEY=...
-NEXT_PUBLIC_POSTHOG_HOST=...
-POSTHOG_PERSONAL_API_KEY=...  # runtime; used for querying the PostHog API
 
 # The time zone of the scheduled jobs and of "today". Set your own.
 TZ=America/New_York
@@ -643,6 +635,10 @@ route with `CRON_SECRET`:
 ```bash
 curl -H "authorization: Bearer ${CRON_SECRET}" http://localhost:3000/api/cron/recurring
 ```
+
+The routes are `recurring`, `plaid-sync`, `price-sync`, `typesafe-cleanup`,
+`weekly-review` and `backup`. `/api/cron/backup` writes a snapshot now, as
+`ledger-cli backup` does, and answers with the name of the file.
 
 ## Connecting a Bank (Plaid)
 

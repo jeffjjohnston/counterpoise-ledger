@@ -1,0 +1,50 @@
+# cargo-deny: the supply-chain checks of the Rust workspace. CI runs
+# `cargo deny --locked check` on each pull request.
+
+[graph]
+# Check the crates of every target: the native server and the wasm32 Worker
+# and browser builds.
+all-features = true
+
+[advisories]
+# Fail on each RustSec advisory: a vulnerability, an unmaintained crate, an
+# unsound crate or a yanked version. To accept one, add its ID here with the
+# reason and the date.
+yanked = "deny"
+ignore = []
+
+[sources]
+# Crates come only from crates.io. A git source or another registry fails.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[bans]
+# Two versions of one crate are more code to trust. Report them; do not fail.
+multiple-versions = "warn"
+# A dependency with no version ("*") fails. The workspace's own path
+# dependencies are exempt.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[licenses]
+# The workspace crates are not published.
+private = { ignore = true }
+confidence-threshold = 0.9
+# Each license that a crate in Cargo.lock uses now. A new license fails the
+# check until a person reads it and adds it here.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]

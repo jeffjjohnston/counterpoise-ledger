@@ -1,9 +1,11 @@
 //! Plaid reconciliation: the queue of
 //! staged bank transactions that need a decision, and the six decisions.
 //!
-//! The resolver takes no advisory lock. It changes one staged row, which it
-//! reads `FOR UPDATE`, so PostgreSQL row locking serializes two resolves of
-//! the same row.
+//! The resolver takes no lease. It changes one staged row inside one
+//! database transaction, which holds the write lock from its start, so two
+//! resolves of the same row run one after the other. Each decision checks
+//! the state of the row against the transition table
+//! (`Action::allowed_from`), and each write repeats that check.
 
 use crate::{
     book_auth::{AccessLevel, authenticate_book},
@@ -113,7 +115,7 @@ pub(crate) fn reconcilable_link(
 const ROW_COLUMNS: &str = "r.id, r.book_id, r.plaid_account_link_id, r.plaid_transaction_id,
     r.date, r.authorized_date, r.amount_cents, r.name, r.merchant_name, r.original_description,
     r.resolution_status, r.review_reason, r.matched_transaction_id, r.pending, r.first_seen_at,
-    r.last_seen_at";
+    r.last_seen_at, r.review_metadata_json";
 
 #[derive(ledger_db::store::FromRow)]
 pub(crate) struct ReconRow {
@@ -133,6 +135,7 @@ pub(crate) struct ReconRow {
     pub(crate) pending: bool,
     pub(crate) first_seen_at: NaiveDateTime,
     pub(crate) last_seen_at: NaiveDateTime,
+    pub(crate) review_metadata_json: Option<String>,
 }
 
 impl ReconRow {
@@ -456,7 +459,49 @@ pub(crate) fn load_item(
         "lastSeenAt": iso_timestamp(row.last_seen_at),
         "candidates": candidates,
         "suggestedCounterAccountId": suggested,
+        "reviewChanges": review_changes(row.review_metadata_json.as_deref()),
     }))
+}
+
+/// The fields that a modification review compares (`plaid_sync.rs`,
+/// `ReviewFields`), in the order that the queue shows them.
+const REVIEW_FIELDS: [&str; 7] = [
+    "date",
+    "amountCents",
+    "name",
+    "merchantName",
+    "originalDescription",
+    "categoryPrimary",
+    "categoryDetailed",
+];
+
+/// The fields that the bank changed on a row flagged `plaid_modified`, each
+/// as `{field, previous, incoming}`, from the row's review metadata. A field
+/// that the incoming values leave out was not sent, and the sync kept it, so
+/// it is not a change. Any other row, or metadata that does not parse, gives
+/// an empty list.
+fn review_changes(metadata: Option<&str>) -> Value {
+    let Some(metadata) = metadata.and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
+        return json!([]);
+    };
+    if metadata.get("event").and_then(Value::as_str) != Some("modified") {
+        return json!([]);
+    }
+    let (Some(previous), Some(incoming)) = (
+        metadata.get("previous").and_then(Value::as_object),
+        metadata.get("incoming").and_then(Value::as_object),
+    ) else {
+        return json!([]);
+    };
+    let changes: Vec<Value> = REVIEW_FIELDS
+        .iter()
+        .filter_map(|field| {
+            let new = incoming.get(*field)?;
+            let old = previous.get(*field).unwrap_or(&Value::Null);
+            (old != new).then(|| json!({ "field": field, "previous": old, "incoming": new }))
+        })
+        .collect();
+    Value::Array(changes)
 }
 
 // ---------------------------------------------------------------------------
@@ -642,15 +687,59 @@ impl Action {
         }
     }
 
-    /// `RECONCILE_EVENT_NAMES`.
-    fn event_name(self) -> &'static str {
+    /// The transition table: the states that this decision can start from, as
+    /// an SQL condition on the staged row. `guides/plaid-sync.md` has the
+    /// same table. Keep the two the same.
+    ///
+    /// The check before a decision and the `WHERE` of each write both use
+    /// this condition, so no write can leave a state that the table refuses.
+    fn allowed_from(self) -> &'static str {
         match self {
-            Self::Match => "sync_transaction_matched",
-            Self::MatchUpdateAmount => "sync_transaction_amount_updated",
-            Self::Create => "sync_transaction_created",
-            Self::Ignore => "sync_transaction_ignored",
-            Self::KeepLocal => "sync_transaction_kept_local",
-            Self::Unlink => "sync_transaction_unlinked",
+            // A pending row, or a linked row that is flagged for review. A
+            // linked row with no flag must be unlinked first. An ignored row
+            // takes no decision.
+            Self::Match | Self::MatchUpdateAmount | Self::Create | Self::Ignore => {
+                "(resolution_status = 'pending'
+                  OR (resolution_status IN ('matched', 'created') AND review_reason IS NOT NULL))"
+            }
+            // Only a row that the bank changed has a local side to keep. A
+            // row that the bank removed must not go back to the plain
+            // pending state, where the auto-matcher takes it.
+            Self::KeepLocal => {
+                "(resolution_status IN ('pending', 'matched', 'created')
+                  AND review_reason = 'plaid_modified')"
+            }
+            Self::Unlink => "resolution_status IN ('matched', 'created')",
+        }
+    }
+
+    /// Why the transition table refuses this decision on `row`.
+    fn refusal(self, row: &ReconRow) -> String {
+        let status = row.resolution_status.as_str();
+        if status == "ignored" {
+            return "This bank transaction is ignored and cannot be changed".to_owned();
+        }
+        if !matches!(status, "pending" | "matched" | "created") {
+            return "This bank transaction has a status that takes no decision".to_owned();
+        }
+        match self {
+            Self::KeepLocal if row.review_reason.as_deref() == Some("plaid_removed") => {
+                "Keep local does not apply: the bank removed this transaction".to_owned()
+            }
+            Self::KeepLocal => {
+                "Keep local applies only to a bank transaction that the bank changed".to_owned()
+            }
+            Self::Unlink => "This bank transaction is not linked to a transaction".to_owned(),
+            Self::Match | Self::MatchUpdateAmount | Self::Create | Self::Ignore => {
+                match row.matched_transaction_id {
+                    Some(matched) => format!(
+                        "This bank transaction is already linked to transaction #{matched} — unlink it first"
+                    ),
+                    None => {
+                        "This bank transaction is already resolved — unlink it first".to_owned()
+                    }
+                }
+            }
         }
     }
 }
@@ -794,22 +883,58 @@ fn mark_matched(
         .ok_or(ReconcileError::NotFound("Transaction not found"))
 }
 
-/// Sets the resolution of the row, and clears its review flag.
+/// A write of a decision changed no row: the row is not in a state that the
+/// transition table allows. `apply` checks the state first, so this is a
+/// fault, and the error rolls the decision back.
+fn changed(rows: u64, action: Action) -> Result<(), ReconcileError> {
+    if rows == 1 {
+        Ok(())
+    } else {
+        Err(ReconcileError::Failed(format!(
+            "the {} decision changed {rows} rows: the row left the state that the decision needs",
+            action.name()
+        )))
+    }
+}
+
+/// Sets the resolution of the row, and clears its review flag. The write
+/// applies only from a state that the transition table allows for `action`.
 fn resolve_row(
     sql: &impl Sql,
     row: &ReconRow,
+    action: Action,
     status: &str,
     matched_transaction_id: Option<i32>,
     now: NaiveDateTime,
-) -> Result<(), store::Error> {
-    sql.execute(
-        "UPDATE plaid_transaction_reconciliation
-         SET resolution_status = ?3, matched_transaction_id = ?4, review_reason = NULL,
-             review_metadata_json = NULL, resolved_at = ?5, updated_at = ?5
-         WHERE id = ?1 AND book_id = ?2",
+) -> Result<(), ReconcileError> {
+    let rows = sql.execute(
+        &format!(
+            "UPDATE plaid_transaction_reconciliation
+             SET resolution_status = ?3, matched_transaction_id = ?4, review_reason = NULL,
+                 review_metadata_json = NULL, resolved_at = ?5, updated_at = ?5
+             WHERE id = ?1 AND book_id = ?2 AND {}",
+            action.allowed_from()
+        ),
         &params![row.id, row.book_id, status, matched_transaction_id, now],
     )?;
-    Ok(())
+    changed(rows, action)
+}
+
+/// The columns that an unlink sets. The row goes back to pending. The flag
+/// of a row that the bank changed goes, because the row now has the bank's
+/// values and no local side. The flag of a row that the bank removed stays:
+/// without it the auto-matcher takes a row that the bank deleted. The
+/// transaction unlink route (`sync.rs`) uses the same columns. `?3` is the
+/// time.
+pub(crate) const UNLINK_SET: &str = "resolution_status = 'pending', matched_transaction_id = NULL,
+    review_metadata_json = CASE WHEN review_reason = 'plaid_removed'
+                                THEN review_metadata_json END,
+    review_reason = CASE WHEN review_reason = 'plaid_removed' THEN review_reason END,
+    resolved_at = NULL, updated_at = ?3";
+
+/// The states that an unlink can start from (`Action::allowed_from`).
+pub(crate) fn unlink_allowed_from() -> &'static str {
+    Action::Unlink.allowed_from()
 }
 
 /// Another staged row on this link is already matched to the transaction.
@@ -891,17 +1016,19 @@ pub(crate) fn apply(
     let reconciliation_id = body_id(input.reconciliation_id)?;
     let row = load_row(sql, link.link_id, reconciliation_id, book_id, true)?
         .ok_or(ReconcileError::NotFound("Reconciliation row not found"))?;
-    // A linked bank row cannot be linked again, unless Plaid has changed it
-    // since and it is flagged for review.
-    if matches!(
-        input.action,
-        Action::Match | Action::MatchUpdateAmount | Action::Create
-    ) && row.review_reason.is_none()
-        && let Some(matched) = row.matched_transaction_id
-    {
-        return Err(ReconcileError::Invalid(format!(
-            "This bank transaction is already linked to transaction #{matched} — unlink it first"
-        )));
+    // The transition table, before any write. A linked bank row cannot be
+    // linked again, unless Plaid has changed it since and it is flagged for
+    // review.
+    let allowed: bool = sql.query_row(
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM plaid_transaction_reconciliation
+                            WHERE id = ?1 AND book_id = ?2 AND {})",
+            input.action.allowed_from()
+        ),
+        &params![row.id, book_id],
+    )?;
+    if !allowed {
+        return Err(ReconcileError::Invalid(input.action.refusal(&row)));
     }
     // The two split amounts are the bank amount and its negation. SQLite
     // stores any 64-bit value, and every reader decodes a split amount as a
@@ -929,7 +1056,14 @@ pub(crate) fn apply(
             }
             mark_matched(sql, access, transaction_id, &row, now, actor)?;
             relink(sql, access, &row, transaction_id, now, actor)?;
-            resolve_row(sql, &row, "matched", Some(transaction_id), now)?;
+            resolve_row(
+                sql,
+                &row,
+                input.action,
+                "matched",
+                Some(transaction_id),
+                now,
+            )?;
         }
         Action::MatchUpdateAmount => {
             let transaction_id = body_id(input.transaction().map_err(invalid)?)?;
@@ -980,7 +1114,14 @@ pub(crate) fn apply(
             }
             mark_matched(sql, access, transaction_id, &row, now, actor)?;
             relink(sql, access, &row, transaction_id, now, actor)?;
-            resolve_row(sql, &row, "matched", Some(transaction_id), now)?;
+            resolve_row(
+                sql,
+                &row,
+                input.action,
+                "matched",
+                Some(transaction_id),
+                now,
+            )?;
         }
         Action::Create => {
             let counter_account_id = input.counter_account().map_err(invalid)?;
@@ -1031,28 +1172,45 @@ pub(crate) fn apply(
                 ],
             )?;
             relink(sql, access, &row, transaction_id, now, actor)?;
-            resolve_row(sql, &row, "created", Some(transaction_id), now)?;
+            resolve_row(
+                sql,
+                &row,
+                input.action,
+                "created",
+                Some(transaction_id),
+                now,
+            )?;
         }
         Action::Ignore => {
-            resolve_row(sql, &row, "ignored", None, now)?;
+            resolve_row(sql, &row, input.action, "ignored", None, now)?;
+            // Ignore removes the link, as Unlink does. A row flagged for
+            // review can still link a transaction, so release it.
+            if let Some(previous) = row.matched_transaction_id {
+                release_previous(sql, access, previous, &row, now, actor)?;
+            }
         }
         Action::KeepLocal => {
-            sql.execute(
-                "UPDATE plaid_transaction_reconciliation
-                 SET review_reason = NULL, review_metadata_json = NULL, updated_at = ?3
-                 WHERE id = ?1 AND book_id = ?2",
+            let rows = sql.execute(
+                &format!(
+                    "UPDATE plaid_transaction_reconciliation
+                     SET review_reason = NULL, review_metadata_json = NULL, updated_at = ?3
+                     WHERE id = ?1 AND book_id = ?2 AND {}",
+                    input.action.allowed_from()
+                ),
                 &params![row.id, book_id, now],
             )?;
+            changed(rows, input.action)?;
         }
         Action::Unlink => {
-            sql.execute(
-                "UPDATE plaid_transaction_reconciliation
-                 SET resolution_status = 'pending', matched_transaction_id = NULL,
-                     review_reason = NULL, review_metadata_json = NULL, resolved_at = NULL,
-                     updated_at = ?3
-                 WHERE id = ?1 AND book_id = ?2",
+            let rows = sql.execute(
+                &format!(
+                    "UPDATE plaid_transaction_reconciliation SET {UNLINK_SET}
+                     WHERE id = ?1 AND book_id = ?2 AND {}",
+                    input.action.allowed_from()
+                ),
                 &params![row.id, book_id, now],
             )?;
+            changed(rows, input.action)?;
             if let Some(previous) = row.matched_transaction_id {
                 release_previous(sql, access, previous, &row, now, actor)?;
             }
@@ -1079,8 +1237,7 @@ pub(crate) fn resolve(
 }
 
 /// POST `sync/accounts/[id]/reconcile`. The link is checked before the body
-/// is read. After the decision commits, the TypeSafe observation is saved
-/// and the analytics event is sent.
+/// is read. After the decision commits, the TypeSafe observation is saved.
 pub(crate) async fn resolve_route(
     State(state): State<AppState>,
     Path((raw_book_id, raw_id)): Path<(String, String)>,
@@ -1107,17 +1264,51 @@ pub(crate) async fn resolve_route(
         &observation,
         action_started_at,
     );
-    state.analytics.capture_event(
-        book.user_id(),
-        input.action.event_name(),
-        Some(json!({ "bookId": book.book_id() })),
-    );
     Ok(Json(item))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_changes_lists_the_fields_that_the_bank_changed() {
+        let metadata = json!({
+            "event": "modified",
+            "previous": {
+                "date": "2026-11-04", "amountCents": 880.0, "name": "WSJ",
+                "merchantName": null, "categoryPrimary": "A", "categoryDetailed": null,
+            },
+            "incoming": {
+                "date": "2026-11-04", "amountCents": 880.0, "name": "D J*WSJ",
+                "merchantName": "D J", "categoryPrimary": "A", "categoryDetailed": null,
+            },
+        })
+        .to_string();
+        assert_eq!(
+            review_changes(Some(&metadata)),
+            json!([
+                { "field": "name", "previous": "WSJ", "incoming": "D J*WSJ" },
+                { "field": "merchantName", "previous": null, "incoming": "D J" },
+            ])
+        );
+    }
+
+    #[test]
+    fn review_changes_is_empty_without_a_modification() {
+        assert_eq!(review_changes(None), json!([]));
+        assert_eq!(review_changes(Some("not json")), json!([]));
+        let removed = json!({ "event": "removed", "previous": {}, "incoming": {} }).to_string();
+        assert_eq!(review_changes(Some(&removed)), json!([]));
+        // A field that the incoming values leave out was kept, not changed.
+        let kept = json!({
+            "event": "modified",
+            "previous": { "originalDescription": "OLD" },
+            "incoming": {},
+        })
+        .to_string();
+        assert_eq!(review_changes(Some(&kept)), json!([]));
+    }
 
     #[test]
     fn scores_follow_node() {

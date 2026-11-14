@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useBookChanges } from "@/components/BookChangesProvider";
 import { useToast } from "@/components/ui/ToastProvider";
 import { useBookId } from "@/hooks/useBookId";
@@ -12,7 +12,9 @@ export type BookMemberSummary = { userId: number; username: string; role: BookRo
 
 /**
  * The state of the role load. `loading` is before the first answer. `error`
- * is after the last load failed. In both, the role is the least privilege.
+ * is when no load has succeeded and the last one failed. In both, the role
+ * is the least privilege. After one good load the state stays `ready`: a
+ * failed refresh keeps the last good role.
  */
 export type BookRoleStatus = "loading" | "ready" | "error";
 
@@ -47,13 +49,20 @@ export function BookRoleProvider({ children }: { children: ReactNode }) {
   const [version, setVersion] = useState(0);
   const refresh = useCallback(() => setVersion((v) => v + 1), []);
   const toast = useToast();
+  // True after the first good load of the role.
+  const loadedOnce = useRef(false);
 
   useEffect(() => {
     let active = true;
-    // A failed load shows an error toast, as a failed page load does. It
-    // does not give access: the role becomes the least privilege until a
+    // A failed first load shows an error toast, as a failed page load does.
+    // It does not give access: the role stays the least privilege until a
     // load succeeds. A refresh keeps the last role while it runs, so the
-    // controls do not flicker on each change event.
+    // controls do not flicker on each change event. A failed refresh keeps
+    // the last good role too. A refresh runs on each return to the tab, and
+    // one failure must not hide the write controls: the pages unmount the
+    // entry form and close their dialogs when the role drops, and the user
+    // loses the entry in progress. The server enforces every level, and the
+    // next good load corrects a role that changed.
     let membersErrorShown = false;
     const membersFailed = () => {
       if (!active || membersErrorShown) return;
@@ -61,9 +70,9 @@ export function BookRoleProvider({ children }: { children: ReactNode }) {
       toast.error("Could not load the members of this book.");
     };
     apiGet<BookSummary[]>("/api/books")
-      .then((d) => { if (active) { setBooks(d); setStatus("ready"); } })
+      .then((d) => { if (active) { loadedOnce.current = true; setBooks(d); setStatus("ready"); } })
       .catch(() => {
-        if (!active) return;
+        if (!active || loadedOnce.current) return;
         setStatus("error");
         toast.error("Could not load your role in this book. The controls that change data stay hidden.");
       });

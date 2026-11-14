@@ -64,7 +64,7 @@ describe("entry suggestion routes", () => {
     await setupTestDatabase();
     mock = await startTypeSafeMock();
     ({ baseUrl, stop } = await startHttpTestServer({
-      TYPESAFE_ENABLED: "true", TYPESAFE_API_KEY: "test-typesafe-key", TYPESAFE_API_URL: mock.url, TZ: "UTC",
+      TYPESAFE_ENABLED: "true", TYPESAFE_CLEF_ACCOUNT_ID: "abc123", TYPESAFE_CLEF_API_TOKEN: "test-token", TYPESAFE_CLEF_API_URL: mock.url, TZ: "UTC",
     }));
   }, 120_000);
   beforeEach(async () => {

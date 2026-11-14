@@ -5,7 +5,6 @@
 // Without `native` the Worker crate calls only part of the server so far.
 #![cfg_attr(not(feature = "native"), allow(dead_code, unused_imports))]
 
-mod analytics;
 mod api_key_cache;
 mod auth;
 mod book_auth;
@@ -30,7 +29,6 @@ mod openapi;
 mod plaid;
 mod plaid_token_keys;
 mod platform;
-mod posthog_query;
 mod rate_limit;
 mod recurring_input;
 mod revocations;

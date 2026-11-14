@@ -76,6 +76,7 @@ function makeItem(
     lastSeenAt: "2026-02-09T00:00:00.000Z",
     candidates: [],
     suggestedCounterAccountId: 2,
+    reviewChanges: [],
   ...overrides,
   };
 }
@@ -221,6 +222,7 @@ describe("ReconciliationModal", () => {
       lastSeenAt: "2026-02-09T00:00:00.000Z",
       candidates: [],
       suggestedCounterAccountId: 2,
+      reviewChanges: [],
     };
 
     const postSpy = vi.fn();
@@ -610,7 +612,9 @@ describe("ReconciliationModal", () => {
 
     // Item 21: three candidates, so the top one is promoted and two fold
     // away. Item 22: no candidates at all, so Create must open on its own.
-    // Item 23: flagged by the bank, so Keep local and Unlink must enable.
+    // Item 23: linked, and changed by the bank, so Keep local and Unlink
+    // must enable. Items 24 to 26 are the states where the server refuses
+    // one of them or both (the transition table in guides/plaid-sync.md).
     const items: SyncReconciliationItem[] = [
       makeItem({
         id: 21,
@@ -641,9 +645,20 @@ describe("ReconciliationModal", () => {
       makeItem({
         id: 23,
         amountCents: 900,
+        resolutionStatus: "matched",
+        matchedTransactionId: 701,
         reviewReason: "plaid_modified",
         candidates: [],
       }),
+      makeItem({
+        id: 24,
+        resolutionStatus: "matched",
+        matchedTransactionId: 702,
+        reviewReason: "plaid_removed",
+        candidates: [],
+      }),
+      makeItem({ id: 25, reviewReason: "plaid_removed", candidates: [] }),
+      makeItem({ id: 26, reviewReason: "plaid_modified", candidates: [] }),
     ];
 
     beforeEach(() => {
@@ -687,6 +702,41 @@ describe("ReconciliationModal", () => {
       const footer = screen.getByTestId("resolve-footer");
       expect(within(footer).getByRole("button", { name: /Keep local/ })).toBeEnabled();
       expect(within(footer).getByRole("button", { name: /Unlink/ })).toBeEnabled();
+    });
+
+    // The server refuses Keep local on a row that the bank removed, and
+    // Unlink on a row with no link. The buttons and the keys must not send
+    // those decisions.
+    it.each([
+      { id: 24, state: "a linked row that the bank removed", keep: false, unlink: true },
+      { id: 25, state: "a pending row that the bank removed", keep: false, unlink: false },
+      { id: 26, state: "a changed row with no link", keep: true, unlink: false },
+    ])("offers only the decisions that apply to $state", async ({ id, keep, unlink }) => {
+      const posted: unknown[] = [];
+      stubQueueList(items, (body) => {
+        posted.push(body);
+        return new Response(JSON.stringify(items.find((item) => item.id === id)));
+      });
+      render(
+        <KeyboardShortcutProvider>
+          <ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />
+        </KeyboardShortcutProvider>
+      );
+      fireEvent.click(await screen.findByTestId(`queue-item-${id}`));
+      await flushEffects();
+
+      const footer = screen.getByTestId("resolve-footer");
+      const keepButton = within(footer).getByRole("button", { name: /Keep local/ });
+      const unlinkButton = within(footer).getByRole("button", { name: /Unlink/ });
+      expect(keepButton.hasAttribute("disabled")).toBe(!keep);
+      expect(unlinkButton.hasAttribute("disabled")).toBe(!unlink);
+      expect(within(footer).getByRole("button", { name: /Ignore/ })).toBeEnabled();
+
+      // The shortcut of a decision that does not apply sends nothing.
+      if (!keep) fireEvent.keyDown(document, { key: "k" });
+      if (!unlink) fireEvent.keyDown(document, { key: "u" });
+      await flushEffects();
+      expect(posted).toEqual([]);
     });
   });
 
@@ -836,6 +886,128 @@ describe("ReconciliationModal", () => {
       fireEvent.click(screen.getByRole("button", { name: "Create anyway" }));
       await waitFor(() => expect(posts).toHaveLength(1));
       expect(posts[0]).toMatchObject({ action: "create", reconciliationId: 31 });
+    });
+
+    // The best candidate can be the transaction that the row is linked to.
+    // Match there keeps the same link, so the button is Keep, and it sends
+    // keep_local, which does not write to the transaction.
+    const linkedCandidate = makeItem({
+      ...linked,
+      candidates: [makeCandidate({ transactionId: 701, payeeName: "Wall Street Journal", linkedSplitAmount: -880, expectedAmount: -880 })],
+    });
+
+    it("labels the linked candidate Keep and sends keep_local", async () => {
+      const posts: unknown[] = [];
+      stubQueueList([linkedCandidate], (body) => {
+        posts.push(body);
+        return new Response(JSON.stringify({ ...linkedCandidate, reviewReason: null }));
+      }, undefined, transactions);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      const best = await screen.findByTestId("best-match");
+      expect(within(best).queryByRole("button", { name: "Match" })).toBeNull();
+      expect(best).toHaveTextContent("linked now");
+      expect(screen.getByTestId("linked-transaction")).toHaveTextContent(
+        "Keep keeps this link. Match on another transaction, or Create, moves it."
+      );
+
+      fireEvent.click(within(best).getByRole("button", { name: "Keep" }));
+      await waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0]).toEqual({ reconciliationId: 31, action: "keep_local" });
+    });
+
+    it("sends keep_local for Enter when the best candidate is the linked one", async () => {
+      const posts: unknown[] = [];
+      stubQueueList([linkedCandidate], (body) => {
+        posts.push(body);
+        return new Response(JSON.stringify({ ...linkedCandidate, reviewReason: null }));
+      }, undefined, transactions);
+      render(
+        <KeyboardShortcutProvider>
+          <ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />
+        </KeyboardShortcutProvider>
+      );
+      await screen.findByTestId("best-match");
+      await flushEffects();
+      fireEvent.keyDown(document, { key: "Enter" });
+      await waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0]).toEqual({ reconciliationId: 31, action: "keep_local" });
+    });
+
+    // When the bank amount differs, Keep would clear the flag and leave the
+    // amounts apart, so Update (the same link, with the bank amount) leads.
+    const amountChanged = makeItem({
+      ...linked,
+      candidates: [makeCandidate({ transactionId: 701, linkedSplitAmount: -800, expectedAmount: -880, amountDelta: 80, splitCount: 2 })],
+    });
+
+    it("leads with Update when the bank amount differs on the linked candidate", async () => {
+      const posts: unknown[] = [];
+      stubQueueList([amountChanged], (body) => {
+        posts.push(body);
+        return new Response(JSON.stringify({ ...amountChanged, reviewReason: null }));
+      }, undefined, transactions);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      const best = await screen.findByTestId("best-match");
+      const buttons = within(best).getAllByRole("button").map((button) => button.textContent);
+      expect(buttons).toEqual(["Update to $8.80", "Keep"]);
+      // Only one main action: the footer's Keep local steps back.
+      const footerKeep = within(screen.getByTestId("resolve-footer")).getByRole("button", { name: /Keep local/ });
+      expect(footerKeep).not.toHaveClass("bg-accent");
+      expect(screen.getByTestId("linked-transaction")).toHaveTextContent(
+        "The bank amount is different. Update changes your amount to the bank amount and keeps this link."
+      );
+
+      fireEvent.click(within(best).getByRole("button", { name: "Update to $8.80" }));
+      await waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0]).toEqual({ reconciliationId: 31, action: "match_update_amount", transactionId: 701 });
+    });
+
+    it("sends the amount update for Enter when the linked amount differs", async () => {
+      const posts: unknown[] = [];
+      stubQueueList([amountChanged], (body) => {
+        posts.push(body);
+        return new Response(JSON.stringify({ ...amountChanged, reviewReason: null }));
+      }, undefined, transactions);
+      render(
+        <KeyboardShortcutProvider>
+          <ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />
+        </KeyboardShortcutProvider>
+      );
+      await screen.findByTestId("best-match");
+      await flushEffects();
+      fireEvent.keyDown(document, { key: "Enter" });
+      await waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0]).toEqual({ reconciliationId: 31, action: "match_update_amount", transactionId: 701 });
+    });
+
+    it("keeps Match on a candidate that is not the linked one", async () => {
+      const other = makeItem({ ...linked, candidates: [makeCandidate({ transactionId: 702 })] });
+      stubQueueList([other], undefined, undefined, transactions);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      const best = await screen.findByTestId("best-match");
+      expect(within(best).getByRole("button", { name: "Match" })).toBeInTheDocument();
+      expect(within(best).queryByRole("button", { name: "Keep" })).toBeNull();
+      expect(best).not.toHaveTextContent("linked now");
+      expect(screen.getByTestId("linked-transaction")).toHaveTextContent(
+        "Keep local keeps this link. Match or Create moves it to another transaction."
+      );
+    });
+
+    it("shows the fields that the bank changed", async () => {
+      const changed = makeItem({
+        ...linked,
+        reviewChanges: [
+          { field: "name", previous: "WSJ", incoming: "D J*WSJ" },
+          { field: "amountCents", previous: 800, incoming: 880 },
+          { field: "merchantName", previous: null, incoming: "D J" },
+        ],
+      });
+      stubQueueList([changed], undefined, undefined, transactions);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      const list = await screen.findByTestId("review-changes");
+      expect(list).toHaveTextContent("NameWSJ → D J*WSJ");
+      expect(list).toHaveTextContent("Amount−$8.00 → −$8.80");
+      expect(list).toHaveTextContent("Merchantnone → D J");
     });
 
     it("does not show the linked box or ask on a row the bank did not change", async () => {

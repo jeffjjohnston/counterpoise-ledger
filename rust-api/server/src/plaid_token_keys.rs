@@ -131,7 +131,7 @@ impl TokenKeys {
         let ciphertext = key
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: token.as_bytes(),
                     aad: ASSOCIATED_DATA,
@@ -162,7 +162,7 @@ impl TokenKeys {
         let plaintext = key
             .cipher
             .decrypt(
-                XNonce::from_slice(nonce),
+                &XNonce::try_from(nonce).map_err(|_| undecodable())?,
                 Payload {
                     msg: ciphertext,
                     aad: ASSOCIATED_DATA,
@@ -295,6 +295,26 @@ mod tests {
         assert_ne!(
             keys.seal("access-sandbox-secret").unwrap().text,
             sealed.text
+        );
+    }
+
+    /// A token that chacha20poly1305 0.10 sealed, with the key [7; 32] and
+    /// the nonce [9; 24]. Rows sealed by an older build must still open after
+    /// a change to the cipher crate.
+    #[test]
+    fn a_token_sealed_by_an_older_build_opens() {
+        let keys = TokenKeys::parse(Some(&STANDARD.encode([7u8; 32])), None).unwrap();
+        let mut stored = vec![9u8; NONCE_LEN];
+        stored.extend(
+            hex::decode(
+                "df1181ef0fd95411957c6c5e070b2a80449cc0f46d00f392d1e86a6eb6d2320c76775cf4bbb7513135af26",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            keys.open(&STANDARD.encode(stored), keys.current_id())
+                .unwrap(),
+            "access-sandbox-known-answer"
         );
     }
 

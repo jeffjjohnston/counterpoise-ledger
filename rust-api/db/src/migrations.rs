@@ -95,6 +95,16 @@ pub fn migrate(database: &Database) -> Result<(), MigrateError> {
     migrate_with(database, MIGRATIONS)
 }
 
+/// The migrations up to `version`: what a release before a later file had.
+#[cfg(feature = "native")]
+pub(crate) fn through(version: i64) -> Vec<Migration> {
+    MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= version)
+        .copied()
+        .collect()
+}
+
 pub(crate) fn migrate_with(
     database: &Database,
     migrations: &[Migration],

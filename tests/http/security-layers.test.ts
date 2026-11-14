@@ -17,7 +17,9 @@ const SECURITY_HEADERS: Record<string, string> = {
   "referrer-policy": "same-origin",
   "permissions-policy": "camera=(), microphone=(), geolocation=()",
   "content-security-policy":
-    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'",
+    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; " +
+    "script-src 'self' 'sha256-jxtKqttDRtcScKTqB1x/g7RPLO4Ed82ESVjBlkUrs3w=' 'wasm-unsafe-eval'; " +
+    "connect-src 'self'",
 };
 
 /**

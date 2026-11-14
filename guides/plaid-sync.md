@@ -168,8 +168,42 @@ run. They put the access token on the terminal and the clipboard, so the
 in-app flow is the default.
 
 ## Sync Trigger Points
-- **Manual**: POST `/api/b/[bookId]/sync/tokens/[id]/sync` — syncs a single token on demand. Sync is always per token: there is **no** per-account sync route. `DELETE` on that same path clears the token's staged sync data. The only route under `sync/accounts/[id]/` is `reconcile`
+- **Manual**: POST `/api/b/[bookId]/sync/tokens/[id]/sync` — syncs a single token on demand. Sync is always per token: there is **no** per-account sync route. `DELETE` on that same path clears the token's staged sync data (the reset; see "The connection lease and the cursor"). The only route under `sync/accounts/[id]/` is `reconcile`
 - **Scheduled**: the server syncs all tokens with linked accounts every 6 hours (12am, 6am, 12pm, 6pm, in `TZ`; `rust-api/server/src/scheduler/mod.rs`). The scheduled run syncs three tokens per step, in ID order, and keeps the last ID in its slot's cursor (`job_slots`), so one step fits in a Workers alarm. GET `/api/cron/plaid-sync` runs the same job now, every token in one call, and requires the `CRON_SECRET` bearer token. **Tokens with `isDemo = true` are excluded**, and `sync_token()` refuses them outright. The seed gives a demo book a Plaid connection with a synthetic access token so the Sync page has something to show; it is linked to a liability account exactly like a real connection, so nothing but that column tells them apart. Without the exclusion, every demo book makes a guaranteed-failing call to Plaid every six hours and writes the rejection to `lastError`, which the Sync page renders as "Last sync failed". The guard in `sync_locked()` runs *before* the step that writes `lastError` for that reason: a demo connection must not be recorded as a broken one.
+
+## The connection lease and the cursor
+
+`plaid_tokens.sync_cursor` says where the next sync starts. Plaid sends a
+bank row one time for each cursor position, so a cursor that moves past a
+row that is not staged loses that row for good. Two guards keep the cursor
+and the staged rows together:
+
+- **Each writer of the cursor holds the lease `plaid-sync:<id>`**
+  (`connection_lease()` in `plaid_sync.rs`). The sync holds it for its whole
+  life. The reset (`DELETE sync/tokens/[id]/sync`), the edit
+  (`PUT sync/tokens/[id]`) and the delete (`DELETE sync/tokens/[id]`) take
+  it for their write. Each one answers 409 `A sync is already running for
+  this connection` while another run holds it, as a second sync does, and
+  does not wait. Before this rule, a reset during a sync deleted the pending
+  rows and cleared the cursor, and the sync then saved its `next_cursor`:
+  the next sync started past the deleted rows. Take the lease only after
+  the route proves that the connection is in the book. The lease name has
+  no book in it.
+- **The sync saves its cursor with a compare**: `WHERE id = ?1 AND
+  sync_cursor IS ?4`, where `?4` is the cursor that the sync read at its
+  start. A lease can lapse (`leases.rs`: a process that stops for longer
+  than the TTL), so the lease alone is not enough. When the compare fails,
+  the sync answers 409 `The connection changed during the sync. Sync
+  again.`, records that text in `last_error`, and leaves the stored cursor.
+  The rows that it staged stay; the next sync fetches from the stored cursor
+  and stages them again (the upsert makes that safe). The cron counts the
+  409 as skipped.
+
+**An edit that changes the Item resets the cursor.** A cursor belongs to
+one Plaid Item. `PUT sync/tokens/[id]` sets `sync_cursor` to NULL when the
+`itemId` changes or when the body has an access token that is not the stored
+one. A new name, or the same token again, keeps the cursor. The reconnect
+(update mode) keeps the Item and its access token, so it keeps the cursor.
 
 ## Auto-Match Algorithm (`auto_match()` in `rust-api/server/src/routes/plaid_sync.rs`)
 Auto-match runs automatically after every sync (both manual and cron). It uses a learned payee map built from previously human-matched reconciliation rows:
@@ -177,6 +211,7 @@ Auto-match runs automatically after every sync (both manual and cron). It uses a
 2. **For each pending row** (without `reviewReason`):
    - Look up the Plaid merchant name in the payee map
    - Find candidate transactions with: exact amount match, matching payee ID, on the mapped Counterpoise account
+   - Drop a candidate that is already reconciled (`isReconciled`), unless a bank row links it. The match stamps the date of its transaction, and a transaction that the user reconciled by hand must keep its date. A transaction that a bank row links is a transfer that the other link matched: it stays a candidate, and the per-link rule below keeps it off its own link
    - Filter candidates to ±1 day of **either** the Plaid authorization date **or** the posted date (the union keeps delayed settlements in range — a transaction the user entered on the posted date matches even when the authorization date is 7+ days earlier — without matching anything in the gap between the two dates)
    - If any candidates remain, pick the one whose date is CLOSEST to the date the match will stamp (`pick_matched_date()`). Candidates are ordered by date then ID, and that ordering breaks ties at equal distance. Nearest-to-stamped avoids re-dating an earlier transaction and stranding the real posted-date one
    - Atomically set `resolutionStatus = 'matched'`, mark the local transaction as reconciled (and `isFloating = false`), and stamp its `date` (see date rule below)
@@ -186,20 +221,99 @@ Auto-match runs automatically after every sync (both manual and cron). It uses a
 
 ## Sync Handling of Modified/Removed Transactions
 - **Modified**: If a previously matched/created row is modified by Plaid, it gets `reviewReason: 'plaid_modified'` with before/after metadata for human review
-- **Removed**: If a previously resolved row is removed by Plaid, it gets `reviewReason: 'plaid_removed'`
-- **Pending rows**: Modified pending rows are simply updated in place
+- **Removed**: If a pending, matched or created row is removed by Plaid, it gets `reviewReason: 'plaid_removed'`. An ignored row stays as it is
+- **Pending rows**: Modified pending rows are simply updated in place. A flag on such a row goes, and `reviewMetadataJson` goes with it
+
+The transition table in "Reconciliation" lists each of these writes with the
+decisions.
 
 ## Transaction Unlink
-- POST `/api/b/[bookId]/transactions/[id]/plaid/unlink` — Removes the Plaid link from a matched transaction (sets reconciliation back to `pending`, clears `isReconciled`). Clearing `isReconciled` is necessary. A transaction left marked reconciled asserts a match to a bank record that no longer links to it, and the `stale-unmatched` read flags only rows with `isReconciled = false`, so the sync health check would never show it again.
+- POST `/api/b/[bookId]/transactions/[id]/plaid/unlink` — Removes the Plaid link from a matched transaction (sets reconciliation back to `pending`, clears `isReconciled`). It is the Unlink of the transition table for each row that links the transaction: the write has the same `WHERE` and the same columns (`UNLINK_SET` in `reconcile.rs`), so the flag of a row that the bank removed stays. Clearing `isReconciled` is necessary. A transaction left marked reconciled asserts a match to a bank record that no longer links to it, and the `stale-unmatched` read flags only rows with `isReconciled = false`, so the sync health check would never show it again.
 
 ## Reconciliation
 
-`rust-api/server/src/routes/reconcile.rs` owns the two queue reads and the six decisions. The route `sync/accounts/[id]/reconcile` serves them, and the two MCP tools send their requests through that route. Seven things about it are easy to get wrong:
+`rust-api/server/src/routes/reconcile.rs` owns the two queue reads and the six decisions. The route `sync/accounts/[id]/reconcile` serves them, and the two MCP tools send their requests through that route.
+
+### Transition table
+
+A staged bank row (`plaid_transaction_reconciliation`) has a status
+(`resolution_status`: `pending`, `matched`, `created`, `ignored`) and a flag
+(`review_reason`: NULL, `plaid_modified`, `plaid_removed`). "Linked" below is
+`matched` or `created`. The queue shows a row that is `pending` or has a flag.
+
+The six decisions. Each cell is the state after the decision, or "refused"
+(400, and nothing is written):
+
+| State of the row | `match`, `match_update_amount` | `create` | `ignore` | `keep_local` | `unlink` |
+| --- | --- | --- | --- | --- | --- |
+| `pending`, no flag | `matched`, no flag | `created`, no flag | `ignored`, no flag | refused | refused |
+| `pending`, `plaid_modified` (its transaction was deleted) | `matched`, no flag | `created`, no flag | `ignored`, no flag | `pending`, no flag | refused |
+| `pending`, `plaid_removed` | `matched`, no flag | `created`, no flag | `ignored`, no flag | refused | refused |
+| linked, no flag | refused: unlink first | refused: unlink first | refused: unlink first | refused | `pending`, no flag |
+| linked, `plaid_modified` | `matched`, no flag | `created`, no flag | `ignored`, no flag | same status, no flag | `pending`, no flag |
+| linked, `plaid_removed` | `matched`, no flag | `created`, no flag | `ignored`, no flag | refused | `pending`, `plaid_removed` |
+| `ignored` | refused | refused | refused | refused | refused |
+
+A decision that removes or replaces the link of a linked row also releases
+the old transaction (`release_previous()`, below). A status that is not one
+of the four takes no decision.
+
+The other writers of these columns:
+
+| Writer | From | To |
+| --- | --- | --- |
+| Sync, added (`stage_added()`) | no row | `pending`, no flag |
+| Sync, added again | any | same status, no flag |
+| Sync, modified (`stage_modified()`) | no row | `pending`, no flag |
+| Sync, modified | `pending`, any flag | `pending`, no flag, no metadata |
+| Sync, modified | linked, any flag | same status, `plaid_modified` |
+| Sync, modified | `ignored` | no change to the status or the flag |
+| Sync, removed (`stage_removed()`) | `pending` or linked, any flag | same status, `plaid_removed` |
+| Sync, removed | `ignored` | no change |
+| Auto-match (`auto_match()`) | `pending`, no flag | `matched`, no flag |
+| Transaction unlink route (`sync.rs`) | linked, any flag | as `unlink` above |
+| Transaction delete (`transactions.rs`) | linked, any flag | `pending`, same flag |
+| Reset (`clear_sync_data()`) | `pending`, any flag | the row is deleted |
+
+Rules that the table follows:
+
+- **The code has the table one time.** `Action::allowed_from()` in
+  `reconcile.rs` gives, for each decision, the states that it can start
+  from, as an SQL condition. `apply()` checks it before the first write, and
+  each decision's `UPDATE` has it in its `WHERE` (`resolve_row()`,
+  `UNLINK_SET`). A write that changes no row fails the decision, and the
+  transaction rolls back. `Action::refusal()` only selects the message.
+  Change the table here and that function together.
+- **`keep_local` is for a row that the bank changed.** A row that the bank
+  removed has no bank side to keep. Before this rule, Keep local made a
+  `pending` row with `plaid_removed` a plain pending row, and the
+  auto-matcher could then match a row that the bank had deleted. Ignore is
+  the way out of that state. For the same reason `unlink` keeps the
+  `plaid_removed` flag.
+- **`ignored` is final for the decisions.** No decision brings an ignored row
+  back, and the queue does not show it. A sync that adds the row again keeps
+  it ignored.
+- **A linked row with no flag takes only `unlink`.** It left the queue. This
+  is the already-linked guard below, and it now covers `ignore` too.
+- **`create` on a linked row that has a flag stays open.** It adds a second
+  transaction for the same bank charge and releases the old one. The modal
+  asks first ("Create a second transaction?") on a `plaid_modified` row. The
+  MCP tool has no such question.
+- **The client follows the table.** `ReconciliationModal` enables Keep local
+  only on a `plaid_modified` row (`canKeep`) and Unlink only on a linked row
+  (`canUnlink`), for the buttons and for the keys.
+- **The columns have no CHECK constraint yet.** The
+  guards are in the code only.
+
+### Rules of the resolver
+
+Eight things about it are easy to get wrong:
 
 - **It does not take a session lock**, unlike `sync_token()`. It changes one staged row by id inside one database transaction, and that transaction is the whole concurrency story. The transaction opens with `BEGIN IMMEDIATE` (`Database::transaction`), which holds the write lock of the database file before `apply()` reads the staged row (`load_row()`). Without that lock, two resolves of one row that run at the same time (two tabs, or the ordinary route and a TypeSafe confirmation) both read it as pending, both insert a transaction, and the second UPDATE overwrites the link, so the first transaction is left orphaned. With the lock, the second resolve waits, reads the row as linked, and the already-linked guard refuses it. Do not open this transaction with a plain `BEGIN`: a deferred transaction reads without the lock.
 - **The route checks the action's required field before it loads the row.** `validate_reconcile()` runs on the body first, so the route reports `"transactionId is required for match"` (400) ahead of `"Reconciliation row not found"` (404). `apply()` expects a validated decision: it does not check the field again. The TypeSafe confirmation builds its decision itself, from a stored candidate or proposal, so it must give the id that the action needs.
-- **A bank row that is already linked cannot be linked again** — `match`, `match_update_amount` and `create` all refuse when `matchedTransactionId` is set and `reviewReason` is null. Without it a repeated `create` inserts a second transaction and repoints the link at it, orphaning the first (still marked reconciled, attached to nothing, and invisible to the `stale-unmatched` read, which filters `isReconciled = false`). The `reviewReason` half is load-bearing: the queue is "pending OR flagged for review", `ReconciliationModal` renders those buttons for anything in it, so a row Plaid has since modified is both already-linked and legitimately re-linkable. What stays closed is what the UI cannot reach — `load_row()` matches on id, link and book but not queue membership, so MCP can address a fully-resolved row long after it left the queue.
+- **A bank row that is already linked cannot be linked again** — `match`, `match_update_amount`, `create` and `ignore` all refuse when the row is `matched` or `created` and `reviewReason` is null (the transition table above). Without it a repeated `create` inserts a second transaction and repoints the link at it, orphaning the first (still marked reconciled, attached to nothing, and invisible to the `stale-unmatched` read, which filters `isReconciled = false`). The `reviewReason` half is load-bearing: the queue is "pending OR flagged for review", `ReconciliationModal` renders those buttons for anything in it, so a row Plaid has since modified is both already-linked and legitimately re-linkable. What stays closed is what the UI cannot reach — `load_row()` matches on id, link and book but not queue membership, so MCP can address a fully-resolved row long after it left the queue.
 - **`unlink` un-reconciles its transaction, but only when nothing else matches it.** Per-link uniqueness is enforced per link, so one transaction can be matched on two links at once — that is how a transfer reconciles against both sides — and an unconditional clear would make a correctly-reconciled transfer a false positive in the health check.
+- **Every decision that removes or replaces a link releases the old transaction** with that same rule (`release_previous()`): `unlink`, `ignore` on a linked row, and `match`, `match_update_amount` or `create` on a row flagged for review that links a different transaction. A row that Plaid modified is still linked, and `ReconciliationModal` shows Ignore for it. Ignore once cleared the link and left the old transaction reconciled with no link, the same orphan that the already-linked guard prevents.
 - **Matching a floating transaction settles it**: `isFloating` is cleared and `date` stamped with `pick_matched_date()` (shared with the auto-matcher, not reimplemented). A floating transaction's stored date is its original entry date, so clearing the flag alone would snap it backwards in the register. A non-floating transaction keeps its date untouched — see the auto-match date rule above.
 - **There are two queue reads, and they sort differently.** `link_queue()` reads one link, for `sync/accounts/[id]/reconcile`. `book_queue()` reads the whole book, or one link with `linkId`, for `GET sync/reconcile`. The Sync page's review modal uses only the book-wide read, so it can show one list across all accounts. Both put rows that need review first. After that, the per-link read sorts by `lastSeenAt` and the book-wide read sorts by the bank date (`authorizedDate`, else `date`), newest first. A list that mixes accounts is easy to scan only in date order. The book-wide read keeps a link only when it maps to an asset or liability account, which is the rule `reconcilable_link()` applies to one link. There is no book-wide write: the modal posts each decision to `sync/accounts/[id]/reconcile` with the row's own `plaidAccountLinkId`.
 - **The action list is kept in step by hand** in `Action` and `validate_reconcile()` in `reconcile.rs`, the decision branches of `apply()`, `SyncResolveActionPayload` in `types/index.ts`, and the MCP tool's schema in `rust-api/server/mcp-tools.json`. A new action needs all of them.
@@ -209,7 +323,8 @@ Auto-match runs automatically after every sync (both manual and cron). It uses a
 Rust serves every route in this guide:
 
 - `rust-api/server/src/routes/sync.rs`: the connection routes, the account
-  mappings, the reset of a connection, the four sync reads (`pending-count`,
+  mappings, the reset of a connection (it does not run during a sync: see
+  "The connection lease and the cursor"), the four sync reads (`pending-count`,
   `assigned-accounts`, `pending-transactions`, `stale-unmatched`), the
   transaction Plaid link, and unlink.
 - `rust-api/server/src/routes/plaid_sync.rs`: the manual sync and the
@@ -281,6 +396,7 @@ cipher (XChaCha20-Poly1305, pure Rust, so it also builds for wasm32), and
 
 ## Key Functions
 - `sync_token(state, book_id, token_id)` in `routes/plaid_sync.rs` — Main sync entry point, returns `SyncResult` with counts of added/modified/removed/auto-matched. Serialized per token by a lease (`leases::plaid_sync(token_id)`, a row of `job_leases`), so the scheduled job, the MCP process and a manual click cannot fetch the same Plaid pages twice; the loser gets a 409 refusal rather than waiting. The whole sync therefore runs on one reserved connection
-- `SyncError` — `Refused` carries an HTTP status (404 token not found, 400 invalid config, 409 sync already running); `Failed` carries any other failure
-- `auto_match(connection, analytics, book_id, link_ids)` — Builds the learned payee map from historical matches, then returns the count of successful auto-matches
+- `connection_lease(database, token_id)` in `routes/plaid_sync.rs` — Takes that lease. The sync, the reset, the edit and the delete of a connection call it (see "The connection lease and the cursor")
+- `SyncError` — `Refused` carries an HTTP status (404 token not found, 400 invalid config, 409 sync already running, 409 the cursor changed during the sync); `Failed` carries any other failure
+- `auto_match(database, access, link_ids)` — Builds the learned payee map from historical matches, then returns the count of successful auto-matches
 - `Plaid::is_configured()` in `plaid.rs` — Checks if all three Plaid env vars are set

@@ -88,7 +88,7 @@ pub(crate) async fn get_entry_patterns(
 const LEASE: TimeDelta = TimeDelta::seconds(30);
 const RETRY: TimeDelta = TimeDelta::seconds(60);
 const DAILY_ATTEMPTS: i32 = 100;
-const UNAVAILABLE: &str = "TypeSafe is temporarily unavailable";
+const UNAVAILABLE: &str = "AI suggestions are temporarily unavailable";
 const OFF: &str = "Entry suggestions are off for this book";
 
 /// No cause in the log: it can hold request data.

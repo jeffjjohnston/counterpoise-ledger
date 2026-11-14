@@ -15,11 +15,6 @@ use worker::{
 /// The name of the one Durable Object that holds the database.
 const OBJECT_NAME: &str = "ledger";
 
-/// The header of `/health` that names the deployed commit, from the
-/// variable `BUILD_COMMIT` that a deploy sets. The deploy's probe reads it,
-/// so it can tell the new version from the one before it.
-const BUILD_HEADER: &str = "x-build-commit";
-
 #[event(fetch)]
 async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response> {
     let hsts = env
@@ -27,7 +22,6 @@ async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response> {
         .is_ok_and(|value| value.to_string() == "true");
     match route(&request.path()) {
         Route::Object => {
-            let health = request.path() == "/health";
             let restore = (request.method() == Method::Post && request.path() == restore::PATH)
                 .then(request_id);
             let response = match forward(request, &env, restore.as_deref()).await {
@@ -42,13 +36,7 @@ async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response> {
                     None => return Err(cause),
                 },
             };
-            let mut response = with_security_headers(response, hsts)?;
-            if health && let Ok(build) = env.var("BUILD_COMMIT") {
-                response
-                    .headers_mut()
-                    .set(BUILD_HEADER, &build.to_string())?;
-            }
-            Ok(response)
+            with_security_headers(response, hsts)
         }
         Route::Page => {
             let response = match page_gate(&request.path(), &cookie_headers(&request)?) {

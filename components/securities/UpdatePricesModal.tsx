@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useBookId } from "@/hooks/useBookId";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
@@ -91,14 +91,27 @@ export function UpdatePricesModal({
   const [saving, setSaving] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [defaultDate, setDefaultDate] = useState("");
+  // The securities with a fetch preference write in flight.
+  const [togglePending, setTogglePending] = useState<ReadonlySet<number>>(new Set());
+  const togglesInFlight = useRef(new Set<number>());
+  const wasOpen = useRef(false);
+  // The default date of this opening, for a row that arrives later.
+  const openedDate = useRef("");
 
-  // Initialize default date when modal opens
+  // Start with empty prices and the default date when the modal opens. Only
+  // the change from closed to open does this. While the modal is open, a new
+  // `securities` array must not clear what the user typed or retrieved: the
+  // page can give a new array on any render. A security that arrives while
+  // the modal is open gets its own empty row.
   useEffect(() => {
-    if (isOpen) {
-      const date = getDefaultPriceDate();
-      setDefaultDate(date);
+    const opening = isOpen && !wasOpen.current;
+    wasOpen.current = isOpen;
+    if (!isOpen) return;
 
-      // Initialize price updates with default date
+    if (opening) {
+      const date = getDefaultPriceDate();
+      openedDate.current = date;
+      setDefaultDate(date);
       const initialUpdates: Record<number, PriceUpdate> = {};
       securities.forEach((security) => {
         initialUpdates[security.id] = {
@@ -108,15 +121,32 @@ export function UpdatePricesModal({
         };
       });
       setPriceUpdates(initialUpdates);
-      setFetchState((prev) => {
-        const next: FetchState = {};
-        securities.forEach((security) => {
-          next[security.id] = prev[security.id] ?? security.fetchPrices ?? true;
-        });
+    } else {
+      setPriceUpdates((prev) => {
+        const added = securities.filter((security) => !(security.id in prev));
+        if (added.length === 0) return prev;
+        const next = { ...prev };
+        for (const security of added) {
+          next[security.id] = { securityId: security.id, newPrice: "", newDate: openedDate.current };
+        }
         return next;
       });
     }
+    setFetchState((prev) => {
+      const next: FetchState = {};
+      securities.forEach((security) => {
+        next[security.id] = prev[security.id] ?? security.fetchPrices ?? true;
+      });
+      return next;
+    });
   }, [isOpen, securities]);
+
+  // Escape, the backdrop and the X do nothing while a request is in flight,
+  // as Cancel does. A close then would hide the result of the request.
+  const handleClose = () => {
+    if (saving || fetching) return;
+    onClose();
+  };
 
   const handlePriceChange = (securityId: number, price: string) => {
     setPriceUpdates((prev) => ({
@@ -139,6 +169,12 @@ export function UpdatePricesModal({
   };
 
   const handleFetchToggle = async (securityId: number, currentValue: boolean) => {
+    // One write for each security at a time. With two writes in flight, a
+    // failure of one cannot tell which value the server has.
+    if (togglesInFlight.current.has(securityId)) return;
+    togglesInFlight.current.add(securityId);
+    setTogglePending(new Set(togglesInFlight.current));
+
     const nextValue = !currentValue;
     setFetchState((prev) => ({
       ...prev,
@@ -151,11 +187,16 @@ export function UpdatePricesModal({
       });
     } catch (error) {
       console.error("Error updating fetch preference:", error);
+      // No other write of this security was in flight, so the value before
+      // this toggle is the value that the server has.
       setFetchState((prev) => ({
         ...prev,
-        [securityId]: !nextValue,
+        [securityId]: currentValue,
       }));
       toast.error(toMessage(error, "Failed to update fetch preference"));
+    } finally {
+      togglesInFlight.current.delete(securityId);
+      setTogglePending(new Set(togglesInFlight.current));
     }
   };
 
@@ -304,7 +345,7 @@ export function UpdatePricesModal({
   };
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title="Update Security Prices" size="xl">
+    <Modal isOpen={isOpen} onClose={handleClose} title="Update Security Prices" size="xl">
       <div className="space-y-4">
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-border">
@@ -344,7 +385,7 @@ export function UpdatePricesModal({
                             fetchState[security.id] ?? security.fetchPrices ?? true
                           )
                         }
-                        disabled={fetching}
+                        disabled={fetching || saving || togglePending.has(security.id)}
                         className="h-4 w-4 text-fg-accent focus:ring-fg-accent border-border rounded"
                       />
                     ) : (
@@ -385,7 +426,7 @@ export function UpdatePricesModal({
                           onBlur={(e) =>
                             handlePriceChange(security.id, resolveAmountOnBlur(e.target.value))
                           }
-                          disabled={fetching}
+                          disabled={fetching || saving}
                           selectOnFocus
                         />
                       </td>
@@ -394,7 +435,7 @@ export function UpdatePricesModal({
                           type="date"
                           value={priceUpdates[security.id]?.newDate || defaultDate}
                           onChange={(e) => handleDateChange(security.id, e.target.value)}
-                          disabled={fetching}
+                          disabled={fetching || saving}
                         />
                       </td>
                     </>

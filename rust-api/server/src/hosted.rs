@@ -106,10 +106,15 @@ fn prepare_rows(database: &Database) -> Result<(), Box<dyn Error>> {
         );
     }
     // A file whose trades are all buys has lots and no allocation, so the
-    // guard here is that no lot exists where a buy would open one.
-    if ledger_db::lots::lots_absent(database)? {
-        tracing::warn!("The database has trades and no lots: the lot rebuild will run");
-        scheduler::request(database, "lot-rebuild")?;
+    // guard here is that no lot exists where a buy would open one. A rebuild
+    // that the scheduler stopped part way left some lots, so the scheduler
+    // also reads the record of the last rebuild.
+    let absent = ledger_db::lots::lots_absent(database)?;
+    if scheduler::request_lot_rebuild(database, absent)? {
+        tracing::warn!(
+            lots_absent = absent,
+            "The database has trades and no lots, or its last lot rebuild failed: the lot rebuild will run"
+        );
     }
     let token_keys = plaid_token_keys::TokenKeys::from_env()?;
     let prepared = plaid_token_keys::prepare(database, &token_keys)?;
@@ -137,8 +142,8 @@ fn repair_folds(database: &Database) -> Result<(), Box<dyn Error>> {
 /// any plaintext Plaid token. It does not repair the folded columns, which
 /// reads every row: the host calls [`App::repair_folds`] once per build. It
 /// does not rebuild lots, which can outlast the object's start: a file that
-/// has trades and no lots asks the scheduler for the stepped lot rebuild,
-/// which the next alarm starts.
+/// has trades and no lots, or whose last rebuild failed, asks the scheduler
+/// for the stepped lot rebuild, which the next alarm starts.
 pub fn start(database: Database) -> Result<App, Box<dyn Error>> {
     #[cfg(target_arch = "wasm32")]
     crate::tracing_setup::init_console();

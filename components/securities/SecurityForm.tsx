@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useSubmitGuard } from "@/hooks/useSubmitGuard";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
@@ -15,7 +16,7 @@ interface SecurityFormProps {
     symbol: string;
     securityType: Security["securityType"];
     fixedPriceMicros: number | null;
-  }) => void;
+  }) => void | Promise<unknown>;
   onCancel: () => void;
 }
 
@@ -50,6 +51,8 @@ export function SecurityForm({ security, onSubmit, onCancel }: SecurityFormProps
       ? Math.round(parsedFixedPrice * MICROS_PER_SHARE)
       : null;
 
+  const submitGuard = useSubmitGuard();
+
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
 
@@ -62,11 +65,15 @@ export function SecurityForm({ security, onSubmit, onCancel }: SecurityFormProps
     }
 
     setFixedPriceError(null);
-    onSubmit({ name, symbol, securityType, fixedPriceMicros });
+    // One save at a time: a second submit during the request is dropped.
+    void submitGuard.run(() => onSubmit({ name, symbol, securityType, fixedPriceMicros }));
   };
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
+    <form onSubmit={handleSubmit}>
+      {/* The form takes no input during the save. A success closes it, and
+          text typed during the save would be lost. */}
+      <fieldset disabled={submitGuard.saving} className="space-y-4 min-w-0">
       <Input
         id="security-name"
         label="Security Name"
@@ -133,10 +140,11 @@ export function SecurityForm({ security, onSubmit, onCancel }: SecurityFormProps
         <Button type="button" variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button type="submit">
+        <Button type="submit" disabled={submitGuard.saving}>
           {security ? "Save Changes" : "Add Security"}
         </Button>
       </div>
+      </fieldset>
     </form>
   );
 }

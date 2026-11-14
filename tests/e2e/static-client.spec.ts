@@ -61,6 +61,53 @@ test.describe("static client", () => {
   });
 });
 
+// The Rust server sends the Content-Security-Policy with the page
+// (rust-api/server/src/security.rs). The policy must let the app work, and
+// it must refuse what it is there to refuse.
+test.describe("Content-Security-Policy", () => {
+  test.use({ colorScheme: "dark" });
+
+  test("refuses nothing that the pages need", async ({ page, bookId }) => {
+    await page.addInitScript(() => {
+      const seen: string[] = [];
+      (window as unknown as { cspViolations: string[] }).cspViolations = seen;
+      document.addEventListener("securitypolicyviolation", (event) =>
+        seen.push(`${event.violatedDirective} ${event.blockedURI}`)
+      );
+    });
+    const violations = () =>
+      page.evaluate(() => (window as unknown as { cspViolations: string[] }).cspViolations);
+    const socket = page.waitForEvent("websocket");
+
+    // The transaction list needs the WASM module, and the book needs its socket.
+    await page.goto(`/b/${bookId}/transactions`);
+    await expect(page.locator("tbody tr").first()).toBeVisible();
+    await socket;
+    // The inline theme script ran: its hash is in the policy.
+    await expect(page.locator("html")).toHaveClass(/dark/);
+    expect(await violations()).toEqual([]);
+
+    await page.goto(`/b/${bookId}/reports`);
+    await expect(page.getByRole("heading", { name: "Reports", exact: true })).toBeVisible();
+    expect(await violations()).toEqual([]);
+  });
+
+  test("refuses an inline script and a request to another host", async ({ page, bookId }) => {
+    await page.goto(`/b/${bookId}`);
+    const inlineRan = await page.evaluate(() => {
+      const script = document.createElement("script");
+      script.textContent = "window.inlineRan = true";
+      document.head.appendChild(script);
+      return (window as unknown as { inlineRan?: boolean }).inlineRan === true;
+    });
+    expect(inlineRan).toBe(false);
+    const outside = await page.evaluate(() =>
+      fetch("https://outside.example/").then(() => "sent", () => "refused")
+    );
+    expect(outside).toBe("refused");
+  });
+});
+
 // A tab that was open before a deploy asks for chunks that the deploy
 // removed. The unit tests of RouteError use a made-up error. These tests make
 // the real browser, Vite and React Router give the error, so that an upgrade

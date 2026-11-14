@@ -15,6 +15,12 @@ compatibility_date = "2026-10-01"
 # to the zone's origin and skips its Workers and Access, and a client
 # metadata document URL is chosen by whoever signs in.
 compatibility_flags = ["global_fetch_strictly_public"]
+# The Worker answers only on its custom domain, which Cloudflare Access
+# protects. Without these two lines, wrangler uses its default (on), and each
+# deploy turns on a workers.dev URL and preview URLs. Access does not protect
+# these URLs, so a client could reach the app without the Access login.
+workers_dev = false
+preview_urls = false
 
 # The workspace's release profile strips the binaries, which removes the
 # table that wasm-bindgen needs, so the Worker build keeps it. The build also
@@ -44,8 +50,12 @@ new_sqlite_classes = ["LedgerObject"]
 binding = "EXPORTS"
 bucket_name = "counterpoise-exports"
 
+# APP_TZ is the zone of the schedules and of today's date. Workers has no TZ
+# and its system zone is UTC, so without APP_TZ the jobs run on UTC and the
+# date changes at 19:00 or 20:00 New York time (ledger_db::clock).
 [vars]
 ENABLE_HSTS = "false"
+APP_TZ = "America/New_York"
 
 # Workers Logs and traces. Cloudflare keeps them for 7 days. The query string
 # can hold search text, so it is removed from the logged and traced URLs.
@@ -69,7 +79,11 @@ head_sampling_rate = 1
 # bucket, so its daily dump never lands where the other Worker's does. A
 # binding and a variable are not inherited, so each is repeated here.
 [env.staging]
-vars = { ENABLE_HSTS = "false" }
+vars = { ENABLE_HSTS = "false", APP_TZ = "America/New_York" }
+# As at the top: no workers.dev URL and no preview URLs. Repeated here so
+# that the staging Worker does not depend on how wrangler inherits them.
+workers_dev = false
+preview_urls = false
 
 [[env.staging.durable_objects.bindings]]
 name = "LEDGER"
@@ -97,6 +111,10 @@ head_sampling_rate = 1
 # Secrets, set with `../../scripts/wrangler.sh secret put <NAME>`, or in `.dev.vars` for a
 # local run: CRON_SECRET, PLAID_CLIENT_ID, PLAID_SECRET, PLAID_TOKEN_KEY,
 # PLAID_TOKEN_KEY_PREVIOUS, TIINGO_API_KEY, ANTHROPIC_API_KEY,
-# TYPESAFE_API_KEY, ISSUE_SYNC_GITHUB_TOKEN, POSTHOG_PERSONAL_API_KEY.
+# TYPESAFE_ENABLED, TYPESAFE_CLEF_ACCOUNT_ID, TYPESAFE_CLEF_API_TOKEN,
+# ISSUE_SYNC_GITHUB_TOKEN.
+# BACKUP_S3_BUCKET, BACKUP_S3_REGION, BACKUP_S3_ACCESS_KEY_ID and
+# BACKUP_S3_SECRET_ACCESS_KEY turn on the S3 copy of the daily dump: set all
+# four or none (guides/database-management.md#the-s3-copy).
 # IMPORT_SECRET turns on the admin import and restore routes; delete it
 # afterwards.

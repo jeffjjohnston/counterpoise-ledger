@@ -8,7 +8,6 @@ import {
   createRecurringRule,
   createSecurity,
   createInvestmentSplit,
-  createBook,
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
@@ -110,79 +109,54 @@ describe("MCP Tools", () => {
       });
     });
 
-    it("filters by accountId", async () => {
+    // The tool changes each argument into the register route's query. The
+    // route's filters have their own tests in tests/http/transactions.test.ts.
+    // This test makes sure that each argument gets to the route, and that the
+    // tool gives the limit and offset defaults.
+    it("sends each filter, the limit and the offset to the register route", async () => {
       const checking = await createAccount({ name: "Checking", type: "asset" });
       const savings = await createAccount({ name: "Savings", type: "asset" });
+      const vacation = await createAccount({ name: "Vacation Fund", type: "asset" });
       const groceries = await createAccount({ name: "Groceries", type: "expense" });
+      const market = await createPayee({ name: "Market" });
+      const add = (date: string, description: string, from: number, payeeId?: number) =>
+        createTransactionWithSplits({
+          date, description, payeeId,
+          splits: [
+            { accountId: from, amount: -100 },
+            { accountId: groceries.id, amount: 100 },
+          ],
+        });
+      await add("2026-01-10", "Checking at market", checking.id, market.id);
+      await add("2026-01-11", "Savings", savings.id);
+      await add("2026-01-12", "Vacation", vacation.id);
+      await add("2026-02-15", "Checking later", checking.id);
 
-      await createTransactionWithSplits({
-        date: "2025-01-15",
-        description: "Checking transaction",
-        splits: [
-          { accountId: checking.id, amount: -3000 },
-          { accountId: groceries.id, amount: 3000 },
-        ],
-      });
+      const list = async (args: Record<string, unknown>) => {
+        const { data, isError } = await callTool("list_transactions", { bookId: 1, ...args });
+        expect(isError, JSON.stringify(args)).toBe(false);
+        return {
+          ...data,
+          descriptions: data.transactions.map((t: { description: string }) => t.description),
+        };
+      };
 
-      await createTransactionWithSplits({
-        date: "2025-01-16",
-        description: "Savings transaction",
-        splits: [
-          { accountId: savings.id, amount: -2000 },
-          { accountId: groceries.id, amount: 2000 },
-        ],
-      });
+      const all = await list({});
+      expect(all.descriptions).toEqual(["Checking later", "Vacation", "Savings", "Checking at market"]);
+      expect(all).toMatchObject({ totalCount: 4, limit: 50, offset: 0 });
 
-      const { data, isError } = await callTool("list_transactions", {
-        bookId: 1,
-        accountId: checking.id,
-      });
+      expect((await list({ accountId: checking.id })).descriptions)
+        .toEqual(["Checking later", "Checking at market"]);
+      // The tool joins the accountIds array into one comma-separated value.
+      expect((await list({ accountIds: [checking.id, savings.id] })).descriptions)
+        .toEqual(["Checking later", "Savings", "Checking at market"]);
+      expect((await list({ payeeId: market.id })).descriptions).toEqual(["Checking at market"]);
+      expect((await list({ startDate: "2026-01-11", endDate: "2026-01-31" })).descriptions)
+        .toEqual(["Vacation", "Savings"]);
 
-      expect(isError).toBe(false);
-      expect(data.transactions).toHaveLength(1);
-      expect(data.transactions[0].description).toBe("Checking transaction");
-    });
-
-    it("filters by date range", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset" });
-      const groceries = await createAccount({ name: "Groceries", type: "expense" });
-
-      await createTransactionWithSplits({
-        date: "2025-01-15",
-        description: "January",
-        splits: [
-          { accountId: checking.id, amount: -1000 },
-          { accountId: groceries.id, amount: 1000 },
-        ],
-      });
-
-      await createTransactionWithSplits({
-        date: "2025-02-15",
-        description: "February",
-        splits: [
-          { accountId: checking.id, amount: -2000 },
-          { accountId: groceries.id, amount: 2000 },
-        ],
-      });
-
-      await createTransactionWithSplits({
-        date: "2025-03-15",
-        description: "March",
-        splits: [
-          { accountId: checking.id, amount: -3000 },
-          { accountId: groceries.id, amount: 3000 },
-        ],
-      });
-
-      const { data, isError } = await callTool("list_transactions", {
-        bookId: 1,
-        startDate: "2025-02-01",
-        endDate: "2025-02-28",
-      });
-
-      expect(isError).toBe(false);
-      expect(data.transactions).toHaveLength(1);
-      expect(data.transactions[0].description).toBe("February");
+      const page = await list({ limit: 1, offset: 1 });
+      expect(page.descriptions).toEqual(["Vacation"]);
+      expect(page).toMatchObject({ totalCount: 4, limit: 1, offset: 1 });
     });
 
     it("includes payee information", async () => {
@@ -255,147 +229,6 @@ describe("MCP Tools", () => {
       expect(result.investmentSplits[0].sharesMicros).toBe(50_000_000);
     });
 
-    it("respects limit and offset", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset" });
-      const groceries = await createAccount({ name: "Groceries", type: "expense" });
-
-      // Create 5 transactions
-      for (let i = 1; i <= 5; i++) {
-        await createTransactionWithSplits({
-          date: `2025-01-${String(i).padStart(2, "0")}`,
-          description: `Transaction ${i}`,
-          splits: [
-            { accountId: checking.id, amount: -1000 * i },
-            { accountId: groceries.id, amount: 1000 * i },
-          ],
-        });
-      }
-
-      const { data, isError } = await callTool("list_transactions", {
-        bookId: 1,
-        limit: 2,
-        offset: 0,
-      });
-
-      expect(isError).toBe(false);
-      expect(data.transactions).toHaveLength(2);
-      expect(data.totalCount).toBe(5);
-      // Ordered by date DESC, so most recent first
-      expect(data.transactions[0].description).toBe("Transaction 5");
-      expect(data.transactions[1].description).toBe("Transaction 4");
-    });
-
-    it("filters by accountIds across several accounts", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset" });
-      const savings = await createAccount({ name: "Savings", type: "asset" });
-      const groceries = await createAccount({ name: "Groceries", type: "expense" });
-      // Neither leg of this one is in the accountIds filter below — it must
-      // be excluded. Without it, a filter that's ignored entirely would
-      // still pass: the book would contain exactly the two matching rows.
-      const vacationFund = await createAccount({ name: "Vacation Fund", type: "asset" });
-      const rent = await createAccount({ name: "Rent", type: "expense" });
-      await createTransactionWithSplits({
-        date: "2026-01-10", description: "From checking",
-        splits: [
-          { accountId: checking.id, amount: -100 },
-          { accountId: groceries.id, amount: 100 },
-        ],
-      });
-      await createTransactionWithSplits({
-        date: "2026-01-11", description: "From savings",
-        splits: [
-          { accountId: savings.id, amount: -200 },
-          { accountId: groceries.id, amount: 200 },
-        ],
-      });
-      await createTransactionWithSplits({
-        date: "2026-01-12", description: "From vacation fund",
-        splits: [
-          { accountId: vacationFund.id, amount: -300 },
-          { accountId: rent.id, amount: 300 },
-        ],
-      });
-
-      const { data, isError } = await callTool("list_transactions", {
-        bookId: 1,
-        accountIds: [checking.id, savings.id],
-      });
-
-      expect(isError).toBe(false);
-      expect(data.totalCount).toBe(2);
-      const descriptions = data.transactions
-        .map((t: { description: string }) => t.description)
-        .sort();
-      expect(descriptions).toEqual(["From checking", "From savings"]);
-      expect(descriptions).not.toContain("From vacation fund");
-    });
-
-    it("returns each transaction once when accountIds matches both of its legs", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset" });
-      const groceries = await createAccount({ name: "Groceries", type: "expense" });
-      // Not in the accountIds filter below — proves toHaveLength(1) is
-      // distinguishing rather than trivially true from an empty book.
-      const savings = await createAccount({ name: "Savings", type: "asset" });
-      const rent = await createAccount({ name: "Rent", type: "expense" });
-      await createTransactionWithSplits({
-        date: "2026-01-10", description: "Both legs",
-        splits: [
-          { accountId: checking.id, amount: -100 },
-          { accountId: groceries.id, amount: 100 },
-        ],
-      });
-      await createTransactionWithSplits({
-        date: "2026-01-11", description: "Unrelated",
-        splits: [
-          { accountId: savings.id, amount: -200 },
-          { accountId: rent.id, amount: 200 },
-        ],
-      });
-
-      const { data } = await callTool("list_transactions", {
-        bookId: 1,
-        accountIds: [checking.id, groceries.id],
-      });
-
-      expect(data.transactions).toHaveLength(1);
-      expect(data.transactions[0].description).toBe("Both legs");
-      expect(data.totalCount).toBe(1);
-    });
-
-    it("errors on a payeeId from another book rather than returning an empty list", async () => {
-      // An empty list reads as "this payee has no transactions", which is a
-      // wrong answer rather than an empty one.
-      const otherBook = await createBook({ name: "Other Book" });
-      const theirPayee = await createPayee({ name: "Theirs", bookId: otherBook.id });
-
-      const { data, isError } = await callTool("list_transactions", {
-        bookId: 1,
-        payeeId: theirPayee.id,
-      });
-
-      expect(isError).toBe(true);
-      expect(data.error).toBe("Invalid payeeId");
-    });
-
-    it("errors on an accountIds entry from another book rather than returning an empty list", async () => {
-      // Same failure shape as the payeeId case above: an empty list reads as
-      // "this account has no transactions", a wrong answer rather than an
-      // empty one.
-      const checking = await createAccount({ name: "Checking", type: "asset" });
-      const otherBook = await createBook({ name: "Other Book" });
-      const theirAccount = await createAccount({
-        name: "Theirs", type: "asset", bookId: otherBook.id,
-      });
-
-      const { data, isError } = await callTool("list_transactions", {
-        bookId: 1,
-        accountIds: [checking.id, theirAccount.id],
-      });
-
-      expect(isError).toBe(true);
-      expect(data.error).toBe("One or more accounts do not belong to this book");
-    });
-
     it("accountIds wins over accountId when both are given and would select different rows", async () => {
       const checking = await createAccount({ name: "Checking", type: "asset" });
       const savings = await createAccount({ name: "Savings", type: "asset" });
@@ -444,89 +277,6 @@ describe("MCP Tools", () => {
 
   // ---------- search ----------
   describe("search", () => {
-    it("finds accounts by name", async () => {
-      await createAccount({ name: "Checking Account", type: "asset" });
-      await createAccount({ name: "Savings Account", type: "asset" });
-      await createAccount({ name: "Groceries", type: "expense" });
-
-      const { data, isError } = await callTool("search", { bookId: 1, query: "Account" });
-
-      expect(isError).toBe(false);
-      expect(data.accounts.items).toHaveLength(2);
-      const names = data.accounts.items.map((a: { name: string }) => a.name);
-      expect(names).toContain("Checking Account");
-      expect(names).toContain("Savings Account");
-    });
-
-    it("finds payees by name", async () => {
-      await createPayee({ name: "Whole Foods Market" });
-      await createPayee({ name: "Trader Joe's" });
-
-      const { data, isError } = await callTool("search", { bookId: 1, query: "Foods" });
-
-      expect(isError).toBe(false);
-      expect(data.payees.items).toHaveLength(1);
-      expect(data.payees.items[0].name).toBe("Whole Foods Market");
-    });
-
-    it("finds transactions by description", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset" });
-      const groceries = await createAccount({ name: "Groceries", type: "expense" });
-
-      await createTransactionWithSplits({
-        date: "2025-01-15",
-        description: "Weekly grocery shopping at Costco",
-        splits: [
-          { accountId: checking.id, amount: -15000 },
-          { accountId: groceries.id, amount: 15000 },
-        ],
-      });
-
-      await createTransactionWithSplits({
-        date: "2025-01-16",
-        description: "Gas station fill up",
-        splits: [
-          { accountId: checking.id, amount: -6000 },
-          { accountId: groceries.id, amount: 6000 },
-        ],
-      });
-
-      const { data, isError } = await callTool("search", { bookId: 1, query: "Costco" });
-
-      expect(isError).toBe(false);
-      expect(data.transactions).toHaveLength(1);
-      expect(data.transactions[0].description).toBe("Weekly grocery shopping at Costco");
-    });
-
-    it("matches text case-insensitively, like the web search", async () => {
-      const checking = await createAccount({ name: "Checking Account", type: "asset" });
-      const groceries = await createAccount({ name: "Groceries", type: "expense" });
-      const payee = await createPayee({ name: "Whole Foods Market" });
-
-      await createTransactionWithSplits({
-        date: "2025-01-15",
-        description: "Weekly shopping at Costco",
-        payeeId: payee.id,
-        splits: [
-          { accountId: checking.id, amount: -15000 },
-          { accountId: groceries.id, amount: 15000 },
-        ],
-      });
-
-      const { data, isError } = await callTool("search", {
-        bookId: 1,
-        query: "cosTCo",
-      });
-      expect(isError).toBe(false);
-      expect(data.transactions).toHaveLength(1);
-
-      const accountHit = await callTool("search", { bookId: 1, query: "cHeCKing" });
-      expect(accountHit.data.accounts.items).toHaveLength(1);
-
-      const payeeHit = await callTool("search", { bookId: 1, query: "whole foods" });
-      expect(payeeHit.data.payees.items).toHaveLength(1);
-    });
-
     // MCP search shares the web route's implementation (`search_book()` in
     // rust-api/server/src/routes/search.rs), so
     // it gained the capabilities its own query never had: recurring rules,
@@ -595,35 +345,6 @@ describe("MCP Tools", () => {
       const byTxn = await callTool("search", { bookId: 1, query: "Shopping trip" });
       expect(byTxn.data.transactions[0].payeeName).toBe("Whole Foods Market");
       expect(byTxn.data.transactions[0].notes).toBeDefined();
-    });
-
-    it("finds transactions by numeric amount", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset" });
-      const groceries = await createAccount({ name: "Groceries", type: "expense" });
-
-      await createTransactionWithSplits({
-        date: "2025-01-15",
-        description: "Specific purchase",
-        splits: [
-          { accountId: checking.id, amount: -4299 },
-          { accountId: groceries.id, amount: 4299 },
-        ],
-      });
-
-      await createTransactionWithSplits({
-        date: "2025-01-16",
-        description: "Other purchase",
-        splits: [
-          { accountId: checking.id, amount: -9999 },
-          { accountId: groceries.id, amount: 9999 },
-        ],
-      });
-
-      const { data, isError } = await callTool("search", { bookId: 1, query: "42.99" });
-
-      expect(isError).toBe(false);
-      expect(data.transactions).toHaveLength(1);
-      expect(data.transactions[0].description).toBe("Specific purchase");
     });
 
     it("respects date range filters", async () => {

@@ -7,8 +7,7 @@ import {
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
 import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-client";
-import { count, rows } from "@/tests/helpers/sql";
-import type { Account } from "@/types/db";
+import { count } from "@/tests/helpers/sql";
 import { toDateString } from "@/lib/formatters";
 
 let mcp: McpTestClient;
@@ -395,25 +394,6 @@ describe("MCP Account Tools", () => {
       expect(blank.data.icon).toBeNull();
     });
 
-    it("creates the paired cash sub-account for an investment account", async () => {
-      const { data, isError } = await callTool("create_account", {
-        bookId,
-        name: "Brokerage",
-        type: "asset",
-        subtype: "investment",
-      });
-
-      expect(isError).toBe(false);
-
-      const children = await rows<Account>(
-        "SELECT * FROM accounts WHERE parent_id = $1 AND book_id = $2",
-        [data.id, bookId]
-      );
-      expect(children).toHaveLength(1);
-      expect(children[0].isInvestmentCash).toBe(true);
-      expect(children[0].name).toBe("Brokerage Cash");
-    });
-
     it("returns an error for an invalid parentId", async () => {
       const { data, isError } = await callTool("create_account", {
         bookId,
@@ -476,38 +456,6 @@ describe("MCP Account Tools", () => {
   });
 
   describe("delete_account", () => {
-    it("refuses to delete an account with transactions", async () => {
-      const checking = await createAccount({
-        name: "Checking",
-        type: "asset",
-        subtype: "bank",
-        bookId,
-      });
-      const groceries = await createAccount({
-        name: "Groceries",
-        type: "expense",
-        subtype: "other",
-        bookId,
-      });
-      await createTransactionWithSplits({
-        bookId,
-        date: "2026-01-15",
-        description: "Food",
-        splits: [
-          { accountId: groceries.id, amount: 500 },
-          { accountId: checking.id, amount: -500 },
-        ],
-      });
-
-      const { data, isError } = await callTool("delete_account", {
-        bookId,
-        accountId: checking.id,
-      });
-
-      expect(isError).toBe(true);
-      expect(data.error).toMatch(/transactions/i);
-    });
-
     it("deletes an empty account", async () => {
       const spare = await createAccount({
         name: "Spare",

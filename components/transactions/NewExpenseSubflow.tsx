@@ -60,6 +60,9 @@ export function NewExpenseSubflow({
   if (!isOpen) return null;
 
   const handleCreateExpense = async () => {
+    // Enter can arrive again before the first request has an answer. The
+    // Create button is disabled then, but the key is not.
+    if (isCreating) return;
     if (!name.trim()) {
       toast.error("Please enter an expense name");
       return;

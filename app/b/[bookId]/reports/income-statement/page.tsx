@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useBookId } from "@/hooks/useBookId";
+import { useLatestRequest } from "@/hooks/useLatestRequest";
+import { useLiveReload } from "@/components/BookChangesProvider";
 import { AccountCard } from "@/components/accounts/AccountCard";
 import { IncomeStatementCharts } from "@/components/reports/IncomeStatementCharts";
 import { Button } from "@/components/ui/Button";
@@ -12,6 +14,10 @@ import { getDisplayBalance, flattenAccounts } from "@/lib/wasm-client";
 import { csvEscape, datedCsvFilename, triggerDownload } from "@/lib/csv";
 import { apiGet } from "@/lib/api-client";
 import type { AccountWithBalance } from "@/types";
+
+// The tables that the page reads: the accounts with their all-time balances,
+// and the splits and their transactions (the dates) for a period.
+const STATEMENT_TABLES = new Set(["accounts", "transaction_splits", "transactions"]);
 
 interface AccountSummary {
   type: string;
@@ -111,25 +117,55 @@ export default function IncomeStatementPage() {
     IncomeStatementAccountSummary[]
   >([]);
   const [incomeStatementLoading, setIncomeStatementLoading] = useState(false);
+  // Each live update adds one. The period request runs again on a change.
+  const [statementRevision, setStatementRevision] = useState(0);
+
+  // A live update can start a request while another is in flight. Only the
+  // latest request may publish its answer.
+  const startAccountsRequest = useLatestRequest();
+  // Whether the account list has rendered. A live reload can overtake the
+  // first load, so the first answer, not the first request, decides between
+  // the full-page error and a quiet failure.
+  const accountsShown = useRef(false);
+  // The period (book and dates) of the period totals on the screen. A
+  // request for the same period is a background reload: it does not show the
+  // loading text, and if it fails, the old totals stay.
+  const shownPeriod = useRef<string | null>(null);
+
+  const fetchAccounts = useCallback(async () => {
+    const isLatest = startAccountsRequest();
+    try {
+      const data = await apiGet<AccountWithBalance[]>(
+        `/api/b/${bookId}/accounts?includeInactive=true`
+      );
+      if (!isLatest()) return;
+      setAccounts(flattenAccounts(data));
+      setError(null);
+      accountsShown.current = true;
+      setLoading(false);
+    } catch (err) {
+      if (!isLatest()) return;
+      if (!accountsShown.current) {
+        setError("Could not load accounts.");
+        setLoading(false);
+      } else {
+        // A background reload failed. The accounts on the screen stay.
+        console.error("Failed to refresh accounts:", err);
+      }
+    }
+  }, [bookId, startAccountsRequest]);
 
   useEffect(() => {
-    const fetchAccounts = async () => {
-      try {
-        const data = await apiGet<AccountWithBalance[]>(
-          `/api/b/${bookId}/accounts?includeInactive=true`
-        );
-        const flatAccounts = flattenAccounts(data);
-        setAccounts(flatAccounts);
-        setError(null);
-      } catch {
-        setError("Could not load accounts.");
-      } finally {
-        setLoading(false);
-      }
-    };
-
+    accountsShown.current = false;
     void fetchAccounts();
-  }, [bookId]);
+  }, [fetchAccounts]);
+
+  // Another client (an MCP tool, another tab, a scheduled job) changed the
+  // book. The reload keeps the period and the custom dates.
+  useLiveReload(STATEMENT_TABLES, () => {
+    void fetchAccounts();
+    setStatementRevision((revision) => revision + 1);
+  });
 
   useEffect(() => {
     if (incomePeriod !== "custom") return;
@@ -152,24 +188,35 @@ export default function IncomeStatementPage() {
 
   useEffect(() => {
     if (incomePeriod === "all") {
+      shownPeriod.current = null;
       setIncomeStatementAccounts([]);
       setIncomeStatementLoading(false);
       return;
     }
 
     if (!incomePeriodRange.startDate || !incomePeriodRange.endDate) {
+      shownPeriod.current = null;
       setIncomeStatementAccounts([]);
       setIncomeStatementLoading(false);
       return;
     }
+
+    const period = `${bookId}|${incomePeriodRange.startDate}|${incomePeriodRange.endDate}`;
+    const background = shownPeriod.current === period;
 
     const params = new URLSearchParams({
       startDate: incomePeriodRange.startDate,
       endDate: incomePeriodRange.endDate,
     });
 
+    // The abort on cleanup also makes the latest request win when a live
+    // update starts a new request while one is in flight.
     const controller = new AbortController();
-    setIncomeStatementLoading(true);
+    if (!background) {
+      // The totals on the screen are now for another period.
+      shownPeriod.current = null;
+      setIncomeStatementLoading(true);
+    }
     apiGet<{ accounts?: IncomeStatementAccountSummary[] }>(
       `/api/b/${bookId}/reports/income-statement?${params.toString()}`,
       { signal: controller.signal }
@@ -180,6 +227,7 @@ export default function IncomeStatementPage() {
         // rather than restructured around, per the migration plan.
         setIncomeStatementAccounts(data.accounts || []);
         setIncomeStatementLoading(false);
+        shownPeriod.current = period;
       })
       .catch((error) => {
         // The controller's own signal is the authoritative answer to "was this
@@ -188,12 +236,14 @@ export default function IncomeStatementPage() {
         if (controller.signal.aborted) return;
         if ((error as { name?: string })?.name === "AbortError") return;
         console.error("Failed to load income statement:", error);
+        // A background reload failed. The totals on the screen stay.
+        if (background) return;
         setIncomeStatementAccounts([]);
         setIncomeStatementLoading(false);
       });
 
     return () => controller.abort();
-  }, [bookId, incomePeriod, incomePeriodRange.startDate, incomePeriodRange.endDate]);
+  }, [bookId, incomePeriod, incomePeriodRange.startDate, incomePeriodRange.endDate, statementRevision]);
 
   const activeAccounts = accounts.filter((a) => a.isActive);
 
@@ -419,6 +469,7 @@ export default function IncomeStatementPage() {
 
       <IncomeStatementCharts
         bookId={bookId}
+        revision={statementRevision}
         monthlyRange={
           incomePeriod === "all"
             ? {}

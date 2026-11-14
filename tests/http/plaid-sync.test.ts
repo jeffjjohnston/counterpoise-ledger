@@ -267,7 +267,22 @@ describe("Plaid sync HTTP parity", () => {
         incoming: { date: "2025-01-04", amountCents: 650, name: "New name", merchantName: "New Merchant", originalDescription: null, categoryPrimary: "NEW", categoryDetailed: "NEW_DETAIL" },
       }),
     });
-    expect(byId["pending-mod"]).toMatchObject({ resolutionStatus: "pending", reviewReason: null, reviewMetadataJson: "{\"stale\":true}", amountCents: 700, date: "2025-01-06" });
+    // The queue lists the fields that the bank changed on the flagged row.
+    const queueResponse = await client.request(`/api/b/1/sync/accounts/${checkingLink.id}/reconcile?limit=500`);
+    expect(queueResponse.status).toBe(200);
+    const queue = (await queueResponse.json()) as { items: Array<{ plaidTransactionId: string; reviewChanges: unknown }> };
+    const queued = Object.fromEntries(queue.items.map((item) => [item.plaidTransactionId, item]));
+    expect(queued.matched.reviewChanges).toEqual([
+      { field: "date", previous: "2025-01-02", incoming: "2025-01-04" },
+      { field: "amountCents", previous: 500, incoming: 650 },
+      { field: "name", previous: "Old matched", incoming: "New name" },
+      { field: "merchantName", previous: "Old Merchant", incoming: "New Merchant" },
+      { field: "categoryPrimary", previous: "OLD", incoming: "NEW" },
+      { field: "categoryDetailed", previous: null, incoming: "NEW_DETAIL" },
+    ]);
+    expect(queued["pending-mod"].reviewChanges).toEqual([]);
+    // The flag of a pending row goes, and its review metadata goes with it.
+    expect(byId["pending-mod"]).toMatchObject({ resolutionStatus: "pending", reviewReason: null, reviewMetadataJson: null, amountCents: 700, date: "2025-01-06" });
     expect(byId.created).toMatchObject({ resolutionStatus: "created", reviewReason: "plaid_modified", resolved: true, amountCents: 800 });
     expect(byId["ignored-rm"]).toMatchObject({ resolutionStatus: "ignored", reviewReason: null });
     expect(byId["pending-rm"]).toMatchObject({
@@ -417,6 +432,68 @@ describe("Plaid sync HTTP parity", () => {
     });
   });
 
+  // A reset during a sync deleted the pending rows and
+  // cleared the cursor, and the sync then saved its cursor past those rows.
+  it("refuses a reset, an edit and a delete of a connection while its sync runs", async () => {
+    const { token, path } = await connection();
+    plaid.reply("access-1", null, page({ added: [plaidItem({ transaction_id: "chk-1" })], next_cursor: "cursor-1" }));
+    const tokenPath = `/api/b/1/sync/tokens/${token.id}`;
+    const edit = { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ financialInstitution: "Chase", itemId: "item-2" }) };
+    const gate = plaid.hold("access-1");
+    let first: Promise<Response> | undefined;
+    try {
+      first = client.request(path, { method: "POST" });
+      await gate.arrived;
+      const busy = "A sync is already running for this connection";
+      await expectError(client, path, { method: "DELETE" }, 409, busy);
+      await expectError(client, tokenPath, edit, 409, busy);
+      await expectError(client, tokenPath, { method: "DELETE" }, 409, busy);
+    } finally {
+      gate.release();
+    }
+    expect((await first).status).toBe(200);
+    // The sync kept its rows and its cursor, and the connection is as it was.
+    expect((await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id"))[0]).toMatchObject({ itemId: "item-1", syncCursor: "cursor-1" });
+    expect((await stagedRows()).map((staged) => staged.plaidTransactionId)).toEqual(["chk-1"]);
+
+    // Each one works after the sync ends: the lease is free again.
+    expect((await client.request(path, { method: "DELETE" })).status).toBe(200);
+    expect((await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id"))[0].syncCursor).toBeNull();
+    expect(await stagedRows()).toEqual([]);
+    expect((await client.request(tokenPath, edit)).status).toBe(200);
+    expect((await client.request(tokenPath, { method: "DELETE" })).status).toBe(200);
+    expect(await rows("SELECT * FROM plaid_tokens")).toEqual([]);
+  });
+
+  // The cursor write had no compare. A writer that does
+  // not hold the lease (a run whose lease lapsed) must not lose bank rows.
+  it("does not save its cursor when the stored cursor changed during the sync", async () => {
+    const { token, path } = await connection({ syncCursor: "cursor-0" });
+    const added = [plaidItem({ transaction_id: "chk-1" })];
+    plaid.reply("access-1", "cursor-0", page({ added, next_cursor: "cursor-1" }));
+    const gate = plaid.hold("access-1");
+    let first: Promise<Response> | undefined;
+    try {
+      first = client.request(path, { method: "POST" });
+      await gate.arrived;
+      // A reset that no lease stopped: the cursor goes back to the start.
+      await exec("UPDATE plaid_tokens SET sync_cursor = NULL WHERE id = $1", [token.id]);
+    } finally {
+      gate.release();
+    }
+    const changed = "The connection changed during the sync. Sync again.";
+    const response = await first;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: changed });
+    expect((await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id"))[0]).toMatchObject({ syncCursor: null, lastSyncedAt: null, lastError: changed });
+
+    // The next sync starts from the reset cursor, so it gets the rows again.
+    plaid.reply("access-1", null, page({ added, next_cursor: "cursor-1" }));
+    expect((await sync(path)).synced).toEqual({ added: 1, modified: 0, removed: 0 });
+    expect((await rows<PlaidToken>("SELECT * FROM plaid_tokens ORDER BY id"))[0]).toMatchObject({ syncCursor: "cursor-1", lastError: null });
+    expect((await stagedRows()).map((staged) => staged.plaidTransactionId)).toEqual(["chk-1"]);
+  });
+
   it("matches pending rows to transactions through the payees of earlier matches", async () => {
     const { checking, card, checkingLink, cardLink, path } = await connection({ syncCursor: "cursor-0" });
     const food = await createAccount({ name: "Food", type: "expense" });
@@ -438,26 +515,40 @@ describe("Plaid sync HTTP parity", () => {
     const floating = await spend(checking.id, "2025-01-01", 725, coffee.id, { isFloating: true });
     const grocery = await spend(card.id, "2025-03-04", 1999, grocer.id);
     const tooFar = await spend(checking.id, "2025-03-01", 800, coffee.id);
+    // A transaction that is already reconciled, with no
+    // bank row linked to it, is not a candidate.
+    const reconciled = await spend(checking.id, "2025-04-01", 900, coffee.id);
+    await exec("UPDATE transactions SET is_reconciled = true WHERE id = $1", [reconciled.id]);
+    // A transfer that the other link matched is reconciled too. It stays a
+    // candidate, so it can match on both of its links.
+    const payment = await createTransactionWithSplits({ date: "2025-04-10", payeeId: coffee.id, splits: [{ accountId: checking.id, amount: -1000 }, { accountId: card.id, amount: 1000 }] });
+    await exec("UPDATE transactions SET is_reconciled = true WHERE id = $1", [payment.id]);
+    await createPlaidReconciliation({ plaidAccountLinkId: cardLink.id, plaidTransactionId: "payment-in", date: "2025-04-10", amountCents: -1000, name: "PAYMENT", resolutionStatus: "matched", matchedTransactionId: payment.id });
     plaid.reply("access-1", "cursor-0", page({ added: [
       plaidItem({ transaction_id: "delayed", merchant_name: "BLUE BOTTLE", amount: 4.5, authorized_date: "2025-02-01", date: "2025-02-10" }),
       plaidItem({ transaction_id: "floating", merchant_name: "blue bottle", amount: 7.25, authorized_date: daysAgo(1), date: daysAgo(0) }),
       plaidItem({ transaction_id: "grocery", account_id: "plaid-card", name: "Grocer #12", amount: 19.99, date: "2025-03-05" }),
       plaidItem({ transaction_id: "far", merchant_name: "Blue Bottle", amount: 8, date: "2025-03-03" }),
       plaidItem({ transaction_id: "stranger", merchant_name: "Nobody", amount: 4.5, date: "2025-02-10" }),
+      plaidItem({ transaction_id: "reconciled", merchant_name: "Blue Bottle", amount: 9, date: "2025-04-01" }),
+      plaidItem({ transaction_id: "payment-out", merchant_name: "Blue Bottle", amount: 10, date: "2025-04-10" }),
     ] }));
 
     const result = await sync(path);
-    expect(result).toMatchObject({ synced: { added: 5, modified: 0, removed: 0 }, autoMatched: 3, pendingCount: 2, reviewCount: 0 });
+    expect(result).toMatchObject({ synced: { added: 7, modified: 0, removed: 0 }, autoMatched: 4, pendingCount: 3, reviewCount: 0 });
     const byId = Object.fromEntries((await stagedRows()).map((staged) => [staged.plaidTransactionId, staged]));
     expect(byId.delayed).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: postedDay.id, resolved: true });
     expect(byId.floating).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: floating.id });
     expect(byId.grocery).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: grocery.id });
     expect(byId.far).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
     expect(byId.stranger).toMatchObject({ resolutionStatus: "pending" });
+    expect(byId.reconciled).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
+    expect(byId["payment-out"]).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: payment.id });
     const local = Object.fromEntries((await rows<Transaction>("SELECT * FROM transactions ORDER BY id")).map((txn) => [txn.id, txn]));
     expect(local[postedDay.id]).toMatchObject({ isReconciled: true, isFloating: false, date: "2025-02-10" });
     expect(local[floating.id]).toMatchObject({ isReconciled: true, isFloating: false, date: daysAgo(1) });
     expect(local[grocery.id]).toMatchObject({ isReconciled: true, date: "2025-03-05" });
     expect(local[tooFar.id]).toMatchObject({ isReconciled: false, date: "2025-03-01" });
+    expect(local[reconciled.id]).toMatchObject({ isReconciled: true, date: "2025-04-01" });
   });
 });

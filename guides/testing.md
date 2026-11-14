@@ -91,11 +91,31 @@ measurements in one place rather than testing repeated prose for agreement.
     `wrangler dev` instead: `npm run test:http:worker` and
     `npm run test:mcp:worker`. Build it first with `npm run worker:build`
     (`npm run worker:build`, which needs `worker-build`).
-    CI runs both suites on both targets: the native server in the
-    `rust-workspace` job and the Worker in the `worker` job. Each server gets its own wrangler config, with the
+    CI runs the HTTP suite on both targets: the native server in the
+    `rust-workspace` job and the Worker in the `worker` job. The MCP tool
+    suites run on the native server only; the Worker runs the MCP suites that
+    cross its adapter (the HTTP gate, the tool list, the book roles and one
+    call of each result kind), because the tools call the same route
+    handlers that the HTTP suite already runs on the Worker. Each server gets its own wrangler config, with the
     settings as variables, and a `--persist-to` directory whose object file
     is the worker's test database, so the database helpers write the rows the
-    object reads. `onWorker` from `tests/helpers/http-parity.ts` gives a test
+    object reads. The tests and the object thus share one file on two
+    connections, and workerd does not wait for a lock: an object write
+    during a test's write fails with `SQLITE_BUSY` and logs an uncaught
+    error. A test's requests and its own writes never overlap, but an alarm
+    runs when a job is due, so the test Worker runs with
+    `COUNTERPOISE_SCHEDULER=off` and sets no alarm
+    (`tests/http/worker-alarm.test.ts`). A test that needs the alarm passes
+    `COUNTERPOISE_SCHEDULER: "on"` and must not write to the file while the
+    alarm can run. The test Worker has no export bucket, unless a test
+    passes `{ exports: true }` as the second argument of
+    `startHttpTestServer`: it then gets a local R2 bucket, which
+    `putExportsObject` and `hasExportsObject` write and read
+    (`tests/http/worker-restore.test.ts`). A Worker has no system zone, so the test Worker gets
+    its zone by name as `APP_TZ`: the test's `TZ`, else this process's `TZ`,
+    else the zone of the machine (`workerZone()`). Without that, a run with
+    no `TZ` puts the Worker on UTC, and the date tests fail in the hours when
+    the UTC date is not the local date. `onWorker` from `tests/helpers/http-parity.ts` gives a test
     the Worker's expectation where the targets differ, and
     `vitest.config.ts` leaves out the suites that do not apply there, each
     with its reason. Both targets are production (see
@@ -165,11 +185,11 @@ measurements in one place rather than testing repeated prose for agreement.
   `cargo build --target wasm32-unknown-unknown` command cannot find `core`.
   CI installs the target through `rustup` and uses the plain command there.
 - `npm run build`, `npm run dev`, and the npm test commands compile
-  `ledger-core` with its `wasm` feature, run `wasm-bindgen` 0.2.129 and
+  `ledger-core` with its `wasm` feature, run `wasm-bindgen` 0.2.130 and
   `wasm-opt`, then generate `lib/wasm/generated/` before using it. The
   generated files are ignored: Homebrew and rustup produce different bytes,
   and committing either build would make the other toolchain dirty the tree.
-  Install the CLI with `cargo install wasm-bindgen-cli --version 0.2.129
+  Install the CLI with `cargo install wasm-bindgen-cli --version 0.2.130
   --locked` and Binaryen with `brew install binaryen`. If the CLI is outside
   `PATH`, set `WASM_BINDGEN` to its binary path. The build script checks the
   active `rustc` sysroot before selecting the Homebrew `rust-wasm` config and
@@ -185,7 +205,12 @@ measurements in one place rather than testing repeated prose for agreement.
   retired; it is now test data. Add an edge case to it by hand alongside a
   change to the shared logic, then make the Rust implementation pass the new
   case. The corpus fixes the clock to a UTC date for floating-date and
-  fixed-price examples.
+  fixed-price examples. The TypeScript copies of the core and their tests are
+  deleted, and their cases are in the corpus, so a TypeScript test of a core
+  function goes there too. A case that JSON cannot carry (NaN, an infinity)
+  goes in a unit test of the Rust module. `tests/fixtures.rs` fails when the
+  corpus has fewer cases than its floor: increase the floor when you add
+  cases.
 - `npm run test:coverage` reports coverage; use it to locate gaps, not as a
   correctness quota.
 
@@ -223,7 +248,14 @@ suites. Start the server after `setupTestDatabase()` so it receives that
 worker's `DATABASE_PATH`; stop it in `afterAll`. `startHttpTestServer()`
 starts each server with `COUNTERPOISE_TEST_SHARED_DATABASE=1`, which turns off
 the server lock, because a suite can start more than one server on one file.
-Never set it outside tests. The HTTP suite
+Never set it outside tests. A start is ready only after the server itself
+reported that it listens on its port (the native server's "Rust API
+listening" line, wrangler's "Ready on" line), and then answered
+`/api/version`. The answer alone is not proof: the port is chosen before the
+server binds it, another Vitest worker can bind it first, and that worker's
+server then answers on it. Such a start once sent a file's requests to
+another worker's database, and each valid key got 401
+(`tests/http/test-server-port.test.ts`). The HTTP suite
 covers account reads and writes, payee writes, the transaction register and
 transaction CRUD, investments and securities, security prices and the Tiingo
 fetch, recurring rules and their processing, Plaid connections, account

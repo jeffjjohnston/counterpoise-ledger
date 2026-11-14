@@ -24,7 +24,7 @@ const snapshot: MatchSnapshot = {
   revision: 0,
   mappedAccountId: 1,
   effectiveDay: "2026-08-01",
-  model: "jev-1.13.0",
+  model: "clef",
   promptVersion: "plaid-match-v3",
   merchantSeenBefore: true,
   bank: { merchant: "X", name: "X", amountCents: -100, authorizedDate: null, postedDate: "2026-08-01", currency: "USD" },

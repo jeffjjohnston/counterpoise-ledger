@@ -951,15 +951,6 @@ pub(crate) async fn create_transaction(
     let created = load_transaction(&*state.database, book.book_id(), id)
         .map_err(database_error(FAILURE))?
         .ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
-    state.analytics.capture_event(
-        book.user_id(),
-        "transaction_created",
-        Some(json!({
-            "bookId": book.book_id(),
-            "hasInvestmentSplits": input.investment_splits.as_ref().is_some_and(|splits| !splits.is_empty()),
-            "splitCount": input.splits.len(),
-        })),
-    );
     Ok(Json(created))
 }
 
@@ -1222,134 +1213,6 @@ fn update(
     })
 }
 
-/// The transaction as it was before the update, for `diffTransactionFields`.
-struct ExistingTransaction {
-    date: String,
-    description: Option<String>,
-    notes: Option<String>,
-    check_number: Option<String>,
-    is_reconciled: bool,
-    payee_name: Option<String>,
-    splits: Vec<(i32, i32)>,
-}
-
-fn load_existing(
-    sql: &impl Sql,
-    book_id: i32,
-    transaction_id: i32,
-) -> Result<Option<ExistingTransaction>, store::Error> {
-    type Row = (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        bool,
-        Option<String>,
-    );
-    let row: Option<Row> = sql.query_optional(
-        "SELECT t.date, t.description, t.notes, t.check_number, t.is_reconciled, p.name
-         FROM transactions t LEFT JOIN payees p ON p.id = t.payee_id
-         WHERE t.id = ?1 AND t.book_id = ?2",
-        &params![transaction_id, book_id],
-    )?;
-    let Some((date, description, notes, check_number, is_reconciled, payee_name)) = row else {
-        return Ok(None);
-    };
-    let splits = sql.query(
-        "SELECT account_id, amount FROM transaction_splits WHERE transaction_id = ?1 ORDER BY id",
-        &params![transaction_id],
-    )?;
-    Ok(Some(ExistingTransaction {
-        date,
-        description,
-        notes,
-        check_number,
-        is_reconciled,
-        payee_name,
-        splits,
-    }))
-}
-
-/// `diffTransactionFields`: which fields the body changes. The body values
-/// are compared as sent, before any trim.
-fn diff_transaction_fields(
-    existing: &ExistingTransaction,
-    body: &UpdateTransaction,
-) -> (Vec<&'static str>, bool) {
-    let mut changed = Vec::new();
-    if body
-        .date
-        .as_ref()
-        .is_some_and(|date| *date != existing.date)
-    {
-        changed.push("date");
-    }
-    if body
-        .description
-        .as_ref()
-        .is_some_and(|description| Some(description) != existing.description.as_ref())
-    {
-        changed.push("description");
-    }
-    if body
-        .notes
-        .as_ref()
-        .is_some_and(|notes| notes.as_ref() != existing.notes.as_ref())
-    {
-        changed.push("notes");
-    }
-    if body
-        .check_number
-        .as_ref()
-        .is_some_and(|check| Some(check) != existing.check_number.as_ref())
-    {
-        changed.push("checkNumber");
-    }
-    if body
-        .is_reconciled
-        .is_some_and(|reconciled| reconciled != existing.is_reconciled)
-    {
-        changed.push("isReconciled");
-    }
-    if let Some(payee_name) = &body.payee_name {
-        let old = existing.payee_name.as_deref().unwrap_or("").to_lowercase();
-        let new = payee_name.as_deref().unwrap_or("").to_lowercase();
-        if old != new {
-            changed.push("payeeName");
-        }
-    }
-    let mut splits_accounts_changed = false;
-    if let Some(splits) = &body.splits {
-        let mut old_accounts: Vec<i64> = existing
-            .splits
-            .iter()
-            .map(|(account, _)| i64::from(*account))
-            .collect();
-        let mut new_accounts: Vec<i64> = splits.iter().map(|split| split.account_id).collect();
-        old_accounts.sort_unstable();
-        new_accounts.sort_unstable();
-        splits_accounts_changed = old_accounts != new_accounts;
-        let key = |pairs: Vec<String>| {
-            let mut pairs = pairs;
-            pairs.sort();
-            pairs.join(",")
-        };
-        let old_key = key(existing
-            .splits
-            .iter()
-            .map(|(account, amount)| format!("{account}:{amount}"))
-            .collect());
-        let new_key = key(splits
-            .iter()
-            .map(|split| format!("{}:{}", split.account_id, split.amount))
-            .collect());
-        if old_key != new_key {
-            changed.push("splits");
-        }
-    }
-    (changed, splits_accounts_changed)
-}
-
 pub(crate) async fn update_transaction(
     State(state): State<AppState>,
     Path((raw_book_id, raw_id)): Path<(String, String)>,
@@ -1361,28 +1224,11 @@ pub(crate) async fn update_transaction(
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let access = book.write()?;
     let input = validate_update(&parse_json_body(&body, FAILURE)?)?;
-    // The route reads the transaction for the analytics diff before it
-    // updates, so an unusable ID fails at that read.
     let id = transaction_path_id(&raw_id, FAILURE)?;
-    let existing =
-        load_existing(&*state.database, book.book_id(), id).map_err(database_error(FAILURE))?;
     update(&state.database, &access, id, &input, FAILURE)?;
     let updated = load_transaction(&*state.database, book.book_id(), id)
         .map_err(database_error(FAILURE))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, NOT_FOUND))?;
-    let (fields_changed, splits_accounts_changed) = existing
-        .as_ref()
-        .map(|existing| diff_transaction_fields(existing, &input))
-        .unwrap_or_default();
-    state.analytics.capture_event(
-        book.user_id(),
-        "transaction_updated",
-        Some(json!({
-            "bookId": book.book_id(),
-            "fieldsChanged": fields_changed,
-            "splitsAccountsChanged": splits_accounts_changed,
-        })),
-    );
     Ok(Json(updated))
 }
 
@@ -1474,77 +1320,12 @@ pub(crate) async fn delete_transaction(
     if !delete(&state.database, &access, id, expected, FAILURE)? {
         return Err(error(StatusCode::NOT_FOUND, NOT_FOUND));
     }
-    state.analytics.capture_event(
-        book.user_id(),
-        "transaction_deleted",
-        Some(json!({ "bookId": book.book_id() })),
-    );
     Ok(Json(json!({ "success": true })))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction_input::SplitInput;
-
-    fn existing() -> ExistingTransaction {
-        ExistingTransaction {
-            date: "2025-01-01".into(),
-            description: None,
-            notes: Some("n".into()),
-            check_number: None,
-            is_reconciled: false,
-            payee_name: Some("IKEA".into()),
-            splits: vec![(10, -500), (2, 500)],
-        }
-    }
-
-    #[test]
-    fn diff_matches_the_node_analytics_fields() {
-        let body = UpdateTransaction {
-            date: Some("2025-01-01".into()),
-            description: Some(String::new()),
-            notes: Some(None),
-            payee_name: Some(Some("ikea".into())),
-            is_reconciled: Some(true),
-            splits: Some(vec![
-                SplitInput {
-                    account_id: 2,
-                    amount: 400,
-                },
-                SplitInput {
-                    account_id: 10,
-                    amount: -400,
-                },
-            ]),
-            ..UpdateTransaction::default()
-        };
-        assert_eq!(
-            diff_transaction_fields(&existing(), &body),
-            (
-                vec!["description", "notes", "isReconciled", "splits"],
-                false
-            )
-        );
-        let moved = UpdateTransaction {
-            splits: Some(vec![
-                SplitInput {
-                    account_id: 3,
-                    amount: 500,
-                },
-                SplitInput {
-                    account_id: 10,
-                    amount: -500,
-                },
-            ]),
-            payee_name: Some(None),
-            ..UpdateTransaction::default()
-        };
-        assert_eq!(
-            diff_transaction_fields(&existing(), &moved),
-            (vec!["payeeName", "splits"], true)
-        );
-    }
 
     #[test]
     fn investment_account_prefers_the_brokerage_then_the_cash_parent() {

@@ -36,7 +36,7 @@ export function TypeSafeSettings({
         })
         .catch(() => {
           if (active && version === requestVersion.current)
-            setError("Could not load TypeSafe settings.");
+            setError("Could not load the suggestion settings.");
         });
     };
     load();
@@ -68,7 +68,7 @@ export function TypeSafeSettings({
       setError(
         toMessage(
           err,
-          "Could not save TypeSafe settings. Your previous setting is still in effect.",
+          "Could not save the suggestion settings. Your previous setting is still in effect.",
         ),
       );
     } finally {
@@ -80,7 +80,7 @@ export function TypeSafeSettings({
     <section className="pt-4 border-t border-border space-y-3">
       <div>
         <h3 className="text-sm font-semibold text-fg">
-          TypeSafe AI — Experimental
+          AI suggestions — Experimental
         </h3>
         <p className="mt-1 text-xs text-fg-tertiary">Applies to {bookName}.</p>
       </div>
@@ -98,7 +98,8 @@ export function TypeSafeSettings({
       </label>
       <p className="text-xs text-fg-secondary">
         Sends merchant descriptions, amounts, dates, and candidate payee names
-        to TypeSafe to suggest an existing transaction. You confirm every match.
+        to Cloudflare Workers AI (the Clef model) to suggest an existing
+        transaction. You confirm every match.
         Turn this off to stop new requests and hide suggestions.
       </p>
       <label className="flex items-start gap-2 text-sm text-fg">
@@ -118,14 +119,14 @@ export function TypeSafeSettings({
         Suggest entries for new transactions
       </label>
       <p className="text-xs text-fg-secondary">
-        When you pick a payee in a new transaction, TypeSafe chooses among the
+        When you pick a payee in a new transaction, Clef chooses among the
         payee&apos;s earlier patterns in this account. The payee name, the
         dates, the amounts and the income and expense account names are sent;
         memos and asset account names are not.
       </p>
       {settings && !settings.configured && (
         <p className="text-xs text-fg-tertiary">
-          TypeSafe is unavailable on this installation.
+          AI suggestions are unavailable on this installation.
         </p>
       )}
       {saving && (
@@ -146,7 +147,7 @@ export function TypeSafeSettings({
         <div className="space-y-2">
           <p className="text-xs text-fg-secondary">
             Disable suggestions and delete this book’s local experiment records?
-            This does not delete data held by TypeSafe.
+            Data already sent cannot be recalled.
           </p>
           <div className="flex gap-2">
             <Button

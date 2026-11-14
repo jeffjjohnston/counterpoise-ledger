@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { advanceNextDateToFuture, getInitialNextDate, type RecurrenceConfig } from "../../lib/accounting";
+import type { RecurrenceConfig } from "../../lib/accounting";
 import { toDateString } from "../../lib/formatters";
-import { addDaysToDateString, getOccurrenceDate } from "../../lib/recurring";
+import { getNextDate, getOccurrenceDate, previewOccurrences } from "../../lib/wasm-client";
 import {
   addBookMember, createAccount, createBook, createPayee, createRecurringRule,
   createTransactionWithSplits, createUser, resetTestDatabase, setupTestDatabase,
@@ -12,6 +12,11 @@ import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 
 function json(method: string, body: unknown): RequestInit {
   return { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+}
+
+function addDaysToDateString(dateString: string, days: number): string {
+  const [year, month, day] = dateString.split("-").map(Number);
+  return toDateString(new Date(year, month - 1, day + days));
 }
 
 const today = () => toDateString(new Date());
@@ -26,19 +31,34 @@ function normalized(body: unknown): unknown {
   );
 }
 
-/** The nextDate that createRecurringRule and updateRecurringRule compute. */
+/**
+ * The nextDate that createRecurringRule and updateRecurringRule compute. The
+ * dates come from the Rust core through lib/wasm-client.ts. The first
+ * occurrence is the first date of a preview whose today is the start date,
+ * because no occurrence is before the start date. The walk then goes to the
+ * first occurrence whose observed date is not before `from`.
+ */
 function expectedNextDate(
   startDate: string, config: RecurrenceConfig, businessDaysOnly = false, after?: string
 ): string {
   const observe = (date: string) => getOccurrenceDate(date, businessDaysOnly);
-  const next = advanceNextDateToFuture(getInitialNextDate(startDate, config), config, undefined, observe);
-  return after ? advanceNextDateToFuture(next, config, addDaysToDateString(after, 1), observe) : next;
+  const advance = (date: string, from: string) => {
+    for (let step = 0; step < 10_000 && observe(date) < from; step += 1) {
+      const next = getNextDate(date, config);
+      if (next <= date) break;
+      date = next;
+    }
+    return date;
+  };
+  const [initial] = previewOccurrences({ config, startDate, today: startDate, count: 1 });
+  const next = advance(initial, today());
+  return after ? advance(next, addDaysToDateString(after, 1)) : next;
 }
 
 // The recurring rule routes: rule CRUD, the projection, the rule-linked
 // transaction list, and processing. Full bodies are snapshots that the Node
 // run writes and the Rust run must match. A result that depends on today is
-// compared with the value the TypeScript recurrence helpers compute.
+// compared with the value that expectedNextDate() computes.
 describe("recurring HTTP parity", () => {
   let baseUrl: string;
   let stop: () => Promise<void>;

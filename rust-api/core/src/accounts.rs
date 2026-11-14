@@ -210,3 +210,20 @@ pub fn build_category_label_map(accounts: &[Value]) -> Value {
     }
     Value::Object(labels)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The corpus has no operation for these constants. The browser reads the
+    // first two through lib/wasm-client.ts.
+    #[test]
+    fn account_type_groups_keep_their_order() {
+        assert_eq!(
+            ACCOUNT_TYPE_ORDER,
+            ["asset", "liability", "equity", "income", "expense"]
+        );
+        assert_eq!(BALANCE_SHEET_TYPES, ["asset", "liability", "equity"]);
+        assert_eq!(INCOME_STATEMENT_TYPES, ["income", "expense"]);
+    }
+}

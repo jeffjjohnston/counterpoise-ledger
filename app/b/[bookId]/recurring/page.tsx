@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, Suspense, useCallback } from "react";
+import { useEffect, useRef, useState, Suspense, useCallback } from "react";
 import { Link, useRouter, useSearchParams } from "@/lib/navigation";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -23,6 +23,8 @@ import {
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
+import { useLiveReload } from "@/components/BookChangesProvider";
+import { useLatestRequest } from "@/hooks/useLatestRequest";
 import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type {
@@ -57,6 +59,15 @@ const CALENDAR_DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const CALENDAR_WEEKS = 4;
 const DAYS_PER_WEEK = 7;
 const MAX_OCCURRENCE_ITERATIONS = 366;
+
+// The tables that the page reads: the rules, their template splits, and the
+// accounts and payees that they name. The calendar also shows the
+// transactions that the rules created. The page shows no balance, so a change
+// to the splits alone does not change it. The book holds the number of
+// upcoming days that the projections use.
+const RECURRING_TABLES = [
+  "recurring_rules", "recurring_template_splits", "accounts", "payees", "transactions", "books",
+];
 
 function parseDateString(dateString: string): Date {
   return new Date(`${dateString}T00:00:00`);
@@ -137,7 +148,16 @@ function RecurringPageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
 
-  const fetchData = useCallback(async (showLoading: boolean) => {
+  // A live update can start a reload while another is in flight, and the
+  // answers can arrive in either order. Only the latest request may publish.
+  const latestRequest = useLatestRequest();
+  // Whether this book's rules have rendered. A live reload can overtake the
+  // first load, so the first answer, not the first request, decides between
+  // the full-page error and a toast.
+  const shown = useRef(false);
+
+  const fetchData = useCallback(async () => {
+    const isLatest = latestRequest();
     // Compute calendar date range for the recurring transactions query
     const now = new Date();
     const todayStr = toDateString(now);
@@ -165,32 +185,43 @@ function RecurringPageInner() {
       // Flatten accounts
       const flatAccounts = flattenAccounts(accountsData);
 
+      if (!isLatest()) return;
       setRules(rulesData);
       setAccounts(flatAccounts);
       setCompletedTxns(Array.isArray(txnsData) ? txnsData : []);
       setError(null);
+      shown.current = true;
+      setLoading(false);
     } catch {
-      if (showLoading) {
+      if (!isLatest()) return;
+      if (!shown.current) {
         // Nothing has rendered yet — the full-page error state is correct.
+        // Clearing loading here stops a failed first request from hanging
+        // the page on its skeleton.
         setError("Could not load recurring rules.");
+        setLoading(false);
       } else {
         // A background refresh (after processing/deleting/toggling a rule,
-        // or creating/editing one) failed. The already-rendered rules and
-        // calendar are still correct, so keep them on screen and surface
-        // the failure without blanking the page.
+        // or creating/editing one, or a change by another client) failed.
+        // The already-rendered rules and calendar are still correct, so keep
+        // them on screen and surface the failure without blanking the page.
         toast.error("Could not refresh recurring rules.");
       }
-    } finally {
-      if (showLoading) {
-        setLoading(false);
-      }
     }
-  }, [bookId, toast]);
+  }, [bookId, latestRequest, toast]);
 
   useEffect(() => {
+    shown.current = false;
     // fetchData handles its own errors internally.
-    void fetchData(true);
+    void fetchData();
   }, [fetchData]);
+
+  // Another client (an MCP tool, another tab, the scheduled processing)
+  // changed the book. The open form gets its accounts from the loaded data,
+  // so the reload waits until the form closes. The search term is local
+  // state, and the reload does not change it.
+  const reload = useCallback(() => { void fetchData(); }, [fetchData]);
+  useLiveReload(RECURRING_TABLES, reload, { paused: showModal && canWrite });
 
   useEffect(() => {
     // A viewer cannot create a rule, so the link opens the list only. The
@@ -249,7 +280,7 @@ function RecurringPageInner() {
       const data = await apiPost<ProcessResult>(`/api/b/${bookId}/recurring/process`, {
         processAll: true,
       });
-      void fetchData(false);
+      void fetchData();
       const message = describeProcessResult(data);
       if (data.skipped?.length) {
         toast.error(message);
@@ -273,7 +304,7 @@ function RecurringPageInner() {
       // its real state); this toast is what tells the user why it reverted.
       toast.error(toMessage(e, "Failed to update the rule"));
     }
-    void fetchData(false);
+    void fetchData();
   };
 
   if (error) {
@@ -626,7 +657,7 @@ function RecurringPageInner() {
             try {
               await apiPost(`/api/b/${bookId}/recurring`, data);
               closeNewRuleModal();
-              void fetchData(false);
+              void fetchData();
             } catch (e) {
               toast.error(toMessage(e, "Failed to create recurring rule"));
             }

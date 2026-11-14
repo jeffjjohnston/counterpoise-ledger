@@ -90,11 +90,31 @@ impl From<String> for Failure {
     }
 }
 
-/// `isTypeSafeConfigured`, read on each call as Node reads it.
+fn setting(name: &str) -> Option<String> {
+    let value = ledger_db::env::var(name).ok()?;
+    let value = value.trim_matches(is_js_whitespace);
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// The Cloudflare account that runs the model. It becomes a part of the
+/// request URL, so only letters and digits are accepted.
+pub(crate) fn clef_account() -> Option<String> {
+    setting("TYPESAFE_CLEF_ACCOUNT_ID")
+        .filter(|account| account.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// The API token of that account, without the space around it.
+pub(crate) fn clef_token() -> Option<String> {
+    setting("TYPESAFE_CLEF_API_TOKEN")
+}
+
+/// Read on each call: the integration is on, and the server has the account
+/// and the token for Cloudflare's Clef model. The settings keep the prefix
+/// `TYPESAFE_` of the first provider, as the tables and the routes do.
 pub(crate) fn is_configured() -> bool {
     ledger_db::env::var("TYPESAFE_ENABLED").is_ok_and(|value| value == "true")
-        && ledger_db::env::var("TYPESAFE_API_KEY")
-            .is_ok_and(|key| !key.trim_matches(is_js_whitespace).is_empty())
+        && clef_account().is_some()
+        && clef_token().is_some()
 }
 
 /// `typesafeObservationSchema`: what the browser saw before the decision.

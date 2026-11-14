@@ -216,30 +216,6 @@ describe("MCP Payee Tools", () => {
   });
 
   describe("delete_payee", () => {
-    it("refuses to delete a payee with transactions", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
-      const coffee = await createAccount({ name: "Coffee", type: "expense", bookId });
-      const payee = await createPayee({ name: "Blue Bottle", bookId });
-
-      await createTransactionWithSplits({
-        bookId,
-        date: "2024-01-01",
-        payeeId: payee.id,
-        splits: [
-          { accountId: coffee.id, amount: 450 },
-          { accountId: checking.id, amount: -450 },
-        ],
-      });
-
-      const { data, isError } = await callTool("delete_payee", { bookId, payeeId: payee.id });
-
-      expect(isError).toBe(true);
-      expect(data.error).toMatch(/associated transactions/i);
-
-      // The refused delete must not have partially applied.
-      expect(await count("payees", "id = $1", [payee.id])).toBe(1);
-    });
-
     it("deletes an unused payee", async () => {
       const payee = await createPayee({ name: "Unused Payee", bookId });
 

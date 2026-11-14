@@ -1,7 +1,9 @@
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { vi, describe, it, expect, afterEach } from "vitest";
 import AccountsPage from "@/app/b/[bookId]/accounts/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
 import { ToastProvider } from "@/components/ui/ToastProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 
 vi.mock("@/lib/navigation", async () =>
   (await import("@/tests/helpers/navigation")).mockNavigation({
@@ -494,5 +496,112 @@ describe("AccountsPage", () => {
 
     // A failed create must leave the modal open so the user's input isn't lost.
     expect(screen.getByRole("button", { name: "submit account form" })).toBeInTheDocument();
+  });
+  // Another client (an MCP tool, a second tab, the importer) changes the
+  // book. The server sends the book socket a hint for each changed table, and
+  // the page must show the change without a reload.
+  describe("live updates", () => {
+    const savings = { ...accountsPayload[2], id: 4, name: "Savings", balance: 1200 };
+
+    function socket() {
+      return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    }
+
+    function hint(tables: string[]) {
+      act(() => { socket().emit("change", { tables }); });
+    }
+
+    function renderLive() {
+      FakeWebSocket.instances = [];
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      return render(
+        <ToastProvider>
+          <BookChangesProvider>
+            <AccountsPage />
+          </BookChangesProvider>
+        </ToastProvider>
+      );
+    }
+
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    it("shows an account that another client created", async () => {
+      let rows: unknown[] = accountsPayload;
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.startsWith("/api/b/1/accounts")) {
+          return { ok: true, status: 200, json: async () => rows } as Response;
+        }
+        if (url.startsWith("/api/b/1/investments/account-values")) {
+          return { ok: true, status: 200, json: async () => [] } as Response;
+        }
+        throw new Error(`Unexpected fetch url: ${url}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      renderLive();
+      await screen.findByText("Checking");
+      expect(screen.queryByText("Savings")).not.toBeInTheDocument();
+
+      rows = [...accountsPayload, savings];
+      hint(["accounts"]);
+
+      expect(await screen.findByText("Savings")).toBeInTheDocument();
+    });
+
+    it("refreshes the balances when another client adds a transaction", async () => {
+      let rows: unknown[] = accountsPayload;
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.startsWith("/api/b/1/accounts")) {
+          return { ok: true, status: 200, json: async () => rows } as Response;
+        }
+        return { ok: true, status: 200, json: async () => [] } as Response;
+      }));
+
+      renderLive();
+      await screen.findByText("$2,500.00");
+
+      rows = accountsPayload.map((row) => (row.id === 3 ? { ...row, balance: 260000 } : row));
+      hint(["transaction_splits"]);
+
+      expect(await screen.findByText("$2,600.00")).toBeInTheDocument();
+    });
+
+    it("keeps the newer list when an older refresh answers last", async () => {
+      // Each request for the list answers with the rows it was given, when the
+      // test releases it.
+      const pending: Array<{ rows: unknown[]; release: () => void }> = [];
+      let rows: unknown[] = accountsPayload;
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.startsWith("/api/b/1/accounts")) {
+          const captured = rows;
+          if (pending.length > 0 || captured !== accountsPayload) {
+            await new Promise<void>((release) => { pending.push({ rows: captured, release }); });
+          }
+          return { ok: true, status: 200, json: async () => captured } as Response;
+        }
+        return { ok: true, status: 200, json: async () => [] } as Response;
+      }));
+
+      renderLive();
+      await screen.findByText("Checking");
+
+      // The first refresh sees the book before the second change.
+      rows = accountsPayload.filter((row) => row.id !== 3);
+      hint(["accounts"]);
+      await waitFor(() => expect(pending).toHaveLength(1));
+      rows = [...accountsPayload, savings];
+      hint(["accounts"]);
+      await waitFor(() => expect(pending).toHaveLength(2));
+
+      await act(async () => { pending[1].release(); });
+      expect(await screen.findByText("Savings")).toBeInTheDocument();
+      await act(async () => { pending[0].release(); });
+
+      expect(screen.getByText("Savings")).toBeInTheDocument();
+      expect(screen.getByText("Checking")).toBeInTheDocument();
+    });
   });
 });

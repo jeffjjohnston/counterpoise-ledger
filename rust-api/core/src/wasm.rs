@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 
-use crate::{accounting, accounts, expression, formatters, recurring};
+use crate::{accounting, accounts, expression, formatters, notes, recurring};
 
 fn arg<T: DeserializeOwned>(args: &[Value], index: usize) -> Result<T, String> {
     serde_json::from_value(args.get(index).cloned().unwrap_or(Value::Null))
@@ -175,6 +175,7 @@ fn result(op: &str, args: &[Value]) -> Result<Value, String> {
             args.first().and_then(Value::as_f64).unwrap_or(f64::NAN)
         )),
         "formatPriceMicrosInput" => json!(formatters::format_price_micros_input(arg(args, 0)?)),
+        "noteHtml" => json!(notes::note_html(&arg::<String>(args, 0)?)),
         "evaluateExpression" => json!(expression::evaluate_expression(&arg::<String>(args, 0)?)),
         _ => return Err(format!("Unknown core operation: {op}")),
     };

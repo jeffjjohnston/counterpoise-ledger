@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useSubmitGuard } from "@/hooks/useSubmitGuard";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
@@ -22,7 +23,7 @@ interface AccountFormProps {
     parentId?: number | null;
     isActive?: boolean;
     icon?: string | null;
-  }) => void;
+  }) => void | Promise<unknown>;
   onCancel: () => void;
 }
 
@@ -134,9 +135,12 @@ export function AccountForm({
     return buildCategoryLabelMap([...others, draft]).get(draft.id) ?? null;
   })();
 
+  const submitGuard = useSubmitGuard();
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onSubmit({
+    // One save at a time: a second submit during the request is dropped.
+    void submitGuard.run(() => onSubmit({
       name,
       type,
       subtype: subtype || null,
@@ -149,11 +153,14 @@ export function AccountForm({
       // accepts any account type by design: the form only offers an icon for
       // categories, but nothing in the schema restricts it to them.
       icon: isCategory ? icon : undefined,
-    });
+    }));
   };
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
+    <form onSubmit={handleSubmit}>
+      {/* The form takes no input during the save. A success closes it, and
+          text typed during the save would be lost. */}
+      <fieldset disabled={submitGuard.saving} className="space-y-4 min-w-0">
       <Input
         label="Account Name"
         id="name"
@@ -259,10 +266,11 @@ export function AccountForm({
         <Button type="button" variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button type="submit">
+        <Button type="submit" disabled={submitGuard.saving}>
           {account ? "Save Changes" : "Create Account"}
         </Button>
       </div>
+      </fieldset>
     </form>
   );
 }

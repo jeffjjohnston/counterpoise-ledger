@@ -10,6 +10,7 @@ const pushMock = vi.fn();
 const replaceMock = vi.fn();
 let transactionListProps: Record<string, unknown> | null = null;
 let transactionFormProps: Record<string, unknown> | null = null;
+let mobileFormProps: Record<string, unknown> | null = null;
 let searchParamsValue = new URLSearchParams("accountId=1");
 const toast = { error: vi.fn(), success: vi.fn() };
 
@@ -74,6 +75,8 @@ vi.mock("@/components/transactions/TransactionForm", () => ({
       transactionFormProps = props;
       return <div data-testid="edit-transaction-form" />;
     }
+    // Of the two create forms, only the mobile sheet's form has fullLayout.
+    if (props.fullLayout) mobileFormProps = props;
     return <div data-testid="transaction-form" />;
   },
 }));
@@ -94,8 +97,10 @@ vi.mock("@/components/transactions/InvestmentPositionsSection", () => ({
 }));
 
 vi.mock("@/components/ui/Modal", () => ({
-  Modal: ({ children }: { children: React.ReactNode }) => (
-    <div data-testid="modal">{children}</div>
+  // The mock always shows its children. The attributes let a test read
+  // which modal it is and whether the page has it open.
+  Modal: ({ children, title, isOpen }: { children: React.ReactNode; title: string; isOpen: boolean }) => (
+    <div data-testid="modal" data-title={title} data-open={String(isOpen)}>{children}</div>
   ),
 }));
 
@@ -195,6 +200,7 @@ describe("TransactionsPage", () => {
     replaceMock.mockReset();
     transactionListProps = null;
     transactionFormProps = null;
+    mobileFormProps = null;
     balanceChartProps = null;
     toast.error.mockClear();
     toast.success.mockClear();
@@ -1275,11 +1281,201 @@ describe("TransactionsPage", () => {
       });
     });
 
-    // First PUT was the reconcile toggle (no expectedUpdatedAt); second is the
-    // modal save, which must carry the toggle response's updatedAt rather
-    // than the stale value the row had when the modal first opened.
+    // The first PUT was the reconcile toggle. It carries the updatedAt that
+    // the row was loaded with. The second PUT is the modal save. It must
+    // carry the updatedAt from the toggle response, not the stale value the
+    // row had when the page loaded it.
     expect(putBodies).toHaveLength(2);
+    expect(putBodies[0].expectedUpdatedAt).toBe(original.updatedAt.toISOString());
     expect(putBodies[1].expectedUpdatedAt).toBe(afterToggle.updatedAt.toISOString());
+  });
+
+  describe("row writes and the revision check", () => {
+    const row = makeTransaction({
+      id: 9,
+      date: "2024-06-03",
+      isReconciled: false,
+      updatedAt: new Date("2024-06-01T00:00:00.000Z"),
+    });
+
+    /** A register with one row. Each PUT to the row gets `putResponse`. */
+    function stubRowFetch(putResponse: () => Response) {
+      const putBodies: Array<Record<string, unknown>> = [];
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "/api/b/1/transactions/9" && method === "PUT") {
+          putBodies.push(JSON.parse(init!.body as string));
+          return putResponse();
+        }
+        if (url.startsWith("/api/b/1/transactions")) {
+          return {
+            ok: true,
+            json: async () => ({ transactions: [row], startingBalance: 0, totalCount: 1 }),
+          } as Response;
+        }
+        const standard = standardFetchResponse(url);
+        if (standard) return standard;
+        throw new Error(`Unexpected fetch url: ${url}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      return { putBodies, fetchMock };
+    }
+
+    const conflict = () =>
+      ({
+        ok: false,
+        status: 409,
+        json: async () => ({ error: TRANSACTION_CONFLICT_MESSAGE }),
+      }) as Response;
+
+    const listLoads = (fetchMock: { mock: { calls: unknown[][] } }) =>
+      fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/b/1/transactions?")).length;
+
+    const shownRow = () =>
+      (transactionListProps?.transactions as TransactionWithSplits[] | undefined)?.find((t) => t.id === 9);
+
+    async function renderWithRow() {
+      render(<TransactionsPage />);
+      await waitFor(() => expect(shownRow()).toBeDefined());
+    }
+
+    const toggle = (reconciled: boolean) =>
+      (transactionListProps!.onToggleReconciled as (id: number, reconciled: boolean) => Promise<void>)(9, reconciled);
+    const move = () =>
+      (transactionListProps!.onMoveToNextBusinessDay as (id: number) => Promise<void>)(9);
+
+    it("shows the conflict and reloads the register when the reconcile toggle gets a 409", async () => {
+      const { putBodies, fetchMock } = stubRowFetch(conflict);
+      await renderWithRow();
+      const loadsBefore = listLoads(fetchMock);
+
+      await act(async () => {
+        await toggle(true);
+      });
+
+      expect(putBodies).toEqual([
+        { isReconciled: true, expectedUpdatedAt: "2024-06-01T00:00:00.000Z" },
+      ]);
+      expect(toast.error).toHaveBeenCalledWith(TRANSACTION_CONFLICT_MESSAGE);
+      await waitFor(() => expect(listLoads(fetchMock)).toBeGreaterThan(loadsBefore));
+      expect(shownRow()?.isReconciled).toBe(false);
+    });
+
+    it("sends the revision with Move to next business day", async () => {
+      const moved = { ...row, date: "2024-06-04", updatedAt: new Date("2024-06-05T00:00:00.000Z") };
+      const { putBodies } = stubRowFetch(() => ({ ok: true, json: async () => moved }) as Response);
+      await renderWithRow();
+
+      await act(async () => {
+        await move();
+      });
+
+      // 2024-06-03 is a Monday. The next business day is Tuesday.
+      expect(putBodies).toEqual([
+        { date: "2024-06-04", expectedUpdatedAt: "2024-06-01T00:00:00.000Z" },
+      ]);
+    });
+
+    it("shows the conflict and reloads the register when the move gets a 409", async () => {
+      const { fetchMock } = stubRowFetch(conflict);
+      await renderWithRow();
+      const loadsBefore = listLoads(fetchMock);
+
+      await act(async () => {
+        await move();
+      });
+
+      expect(toast.error).toHaveBeenCalledWith(TRANSACTION_CONFLICT_MESSAGE);
+      expect(toast.success).not.toHaveBeenCalled();
+      await waitFor(() => expect(listLoads(fetchMock)).toBeGreaterThan(loadsBefore));
+      expect(shownRow()?.date).toBe("2024-06-03");
+    });
+
+    it("sends one write when the reconcile toggle is used twice before the answer", async () => {
+      let answer: (response: Response) => void = () => undefined;
+      const { putBodies } = stubRowFetch(
+        () => new Promise<Response>((resolve) => (answer = resolve)) as unknown as Response
+      );
+      await renderWithRow();
+
+      let first: Promise<void> = Promise.resolve();
+      await act(async () => {
+        first = toggle(true);
+        await Promise.resolve();
+      });
+      // The second toggle would send the same revision. The server would
+      // refuse it as a conflict with the first one.
+      await act(async () => {
+        void toggle(false);
+        await Promise.resolve();
+      });
+      expect(putBodies).toHaveLength(1);
+
+      await act(async () => {
+        answer({ ok: true, json: async () => ({ ...row, isReconciled: true }) } as Response);
+        await first;
+      });
+      expect(shownRow()?.isReconciled).toBe(true);
+    });
+  });
+
+  describe("mobile create sheet", () => {
+    const sheet = () =>
+      screen.getAllByTestId("modal").find((modal) => modal.dataset.title === "New Transaction")!;
+
+    function stubCreate(response: () => Response) {
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "/api/b/1/transactions" && method === "POST") return response();
+        if (url.startsWith("/api/b/1/transactions")) {
+          return { ok: true, json: async () => transactionsPayload } as Response;
+        }
+        const standard = standardFetchResponse(url);
+        if (standard) return standard;
+        throw new Error(`Unexpected fetch url: ${url}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+    }
+
+    async function openSheetAndSave() {
+      render(<TransactionsPage />);
+      fireEvent.click(await screen.findByRole("button", { name: "New transaction" }));
+      expect(sheet().dataset.open).toBe("true");
+      let saved: unknown;
+      await act(async () => {
+        saved = await (mobileFormProps!.onSubmit as (data: unknown) => Promise<unknown>)({
+          date: "2024-06-01",
+          description: "Coffee",
+          splits: [],
+        });
+      });
+      return saved;
+    }
+
+    it("stays open when the create fails, so the entry is not lost", async () => {
+      stubCreate(() => ({ ok: false, status: 500, json: async () => ({ error: "Internal error" }) }) as Response);
+
+      expect(await openSheetAndSave()).toBe(false);
+
+      expect(toast.error).toHaveBeenCalled();
+      expect(sheet().dataset.open).toBe("true");
+    });
+
+    it("closes when the create succeeds", async () => {
+      stubCreate(() => ({ ok: true, json: async () => makeTransaction({ id: 31 }) }) as Response);
+      // The page scrolls the register to the top after a create. jsdom has
+      // no scrollTo on an element.
+      const original = Element.prototype.scrollTo;
+      Element.prototype.scrollTo = vi.fn();
+      try {
+        expect(await openSheetAndSave()).toBe(31);
+        expect(sheet().dataset.open).toBe("false");
+      } finally {
+        Element.prototype.scrollTo = original;
+      }
+    });
   });
   describe("balance chart", () => {
     const checking = {

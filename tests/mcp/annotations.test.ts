@@ -73,7 +73,6 @@ const EXPECTED_ANNOTATIONS: Record<string, ToolAnnotations> = {
   create_transaction: CREATE,
   update_transaction: DESTRUCTIVE,
   delete_transaction: DESTRUCTIVE,
-  analyze_usage: READ_NETWORK,
   list_payees: READ,
   get_payee: READ,
   create_payee: CREATE,

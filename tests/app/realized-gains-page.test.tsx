@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor, within, fireEvent } from "@testing-library/react";
+import { act, render, screen, waitFor, within, fireEvent } from "@testing-library/react";
 import RealizedGainsPage from "@/app/b/[bookId]/reports/realized-gains/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 import { stubResizeObserver } from "@/tests/helpers/resize-observer";
 
 vi.mock("@/lib/navigation", async () =>
@@ -394,5 +396,112 @@ describe("RealizedGainsPage", () => {
     // Selecting an account must not drop the date range it is scoped within.
     expect(requested[1]).toContain("startDate=");
     expect(requested[1]).toContain("endDate=");
+  });
+
+  // Another client (an MCP tool, a second tab, a scheduled job) changes the
+  // book. The server sends the book socket a hint for each changed table, and
+  // the report must show the change without a reload.
+  describe("live updates", () => {
+    function socket() {
+      return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    }
+
+    function hint(tables: string[]) {
+      act(() => { socket().emit("change", { tables }); });
+    }
+
+    function renderLive() {
+      FakeWebSocket.instances = [];
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      return render(
+        <BookChangesProvider>
+          <RealizedGainsPage />
+        </BookChangesProvider>
+      );
+    }
+
+    it("shows a sale that another client recorded", async () => {
+      let body: unknown = payload;
+      const requested: string[] = [];
+      global.fetch = routeFetch((url) => {
+        requested.push(url);
+        return okJson(body);
+      });
+
+      renderLive();
+      await waitFor(() => {
+        expect(screen.getByTestId("short-term-total")).toHaveTextContent("$200.00");
+      });
+
+      body = { ...payload, totals: { ...payload.totals, shortTermGainCents: 70_000 } };
+      hint(["investment_lots"]);
+
+      await waitFor(() => {
+        expect(screen.getByTestId("short-term-total")).toHaveTextContent("$700.00");
+      });
+      expect(requested).toHaveLength(2);
+      // A background reload does not replace the table with "Loading".
+      expect(screen.queryByText("Loading…")).not.toBeInTheDocument();
+    });
+
+    it("does not get the report again for a table that it does not read", async () => {
+      const requested: string[] = [];
+      global.fetch = routeFetch((url) => {
+        requested.push(url);
+        return okJson(payload);
+      });
+
+      renderLive();
+      await waitFor(() => expect(screen.getAllByText("VTI")).toHaveLength(2));
+
+      hint(["payees"]);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      expect(requested).toHaveLength(1);
+    });
+
+    it("keeps the dates and the account filter", async () => {
+      const requested: string[] = [];
+      global.fetch = routeFetch((url) => {
+        requested.push(url);
+        return okJson(payload);
+      });
+
+      renderLive();
+      await waitFor(() => expect(requested).toHaveLength(1));
+      const select = await screen.findByLabelText("Account");
+      await waitFor(() => expect(within(select).getByText("IRA")).toBeInTheDocument());
+      fireEvent.change(select, { target: { value: "7" } });
+      await waitFor(() => expect(requested).toHaveLength(2));
+
+      hint(["investment_splits"]);
+
+      await waitFor(() => expect(requested).toHaveLength(3));
+      expect(requested[2]).toBe(requested[1]);
+      expect(requested[2]).toContain("accountId=7");
+      expect(screen.getByLabelText("Account")).toHaveValue("7");
+    });
+
+    it("keeps the result when a background reload fails", async () => {
+      let fail = false;
+      global.fetch = routeFetch(() =>
+        fail ? ({ ok: false, json: async () => ({ error: "boom" }) }) as Response : okJson(payload)
+      );
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      renderLive();
+      await waitFor(() => expect(screen.getAllByText("VTI")).toHaveLength(2));
+
+      fail = true;
+      hint(["transactions"]);
+
+      await waitFor(() => expect(error).toHaveBeenCalled());
+      expect(screen.getAllByText("VTI")).toHaveLength(2);
+      expect(screen.getByTestId("short-term-total")).toHaveTextContent("$200.00");
+      expect(
+        screen.queryByText("Failed to load realized gains. Please try again.")
+      ).not.toBeInTheDocument();
+      error.mockRestore();
+    });
   });
 });

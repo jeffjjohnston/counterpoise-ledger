@@ -1,6 +1,19 @@
 import { test, expect } from "./fixtures";
-import { formatDate, toDateString } from "../../lib/formatters";
-import { getOccurrenceDate } from "../../lib/recurring";
+import { toDateString } from "../../lib/formatters";
+
+/** The date as the rule card shows it: "Jan 15, 2026". */
+function formatDate(dateString: string): string {
+  return new Intl.DateTimeFormat("en-US", { year: "numeric", month: "short", day: "numeric" })
+    .format(new Date(`${dateString}T00:00:00`));
+}
+
+/** The Monday after a Saturday or a Sunday; any other date stays the same. */
+function businessDayOf(dateString: string): string {
+  const date = new Date(`${dateString}T00:00:00`);
+  const shift = { 0: 1, 6: 2 }[date.getDay()] ?? 0;
+  date.setDate(date.getDate() + shift);
+  return toDateString(date);
+}
 
 // Rules must be dated in the same timezone the app reckons "today" in. Using
 // toISOString() here dates them in UTC, which after ~8pm ET creates a rule due
@@ -212,7 +225,7 @@ test.describe("recurring transactions", () => {
     // actually be dated.
     await expect(ruleCard).toContainText("(business days only)");
     await expect(ruleCard).toContainText(
-      formatDate(getOccurrenceDate(rule.nextDate, true))
+      formatDate(businessDayOf(rule.nextDate))
     );
     await expect(ruleCard).not.toContainText(formatDate(rule.nextDate));
 

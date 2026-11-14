@@ -479,7 +479,8 @@ function TransactionsPageInner() {
       toast.success("Transaction added");
       scrollContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
       void refreshData(false);
-      return true;
+      // The id, not only `true`: the form sends it with the entry outcome.
+      return created.id;
     } catch (e) {
       toast.error(toMessage(e, "Failed to create transaction"));
       return false;
@@ -570,10 +571,41 @@ function TransactionsPageInner() {
     }
   }, [favoriteUpdating, selectedAccount, selectedAccountId, bookId, toast, setAccounts]);
 
+  // The row writes below (the reconcile toggle and Move to next business
+  // day) send the updatedAt that the row was loaded with, as the editor
+  // does. The server refuses the write (HTTP 409) when another user changed
+  // the row after the load.
+  const putRow = useCallback(
+    <T,>(row: TransactionWithSplits, payload: object) => putTransaction<T>(bookId, row, payload),
+    [bookId]
+  );
+
+  // The ids of the rows with a write in flight. A second write to a row
+  // would send the same updatedAt as the first, and the server would refuse
+  // it as a conflict with the first. The second action is dropped.
+  const rowWrites = useRef(new Set<number>());
+  const beginRowWrite = useCallback((transactionId: number) => {
+    if (rowWrites.current.has(transactionId)) return false;
+    rowWrites.current.add(transactionId);
+    return true;
+  }, []);
+
+  // On a conflict, tell the user and load the latest rows, as the editor
+  // does. Other failures keep their current behavior: the row goes back.
+  const showRowConflict = useCallback(
+    (error: unknown) => {
+      if (!isTransactionConflict(error)) return;
+      toast.error(TRANSACTION_CONFLICT_MESSAGE);
+      void refreshData(false);
+    },
+    [toast, refreshData]
+  );
+
   const handleToggleReconciled = useCallback(
     async (transactionId: number, isReconciled: boolean) => {
       const existing = transactions.find((tx) => tx.id === transactionId);
-      const clearFloating = isReconciled && existing?.isFloating === true;
+      if (!existing || !beginRowWrite(transactionId)) return;
+      const clearFloating = isReconciled && existing.isFloating === true;
       const clearedDate = clearFloating ? toDateString(new Date()) : undefined;
 
       const payload: {
@@ -586,13 +618,11 @@ function TransactionsPageInner() {
         payload.date = clearedDate;
       }
 
-      const previousSnapshot = existing
-        ? {
-            isReconciled: existing.isReconciled,
-            isFloating: existing.isFloating,
-            date: existing.date,
-          }
-        : null;
+      const previousSnapshot = {
+        isReconciled: existing.isReconciled,
+        isFloating: existing.isFloating,
+        date: existing.date,
+      };
 
       // Optimistic update
       setTransactions((prev) =>
@@ -608,10 +638,7 @@ function TransactionsPageInner() {
       );
 
       try {
-        const updated = await apiPut<TransactionWithSplits>(
-          `/api/b/${bookId}/transactions/${transactionId}`,
-          payload
-        );
+        const updated = await putRow<TransactionWithSplits>(existing, payload);
         // Merge the server's updatedAt/updatedBy into the local row. Without
         // this the row keeps the value it was loaded with until the next
         // live-update refetch, and a save in the edit modal right after
@@ -629,28 +656,20 @@ function TransactionsPageInner() {
         console.error("Error toggling reconciled:", error);
         // Revert optimistic update
         setTransactions((prev) =>
-          prev.map((tx) =>
-            tx.id === transactionId
-              ? {
-                  ...tx,
-                  isReconciled: previousSnapshot?.isReconciled ?? !isReconciled,
-                  ...(previousSnapshot && {
-                    isFloating: previousSnapshot.isFloating,
-                    date: previousSnapshot.date,
-                  }),
-                }
-              : tx
-          )
+          prev.map((tx) => (tx.id === transactionId ? { ...tx, ...previousSnapshot } : tx))
         );
+        showRowConflict(error);
+      } finally {
+        rowWrites.current.delete(transactionId);
       }
     },
-    [bookId, transactions, setTransactions]
+    [transactions, setTransactions, putRow, beginRowWrite, showRowConflict]
   );
 
   const handleMoveToNextBusinessDay = useCallback(
     async (transactionId: number) => {
       const existing = transactions.find((tx) => tx.id === transactionId);
-      if (!existing || existing.isReconciled) return;
+      if (!existing || existing.isReconciled || !beginRowWrite(transactionId)) return;
 
       // Base off the effective date: for floating transactions the stored date may
       // be stale (it auto-advances to today), so "next business day" means the next
@@ -678,10 +697,7 @@ function TransactionsPageInner() {
       );
 
       try {
-        const updated = await apiPut<TransactionWithSplits>(
-          `/api/b/${bookId}/transactions/${transactionId}`,
-          payload
-        );
+        const updated = await putRow<TransactionWithSplits>(existing, payload);
         // Merge updatedAt/updatedBy — see handleToggleReconciled above for why.
         setTransactions((prev) =>
           prev.map((tx) =>
@@ -703,9 +719,12 @@ function TransactionsPageInner() {
             tx.id === transactionId ? { ...tx, ...previousSnapshot } : tx
           )
         );
+        showRowConflict(error);
+      } finally {
+        rowWrites.current.delete(transactionId);
       }
     },
-    [bookId, transactions, refreshData, toast, setTransactions]
+    [transactions, refreshData, toast, setTransactions, putRow, beginRowWrite, showRowConflict]
   );
 
   const handleMakeRecurring = useCallback((transactionId: number) => {
@@ -1199,7 +1218,8 @@ function TransactionsPageInner() {
             fullLayout
             onSubmit={async (data) => {
               const saved = await handleCreateTransaction(data);
-              setMobileCreateOpen(false);
+              // A failed create keeps the sheet open, so the entry stays.
+              if (saved !== false) setMobileCreateOpen(false);
               return saved;
             }}
             onCancel={() => setMobileCreateOpen(false)}

@@ -3,7 +3,6 @@ import {
   setupTestDatabase,
   resetTestDatabase,
   createAccount,
-  createTransactionWithSplits,
   createUser,
 } from "@/tests/helpers/db-utils";
 import { callMcpTool } from "@/tests/helpers/mcp";
@@ -34,35 +33,6 @@ describe("MCP Write Transaction Tools", () => {
   });
 
   describe("create_transaction", () => {
-    it("creates a basic transaction", async () => {
-      const checking = await createAccount({
-        name: "Checking",
-        type: "asset",
-        subtype: "bank",
-        bookId,
-      });
-      const groceries = await createAccount({
-        name: "Groceries",
-        type: "expense",
-        subtype: "other",
-        bookId,
-      });
-
-      const { data, isError } = await callTool("create_transaction", {
-        bookId,
-        date: "2025-01-15",
-        description: "Grocery store",
-        splits: [
-          { accountId: groceries.id, amount: 5000 },
-          { accountId: checking.id, amount: -5000 },
-        ],
-      });
-
-      expect(isError).toBe(false);
-      expect(data.id).toBeDefined();
-      expect(data.splits).toHaveLength(2);
-    });
-
     it("rejects unbalanced splits", async () => {
       const checking = await createAccount({
         name: "Checking",
@@ -112,24 +82,6 @@ describe("MCP Write Transaction Tools", () => {
       expect(stored.isReconciled).toBe(true);
     });
 
-    it("creates transaction with payee", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
-      const groceries = await createAccount({ name: "Groceries", type: "expense", subtype: "other", bookId });
-
-      const { data, isError } = await callTool("create_transaction", {
-        bookId,
-        date: "2025-01-15",
-        payeeName: "Whole Foods",
-        splits: [
-          { accountId: groceries.id, amount: 5000 },
-          { accountId: checking.id, amount: -5000 },
-        ],
-      });
-
-      expect(isError).toBe(false);
-      expect(data.payee.name).toBe("Whole Foods");
-    });
-
     // The key check itself is in rust-transport.test.ts and rust-stdio.test.ts.
     it("returns book access error when not authorized", async () => {
       const stranger = await createUser({ username: "stranger" });
@@ -144,90 +96,6 @@ describe("MCP Write Transaction Tools", () => {
 
       expect(isError).toBe(true);
       expect(data).toEqual({ error: "You do not have access to this book" });
-    });
-  });
-
-  describe("update_transaction", () => {
-    it("updates transaction description", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
-      const groceries = await createAccount({ name: "Groceries", type: "expense", subtype: "other", bookId });
-
-      const { data: created } = await callTool("create_transaction", {
-        bookId,
-        date: "2025-01-15",
-        description: "Original",
-        splits: [
-          { accountId: groceries.id, amount: 5000 },
-          { accountId: checking.id, amount: -5000 },
-        ],
-      });
-
-      const { data: updated, isError } = await callTool("update_transaction", {
-        bookId,
-        transactionId: created.id,
-        description: "Updated",
-      });
-
-      expect(isError).toBe(false);
-      expect(updated.description).toBe("Updated");
-    });
-
-    it("updates transaction splits", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
-      const groceries = await createAccount({ name: "Groceries", type: "expense", subtype: "other", bookId });
-      const dining = await createAccount({ name: "Dining", type: "expense", subtype: "other", bookId });
-
-      const { data: created } = await callTool("create_transaction", {
-        bookId,
-        date: "2025-01-15",
-        description: "Dinner",
-        splits: [
-          { accountId: groceries.id, amount: 5000 },
-          { accountId: checking.id, amount: -5000 },
-        ],
-      });
-
-      const { data: updated, isError } = await callTool("update_transaction", {
-        bookId,
-        transactionId: created.id,
-        splits: [
-          { accountId: dining.id, amount: 7500 },
-          { accountId: checking.id, amount: -7500 },
-        ],
-      });
-
-      expect(isError).toBe(false);
-      expect(updated.splits).toHaveLength(2);
-      // Verify the new split amounts
-      const amounts = updated.splits.map((s: { amount: number }) => s.amount).sort((a: number, b: number) => a - b);
-      expect(amounts).toEqual([-7500, 7500]);
-    });
-
-    it("marks a transaction reconciled", async () => {
-      const checking = await createAccount({ name: "Checking", type: "asset", subtype: "bank", bookId });
-      const groceries = await createAccount({ name: "Groceries", type: "expense", subtype: "other", bookId });
-
-      const { data: created } = await callTool("create_transaction", {
-        bookId,
-        date: "2025-01-15",
-        description: "Original",
-        splits: [
-          { accountId: groceries.id, amount: 5000 },
-          { accountId: checking.id, amount: -5000 },
-        ],
-      });
-
-      const { data: updated, isError } = await callTool("update_transaction", {
-        bookId,
-        transactionId: created.id,
-        isReconciled: true,
-      });
-
-      expect(isError).toBe(false);
-      expect(updated.isReconciled).toBe(true);
-
-      const stored = await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [created.id]);
-      expect(stored.isReconciled).toBe(true);
     });
   });
 
@@ -252,40 +120,6 @@ describe("MCP Write Transaction Tools", () => {
   });
 
   describe("delete_transaction", () => {
-    it("deletes a transaction", async () => {
-      const checking = await createAccount({
-        name: "Checking",
-        type: "asset",
-        subtype: "bank",
-        bookId,
-      });
-      const supplies = await createAccount({
-        name: "Supplies",
-        type: "expense",
-        subtype: "other",
-        bookId,
-      });
-      const txn = await createTransactionWithSplits({
-        bookId,
-        date: "2026-02-01",
-        description: "To be deleted",
-        splits: [
-          { accountId: supplies.id, amount: 2500 },
-          { accountId: checking.id, amount: -2500 },
-        ],
-      });
-
-      const { data, isError } = await callTool("delete_transaction", {
-        bookId,
-        transactionId: txn.id,
-      });
-
-      expect(isError).toBe(false);
-      expect(data.success).toBe(true);
-
-      expect(await count("transactions", "id = $1", [txn.id])).toBe(0);
-    });
-
     it("returns an error for an unknown transaction", async () => {
       const { data, isError } = await callTool("delete_transaction", {
         bookId,

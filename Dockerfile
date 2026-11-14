@@ -1,14 +1,14 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # The production image: one container, one process (the `rust-api` service of
 # docker-compose.yml). The Rust server applies the SQLite migrations when it
 # starts, then serves the client build, the API and MCP, and runs the
 # scheduled jobs and the backups.
 
 # --- Compile the shared Rust core for the browser ---
-FROM rust:1.99 AS wasm-builder
+FROM rust:1.99@sha256:edc584c5d2f915bcc5b08049987e7a492ccb8ab188444daf0a870b3ef82a3b2e AS wasm-builder
 WORKDIR /app
 RUN rustup target add wasm32-unknown-unknown
-RUN cargo install wasm-bindgen-cli --version 0.2.129 --locked
+RUN cargo install wasm-bindgen-cli --version 0.2.130 --locked
 RUN apt-get update && apt-get install -y --no-install-recommends binaryen \
     && rm -rf /var/lib/apt/lists/*
 COPY rust-api ./rust-api
@@ -21,7 +21,7 @@ RUN wasm-opt --enable-bulk-memory --enable-nontrapping-float-to-int -Oz \
     && mv /wasm-pkg/optimized.wasm /wasm-pkg/ledger_core_bg.wasm
 
 # --- Build the client (vite build writes build/) ---
-FROM node:26-alpine AS client
+FROM node:26-alpine@sha256:c6ad9e9c1d80f6eb607c26b4b0a132ff7a2344fad1c78ea3baa2a7d4c8de6d94 AS client
 WORKDIR /app
 # .npmrc carries strict-allow-scripts=true, which makes package.json's
 # allowScripts map enforcing. Without it here, npm ci would run unapproved
@@ -31,16 +31,10 @@ RUN npm ci
 COPY . .
 COPY --from=wasm-builder /wasm-pkg/ledger_core.js /wasm-pkg/ledger_core.d.ts \
     /wasm-pkg/ledger_core_bg.wasm /wasm-pkg/ledger_core_bg.wasm.d.ts ./lib/wasm/generated/
-# vite.config.ts puts these in the client at build time, so they must be here
-# now. A runtime value has no effect on a built client.
-ARG NEXT_PUBLIC_POSTHOG_KEY
-ARG NEXT_PUBLIC_POSTHOG_HOST
-ENV NEXT_PUBLIC_POSTHOG_KEY=$NEXT_PUBLIC_POSTHOG_KEY
-ENV NEXT_PUBLIC_POSTHOG_HOST=$NEXT_PUBLIC_POSTHOG_HOST
 RUN CORE_WASM_PREBUILT=1 npm run build
 
 # --- Build the server and ledger-cli ---
-FROM rust:1.99-alpine AS builder
+FROM rust:1.99-alpine@sha256:f432d4b8663fbc50b29e33846bf6a1fb9f17f142023598899d641cddf57c6b22 AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY package.json ./package.json
@@ -65,7 +59,7 @@ RUN --mount=type=cache,id=counterpoise-rust-registry,target=/usr/local/cargo/reg
 # --- Runtime ---
 # No Node and no shell tools are needed: the binaries are static (musl), and
 # reqwest carries its own TLS roots. Alpine gives `sh` for `docker exec`.
-FROM alpine:3.24
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 # chrono::Local reads TZ from these files. Without them it uses UTC in silence.
 RUN apk add --no-cache tzdata
 # The server runs as uid 1000. /data holds counterpoise.db with its -wal,

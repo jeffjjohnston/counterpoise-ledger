@@ -16,6 +16,22 @@ pub struct TempDatabase {
 impl TempDatabase {
     /// Creates the file and applies the migrations.
     pub fn new() -> Self {
+        let file = Self::empty();
+        crate::migrate(&file.database).expect("migrate a test database");
+        file
+    }
+
+    /// Creates the file and applies the migrations up to `version` only: the
+    /// schema that a release before a later migration left.
+    pub fn at_version(version: i64) -> Self {
+        let file = Self::empty();
+        crate::migrations::migrate_with(&file.database, &crate::migrations::through(version))
+            .expect("migrate a test database");
+        file
+    }
+
+    /// Creates the file with no schema.
+    fn empty() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "counterpoise-test-{}-{}.db",
@@ -24,7 +40,6 @@ impl TempDatabase {
         ));
         remove(&path);
         let database = crate::Database::open(&path, true).expect("create a test database");
-        crate::migrate(&database).expect("migrate a test database");
         Self { path, database }
     }
 

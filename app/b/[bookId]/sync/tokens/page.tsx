@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "@/lib/navigation";
 import { AccountAutocomplete } from "@/components/ui/AccountAutocomplete";
 import { Button } from "@/components/ui/Button";
@@ -15,6 +15,8 @@ import { flattenAccounts } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
+import { useLiveReload } from "@/components/BookChangesProvider";
+import { useLatestRequest } from "@/hooks/useLatestRequest";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import type {
   AccountWithBalance,
@@ -33,6 +35,14 @@ type EditTokenForm = {
   itemId: string;
   accessToken: string;
 };
+
+// The list reads the tokens and counts their Plaid accounts. plaid_tokens
+// sends no hint, but a change to a token comes with a reset on each return to
+// the tab, and useLiveReload reloads on each reset. So the page needs no
+// onTabReturn() of its own.
+const TOKEN_TABLES = ["plaid_accounts"];
+// The accounts that a Plaid account can map to.
+const ACCOUNT_TABLES = ["accounts"];
 
 const initialFormState: NewTokenForm = {
   financialInstitution: "",
@@ -94,10 +104,31 @@ export default function SyncTokensPage() {
     [accounts]
   );
 
+  // A live update can start a reload while another is in flight. Only the
+  // latest request of each list may publish its answer.
+  const tokensRequest = useLatestRequest();
+  const accountsRequest = useLatestRequest();
+  // Whether the token list has rendered. A live reload can overtake the
+  // first load, so the first answer, not the first request, decides between
+  // the error and a quiet failure.
+  const tokensShown = useRef(false);
+
+  // A request that a later one replaced resolves and publishes nothing. A
+  // request that is still the latest rejects on failure.
   const fetchTokens = useCallback(async () => {
-    const data = await apiGet<PlaidTokenListItem[]>(`/api/b/${bookId}/sync/tokens`);
+    const isLatest = tokensRequest();
+    let data: PlaidTokenListItem[];
+    try {
+      data = await apiGet<PlaidTokenListItem[]>(`/api/b/${bookId}/sync/tokens`);
+    } catch (fetchError) {
+      if (isLatest()) throw fetchError;
+      return;
+    }
+    if (!isLatest()) return;
     setTokens(Array.isArray(data) ? data : []);
-  }, [bookId]);
+    tokensShown.current = true;
+    setLoading(false);
+  }, [bookId, tokensRequest]);
 
   // The row behind the assignment modal reports "N of M accounts mapped" and
   // gates the amber warning on it. Both the Plaid refresh (which upserts
@@ -113,38 +144,47 @@ export default function SyncTokensPage() {
   }, [fetchTokens]);
 
   const fetchAccounts = useCallback(async () => {
-    // Degrades to [] on failure rather than throwing — the account list only
-    // feeds the assignment dropdown, so a failure here shouldn't block the
-    // token list (fetchTokens, above) from loading.
+    // A failure does not throw. The account list only fills the assignment
+    // dropdown, so a failure must not stop the token list (fetchTokens,
+    // above). The list starts empty, and a failed reload keeps the old list.
+    const isLatest = accountsRequest();
     try {
       const data = await apiGet<AccountWithBalance[]>(`/api/b/${bookId}/accounts`);
+      if (!isLatest()) return;
       const flatAccounts = flattenAccounts(Array.isArray(data) ? data : []);
       setAccounts(
         [...flatAccounts].sort((a, b) => a.name.localeCompare(b.name))
       );
     } catch {
-      setAccounts([]);
+      // Keep the accounts that are on the screen.
     }
-  }, [bookId]);
+  }, [bookId, accountsRequest]);
+
+  // Before the list has rendered, a failure shows the error and ends the
+  // loading state. After that, a failed background reload keeps the list on
+  // the screen and shows nothing: the next reload tries again.
+  const tokensFailed = useCallback((fetchError: unknown) => {
+    if (tokensShown.current) return;
+    setError(toMessage(fetchError, "Failed to load bank connections"));
+    setLoading(false);
+  }, []);
 
   useEffect(() => {
-    const fetchInitialData = async () => {
-      try {
-        setLoading(true);
-        setError(null);
-        await Promise.all([fetchTokens(), fetchAccounts()]);
-      } catch (fetchError) {
-        const message = toMessage(fetchError, "Failed to load bank connections");
-        setError(message);
-      } finally {
-        setLoading(false);
-      }
-    };
+    tokensShown.current = false;
+    setLoading(true);
+    setError(null);
+    fetchTokens().catch(tokensFailed);
+    // fetchAccounts catches its own failures, so it cannot reject.
+    void fetchAccounts();
+  }, [fetchAccounts, fetchTokens, tokensFailed]);
 
-    // fetchInitialData already catches its own errors into `error`, so
-    // this cannot reject.
-    void fetchInitialData();
-  }, [fetchAccounts, fetchTokens]);
+  // Another client (another tab, an MCP tool, a scheduled job) changed the
+  // book. The token forms and the account mapping keep their own state, but
+  // their fields come from the loaded rows, so the reloads wait until they
+  // close.
+  const formOpen = showAddModal || showEditModal || showAssignModal;
+  useLiveReload(TOKEN_TABLES, () => { fetchTokens().catch(tokensFailed); }, { paused: formOpen });
+  useLiveReload(ACCOUNT_TABLES, () => { void fetchAccounts(); }, { paused: formOpen });
 
   const closeAddModal = () => {
     setShowAddModal(false);
@@ -253,9 +293,10 @@ export default function SyncTokensPage() {
   const handleMapNewConnection = async (tokenId: number) => {
     setLinkTarget(null);
     try {
+      const isLatest = tokensRequest();
       const data = await apiGet<PlaidTokenListItem[]>(`/api/b/${bookId}/sync/tokens`);
       const list = Array.isArray(data) ? data : [];
-      setTokens(list);
+      if (isLatest()) setTokens(list);
       const token = list.find((entry) => entry.id === tokenId);
       if (token) await handleOpenAssignModal(token);
     } catch (fetchError) {

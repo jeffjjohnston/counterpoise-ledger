@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Transaction, TransactionSplit, TypeSafeEvaluation } from "../../types/db";
 import {
   addBookMember, createAccount, createBook, createPayee, createPlaidAccount, createPlaidReconciliation,
@@ -82,6 +82,9 @@ async function fixture() {
   });
   const exact = await spend("2025-03-09", 450, coffee.id, food.id);
   const close = await spend("2025-03-12", 460, coffee.id, food.id);
+  // A second transaction of the exact amount, so the match row has two
+  // eligible candidates and TypeSafe is asked. With one, it is not asked.
+  await spend("2025-03-11", 450, null, food.id);
   await createTransactionWithSplits({ date: "2025-03-01", splits: [{ accountId: checking.id, amount: 90000 }, { accountId: salary.id, amount: -90000 }] });
   const matchRow = await createPlaidReconciliation({
     plaidAccountLinkId: link.id, plaidTransactionId: "t-match", date: "2025-03-10", authorizedDate: "2025-03-09",
@@ -91,11 +94,15 @@ async function fixture() {
     plaidAccountLinkId: link.id, plaidTransactionId: "t-new", date: "2025-06-15",
     amountCents: 2500, name: "Zelle to jane@example.com CONF 99887766",
   });
+  const singleRow = await createPlaidReconciliation({
+    plaidAccountLinkId: link.id, plaidTransactionId: "t-single", date: "2025-03-12",
+    amountCents: 460, name: "SQ *BLUE BOTTLE", merchantName: "SQ *BLUE BOTTLE",
+  });
   const reviewRow = await createPlaidReconciliation({
     plaidAccountLinkId: link.id, plaidTransactionId: "t-review", date: "2025-06-15",
     amountCents: 100, name: "Changed", reviewReason: "plaid_modified",
   });
-  return { checking, food, dining, coffee, link, exact, close, matchRow, newRow, reviewRow };
+  return { checking, food, dining, coffee, link, exact, close, matchRow, newRow, singleRow, reviewRow };
 }
 
 describe("TypeSafe suggestion HTTP parity", () => {
@@ -110,7 +117,7 @@ describe("TypeSafe suggestion HTTP parity", () => {
     await setupTestDatabase();
     mock = await startTypeSafeMock();
     ({ baseUrl, stop } = await startHttpTestServer({
-      TYPESAFE_ENABLED: "true", TYPESAFE_API_KEY: " test-key ", TYPESAFE_API_URL: mock.url, TZ: "UTC",
+      TYPESAFE_ENABLED: "true", TYPESAFE_CLEF_ACCOUNT_ID: "abc123", TYPESAFE_CLEF_API_TOKEN: " test-key ", TYPESAFE_CLEF_API_URL: mock.url, TZ: "UTC",
     }));
   }, 120_000);
 
@@ -119,13 +126,7 @@ describe("TypeSafe suggestion HTTP parity", () => {
     client = await sessionHttpClient(baseUrl);
     mock.reset();
     data = await fixture();
-    // The TypeScript library in this process is the reference.
-    vi.stubEnv("TYPESAFE_ENABLED", "true");
-    vi.stubEnv("TYPESAFE_API_KEY", "test-key");
-    vi.stubEnv("TYPESAFE_API_URL", mock.url);
   });
-
-  afterEach(() => { vi.unstubAllEnvs(); });
 
   afterAll(async () => {
     await stop?.();
@@ -203,7 +204,7 @@ describe("TypeSafe suggestion HTTP parity", () => {
       proposalPayeeKept: null, proposalCategoryKept: null, activeReviewMs: null,
     }]);
     // The row is resolved now: the evaluation is stale.
-    await expectError(client, path(), json("PUT", { evaluationId }), 409, "This TypeSafe suggestion is stale. Refresh and review the transaction again.");
+    await expectError(client, path(), json("PUT", { evaluationId }), 409, "This AI suggestion is stale. Refresh and review the transaction again.");
   });
 
   it("stores provider failures, waits before a retry, and never acts on a bad response", async () => {
@@ -217,10 +218,11 @@ describe("TypeSafe suggestion HTTP parity", () => {
     expect(stored).toMatchObject({ status: "error", errorCode: "rate_limited", choice: null, answers: null, usage: null });
 
     for (const [reply, code] of [
-      [() => ({ status: 200, body: JSON.stringify({ model: "other", answers: {} }) }), "invalid_response"],
-      [() => ({ status: 200, body: "not json" }), "invalid_response"],
+      [() => ({ status: 200, body: JSON.stringify({ result: { model: "other", answers: {} }, success: true }) }), "invalid_response_model"],
+      [() => ({ status: 200, body: JSON.stringify({ result: { model: "clef", answers: {} }, success: true }) }), "invalid_response_missing"],
+      [() => ({ status: 200, body: "not json" }), "invalid_response_json"],
       [() => ({ status: 500, body: "{}" }), "provider_error"],
-      [(text: string) => typesafeReply({ body: text }).text().then((body) => ({ status: 200, body: body.replace('"none":0', '"none":0.5') })), "invalid_response"],
+      [(text: string) => typesafeReply({ body: text }).text().then((body) => ({ status: 200, body: body.replace('"none":0', '"none":0.5') })), "invalid_response_sum"],
     ] as [Reply, string][]) {
       await exec("UPDATE typesafe_evaluations SET started_at = $1", [new Date(Date.now() - 61_000)]);
       mock.replies.push(reply);
@@ -235,6 +237,8 @@ describe("TypeSafe suggestion HTTP parity", () => {
     const ask = async (reconciliationId: number) =>
       (await client.request(path(), json("POST", { reconciliationId }))).json();
     expect(await ask(data.reviewRow.id)).toEqual({ status: "skipped" });
+    // One eligible candidate: the list already shows it first.
+    expect(await ask(data.singleRow.id)).toEqual({ status: "skipped", evaluationId: expect.any(Number) });
     await insert("typesafe_evaluations", {
       bookId: 1, reconciliationId: data.newRow.id, linkId: data.link.id, revision: 2, fingerprint: "other",
       attempt: "a", snapshot: {}, status: "pending", startedAt: new Date(),
@@ -267,15 +271,15 @@ describe("TypeSafe suggestion HTTP parity", () => {
     }
     await expectError(client, path(), json("POST", { reconciliationId: 999999 }), 404, "Reconciliation row not found");
     await expectError(client, "/api/b/1/sync/accounts/999999/reconcile/suggestion", json("POST", { reconciliationId: data.matchRow.id }), 404, "Linked sync account not found");
-    await expectError(client, "/api/b/1/sync/accounts/99999999999/reconcile/suggestion", json("POST", { reconciliationId: data.matchRow.id }), 503, "TypeSafe is temporarily unavailable");
-    await expectError(client, path(), json("PATCH", { evaluationId: 999999 }), 409, "This TypeSafe suggestion is stale. Refresh and review the transaction again.");
-    await expectError(client, path(), json("PUT", { evaluationId: 999999 }), 409, "This TypeSafe suggestion is stale. Refresh and review again.");
+    await expectError(client, "/api/b/1/sync/accounts/99999999999/reconcile/suggestion", json("POST", { reconciliationId: data.matchRow.id }), 503, "AI suggestions are temporarily unavailable");
+    await expectError(client, path(), json("PATCH", { evaluationId: 999999 }), 409, "This AI suggestion is stale. Refresh and review the transaction again.");
+    await expectError(client, path(), json("PUT", { evaluationId: 999999 }), 409, "This AI suggestion is stale. Refresh and review again.");
 
     // A match evaluation has no proposal to create; a changed row makes it stale.
     const { evaluationId } = await (await client.request(path(), json("POST", { reconciliationId: data.matchRow.id }))).json();
-    await expectError(client, path(), json("PUT", { evaluationId, kind: "create" }), 409, "This TypeSafe suggestion has no new transaction to create.");
+    await expectError(client, path(), json("PUT", { evaluationId, kind: "create" }), 409, "This AI suggestion has no new transaction to create.");
     await exec("UPDATE plaid_transaction_reconciliation SET name = $1 WHERE id = $2", ["Changed name", data.matchRow.id]);
-    await expectError(client, path(), json("PATCH", { evaluationId }), 409, "This TypeSafe suggestion is stale. Refresh and review the transaction again.");
+    await expectError(client, path(), json("PATCH", { evaluationId }), 409, "This AI suggestion is stale. Refresh and review the transaction again.");
 
     const owner = await createUser({ username: "owner" });
     const shared = await createBook({ name: "Shared", userId: owner.id });

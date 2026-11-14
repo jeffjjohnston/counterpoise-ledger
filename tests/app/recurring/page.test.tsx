@@ -1,6 +1,9 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import RecurringPage from "@/app/b/[bookId]/recurring/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { ToastProvider } from "@/components/ui/ToastProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 
 // One stable object, so the page effect that reads it does not run again on
 // each render. A test that opens the page from a transaction replaces it.
@@ -764,5 +767,149 @@ describe("RecurringPage viewer access", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "New Rule" })).toBeInTheDocument();
     expect(within(card).getByRole("button", { name: "Pause" })).toBeInTheDocument();
+  });
+});
+
+// Another client (an MCP tool, a second tab, the scheduled processing)
+// changes the book. The server sends the book socket a hint for each changed
+// table, and the page must show the change without a reload.
+describe("RecurringPage live updates", () => {
+  const newRule = { ...recurringPayload[1], id: 4, name: "Friday Gym Fee" };
+  let rules: unknown[] = recurringPayload;
+  let failRules = false;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  function socket() {
+    return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+  }
+
+  function hint(tables: string[]) {
+    act(() => { socket().emit("change", { tables }); });
+  }
+
+  function ruleReads() {
+    return fetchMock.mock.calls.filter(([input]) => String(input) === "/api/b/1/recurring").length;
+  }
+
+  // The provider sends hints after 100 ms. Wait longer than that before a
+  // test says that no reload occurred.
+  async function settle() {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 250)); });
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-02-08T12:00:00.000Z"));
+    rules = recurringPayload;
+    failRules = false;
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/recurring") {
+        if (failRules) {
+          return { ok: false, status: 500, json: async () => ({ error: "boom" }) } as Response;
+        }
+        return { ok: true, status: 200, json: async () => rules } as Response;
+      }
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, status: 200, json: async () => accountPayload } as Response;
+      }
+      if (url.startsWith("/api/b/1/recurring/transactions")) {
+        return { ok: true, status: 200, json: async () => [] } as Response;
+      }
+      if (url.startsWith("/api/b/1/payees")) {
+        return { ok: true, status: 200, json: async () => [] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function renderLive() {
+    return render(
+      <ToastProvider>
+        <BookChangesProvider>
+          <RecurringPage />
+        </BookChangesProvider>
+      </ToastProvider>
+    );
+  }
+
+  it("shows a rule that another client created", async () => {
+    renderLive();
+    await screen.findByTestId("recurring-rule-card-1");
+    expect(screen.queryByText("Friday Gym Fee")).not.toBeInTheDocument();
+
+    rules = [...recurringPayload, newRule];
+    hint(["recurring_rules"]);
+
+    expect(await screen.findByTestId("recurring-rule-card-4")).toBeInTheDocument();
+  });
+
+  it("keeps the search term when it reloads", async () => {
+    renderLive();
+    await screen.findByTestId("recurring-rule-card-1");
+    fireEvent.change(screen.getByLabelText("Search recurring rules"), {
+      target: { value: "friday" },
+    });
+
+    rules = [...recurringPayload, newRule];
+    hint(["transactions"]);
+
+    expect(await screen.findByTestId("recurring-rule-card-4")).toBeInTheDocument();
+    expect(screen.getByLabelText("Search recurring rules")).toHaveValue("friday");
+    expect(screen.getByTestId("recurring-rule-card-2")).toBeInTheDocument();
+    expect(screen.queryByTestId("recurring-rule-card-1")).not.toBeInTheDocument();
+  });
+
+  it("does not reload for a table that it does not read", async () => {
+    renderLive();
+    await screen.findByTestId("recurring-rule-card-1");
+    const before = ruleReads();
+
+    hint(["security_prices"]);
+    await settle();
+
+    expect(ruleReads()).toBe(before);
+  });
+
+  it("keeps the new rule draft, and reloads after the form closes", async () => {
+    renderLive();
+    await screen.findByTestId("recurring-rule-card-1");
+    fireEvent.click(screen.getByRole("button", { name: "New Rule" }));
+    const modal = within(screen.getByTestId("modal"));
+    fireEvent.change(modal.getByLabelText("Rule Name"), { target: { value: "Draft rule" } });
+    const before = ruleReads();
+
+    rules = [...recurringPayload, newRule];
+    hint(["recurring_rules"]);
+    await settle();
+
+    expect(ruleReads()).toBe(before);
+    expect(modal.getByLabelText("Rule Name")).toHaveValue("Draft rule");
+    expect(screen.queryByTestId("recurring-rule-card-4")).not.toBeInTheDocument();
+
+    fireEvent.click(modal.getByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByTestId("recurring-rule-card-4")).toBeInTheDocument();
+  });
+
+  it("keeps the rules on the screen when a reload fails", async () => {
+    renderLive();
+    await screen.findByTestId("recurring-rule-card-1");
+
+    failRules = true;
+    hint(["recurring_rules"]);
+
+    expect(await screen.findByText("Could not refresh recurring rules.")).toBeInTheDocument();
+    expect(screen.getByTestId("recurring-rule-card-1")).toBeInTheDocument();
+    expect(screen.queryByText("Could not load recurring rules.")).not.toBeInTheDocument();
   });
 });

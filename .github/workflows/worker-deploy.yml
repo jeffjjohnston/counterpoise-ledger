@@ -39,8 +39,6 @@ name: Deploy the Worker
 #                                   managed outside this repository)
 #            ACCESS_CLIENT_ID       a Cloudflare Access service token, sent
 #            ACCESS_CLIENT_SECRET   by the probe; empty when Access is not on
-#   vars     NEXT_PUBLIC_POSTHOG_KEY   the PostHog project key and host of the
-#            NEXT_PUBLIC_POSTHOG_HOST  client build; unset, no analytics
 # The Worker's own secrets (CRON_SECRET, PLAID_*, ...) are set once with
 # `scripts/wrangler.sh secret put` (with `--env` for the staging Worker), and a
 # deploy keeps them.
@@ -104,21 +102,21 @@ jobs:
             *) echo "Unknown target '$TARGET': use staging or production" >&2; exit 1 ;;
           esac
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 26
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           targets: wasm32-unknown-unknown
 
       - name: Install the WASM tools
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
           bash scripts/install-worker-build.sh
           bash scripts/install-wasm-opt.sh
 
@@ -126,14 +124,7 @@ jobs:
 
       # The Worker serves this build as its static assets. The commit lets an
       # open page see a new commit of the same version (/api/version).
-      # The PostHog project key goes into the client build, as the Docker
-      # build argument does. It is not a secret: every browser gets it. It is
-      # a variable of the environment, so a fork without one builds with no
-      # analytics.
       - name: Build the client
-        env:
-          NEXT_PUBLIC_POSTHOG_KEY: ${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
-          NEXT_PUBLIC_POSTHOG_HOST: ${{ vars.NEXT_PUBLIC_POSTHOG_HOST }}
         run: NEXT_PUBLIC_BUILD_COMMIT="$(git rev-parse HEAD)" npm run build
 
       # The build command in wrangler.toml builds the Worker first.

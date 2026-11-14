@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useId, useMemo, useRef, useImperativeHandle, forwardRef } from "react";
 import { useBookId } from "@/hooks/useBookId";
+import { useSubmitGuard } from "@/hooks/useSubmitGuard";
 import { apiGet, apiPost } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import { Button } from "@/components/ui/Button";
@@ -52,8 +53,11 @@ interface TransactionFormProps {
   editingTransaction?: TransactionWithSplits | null;
   plaidData?: PlaidLinkData | null;
   onPlaidUnlinked?: () => void;
-  /** `true` when the save succeeded; the entry outcome is recorded only then. */
-  onSubmit: (data: TransactionFormSubmitData) => void | boolean | Promise<void | boolean>;
+  /**
+   * `true` or the saved transaction's id when the save succeeded; the entry
+   * outcome is recorded only then, with the id when there is one.
+   */
+  onSubmit: (data: TransactionFormSubmitData) => void | boolean | number | Promise<void | boolean | number>;
   onCancel?: () => void;
   onDelete?: () => void;
   onMakeRecurring?: (transactionId: number) => void;
@@ -170,6 +174,14 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     source: "history" | "typesafe";
   } | null>(null);
 
+  // One save at a time. The entry stays in the form until the save handler
+  // reports the result.
+  const submitGuard = useSubmitGuard();
+  const saving = submitGuard.saving;
+  // The fill of the entry whose last save failed. Its outcome is not
+  // `abandoned`: the user tried to save it.
+  const failedFill = useRef<typeof appliedFill>(null);
+
   const compact = !fullLayout && !editingTransaction;
 
   useImperativeHandle(ref, () => ({
@@ -178,7 +190,8 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     },
   }));
 
-  // Ctrl/Cmd+Enter to submit from anywhere in the form
+  // Ctrl/Cmd+Enter to submit from anywhere in the form. handleSubmit drops
+  // the submit while a save is in flight.
   useEffect(() => {
     const form = formRef.current;
     if (!form) return;
@@ -354,6 +367,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     editedSinceFill.current = false;
     chipShown.current = false;
     typedCents.current = null;
+    failedFill.current = null;
     setAppliedFill(null);
     const defaultAccount = accounts.find((a) => a.type === "expense") || accounts[0];
     setSplits([
@@ -365,6 +379,13 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     setIsFloating(false);
     investment.reset();
   }, [accounts, resolveSimpleAccountId, selectedAccountId, isInvestmentAccountSelected, investment]);
+
+  // A save that ends after a later render must reset with the current
+  // accounts, not with those of the render that started it.
+  const resetFormRef = useRef(resetForm);
+  useEffect(() => {
+    resetFormRef.current = resetForm;
+  });
 
   const isEditing = Boolean(editingTransaction);
 
@@ -614,7 +635,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
       source: appliedFill.source,
       chipVisible: chipShown.current,
       pickedIndex: appliedFill.picked ? appliedFill.index : null,
-      transactionId: null,
+      transactionId: null as number | null,
     };
   };
   /** Sends an outcome. It never blocks or undoes a save. */
@@ -625,15 +646,19 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   const postEntryOutcome = (outcome: string) => sendEntryOutcome(entryOutcome(outcome));
 
   // Closing the form with a fill and no save (the sheet's X, its backdrop,
-  // leaving the page) records `abandoned`, as Cancel does.
+  // leaving the page) records `abandoned`, as Cancel does. A close during a
+  // save, or after a save that failed, records nothing: the user did not
+  // abandon that entry. A save that is in flight sends its own outcome when
+  // it succeeds.
+  const abandoned = appliedFill !== null && !saving && appliedFill !== failedFill.current;
   const abandonOnUnmount = useRef<(() => void) | null>(null);
   useEffect(() => {
-    abandonOnUnmount.current = appliedFill ? () => postEntryOutcome("abandoned") : null;
+    abandonOnUnmount.current = abandoned ? () => postEntryOutcome("abandoned") : null;
   });
   useEffect(() => () => abandonOnUnmount.current?.(), []);
 
   const handleCancel = () => {
-    postEntryOutcome("abandoned");
+    if (abandoned) postEntryOutcome("abandoned");
     abandonOnUnmount.current = null;
     onCancel?.();
   };
@@ -668,9 +693,9 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           appliedFill.picked
             ? "your pick"
             : appliedFill.source === "typesafe"
-              ? "TypeSafe"
+              ? "Clef"
               : entryFill.unsure
-                ? "TypeSafe was not sure"
+                ? "Clef was not sure"
                 : "history"
         }
         hideAmount={mode === "simple" ? !appliedFill.pattern.stable : journalHint !== null}
@@ -856,7 +881,14 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     e.preventDefault();
     // A viewer's Enter key must not submit the form.
     if (readOnly) return;
+    // The button, Enter and Ctrl/Cmd+Enter all come here. A submit during a
+    // save is dropped, so one entry cannot be sent twice.
+    void submitGuard.run(save);
+  };
 
+  // Checks the entry, sends it, and waits for the save handler. The part
+  // before the first await runs in the submit gesture.
+  const save = async () => {
     const entry = buildModeEntry();
     if ("error" in entry) {
       toast.error(entry.error);
@@ -895,23 +927,46 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     // starts later on its own. It plays only when the save handler reports
     // success.
     const playChord = prepareSaveChord();
-    if (outcome || playChord) {
-      void Promise.resolve(saved)
-        .then((ok) => {
-          if (ok !== true) return;
-          if (outcome) sendEntryOutcome(outcome);
-          playChord?.();
-        })
-        .catch(() => undefined);
+    const fill = appliedFill;
+    // The handler reports a failure with `false` or with a rejection. It
+    // shows the reason itself.
+    let result: void | boolean | number;
+    try {
+      result = await saved;
+    } catch (error) {
+      console.error("The save handler failed:", error);
+      result = false;
+    }
+    if (result === false) {
+      // The entry stays in the form, so the user can correct it or send it
+      // again.
+      failedFill.current = fill;
+      return;
+    }
+    if (result === true || typeof result === "number") {
+      // The saved id lets the report see which pattern was saved.
+      if (outcome) sendEntryOutcome({ ...outcome, transactionId: typeof result === "number" ? result : null });
+      playChord?.();
     }
     if (!editingTransaction) {
-      resetForm();
-      // Focus the payee field for immediate next entry
-      requestAnimationFrame(() => {
-        payeeRef.current?.focus();
-      });
+      resetFormRef.current();
+      // Focus the payee field for immediate next entry. The effect below
+      // does it, after the fields are enabled again.
+      focusPayeeAfterSave.current = true;
+      setSavedCount((count) => count + 1);
     }
   };
+
+  // The fields are disabled during the save, and a disabled field cannot
+  // take the focus. So the focus moves to Payee only in a render where the
+  // save is over. `savedCount` makes sure that such a render comes.
+  const focusPayeeAfterSave = useRef(false);
+  const [savedCount, setSavedCount] = useState(0);
+  useEffect(() => {
+    if (saving || !focusPayeeAfterSave.current) return;
+    focusPayeeAfterSave.current = false;
+    payeeRef.current?.focus();
+  }, [saving, savedCount]);
 
   const simpleAccountFilter = useCallback(
     (a: AccountWithBalance) => !(a.subtype === "investment" && !a.isInvestmentCash),
@@ -960,6 +1015,9 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   if (compact) {
     return (
       <form ref={formRef} onSubmit={handleSubmit}>
+        {/* The entry takes no input during the save: the save would not send
+            it, and the reset after the save would erase it. */}
+        <fieldset disabled={saving} className="min-w-0">
         {/* Tab bar + actions */}
         <div className="flex items-center justify-between border-b border-border">
           {renderTabBar(true)}
@@ -1122,6 +1180,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               type="submit"
               aria-label="Add Transaction"
               className="py-1 px-5 border border-transparent"
+              disabled={saving}
             >
               Add
             </Button>
@@ -1176,7 +1235,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               submitRef={journalAddButtonRef}
             />
             <div className="flex justify-end">
-              <Button ref={journalAddButtonRef} type="submit" size="sm">
+              <Button ref={journalAddButtonRef} type="submit" size="sm" disabled={saving}>
                 Add Transaction
                 <span className="ml-1.5 text-xs opacity-60" aria-hidden="true">
                   {typeof navigator !== "undefined" && /Mac/.test(navigator.platform) ? "⌘" : "Ctrl"}+↵
@@ -1298,6 +1357,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           isCreating={isCreatingExpense}
           onCreatingChange={setIsCreatingExpense}
         />
+        </fieldset>
       </form>
     );
   }
@@ -1315,7 +1375,9 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
         />
       )}
       <form ref={formRef} onSubmit={handleSubmit} className="space-y-4">
-      <fieldset disabled={readOnly} className="space-y-4 min-w-0">
+      {/* Disabled for a viewer, and during the save: the save would not send
+          later input, and the reset after the save would erase it. */}
+      <fieldset disabled={readOnly || saving} className="space-y-4 min-w-0">
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-sm font-medium text-fg-secondary">
           {editingTransaction ? "Edit Transaction" : "New Transaction"}
@@ -1572,7 +1634,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           <>
             <div className="flex gap-3">
               {editingTransaction && onDelete && (
-                <Button type="button" variant="danger" onClick={onDelete}>
+                <Button type="button" variant="danger" onClick={onDelete} disabled={saving}>
                   Delete
                 </Button>
               )}
@@ -1582,7 +1644,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               {editingTransaction &&
                 (editingTransaction.investmentSplits?.length ?? 0) === 0 &&
                 onMakeRecurring && (
-                <Button type="button" variant="secondary" onClick={() => onMakeRecurring(editingTransaction.id)}>
+                <Button type="button" variant="secondary" onClick={() => onMakeRecurring(editingTransaction.id)} disabled={saving}>
                   Make recurring...
                 </Button>
               )}
@@ -1593,7 +1655,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
                   Cancel
                 </Button>
               )}
-              <Button type="submit">
+              <Button type="submit" disabled={saving}>
                 {editingTransaction ? "Save Changes" : "Add Transaction"}
                 {!editingTransaction && (
                   <span className="ml-1.5 text-xs opacity-60" aria-hidden="true">

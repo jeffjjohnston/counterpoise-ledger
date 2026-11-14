@@ -173,3 +173,36 @@ const notLive = () => false;
 export function useBookChangesLive(): () => boolean {
   return useContext(BookChangesContext)?.live ?? notLive;
 }
+
+
+/** Calls `reload` when another client changes one of `tables`, and on each
+ * reset (a new socket, or a return to the tab), since a reset can hide any
+ * change. While `paused` is true (for example, while an editor is open), a
+ * matching change is kept, and `reload` runs one time when `paused` becomes
+ * false. `tables` and `reload` can change on each render. `reload` must keep the
+ * data on the screen and must not replace a form that the user edits. */
+export function useLiveReload(
+  tables: Iterable<string>,
+  reload: () => void,
+  options: { paused?: boolean } = {},
+) {
+  const paused = options.paused ?? false;
+  const state = useRef({ tables: new Set<string>(), reload, paused, missed: false });
+  useEffect(() => {
+    state.current.tables = new Set(tables);
+    state.current.reload = reload;
+  });
+  useBookChanges((change) => {
+    const current = state.current;
+    if (change.type !== "reset" && !change.tables.some((table) => current.tables.has(table))) return;
+    if (current.paused) { current.missed = true; return; }
+    current.reload();
+  });
+  useEffect(() => {
+    const current = state.current;
+    current.paused = paused;
+    if (paused || !current.missed) return;
+    current.missed = false;
+    current.reload();
+  }, [paused]);
+}

@@ -32,6 +32,8 @@ pub(crate) struct Last {
     pub(crate) finished: bool,
     /// Where the next step of an unfinished run starts.
     pub(crate) cursor: Option<String>,
+    /// How many times the step at `cursor` started and did not end.
+    pub(crate) attempts: u32,
 }
 
 /// What the tables say of one job.
@@ -75,6 +77,11 @@ pub(crate) struct Plan {
 ///
 /// A job whose lease another run holds is not due; the plan wakes again a
 /// minute later.
+///
+/// The due jobs keep the order of `schedules`, but a run whose step started
+/// and did not end comes after the others, the most starts last. The alarm
+/// of a Durable Object runs the first due job only, so a run that never
+/// finishes must not stay first in the line.
 pub(crate) fn plan(
     now: DateTime<Utc>,
     zone: Tz,
@@ -95,25 +102,36 @@ pub(crate) fn plan(
             Some(last) => at > last.at,
             None => at == minute,
         });
+        // The second value is the count of failed starts. A new run has
+        // none.
         let run = match (fresh, known.last) {
-            (Some(slot), _) => Some(Due {
-                job,
-                slot,
-                resume: false,
-                cursor: None,
-            }),
-            (None, _) if known.requested => Some(Due {
-                job,
-                slot: minute,
-                resume: false,
-                cursor: None,
-            }),
-            (None, Some(last)) if !last.finished => Some(Due {
-                job,
-                slot: last.at,
-                resume: true,
-                cursor: last.cursor,
-            }),
+            (Some(slot), _) => Some((
+                Due {
+                    job,
+                    slot,
+                    resume: false,
+                    cursor: None,
+                },
+                0,
+            )),
+            (None, _) if known.requested => Some((
+                Due {
+                    job,
+                    slot: minute,
+                    resume: false,
+                    cursor: None,
+                },
+                0,
+            )),
+            (None, Some(last)) if !last.finished => Some((
+                Due {
+                    job,
+                    slot: last.at,
+                    resume: true,
+                    cursor: last.cursor,
+                },
+                last.attempts,
+            )),
             (None, _) => None,
         };
         match run {
@@ -122,6 +140,9 @@ pub(crate) fn plan(
             None => {}
         }
     }
+    // A stable sort: jobs with the same count keep the order of `schedules`.
+    due.sort_by_key(|&(_, attempts)| attempts);
+    let due: Vec<Due> = due.into_iter().map(|(due, _)| due).collect();
     let next_wake = if due.is_empty() {
         let next_minute = minute + TimeDelta::minutes(1);
         let scheduled = (1..=HORIZON.num_minutes())
@@ -161,6 +182,7 @@ mod tests {
                 at: utc(at),
                 finished: true,
                 cursor: None,
+                attempts: 0,
             }),
             ..Known::default()
         }
@@ -203,11 +225,18 @@ mod tests {
             finished("2026-03-08T06:00:00Z"),
         );
         assert_eq!(skipped.next_wake, utc("2026-03-08T07:00:00Z"));
-        // The weekly review runs on Monday at 05:00 local.
+        // The weekly review runs on Monday at 05:00 local, and again at
+        // 06:00 and 07:00.
         let review = plan_of(
             "weekly-review",
             "2026-03-02T10:00:00Z",
             finished("2026-03-02T10:00:00Z"),
+        );
+        assert_eq!(review.next_wake, utc("2026-03-02T11:00:00Z"));
+        let review = plan_of(
+            "weekly-review",
+            "2026-03-02T12:00:00Z",
+            finished("2026-03-02T12:00:00Z"),
         );
         assert_eq!(review.next_wake, utc("2026-03-09T09:00:00Z"));
     }
@@ -269,6 +298,7 @@ mod tests {
                     at: utc("2026-10-21T10:00:00Z"),
                     finished: false,
                     cursor: None,
+                    attempts: 0,
                 }),
                 running: true,
                 ..Known::default()
@@ -312,6 +342,7 @@ mod tests {
                 at: utc("2026-10-21T10:00:00Z"),
                 finished: false,
                 cursor: Some("7".to_owned()),
+                attempts: 0,
             }),
             running,
             ..Known::default()
@@ -334,6 +365,41 @@ mod tests {
         assert_eq!(newer.due[0].slot, utc("2026-10-21T16:00:00Z"));
         assert!(!newer.due[0].resume);
         assert_eq!(newer.due[0].cursor, None);
+    }
+
+    #[test]
+    fn a_run_that_failed_to_finish_is_due_after_the_other_jobs() {
+        // The Plaid sync is before the prune in the list of jobs. Its step
+        // started two times and did not end. The alarm of a Durable Object
+        // runs the first due job only, so the prune must come first.
+        let stuck = |attempts| Known {
+            last: Some(Last {
+                at: utc("2026-10-21T10:00:00Z"),
+                finished: false,
+                cursor: Some("7".to_owned()),
+                attempts,
+            }),
+            ..Known::default()
+        };
+        let requested = Known {
+            requested: true,
+            ..finished("2026-10-21T08:00:00Z")
+        };
+        let order = |attempts| {
+            let schedules: Vec<_> = crate::scheduler::schedules()
+                .into_iter()
+                .filter(|(job, _)| ["plaid-sync", "prune"].contains(job))
+                .collect();
+            let known = HashMap::from([
+                ("plaid-sync", stuck(attempts)),
+                ("prune", requested.clone()),
+            ]);
+            let plan = plan(utc("2026-10-21T10:20:00Z"), new_york(), &schedules, &known);
+            plan.due.iter().map(|due| due.job).collect::<Vec<_>>()
+        };
+        assert_eq!(order(2), ["prune", "plaid-sync"]);
+        // A run with no failed start keeps its place in the list.
+        assert_eq!(order(0), ["plaid-sync", "prune"]);
     }
 
     #[test]

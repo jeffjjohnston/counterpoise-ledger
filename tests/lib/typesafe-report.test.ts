@@ -21,7 +21,7 @@ function evaluation(id: number, overrides: Partial<Evaluation> = {}): Evaluation
       revision: 1,
       mappedAccountId: 1,
       effectiveDay: "2026-09-22",
-      model: "jev-1.13.0",
+      model: "clef",
       promptVersion: "plaid-match-v2",
       merchantSeenBefore: false,
       bank: {

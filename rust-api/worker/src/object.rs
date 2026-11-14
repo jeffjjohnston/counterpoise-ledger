@@ -2,7 +2,7 @@
 //! the router.
 
 use crate::storage::{
-    ObjectContext, ObjectDatabase, ObjectStorage, object_context, object_storage, reset,
+    ObjectContext, ObjectDatabase, ObjectStorage, Timer, object_context, object_storage, reset,
 };
 use counterpoise_rust_api::hosted::{self, restore};
 use http::StatusCode;
@@ -34,6 +34,10 @@ pub struct LedgerObject {
     /// Whether this instance has looked for the marker of a restore. It does
     /// that once, before its first event is served.
     restore_checked: Rc<Cell<bool>>,
+    /// The answer to come of the HEAD of the restore marker, which the
+    /// construction sends before the start ([`ask_for_marker`]).
+    /// [`LedgerObject::finish_restore`] gives the rules for its use.
+    marker: Option<js_sys::Promise>,
     /// Whether this instance has made sure that the folds were repaired for
     /// this build ([`LedgerObject::finish_folds`]).
     folds_checked: Rc<Cell<bool>>,
@@ -43,6 +47,19 @@ pub struct LedgerObject {
 /// folds.
 const FOLDS_KEY: &str = "folds-repaired-for";
 
+/// How long an event waits for the answer to the early HEAD of the restore
+/// marker, in milliseconds, before it asks again inside the callback
+/// ([`LedgerObject::finish_restore`]). The answers seen on Cloudflare came in
+/// less than 600 ms.
+const MARKER_WAIT_MS: i32 = 5_000;
+
+/// The header of `/health` that names the deployed commit, from the
+/// variable `BUILD_COMMIT` that a deploy sets. The deploy's probe reads it,
+/// so it can tell the new version from the one before it. The object adds
+/// it, not the front Worker: after a deploy, the front Worker can run the
+/// new version while the object still runs the old one.
+const BUILD_HEADER: &str = "x-build-commit";
+
 impl DurableObject for LedgerObject {
     fn new(state: State, env: Env) -> Self {
         reset_on_panic(object_context(&state));
@@ -50,6 +67,9 @@ impl DurableObject for LedgerObject {
         keep_alive(&state);
         export_to(&env);
         let exports = env.bucket("EXPORTS").ok();
+        // The HEAD goes out before the start, so that the bucket can answer
+        // while the start runs. Nothing here waits for the answer.
+        let marker = exports.as_ref().and_then(ask_for_marker);
         // The start has no await, so no other event reaches the object
         // while it runs: it needs no `blockConcurrencyWhile`.
         let app = start(&state);
@@ -59,6 +79,7 @@ impl DurableObject for LedgerObject {
             alarm_set: Cell::new(false),
             exports,
             restore_checked: Rc::new(Cell::new(false)),
+            marker,
             folds_checked: Rc::new(Cell::new(false)),
         }
     }
@@ -91,13 +112,21 @@ impl DurableObject for LedgerObject {
         let sockets = self.sockets();
         app.watch_books(&books(&sockets));
         let import = request.uri().path() == hosted::IMPORT_PATH;
+        let health = request.uri().path() == "/health";
         let response = if let Some(book) = socket_book(&request) {
             self.open_socket(&app, &request, &book).await?
         } else {
-            let response = match app.router().call(request).await {
+            let mut response = match app.router().call(request).await {
                 Ok(response) => response,
                 Err(never) => match never {},
             };
+            if health
+                && let Some(build) = ledger_db::env::var("BUILD_COMMIT")
+                    .ok()
+                    .and_then(|build| http::HeaderValue::from_str(&build).ok())
+            {
+                response.headers_mut().insert(BUILD_HEADER, build);
+            }
             // The imported job tables replace those that set the alarm
             // above, and can hold work that is due now. The import has
             // committed, so a storage error here leaves the next request to
@@ -119,6 +148,11 @@ impl DurableObject for LedgerObject {
     /// returns an error is retried by the runtime with a backoff, so a
     /// failed start sets the next alarm itself, a minute later.
     async fn alarm(&self) -> Result<Response> {
+        // An alarm that was set before the setting changed to `off` runs
+        // one time. It does no work and sets no other alarm.
+        if !alarm_enabled() {
+            return Response::empty();
+        }
         let next = match self.app() {
             Ok(app) => {
                 self.finish_restore(&app).await?;
@@ -184,6 +218,40 @@ impl LedgerObject {
     /// Each instance looks once. A step that fails resets the object, so
     /// that nothing is served before the floor marker is in: the next event
     /// constructs the object and looks again.
+    ///
+    /// The construction sent a HEAD of the marker before the start
+    /// ([`ask_for_marker`]). Only the answer "no marker" (null) of that HEAD
+    /// lets the events through without the callback. For each other result
+    /// (a marker, an error, no answer in [`MARKER_WAIT_MS`]) the callback
+    /// below asks the bucket again and does all of the work, as it did
+    /// before the early HEAD was added.
+    ///
+    /// Why the answer "no marker" is sufficient:
+    ///
+    /// - A restore that this start must finish put its marker before the
+    ///   instance before this one reset (`schedule_restore`: the put ends,
+    ///   then the storage gets the bookmark, then the reset). The bucket
+    ///   gives a completed put to each later read, and the early HEAD goes
+    ///   out after the reset. Thus the early HEAD finds that marker.
+    /// - Only `schedule_restore` puts the marker, and it runs in this
+    ///   object. When it puts the marker while this instance runs, the
+    ///   restore is for the next start: the reset ends this instance, and
+    ///   the next instance asks again. When the storage refuses the
+    ///   bookmark, `schedule_restore` deletes its marker and no restore
+    ///   follows.
+    /// - Every event that uses the server (`fetch`, but not the restore
+    ///   route, and `alarm`) waits here first. An event that arrives while
+    ///   another event waits for the answer waits for the same answer.
+    /// - The answer "no marker" changes no stored data. A stop of the
+    ///   object at any point of this path leaves nothing to repair.
+    ///
+    /// The wait for the early answer is outside `blockConcurrencyWhile` on
+    /// purpose. The callback holds back every event that it did not start
+    /// itself, and that includes the answer to a HEAD sent before it: a
+    /// callback that waits for that answer waits until the runtime resets
+    /// the object, at each start. An earlier version did that: it passed
+    /// the local tests, where the bucket answers before the callback
+    /// starts, and it stopped the object on Cloudflare.
     async fn finish_restore(&self, app: &hosted::App) -> Result<()> {
         if self.restore_checked.get() {
             return Ok(());
@@ -192,6 +260,18 @@ impl LedgerObject {
             self.restore_checked.set(true);
             return Ok(());
         };
+        if let Some(asked) = self.marker.clone() {
+            // The timer resolves with `undefined`, which is not the answer
+            // "no marker".
+            let limit = Timer::start(MARKER_WAIT_MS);
+            let answer = js_sys::Promise::race(&js_sys::Array::of2(&asked, limit.elapsed()));
+            let answer = JsFuture::from(answer).await;
+            drop(limit);
+            if answer.is_ok_and(|marker| marker.is_null()) {
+                self.restore_checked.set(true);
+                return Ok(());
+            }
+        }
         let app = app.clone();
         let checked = self.restore_checked.clone();
         self.state
@@ -199,11 +279,9 @@ impl LedgerObject {
                 if checked.get() {
                     return Ok(());
                 }
-                // The HEAD goes out inside the callback. The callback holds
-                // back every event that it did not start itself, and that
-                // includes the answer to a HEAD sent before it: the callback
-                // then waits for that answer until the runtime resets the
-                // object, at each start.
+                // This HEAD goes out inside the callback, so the callback
+                // can wait for its answer. Do not wait here for the answer
+                // to the early HEAD.
                 if bucket.head(restore::MARKER).await?.is_some() {
                     app.after_restore().map_err(worker::Error::RustError)?;
                     bucket.delete(restore::MARKER).await?;
@@ -393,6 +471,9 @@ impl LedgerObject {
     /// not past ([`crate::needs_alarm`]). An alarm that comes too soon only
     /// plans again.
     async fn set_alarm_by(&self, at: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        if !alarm_enabled() {
+            return Ok(());
+        }
         let storage = self.state.storage();
         let set = storage.get_alarm().await?;
         let now = chrono::Utc::now().timestamp_millis();
@@ -406,6 +487,16 @@ impl LedgerObject {
         }
         Ok(())
     }
+}
+
+/// Whether `COUNTERPOISE_SCHEDULER` permits the alarm
+/// ([`crate::alarm_enabled`]).
+fn alarm_enabled() -> bool {
+    crate::alarm_enabled(
+        ledger_db::env::var("COUNTERPOISE_SCHEDULER")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Leaves the marker and tells the storage to restore at the next start.
@@ -572,6 +663,22 @@ fn export_to(env: &Env) {
                 .map_err(|cause| wasm_bindgen::JsValue::from_str(&cause.to_string()))
         })
     });
+}
+
+/// Sends the HEAD of the restore marker and returns its answer to come: an
+/// R2 object, or null when there is no marker. The call goes out now, as
+/// `R2Bucket.head` sends it when it is called; `Bucket::head` would send
+/// it only when awaited. `None` when the call cannot be made:
+/// [`LedgerObject::finish_restore`] then sends it itself.
+fn ask_for_marker(bucket: &Bucket) -> Option<js_sys::Promise> {
+    let head: js_sys::Function = js_sys::Reflect::get(bucket.as_ref(), &"head".into())
+        .ok()?
+        .dyn_into()
+        .ok()?;
+    head.call1(bucket.as_ref(), &restore::MARKER.into())
+        .ok()?
+        .dyn_into()
+        .ok()
 }
 
 fn start(state: &State) -> std::result::Result<hosted::App, String> {

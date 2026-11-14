@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "@/lib/navigation";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
@@ -22,10 +22,18 @@ import {
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
+import { useBookChanges } from "@/components/BookChangesProvider";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { AccountMarketValue } from "@/lib/investments";
 import type { AccountWithBalance } from "@/types";
+
+// The tables whose rows the page shows: the accounts, their balances (the
+// splits) and the market values of investment accounts.
+const ACCOUNT_TABLES = new Set(["accounts", "transactions", "transaction_splits"]);
+const MARKET_VALUE_TABLES = new Set([
+  ...ACCOUNT_TABLES, "investment_splits", "investment_lots", "securities", "security_prices",
+]);
 
 // Keep each account whose full name contains the search term, and all its
 // sub-accounts, because the name of a sub-account does not always contain the
@@ -89,33 +97,45 @@ export default function AccountsPage() {
     new Set(["bank", "investment", "credit_card", "loan", "cash", "other"])
   );
 
+  // A live update can start a refresh while another is in flight, and the
+  // answers can arrive in either order. Only the latest request may publish.
+  const accountsRequest = useRef(0);
+  const marketValuesRequest = useRef(0);
+  // Whether this book's list has rendered. A live refresh can overtake the
+  // first load, so the page's first answer, not the first request, decides
+  // between the full-page error and a toast.
+  const accountsShown = useRef(false);
+
   const fetchAccounts = useCallback(
-    async (showLoading: boolean) => {
+    async () => {
+      const request = ++accountsRequest.current;
       try {
         const data = await apiGet<AccountWithBalance[]>(
           `/api/b/${bookId}/accounts?includeInactive=true`
         );
+        if (request !== accountsRequest.current) return;
         setAccounts(flattenAccounts(data));
         setError(null);
+        accountsShown.current = true;
+        setLoading(false);
       } catch {
+        if (request !== accountsRequest.current) return;
         // No AbortController on this page, so every rejection here is a real
         // failure. Pages that DO abort (search, reports, TransactionForm,
         // ReconciliationModal) keep their `err.name === "AbortError"` early
         // return above this branch — a cancelled request is not an error.
-        if (showLoading) {
+        if (!accountsShown.current) {
           // Nothing has rendered yet — the full-page error state is correct.
+          // Clearing loading here is what stops a failed initial request from
+          // hanging the page on its skeleton.
           setError("Could not load accounts.");
-        } else {
-          // A background refresh (after a create/update/delete/toggle) failed.
-          // The already-rendered account list is still correct, so keep it on
-          // screen and surface the failure without blanking the page.
-          toast.error("Could not refresh accounts.");
-        }
-      } finally {
-        // Always — this is what stops a failed initial request from hanging
-        // the page on its skeleton.
-        if (showLoading) {
           setLoading(false);
+        } else {
+          // A background refresh (after a create/update/delete/toggle, or a
+          // change by another client) failed. The already-rendered account
+          // list is still correct, so keep it on screen and surface the
+          // failure without blanking the page.
+          toast.error("Could not refresh accounts.");
         }
       }
     },
@@ -123,19 +143,35 @@ export default function AccountsPage() {
   );
 
   const fetchMarketValues = useCallback(async () => {
+    const request = ++marketValuesRequest.current;
     try {
       const data = await apiGet<AccountMarketValue[]>(
         `/api/b/${bookId}/investments/account-values`
       );
+      if (request !== marketValuesRequest.current) return;
       setMarketValues(Array.isArray(data) ? data : []);
     } catch {
+      if (request !== marketValuesRequest.current) return;
       // Market values are supplementary; the page is useful without them.
       setMarketValues([]);
     }
   }, [bookId]);
 
+  // Another client (an MCP tool, another tab, a scheduled job) changed the
+  // book. A reset (a new socket, or the tab coming back) can hide any change.
+  useBookChanges((change) => {
+    const reset = change.type === "reset";
+    if (reset || change.tables.some((table) => ACCOUNT_TABLES.has(table))) {
+      void fetchAccounts();
+    }
+    if (reset || change.tables.some((table) => MARKET_VALUE_TABLES.has(table))) {
+      void fetchMarketValues();
+    }
+  });
+
   useEffect(() => {
-    void fetchAccounts(true);
+    accountsShown.current = false;
+    void fetchAccounts();
     void fetchMarketValues();
   }, [fetchAccounts, fetchMarketValues]);
 
@@ -149,7 +185,7 @@ export default function AccountsPage() {
     try {
       await apiPost(`/api/b/${bookId}/accounts`, data);
       setShowModal(false);
-      void fetchAccounts(false);
+      void fetchAccounts();
     } catch (e) {
       toast.error(toMessage(e, "Failed to create account"));
     }
@@ -167,7 +203,7 @@ export default function AccountsPage() {
     try {
       await apiPut(`/api/b/${bookId}/accounts/${editingAccount.id}`, data);
       setEditingAccount(null);
-      void fetchAccounts(false);
+      void fetchAccounts();
     } catch (e) {
       toast.error(toMessage(e, "Failed to update account"));
     }
@@ -178,7 +214,7 @@ export default function AccountsPage() {
     if (!confirm("Are you sure you want to delete this account?")) return;
     try {
       await apiDelete(`/api/b/${bookId}/accounts/${id}`);
-      void fetchAccounts(false);
+      void fetchAccounts();
     } catch (e) {
       toast.error(toMessage(e, "Failed to delete account"));
     }
@@ -193,7 +229,7 @@ export default function AccountsPage() {
         parentId: account.parentId,
         isActive: !account.isActive,
       });
-      void fetchAccounts(false);
+      void fetchAccounts();
       void fetchMarketValues();
     } catch (e) {
       toast.error(toMessage(e, "Failed to update account"));

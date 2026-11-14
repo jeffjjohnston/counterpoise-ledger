@@ -12,7 +12,7 @@ it carries the rules that apply everywhere and says when to come here.
 - Process via POST to `/api/b/[bookId]/recurring/process`
 - The server runs the recurring job hourly (`rust-api/server/src/scheduler/mod.rs`; it also runs Plaid sync — see [guides/plaid-sync.md](plaid-sync.md)). `/api/cron/recurring` runs the same job now. Rust serves it from `rust-api/server/src/routes/cron.rs`, which calls `process_all()` in `routes/recurring.rs` for each book. A failure in one book is logged, and the job continues with the next book. `tests/http/cron.test.ts` covers it
 - `rust-api/server/src/routes/recurring.rs` is the single home for rule CRUD, processing and projections. It serves the `/api/b/[bookId]/recurring/**` routes, the MCP recurring tools send their requests through those routes, and the cron calls its `process_all()`. `tests/http/recurring.test.ts` covers the routes. See [the Rust book routes](api-route-patterns.md)
-- The date rules are in `ledger_core::recurring` (`rust-api/core/src/recurring.rs`). The browser runs the same code as WASM through `lib/wasm-client.ts`, and `lib/recurring.ts` and `lib/accounting.ts` hold the TypeScript helpers that the pages call
+- The date rules are in `ledger_core::recurring` (`rust-api/core/src/recurring.rs`). The browser runs the same code as WASM through `lib/wasm-client.ts`. `lib/recurring.ts` and `lib/accounting.ts` hold only the TypeScript types of those functions
 
 ## Processing Due Rules
 1. Check if the *observed* date (`occurrence_date(next_date, business_days_only)`) is `<= today` (plus `autoCreateDaysBefore`)
@@ -23,8 +23,8 @@ it carries the rules that apply everywhere and says when to come here.
 
 ## Business-Day Occurrences
 `occurrence_date(scheduled, business_days_only)` in `ledger_core::recurring` is
-the single place the shift is applied, and `getOccurrenceDate()` in
-`/lib/recurring.ts` is its TypeScript copy for the pages. The shift is applied
+the single place the shift is applied. The pages call it as
+`getOccurrenceDate()` from `lib/wasm-client.ts`. The shift is applied
 at *read* time — when a scheduled date becomes a transaction date — never
 written back into the rule. Storing the shifted date in `nextDate` would make
 `next_date()` compute the following occurrence from the Monday, so a rule due
@@ -35,27 +35,24 @@ Everything that turns a rule into dates goes through it: `process_rule()` and
 the recurring page's due badge, "Next:" line and calendar, and the global
 search page's "Next Date" column (the search route in
 `rust-api/server/src/routes/search.rs` carries `businessDaysOnly` through so the
-two pages cannot disagree). `is_recurring_rule_due()` (and `isRecurringRuleDue()`
-in TypeScript) takes `businessDaysOnly` and compares the observed date, so a
+two pages cannot disagree). `is_recurring_rule_due()` (`isRecurringRuleDue()`
+in `lib/wasm-client.ts`) takes `businessDaysOnly` and compares the observed date, so a
 rule whose occurrence falls on a Saturday is not due — and is not created —
 until the Monday it will be dated.
 
-`advance_next_date_to_future()` (and `advanceNextDateToFuture()` in `/lib/accounting.ts`) needs the observed date too,
+`advance_next_date_to_future()` needs the observed date too,
 for the opposite reason: it decides which scheduled occurrence to *store* when a
 rule is created or its schedule is edited. Comparing raw dates against today
 threw away a Saturday occurrence for a rule created on that Sunday or Monday,
 even though the rule would still have created the transaction on the Monday.
-The Rust function takes `business_days_only`. The TypeScript copy takes an
-optional `observe` transform rather than a `businessDaysOnly` flag:
-`lib/recurring.ts` already imports `lib/accounting.ts`, so a flag would need
-either a circular import or a second copy of the shift inside `accounting.ts`.
-Callers pass `(date) => getOccurrenceDate(date, businessDaysOnly)`; the default
-leaves dates alone.
+The function takes `business_days_only` and compares the observed date. The
+form preview (`previewOccurrences()` in `lib/wasm-client.ts`) calls it the
+same way.
 
 Two consequences worth knowing:
 - **Weekends are the whole definition of "non-business day."** Bank holidays are
   not modeled, the same limitation `get_next_business_day()` in
-  `ledger_core::recurring` (and `getNextBusinessDay()` in `/lib/accounting.ts`)
+  `ledger_core::recurring` (`getNextBusinessDay()` in `lib/wasm-client.ts`)
   documents. `advance_to_business_day()` next to it is the "when is this
   observed?" variant — it leaves a weekday alone, where
   `get_next_business_day()` always moves.

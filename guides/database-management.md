@@ -102,6 +102,43 @@ Follow the type rules of the baseline:
 A new table that a page shows must also get the `*_mark` triggers and an
 entry in `CHANGE_TABLES` (see "Live updates" below).
 
+### Making a table again
+
+SQLite cannot add a CHECK constraint to a table, and it cannot change one.
+Such a change makes the table again: create `<table>_new`, copy the rows,
+drop the old table, rename the new table. `0019_status_checks.sql` is the
+example. The runner applies a migration in one transaction with foreign keys
+on, and `PRAGMA foreign_keys` does nothing inside a transaction. Thus these
+rules apply:
+
+- **`DROP TABLE` deletes the rows first, and that delete runs the foreign key
+  actions.** A table that points at the dropped table with `ON DELETE
+  CASCADE` loses its rows, and one with `ON DELETE SET NULL` loses its
+  references. Find each foreign key that points at the table. Keep those
+  references in a side table, set them to NULL before the drop, write them
+  back after the rename, and drop the side table.
+- **Carry the `sqlite_sequence` row to the new table** before the drop. If
+  you do not, the `AUTOINCREMENT` counter starts again from the largest ID
+  that is left, and a deleted ID can come back.
+- **Make the indexes and triggers again.** They go with the dropped table.
+  Copy their text from the migrations that first made them, which can be
+  more than one file.
+- Give the new table the same columns in the same order. A column that a
+  later `ALTER TABLE ... ADD COLUMN` added is last.
+- The delete of a `DROP TABLE` fires no trigger, and the new table has no
+  trigger while the rows go in, so `change_marks` and `transaction_changes`
+  do not move.
+- A row that the new constraint refuses fails the copy, and thus the
+  migration and the start of the server (see above). Check the production
+  data before the release.
+- After the rename, `sqlite_schema` has the table name in double quotes
+  (`CREATE TABLE "issue_reports" (...)`). This has no effect.
+
+`rust-api/db/src/status_checks_tests.rs` compares the whole schema before
+and after 0019 (`describe()`), and the rows and the ID counters. Write the
+same tests for the next migration of this kind:
+`TempDatabase::at_version(n)` gives a file at an older version.
+
 ## ⚠️ Never edit an applied migration
 
 Do not change a migration file after it ran on any database. Do not use
@@ -331,8 +368,14 @@ The server makes the backups itself (`rust-api/server/src/scheduler/mod.rs`):
 - On the 1st of each month at 03:00, it runs `VACUUM`.
 
 To make a snapshot now, run `ledger-cli backup [--dir D]`. On the Docker
-target: `docker exec counterpoise-rust-api-1 ledger-cli backup`. The Worker
-has no `ledger-cli` and no snapshots: see
+target: `docker exec counterpoise-rust-api-1 ledger-cli backup`. The route
+`GET /api/cron/backup` with `Authorization: Bearer $CRON_SECRET` also runs
+the backup job now, in the server: it writes a snapshot into `BACKUP_DIR`,
+and the dump when it is the first backup of the UTC day. It waits for the
+lease that backup, prune and `VACUUM` share, and it records the run of the
+`backup` job. Its answer gives the file's `name`, `bytes` and `verified`. A
+failure answers 500 with the cause in `error`. The Worker has no
+`ledger-cli` and no snapshots: see
 [Backups on the Worker](#backups-on-the-worker).
 
 ### Dump and load
@@ -400,11 +443,104 @@ dump instead (`backup` and `export` in `rust-api/server/src/scheduler/mod.rs`):
 - The object has no prune of backup files and no reindex. Its `prune` job
   still prunes the rate limits.
 
+#### A dump on demand
+
+The daily dump is as old as 03:45. To get the data as it is now, for example
+before a rollback to the Docker target, run the export by hand:
+
+```bash
+curl -sS -H "Authorization: Bearer $CRON_SECRET" https://<host>/api/cron/backup
+# {"success":true,"name":"counterpoise-manual-20261110-142233.json","bytes":1234567}
+```
+
+- `GET /api/cron/backup` (`backup` in `rust-api/server/src/routes/cron.rs`,
+  `backup_now` in the scheduler) writes the dump now as
+  `counterpoise-manual-YYYYMMDD-HHMMSS.json`. The time is UTC. The name is
+  never the name of a day's dump, so the run does not replace that dump.
+  Two runs in one second write the same name, and the second replaces the
+  first.
+- The run is the `backup` job with another name for the object. It writes
+  the S3 copy under the same name when the copy is set, it holds the
+  maintenance lease, and it records the run of the `backup` job. Thus the
+  status page shows a manual run as the last backup.
+- The answer gives the object's `name` and its `bytes`, and `detail` when
+  the S3 copy is set. A failure answers 500 with the cause in `error`, which
+  is also the `detail` of the job status: for example
+  `the dump is in R2 but not in S3: ...`.
+- The lifecycle rules delete a manual dump after 30 days, as they do a daily
+  dump. The name starts with `counterpoise-`, which the S3 rule and the S3
+  write permission need.
+- The route is the same on the Docker target, where it writes a snapshot
+  (see [Backups and restore](#backups-and-restore)).
+
 To restore from a dump, fetch it with
-`scripts/wrangler.sh r2 object get <bucket>/counterpoise-YYYY-MM-DD.json --remote --file dump.json`.
+`scripts/wrangler.sh r2 object get <bucket>/<name> --remote --file dump.json`.
+The name is `counterpoise-YYYY-MM-DD.json` for a daily dump, or the `name`
+that the manual run answered.
 Then either `ledger-cli load dump.json` into a native file, as above, or
 load it into an empty object through the admin import route, below. Both
 paths add the floor marker.
+
+### The S3 copy
+
+The R2 bucket is in the same Cloudflare account as the Worker. To keep a
+copy outside Cloudflare, the `backup` job can also write each dump into an
+S3 bucket, under the same name (`rust-api/server/src/scheduler/offsite.rs`):
+
+- The copy runs only when the four Worker secrets `BACKUP_S3_BUCKET`,
+  `BACKUP_S3_REGION`, `BACKUP_S3_ACCESS_KEY_ID` and
+  `BACKUP_S3_SECRET_ACCESS_KEY` are set. With none set, the job writes only
+  to R2, as before. With some set and not all, the R2 copy is written and
+  the run fails with the missing name in `detail`.
+- The job writes to R2 first. If the S3 copy then fails, the R2 copy stays,
+  and the run fails with `the dump is in R2 but not in S3: ...` in `detail`.
+  When both are written, `detail` is `stored in R2 and S3`.
+- The request is a `PUT` that the module signs with AWS Signature Version 4.
+  The bucket is in the host name, so its name must have no dot.
+- Only the Worker target has the copy. The Docker target keeps its backups
+  in `backups/`.
+
+Set up the bucket once, with the AWS CLI:
+
+1. Make a bucket for this use only, and block public access:
+   `aws s3api create-bucket --bucket <bucket> --region <region> --create-bucket-configuration LocationConstraint=<region>`,
+   then `aws s3api put-public-access-block --bucket <bucket> --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true`.
+   A new bucket has SSE-S3 encryption by default.
+2. Keep 30 days, as R2 does:
+   `aws s3api put-bucket-lifecycle-configuration --bucket <bucket> --lifecycle-configuration '{"Rules":[{"ID":"expire-dumps","Status":"Enabled","Filter":{"Prefix":"counterpoise-"},"Expiration":{"Days":30}}]}'`.
+3. Make an IAM user whose only permission is to write the dumps. It cannot
+   read, list or delete them:
+   `aws iam create-user --user-name <user>`, then
+   `aws iam put-user-policy --user-name <user> --policy-name put-dumps --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::<bucket>/counterpoise-*"}]}'`,
+   then `aws iam create-access-key --user-name <user>`.
+4. Check the bucket and the key from a checkout: with the four settings in
+   the environment, run
+   `cargo test -p counterpoise-rust-api --lib -- --ignored a_put_reaches_the_configured_bucket`
+   from `rust-api/`. It writes `counterpoise-selftest.json`.
+5. Set the four secrets with `scripts/wrangler.sh secret put <NAME>` from
+   `rust-api/worker/`. Each `secret put` deploys the Worker again at once.
+
+The access key is a long-lived key. Cloudflare Workers have no identity token
+that AWS can trust, as a GitHub Actions job has. Thus the key can only write
+and is limited to the `counterpoise-*` objects of one bucket.
+
+### Recovery without Cloudflare
+
+If the Cloudflare account cannot be used, run the app on the Docker target
+from the newest dump in S3:
+
+1. Get the dump with credentials that can read the bucket (not the Worker's
+   key): `aws s3 ls s3://<bucket>/`, then
+   `aws s3 cp s3://<bucket>/counterpoise-YYYY-MM-DD.json dump.json`.
+2. Load it into an empty file: `DATABASE_PATH=<file> ledger-cli load dump.json`
+   (see [Dump and load](#dump-and-load)).
+3. Start the Docker target on that file, as for a new install
+   ([upgrade-to-sqlite.md](upgrade-to-sqlite.md) has the steps to put a file
+   in the volume).
+4. Set `PLAID_TOKEN_KEY` to the key that the Worker had. The Plaid tokens in
+   the dump are encrypted with it, and only a copy of it that you keep outside
+   Cloudflare can open them. Without it, each bank connection must be linked
+   again. Get the other secrets (Plaid, Tiingo, Anthropic) from each vendor.
 
 ### The admin import route
 
@@ -490,6 +626,16 @@ that `rust-api/worker/src/storage.rs` binds.
   the bucket cannot be read, the object resets and the next event tries
   again, so nothing is served before the marker is in. A refused restore
   deletes the key again, unless an earlier restore left it.
+- Each start of the object asks the bucket for the key, because only the
+  bucket survives a restore: a value in the object's storage cannot show
+  that no restore is pending, since a restore to a time after the value was
+  written brings the value back. The object sends that HEAD when it is
+  constructed, before the start, and each event waits for the answer before
+  it uses the server. Only the answer "no key" lets the events through. For
+  a key, an error or no answer in 5 seconds, the object asks again inside
+  `blockConcurrencyWhile` and does the steps above there. The comment of
+  `finish_restore` in `rust-api/worker/src/object.rs` holds the argument
+  for each sequence of events.
 
 ### Production data on the Worker
 

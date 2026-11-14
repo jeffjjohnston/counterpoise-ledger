@@ -1,7 +1,10 @@
 // tests/app/reports-page.test.tsx
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ReportsPage from "@/app/b/[bookId]/reports/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import type { ReportConfig } from "@/components/reports/ReportConfigPanel";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 
 vi.mock("@/lib/navigation", async () =>
   (await import("@/tests/helpers/navigation")).mockNavigation({
@@ -13,13 +16,20 @@ vi.mock("@/lib/navigation", async () =>
 
 vi.mock("@/components/reports/ReportConfigPanel", () => ({
   ReportConfigPanel: ({
+    config,
+    onChange,
     onGenerate,
     loading,
   }: {
+    config: ReportConfig;
+    onChange: (config: ReportConfig) => void;
     onGenerate: () => void;
     loading: boolean;
   }) => (
     <div data-testid="report-config-panel">
+      <button onClick={() => onChange({ ...config, startDate: "2020-01-01" })}>
+        Edit start date
+      </button>
       <button onClick={onGenerate} disabled={loading}>
         Generate Report
       </button>
@@ -28,7 +38,13 @@ vi.mock("@/components/reports/ReportConfigPanel", () => ({
 }));
 
 vi.mock("@/components/reports/ReportTable", () => ({
-  ReportTable: () => <div data-testid="report-table" />,
+  ReportTable: ({ grandTotal }: { grandTotal: number }) => (
+    <div data-testid="report-table">{grandTotal}</div>
+  ),
+}));
+
+vi.mock("@/components/reports/ReportChart", () => ({
+  ReportChart: () => null,
 }));
 
 describe("ReportsPage", () => {
@@ -79,17 +95,98 @@ describe("ReportsPage", () => {
     });
   });
 
-  it("renders ReportConfigPanel", async () => {
-    render(<ReportsPage />);
-    await waitFor(() => {
-      expect(screen.getByTestId("report-config-panel")).toBeInTheDocument();
+  // Another client (an MCP tool, a second tab, a scheduled job) changes the
+  // book. The server sends the book socket a hint for each changed table, and
+  // the report must show the change without a reload.
+  describe("live updates", () => {
+    const split = (amount: number) => ({
+      splitId: 1, transactionId: 1, date: "2026-02-01", amount,
+      accountId: 1, accountName: "Food", accountType: "expense",
+      accountParentId: null, payeeId: null, payeeName: null,
     });
-  });
+    let reportSplits: unknown[];
+    let reportUrls: string[];
 
-  it("renders a Generate Report button inside the config panel", async () => {
-    render(<ReportsPage />);
-    await waitFor(() => {
-      expect(screen.getByText("Generate Report")).toBeInTheDocument();
+    function socket() {
+      return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    }
+
+    function hint(tables: string[]) {
+      act(() => { socket().emit("change", { tables }); });
+    }
+
+    function renderLive() {
+      FakeWebSocket.instances = [];
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      return render(
+        <BookChangesProvider>
+          <ReportsPage />
+        </BookChangesProvider>
+      );
+    }
+
+    beforeEach(() => {
+      reportSplits = [split(1000)];
+      reportUrls = [];
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/reports/data")) {
+          reportUrls.push(url);
+          const accounts = [{ id: 1, name: "Food", type: "expense", parentId: null }];
+          return new Response(JSON.stringify({ splits: reportSplits, accounts }));
+        }
+        return new Response("[]");
+      }));
+    });
+
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    it("shows a split that another client added", async () => {
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("report-table")).toHaveTextContent("1000"));
+
+      reportSplits = [split(1000), split(500)];
+      hint(["transaction_splits"]);
+
+      await waitFor(() => expect(screen.getByTestId("report-table")).toHaveTextContent("1500"));
+      expect(reportUrls).toHaveLength(2);
+    });
+
+    it("does not get the report again for a table that it does not read", async () => {
+      renderLive();
+      await screen.findByTestId("report-table");
+
+      hint(["securities"]);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      expect(reportUrls).toHaveLength(1);
+    });
+
+    it("runs the last query again, not a config that the user did not apply", async () => {
+      renderLive();
+      await screen.findByTestId("report-table");
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit start date" }));
+      hint(["transactions"]);
+
+      await waitFor(() => expect(reportUrls).toHaveLength(2));
+      expect(reportUrls[1]).toBe(reportUrls[0]);
+      expect(reportUrls[1]).not.toContain("2020-01-01");
+      // The report stays on the screen.
+      expect(screen.getByTestId("report-table")).toBeInTheDocument();
+    });
+
+    it("keeps the report when a background reload fails", async () => {
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("report-table")).toHaveTextContent("1000"));
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.mocked(fetch).mockImplementation(async () => new Response("{}", { status: 500 }));
+
+      hint(["transaction_splits"]);
+
+      await waitFor(() => expect(error).toHaveBeenCalled());
+      expect(screen.getByTestId("report-table")).toHaveTextContent("1000");
+      error.mockRestore();
     });
   });
 });

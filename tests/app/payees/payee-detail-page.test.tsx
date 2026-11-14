@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import PayeeDetailPage from "@/app/b/[bookId]/payees/[id]/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 import type { TransactionWithSplits } from "@/types";
 
 const mockPush = vi.fn();
@@ -44,10 +46,12 @@ vi.mock("@/components/transactions/TransactionForm", () => ({
     editingTransaction,
     onSubmit,
     onDelete,
+    onCancel,
   }: {
     editingTransaction?: TransactionWithSplits | null;
     onSubmit: (data: unknown) => void;
     onDelete?: () => void;
+    onCancel?: () => void;
   }) => (
     <div data-testid="transaction-form">
       Editing transaction {editingTransaction?.id ?? "none"}
@@ -55,6 +59,7 @@ vi.mock("@/components/transactions/TransactionForm", () => ({
         Save transaction
       </button>
       <button type="button" onClick={() => onDelete?.()}>Delete transaction</button>
+      <button type="button" onClick={() => onCancel?.()}>Cancel edit</button>
     </div>
   ),
 }));
@@ -559,6 +564,204 @@ describe("PayeeDetailPage", () => {
     await waitFor(() => {
       expect(secondPageAttempts).toBe(2);
       expect(screen.getByTestId("transaction-count")).toHaveTextContent("75");
+    });
+  });
+
+  // Another client (an MCP tool, a second tab, a scheduled job) changes the
+  // book. The server sends the book socket a hint for each changed table, and
+  // the page must show the change without a reload.
+  describe("live updates", () => {
+    function socket() {
+      return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    }
+
+    function hint(tables: string[]) {
+      act(() => { socket().emit("change", { tables }); });
+    }
+
+    function renderLive() {
+      FakeWebSocket.instances = [];
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      return render(
+        <BookChangesProvider>
+          <PayeeDetailPage />
+        </BookChangesProvider>
+      );
+    }
+
+    /** A fetch mock that reads the payee and its transactions at each request. */
+    function serve(data: { payee: () => unknown; transactions: () => TransactionWithSplits[] }) {
+      return vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/b/1/payees/1") {
+          const body = data.payee();
+          if (typeof body === "number") {
+            return { ok: false, status: body, json: async () => ({ error: "failed" }) } as Response;
+          }
+          return { ok: true, status: 200, json: async () => body } as Response;
+        }
+        if (url.startsWith("/api/b/1/transactions?")) {
+          const rows = data.transactions();
+          return { ok: true, status: 200, json: async () => ({ transactions: rows, totalCount: rows.length }) } as Response;
+        }
+        if (url === "/api/b/1/accounts?includeInactive=true") {
+          return { ok: true, status: 200, json: async () => [] } as Response;
+        }
+        throw new Error(`Unexpected fetch url: ${url}`);
+      });
+    }
+
+    function transactionCalls(fetchMock: ReturnType<typeof serve>) {
+      return fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/b/1/transactions?")).length;
+    }
+
+    const blueBottle = (transactionCount: number) => ({ id: 1, name: "Blue Bottle", transactionCount });
+
+    it("adds no old rows when a load more starts during a reload", async () => {
+      let observerCallback: IntersectionObserverCallback | null = null;
+      vi.stubGlobal("IntersectionObserver", vi.fn(function (
+        this: { observe: () => void; unobserve: () => void },
+        callback: IntersectionObserverCallback
+      ) {
+        observerCallback = callback;
+        this.observe = () => {};
+        this.unobserve = () => {};
+      }) as unknown as typeof IntersectionObserver);
+      let rows = Array.from({ length: 75 }, (_, index) => buildTransaction(index + 1));
+      // The test holds the requests of the reload and of the load more, and
+      // releases them in the order that it chooses.
+      const held: Record<string, () => void> = {};
+      let holding = false;
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/b/1/payees/1") {
+          return { ok: true, status: 200, json: async () => blueBottle(rows.length) } as Response;
+        }
+        if (url.startsWith("/api/b/1/transactions?")) {
+          const params = new URL(url, "http://localhost").searchParams;
+          const offset = Number(params.get("offset"));
+          const captured = rows.slice(offset, offset + Number(params.get("limit")));
+          const total = rows.length;
+          if (holding) await new Promise<void>((resolve) => { held[String(offset)] = resolve; });
+          return { ok: true, status: 200, json: async () => ({ transactions: captured, totalCount: total }) } as Response;
+        }
+        return { ok: true, status: 200, json: async () => [] } as Response;
+      }));
+
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("50"));
+      await act(() => new Promise((resolve) => setTimeout(resolve, 150)));
+
+      // Another client adds a transaction at the top of the list.
+      rows = [buildTransaction(200), ...rows];
+      holding = true;
+      hint(["transactions"]);
+      await waitFor(() => expect(held["0"]).toBeDefined());
+      const intersect = observerCallback as IntersectionObserverCallback | null;
+      await act(async () => {
+        intersect?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      });
+      holding = false;
+      await act(async () => { held["0"](); });
+      held["50"]?.();
+
+      // The reload gave the first 50 rows of the new list. The rows after the
+      // old list do not go on the end of it.
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("50"));
+      await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("50");
+    });
+
+    it("shows a transaction that another client added, and refreshes the chart", async () => {
+      let rows = [buildTransaction(101)];
+      vi.stubGlobal("fetch", serve({ payee: () => blueBottle(rows.length), transactions: () => rows }));
+
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("1"));
+      const key = () => screen.getByTestId("payee-spending-chart").getAttribute("data-refresh-key");
+      expect(key()).toBe("0");
+
+      rows = [buildTransaction(102), ...rows];
+      hint(["transactions", "transaction_splits"]);
+
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("2"));
+      expect(screen.getByText("2 transactions")).toBeInTheDocument();
+      expect(key()).toBe("1");
+    });
+
+    it("does not reload for a table that it does not show", async () => {
+      const fetchMock = serve({ payee: () => blueBottle(1), transactions: () => [buildTransaction(101)] });
+      vi.stubGlobal("fetch", fetchMock);
+
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("1"));
+      const before = transactionCalls(fetchMock);
+
+      hint(["recurring_rules", "security_prices", "plaid_accounts"]);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 250)); });
+
+      expect(transactionCalls(fetchMock)).toBe(before);
+    });
+
+    it("keeps the open editor during a change, and reloads after it closes", async () => {
+      let rows = [buildTransaction(101)];
+      const fetchMock = serve({ payee: () => blueBottle(rows.length), transactions: () => rows });
+      vi.stubGlobal("fetch", fetchMock);
+
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("1"));
+      fireEvent.click(screen.getByText("Open transaction editor"));
+      expect(screen.getByTestId("transaction-form")).toHaveTextContent("Editing transaction 101");
+      const before = transactionCalls(fetchMock);
+
+      rows = [buildTransaction(102), ...rows];
+      hint(["transactions"]);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 250)); });
+
+      // The draft stays, and the page did not ask for the new data.
+      expect(transactionCalls(fetchMock)).toBe(before);
+      expect(screen.getByTestId("transaction-form")).toHaveTextContent("Editing transaction 101");
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("1");
+
+      fireEvent.click(screen.getByText("Cancel edit"));
+
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("2"));
+      expect(transactionCalls(fetchMock)).toBe(before + 1);
+    });
+
+    it("shows the not-found state when another client deletes the payee", async () => {
+      let payee: unknown = blueBottle(0);
+      const fetchMock = serve({ payee: () => payee, transactions: () => [] });
+      vi.stubGlobal("fetch", fetchMock);
+
+      renderLive();
+      expect(await screen.findByRole("heading", { name: "Blue Bottle" })).toBeInTheDocument();
+      const before = transactionCalls(fetchMock);
+
+      payee = 404;
+      hint(["payees"]);
+
+      expect(await screen.findByText("Payee not found.")).toBeInTheDocument();
+      // The transaction list refuses the id of a deleted payee, so the page
+      // does not ask for it.
+      expect(transactionCalls(fetchMock)).toBe(before);
+    });
+
+    it("keeps the payee on the screen when a background reload fails", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      let payee: unknown = blueBottle(1);
+      vi.stubGlobal("fetch", serve({ payee: () => payee, transactions: () => [buildTransaction(101)] }));
+
+      renderLive();
+      expect(await screen.findByRole("heading", { name: "Blue Bottle" })).toBeInTheDocument();
+
+      payee = 500;
+      hint(["payees"]);
+
+      await waitFor(() => expect(consoleError).toHaveBeenCalledWith("Could not refresh payee data."));
+      expect(screen.getByRole("heading", { name: "Blue Bottle" })).toBeInTheDocument();
+      expect(screen.queryByText("Payee not found.")).not.toBeInTheDocument();
+      expect(screen.queryByText("Could not load payee.")).not.toBeInTheDocument();
     });
   });
 });

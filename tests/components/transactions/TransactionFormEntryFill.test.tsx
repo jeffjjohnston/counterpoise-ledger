@@ -229,7 +229,7 @@ describe("TransactionForm entry fill", () => {
     await act(async () => { mock.answer({ status: "ready", evaluationId: 5, choice: "6:in", confidence: 0.8 }); });
     expect(screen.getByLabelText("To Account")).toHaveValue("Household");
     expect(screen.getByLabelText("Amount")).toHaveValue("90.00");
-    expect(screen.getByRole("button", { name: /Filled from: Household · \$90\.00 \(TypeSafe\)/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Filled from: Household · \$90\.00 \(Clef\)/ })).toBeInTheDocument();
   });
 
   it("does not apply the TypeSafe pick after the user edits the amount", async () => {
@@ -263,7 +263,7 @@ describe("TransactionForm entry fill", () => {
     await elapseSuggestionDelay();
     expect(mock.suggestions).toHaveLength(1);
     await act(async () => { mock.answer({ status: "ready", evaluationId: 5, choice: null, confidence: 0.4 }); });
-    const chip = screen.getByRole("button", { name: /TypeSafe was not sure/ });
+    const chip = screen.getByRole("button", { name: /Clef was not sure/ });
     fireEvent.click(chip);
     fireEvent.click(screen.getByRole("button", { name: /Household · \$90\.00 · 2 uses/ }));
     expect(screen.getByLabelText("To Account")).toHaveValue("Household");
@@ -274,6 +274,46 @@ describe("TransactionForm entry fill", () => {
     expect(mock.outcomes[0]).toEqual({
       evaluationId: 5, outcome: "picked_other", source: "history", chipVisible: true, pickedIndex: 1, transactionId: null,
     });
+  });
+
+  it("shows the next two patterns as buttons, and a click on one is a pick", async () => {
+    const tax: EntryPattern = {
+      key: "7:in", splits: [{ accountId: 7, amount: 300 }, { accountId: CHECKING, amount: -300 }],
+      count: 2, lastDate: "2026-09-10", stable: true, range: { min: 300, max: 300 },
+    };
+    const dining: EntryPattern = {
+      key: "99:in", splits: [{ accountId: 99, amount: 1500 }, { accountId: CHECKING, amount: -1500 }],
+      count: 2, lastDate: "2026-09-01", stable: true, range: { min: 1500, max: 1500 },
+    };
+    const mock = mockFetch({ patterns: [groceries(), household, tax, dining], entry: true });
+    const onSubmit = renderForm();
+    await pickPayee("Costco");
+    await elapseSuggestionDelay();
+    await act(async () => { mock.answer({ status: "ready", evaluationId: 5, choice: null, confidence: 0.4 }); });
+    const quick = screen.getByRole("group", { name: "Other patterns" });
+    expect(within(quick).getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "Household · $90.00",
+      "Sales Tax · $3.00",
+    ]);
+    fireEvent.click(within(quick).getByRole("button", { name: "Sales Tax · $3.00" }));
+    expect(screen.getByLabelText("To Account")).toHaveValue("Sales Tax");
+    expect(screen.getByRole("button", { name: /Filled from: Sales Tax · \$3\.00 \(your pick\)/ })).toBeInTheDocument();
+    // The pattern shown leaves the buttons, and the one shown before joins them.
+    expect(
+      within(screen.getByRole("group", { name: "Other patterns" })).getAllByRole("button").map((button) => button.textContent),
+    ).toEqual(["Groceries · $42.10", "Household · $90.00"]);
+    fireEvent.click(screen.getByRole("button", { name: "Add Transaction" }));
+    await settle();
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(mock.outcomes[0]).toMatchObject({ outcome: "picked_other", pickedIndex: 2 });
+  });
+
+  it("shows no pattern buttons when the payee has one pattern", async () => {
+    mockFetch({ patterns: [groceries()] });
+    renderForm();
+    await pickPayee("Costco");
+    expect(screen.getByRole("button", { name: /Filled from: Groceries/ })).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Other patterns" })).toBeNull();
   });
 
   it("falls back to the last-account fill when there are no patterns", async () => {
@@ -429,6 +469,19 @@ describe("TransactionForm entry fill", () => {
     expect(mock.outcomes[0]).toMatchObject({ outcome: "kept", pickedIndex: null });
   });
 
+  it("sends the saved transaction's id when the save handler gives one", async () => {
+    const mock = mockFetch({ patterns: [groceries(), household], entry: true });
+    const onSubmit = renderForm(vi.fn().mockResolvedValue(77));
+    await pickPayee("Costco");
+    await elapseSuggestionDelay();
+    await act(async () => { mock.answer({ status: "ready", evaluationId: 5, choice: null, confidence: 0.4 }); });
+    fireEvent.click(screen.getByRole("button", { name: "Add Transaction" }));
+    await settle();
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(mock.outcomes).toHaveLength(1);
+    expect(mock.outcomes[0]).toMatchObject({ outcome: "kept", transactionId: 77 });
+  });
+
   it("clears an untouched fill when the payee no longer matches", async () => {
     mockFetch({ patterns: [groceries(), household] });
     renderForm();
@@ -544,6 +597,49 @@ describe("TransactionForm entry fill", () => {
     await settle();
     expect(mock.outcomes).toHaveLength(1);
     expect(mock.outcomes[0]).toMatchObject({ outcome: "abandoned" });
+  });
+
+  it("records no abandoned outcome when the form closes during a save", async () => {
+    const mock = mockFetch({ patterns: [groceries(), household], entry: true });
+    let confirm: (saved: number) => void = () => undefined;
+    const form = renderForm(vi.fn(() => new Promise<number>((resolve) => { confirm = resolve; })));
+    await pickPayee("Costco");
+    fireEvent.click(screen.getByRole("button", { name: "Add Transaction" }));
+    await settle();
+    // The entry stays until the answer, so the fill is still applied here.
+    expect(screen.getByLabelText("To Account")).toHaveValue("Groceries");
+    form.unmount();
+    await settle();
+    expect(mock.outcomes).toHaveLength(0);
+    // The save was not abandoned: its own outcome goes out when it succeeds.
+    await act(async () => { confirm(77); });
+    expect(mock.outcomes).toHaveLength(1);
+    expect(mock.outcomes[0]).toMatchObject({ outcome: "kept", transactionId: 77 });
+  });
+
+  it("records no abandoned outcome when the form closes after a failed save", async () => {
+    const mock = mockFetch({ patterns: [groceries(), household], entry: true });
+    const form = renderForm(vi.fn().mockResolvedValue(false));
+    await pickPayee("Costco");
+    fireEvent.click(screen.getByRole("button", { name: "Add Transaction" }));
+    await settle();
+    expect(screen.getByLabelText("To Account")).toHaveValue("Groceries");
+    form.unmount();
+    await settle();
+    expect(mock.outcomes).toHaveLength(0);
+  });
+
+  it("records the outcome when the user saves again after a failed save", async () => {
+    const mock = mockFetch({ patterns: [groceries(), household], entry: true });
+    const onSubmit = renderForm(vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(78));
+    await pickPayee("Costco");
+    fireEvent.click(screen.getByRole("button", { name: "Add Transaction" }));
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Add Transaction" }));
+    await settle();
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    expect(mock.outcomes).toHaveLength(1);
+    expect(mock.outcomes[0]).toMatchObject({ outcome: "kept", transactionId: 78 });
   });
 
   it("records abandoned once when Cancel closes the form", async () => {

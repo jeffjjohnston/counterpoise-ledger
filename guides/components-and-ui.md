@@ -13,7 +13,6 @@ Located in `/components/ui/`:
 - `DateInput.tsx` - Date input field
 - `Skeleton.tsx` - Loading skeleton placeholders
 - `EmptyState.tsx` - Empty state displays
-- `ThemeToggle.tsx` - Dark/light theme toggle
 - `Textarea.tsx` - Multi-line text input
 - `AccountAutocomplete.tsx` - Account selection with type-ahead search
 - `PayeeAutocomplete.tsx` - Payee selection with search
@@ -29,8 +28,8 @@ Organized by domain:
 - `/components/charts/` - Chart components (see [Charts](#charts))
 - `/components/dashboard/` - Dashboard cards (NetWorthCard)
 - `/components/sync/` - Plaid sync (ReconciliationModal)
-- `/components/layout/` - Navigation (Navbar, BookNavbar, PriceEntryPill)
-- `/components/ThemeProvider.tsx` - Root theme provider
+- `/components/layout/` - Navigation (BookNavbar, PriceEntryPill)
+- `/components/ThemeProvider.tsx` - Root theme provider. The settings modal in BookNavbar sets the theme
 - `/components/KeyboardShortcutProvider.tsx` + `/components/ui/KeyboardShortcutOverlay.tsx` - Global keyboard shortcut system. Register shortcuts in client components via `useRegisterShortcuts()` from `/hooks/useRegisterShortcuts.ts`; press `?` to view the overlay.
   - A shortcut's `category` is typed from `SHORTCUT_CATEGORIES` in the provider, which is also the order the overlay lists categories in. **One list, on purpose.** The overlay used to keep a second ordering array and *filter* through it, so a category registered but not listed there lost its shortcuts with no error — the price entry pill's `P` never appeared in the overlay for that reason. Adding a category means adding it to `SHORTCUT_CATEGORIES`; nothing else compiles until you do.
 - `/components/ReportIssueModal.tsx` - In-app issue reporting (writes to the `issue_reports` table, which is read when triaging reports)
@@ -290,6 +289,38 @@ pending Plaid rows and defer while edit/mobile-create modals are open. Responses
 from obsolete book/filter scopes are discarded. Explicit local refreshes may run
 inside editors (for example, after creating an account) and retain the existing
 scroll behavior. No unsaved form state is replaced by live updates.
+
+Every book page that shows data reloads it on a hint. A change made elsewhere
+(an MCP tool, another tab, a scheduled job) thus appears without a reload. A
+page outside the book layout (account, login, register, OAuth consent) has no
+socket.
+
+For a new page, use `useLiveReload(tables, reload, { paused })` from
+`components/BookChangesProvider.tsx`, and `useLatestRequest()` from
+`hooks/useLatestRequest.ts`:
+
+- `tables` holds the tables that the page's routes read. Read the Rust route
+  to find them: for example, a payee count reads `transactions`, and the
+  realized gains read `investment_lot_allocations`, which sends no hint, but
+  each change to it also changes `investment_lots`. A reset always reloads.
+- `paused` is true while an editor that loaded data fills is open. The hint is
+  kept, and the reload runs one time when the editor closes. Thus a reload never
+  replaces a draft.
+- `reload` keeps the data on the screen: no skeleton, no loading text, the same
+  filters, query, dates, tab and scroll position. A list with "load more"
+  reloads as many rows as it shows.
+- Only the latest request publishes, because a hint can start a reload while
+  another is in flight. The first answer, not the first request, decides
+  between the full-page error and a toast or a quiet failure. A failed reload
+  keeps the old data.
+- On a detail page, a 404 from a reload shows the page's "not found" state.
+- A chart that loads its own data takes a `revision` or `refreshKey` prop from
+  the page (`IncomeStatementCharts`, `PayeeSpendingChart`), or subscribes
+  itself (`NetWorthCard`).
+
+A page whose data is in a table that sends no hint (`plaid_tokens`) still
+reloads on each return to the tab, because each return sends a reset. Do not add
+`onTabReturn()` to such a page as well: the page then loads two times.
 
 Local write refreshes and automatic invalidations share a fixed 400 ms scheduling
 window, covering the usual server/browser notification delay without resetting

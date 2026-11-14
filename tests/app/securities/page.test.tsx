@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import SecuritiesPage from "@/app/b/[bookId]/securities/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { ToastProvider } from "@/components/ui/ToastProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 import { stubResizeObserver } from "@/tests/helpers/resize-observer";
 
 vi.mock("@/lib/navigation", async () =>
@@ -106,6 +109,18 @@ describe("SecuritiesPage", () => {
 
     expect(screen.getByRole("button", { name: "Update Prices" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add Security" })).toBeInTheDocument();
+  });
+
+  it("keeps a price typed in the Update prices modal when the page renders again", async () => {
+    await renderLoadedPage();
+    fireEvent.click(screen.getByRole("button", { name: "Update Prices" }));
+    const price = await screen.findByPlaceholderText("0.00");
+    fireEvent.change(price, { target: { value: "251.75" } });
+
+    // A page render for any reason: here the search field changes.
+    fireEvent.change(screen.getByLabelText("Search securities"), { target: { value: "v" } });
+
+    expect(screen.getByPlaceholderText("0.00")).toHaveValue("251.75");
   });
 
   it("hides Update Prices and Add Security from a viewer, but keeps Download CSV", async () => {
@@ -225,6 +240,104 @@ describe("SecuritiesPage", () => {
         symbol: "SPAXX",
         fixedPriceMicros: 1_000_000,
       });
+    });
+  });
+
+  // Another client (an MCP tool, a second tab, a scheduled job) changes the
+  // book. The server sends the book socket a hint for each changed table, and
+  // the page must show the change without a reload.
+  describe("live updates", () => {
+    // BookChangesProvider holds socket hints for 100 ms, then sends one change.
+    const AFTER_BATCH_MS = 150;
+    let rows: unknown[] = securitiesFixture;
+    const listCalls = () =>
+      vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === "/api/b/1/securities").length;
+
+    function hint(tables: string[]) {
+      act(() => { FakeWebSocket.instances[FakeWebSocket.instances.length - 1].emit("change", { tables }); });
+    }
+
+    async function settle() {
+      await act(() => new Promise((resolve) => setTimeout(resolve, AFTER_BATCH_MS)));
+    }
+
+    async function renderLive() {
+      rows = securitiesFixture;
+      FakeWebSocket.instances = [];
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/b/1/securities") {
+          return { ok: true, status: 200, json: async () => rows } as Response;
+        }
+        throw new Error(`Unexpected fetch url: ${url}`);
+      }));
+      render(
+        <ToastProvider>
+          <BookChangesProvider>
+            <SecuritiesPage />
+          </BookChangesProvider>
+        </ToastProvider>
+      );
+      await screen.findByText("Vanguard Total Stock Market");
+    }
+
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    it("shows a price that another client recorded", async () => {
+      await renderLive();
+      expect(screen.getByText("$300.00")).toBeInTheDocument();
+
+      rows = securitiesFixture.map((row) =>
+        row.id === 1 ? { ...row, priceMicros: 31_000_000, marketValueCents: 31000 } : row
+      );
+      hint(["security_prices"]);
+
+      expect(await screen.findByText("$310.00")).toBeInTheDocument();
+    });
+
+    it("does not reload for a table that the list does not read", async () => {
+      await renderLive();
+      const before = listCalls();
+
+      hint(["payees", "recurring_rules"]);
+      await settle();
+
+      expect(listCalls()).toBe(before);
+    });
+
+    it("keeps an open edit form, and reloads when it closes", async () => {
+      await renderLive();
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      const name = await screen.findByLabelText("Security Name");
+      fireEvent.change(name, { target: { value: "Acme draft" } });
+      const before = listCalls();
+
+      rows = securitiesFixture.map((row) => (row.id === 2 ? { ...row, name: "Acme Renamed" } : row));
+      hint(["securities"]);
+      await settle();
+
+      expect(listCalls()).toBe(before);
+      expect(screen.getByLabelText("Security Name")).toHaveValue("Acme draft");
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(await screen.findByText("Acme Renamed")).toBeInTheDocument();
+      expect(listCalls()).toBe(before + 1);
+    });
+
+    it("keeps the list and the search when a background reload fails", async () => {
+      await renderLive();
+      fireEvent.change(screen.getByLabelText("Search securities"), { target: { value: "vti" } });
+
+      vi.mocked(fetch).mockImplementation(async () =>
+        ({ ok: false, status: 500, json: async () => ({ error: "boom" }) }) as Response
+      );
+      hint(["securities"]);
+
+      expect(await screen.findByText("Could not refresh securities.")).toBeInTheDocument();
+      expect(screen.getByText("Vanguard Total Stock Market")).toBeInTheDocument();
+      expect(screen.queryByText("Acme Corp")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Search securities")).toHaveValue("vti");
     });
   });
 });

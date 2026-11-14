@@ -13,9 +13,11 @@ import {
   descendantAccountIds,
   ACCOUNT_TYPE_LABELS,
   ACCOUNT_SUBTYPE_LABELS,
+  ACCOUNT_TYPE_ORDER,
+  BALANCE_SHEET_TYPES,
   validateSplits,
 } from "@/lib/wasm-client";
-import { getInvestmentGrossAmountCents as originalGrossAmount, ACCOUNT_TYPE_LABELS as originalTypes, ACCOUNT_SUBTYPE_LABELS as originalSubtypes } from "@/lib/accounting";
+import { getInvestmentGrossAmountCents as originalGrossAmount } from "@/lib/investment-arithmetic";
 import { formatCurrency as originalFormatCurrency, toDateString } from "@/lib/formatters";
 
 describe("browser WASM core in Node", () => {
@@ -86,7 +88,14 @@ describe("browser WASM core in Node", () => {
     ];
     expect(accountHierarchyNames(accounts).get(3)).toBe("Assets : Checking : Cash");
     expect(descendantAccountIds(1, accounts)).toEqual(new Set([2, 3]));
-    expect(ACCOUNT_TYPE_LABELS).toEqual(originalTypes);
-    expect(ACCOUNT_SUBTYPE_LABELS).toEqual(originalSubtypes);
+    expect(ACCOUNT_TYPE_LABELS).toEqual({
+      asset: "Assets", liability: "Liabilities", equity: "Equity", income: "Income", expense: "Expenses",
+    });
+    expect(ACCOUNT_SUBTYPE_LABELS).toEqual({
+      bank: "Bank Account", credit_card: "Credit Card", loan: "Loan",
+      investment: "Investment", cash: "Cash", other: "Other",
+    });
+    expect(ACCOUNT_TYPE_ORDER).toEqual(["asset", "liability", "equity", "income", "expense"]);
+    expect(BALANCE_SHEET_TYPES).toEqual(["asset", "liability", "equity"]);
   });
 });

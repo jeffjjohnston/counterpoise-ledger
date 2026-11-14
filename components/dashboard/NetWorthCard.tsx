@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useLiveReload } from "@/components/BookChangesProvider";
 import { AreaChart } from "@/components/charts/AreaChart";
 import { ChartCard } from "@/components/charts/ChartCard";
 import { ChartLegend } from "@/components/charts/ChartLegend";
 import { LineChart } from "@/components/charts/LineChart";
 import { RangeGroup } from "@/components/charts/RangeGroup";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useLatestRequest } from "@/hooks/useLatestRequest";
 import { apiGet } from "@/lib/api-client";
 import { type ChartRange, rangeStart } from "@/lib/chart-range";
 import {
@@ -14,6 +16,13 @@ import {
 } from "@/lib/net-worth-chart";
 import { cn } from "@/lib/utils";
 import { formatCurrency, formatDate, toDateString } from "@/lib/wasm-client";
+
+// The tables that the net worth history reads: the accounts, their splits,
+// and the market values of investment accounts.
+const NET_WORTH_TABLES = new Set([
+  "accounts", "transactions", "transaction_splits",
+  "investment_splits", "investment_lots", "securities", "security_prices",
+]);
 
 type NetWorthPoint = { date: string; netWorthCents: number };
 
@@ -134,11 +143,15 @@ function NetWorthChart({ bookId, range, view }: { bookId: string; range: ChartRa
   const [failed, setFailed] = useState(false);
   const isMobile = useIsMobile();
   const height = isMobile ? 160 : 200;
+  // A live update can start a reload while another is in flight, and a new
+  // range or view starts a new request. Only the latest request may publish.
+  const nextRequest = useLatestRequest();
+  // Whether the chart shows data for this book, range and view. A failed
+  // background reload then keeps the chart on the screen.
+  const shown = useRef(false);
 
-  useEffect(() => {
-    let current = true;
-    setLoaded(null);
-    setFailed(false);
+  const load = useCallback(() => {
+    const isLatest = nextRequest();
     // The end date is the browser-local date, as the other dashboard requests use.
     // Without it, the server uses the date in its own TZ.
     const today = new Date();
@@ -150,16 +163,26 @@ function NetWorthChart({ bookId, range, view }: { bookId: string; range: ChartRa
     // Only a groupBy=account response has `groups`. The total view reads `points` only.
     apiGet<{ groups: NetWorthGroup[]; points: GroupedNetWorthPoint[] }>(`/api/b/${bookId}/reports/net-worth-history?${params}`)
       .then((data) => {
-        if (!current) return;
+        if (!isLatest()) return;
         setLoaded(view === "group" ? { view, groups: data.groups, points: data.points } : { view, points: data.points });
+        setFailed(false);
+        shown.current = true;
       })
       .catch(() => {
-        if (current) setFailed(true);
+        if (isLatest() && !shown.current) setFailed(true);
       });
-    return () => {
-      current = false;
-    };
-  }, [bookId, range, view]);
+  }, [bookId, range, view, nextRequest]);
+
+  useEffect(() => {
+    shown.current = false;
+    setLoaded(null);
+    setFailed(false);
+    load();
+  }, [load]);
+
+  // Another client changed the book. The reload keeps the chart on the
+  // screen until the new points come.
+  useLiveReload(NET_WORTH_TABLES, load);
 
   if (failed) return <p className="text-sm text-fg-danger">Could not load net worth history.</p>;
   // On the first render after a view change, the state still holds the response of the other view.

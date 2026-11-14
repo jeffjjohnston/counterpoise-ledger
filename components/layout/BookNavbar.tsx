@@ -9,7 +9,6 @@ import { useTheme } from "@/components/ThemeProvider";
 import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
 import { Select } from "@/components/ui/Select";
-import { resetUser } from "@/lib/posthog-client";
 import { ReportIssueModal } from "@/components/ReportIssueModal";
 import { PriceEntryPill } from "@/components/layout/PriceEntryPill";
 import { JobHealthIndicator } from "@/components/layout/JobHealthIndicator";
@@ -127,14 +126,13 @@ export function BookNavbar() {
       // they are so they can retry rather than navigating away while still
       // authenticated server-side. A non-2xx means the server session may
       // still be valid, so don't tell the user they're logged out
-      // (resetUser + navigate) when they might not be — telling someone
+      // (navigate) when they might not be — telling someone
       // they're logged out when they aren't is worse than telling them the
       // logout failed.
       toast.error(toMessage(err, "Failed to sign out"));
       return;
     }
     window.dispatchEvent(new Event(BOOK_SESSION_ENDED_EVENT));
-    resetUser();
     router.push("/login");
   };
 

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import SecurityDetailPage from "@/app/b/[bookId]/securities/[id]/page";
+import { BookChangesProvider } from "@/components/BookChangesProvider";
+import { ToastProvider } from "@/components/ui/ToastProvider";
+import { FakeWebSocket } from "@/tests/helpers/web-socket";
 import { stubResizeObserver } from "@/tests/helpers/resize-observer";
 
 vi.mock("@/lib/navigation", async () =>
@@ -202,5 +205,249 @@ describe("SecurityDetailPage price chart", () => {
     fireEvent.click(screen.getByRole("button", { name: /^(Save|Update)/ }));
 
     await waitFor(() => expect(chartUrls()).toHaveLength(2));
+  });
+});
+
+// Another client (an MCP tool, a second tab, a scheduled job) changes the
+// book. The server sends the book socket a hint for each changed table, and
+// the page must show the change without a reload.
+describe("SecurityDetailPage live updates", () => {
+  // BookChangesProvider holds socket hints for 100 ms, then sends one change.
+  const AFTER_BATCH_MS = 150;
+  const newPrice = { priceDate: "2024-03-08", priceMicros: 260_000_000, source: "Yahoo Finance" };
+  const buy = {
+    id: 91,
+    transactionId: 901,
+    transactionDate: "2024-03-05",
+    transactionDescription: "Buy VTI",
+    accountId: 3,
+    accountName: "Brokerage",
+    action: "buy",
+    sharesMicros: 2_000_000,
+    priceMicros: 255_000_000,
+    feesCents: 0,
+    splitNumerator: null,
+    splitDenominator: null,
+  };
+  let prices: unknown[] = [priceEntry];
+  let splitRows: unknown[] = [stockSplit];
+  let deleted = false;
+
+  const calls = (prefix: string) =>
+    vi.mocked(fetch).mock.calls.filter(([input]) => String(input).startsWith(prefix)).length;
+  // The chart asks for limit=5000, so the "&" keeps its requests out.
+  const tableCalls = () => calls("/api/b/1/securities/4/prices?limit=50&");
+
+  function hint(tables: string[]) {
+    act(() => { FakeWebSocket.instances[FakeWebSocket.instances.length - 1].emit("change", { tables }); });
+  }
+
+  async function settle() {
+    await act(() => new Promise((resolve) => setTimeout(resolve, AFTER_BATCH_MS)));
+  }
+
+  async function renderLive() {
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const notFound = { ok: false, status: 404, json: async () => ({ error: "Security not found" }) } as Response;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (deleted) return notFound;
+      if (url === "/api/b/1/securities/4/detail") {
+        return { ok: true, json: async () => ({ security, positionsByAccount: [] }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/securities/4/prices?")) {
+        return { ok: true, json: async () => ({ prices, totalCount: prices.length }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/securities/4/splits?")) {
+        return { ok: true, json: async () => ({ splits: splitRows, totalCount: splitRows.length }) } as Response;
+      }
+      if (url === "/api/b/1/securities/4/lots") {
+        return { ok: true, json: async () => [] } as Response;
+      }
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }));
+    render(
+      <ToastProvider>
+        <BookChangesProvider>
+          <SecurityDetailPage />
+        </BookChangesProvider>
+      </ToastProvider>
+    );
+    await screen.findByRole("heading", { name: "Vanguard Total Stock Market" });
+    await screen.findByText("manual");
+  }
+
+  beforeEach(() => {
+    stubResizeObserver(600);
+    prices = [priceEntry];
+    splitRows = [stockSplit];
+    deleted = false;
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("shows a price that another client recorded, in the table and the chart", async () => {
+    await renderLive();
+    const chartBefore = calls(CHART_PREFIX);
+
+    prices = [newPrice, priceEntry];
+    hint(["security_prices"]);
+
+    expect(await screen.findByText("Yahoo Finance")).toBeInTheDocument();
+    await waitFor(() => expect(calls(CHART_PREFIX)).toBe(chartBefore + 1));
+  });
+
+  it("shows a new transaction and keeps the open tab", async () => {
+    await renderLive();
+    fireEvent.click(screen.getByRole("button", { name: "Transactions" }));
+    await screen.findByText("Split (2-for-1)");
+
+    splitRows = [buy, stockSplit];
+    hint(["investment_splits"]);
+
+    expect(await screen.findByText("Buy")).toBeInTheDocument();
+    expect(screen.getByText("Split (2-for-1)")).toBeInTheDocument();
+    expect(screen.queryByText("manual")).not.toBeInTheDocument();
+  });
+
+  it("does not reload for a table that the page does not read", async () => {
+    await renderLive();
+    const before = vi.mocked(fetch).mock.calls.length;
+
+    hint(["payees", "plaid_accounts"]);
+    await settle();
+
+    expect(vi.mocked(fetch).mock.calls.length).toBe(before);
+  });
+
+  it("keeps an open price form, and reloads when it closes", async () => {
+    await renderLive();
+    fireEvent.click(screen.getByText("manual").closest("tr")!);
+    await screen.findByRole("heading", { name: "Edit Price Entry" });
+    const price = document.getElementById("price")!;
+    fireEvent.change(price, { target: { value: "249.99" } });
+    const before = tableCalls();
+
+    prices = [newPrice, priceEntry];
+    hint(["security_prices"]);
+    await settle();
+
+    expect(tableCalls()).toBe(before);
+    expect(price).toHaveValue("249.99");
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Yahoo Finance")).toBeInTheDocument();
+    expect(tableCalls()).toBe(before + 1);
+  });
+
+  it("shows the not-found state when another client deletes the security", async () => {
+    await renderLive();
+
+    deleted = true;
+    hint(["securities"]);
+
+    expect(await screen.findByText("Security not found")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Back to Securities/ })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Vanguard Total Stock Market" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the page when a background reload fails", async () => {
+    await renderLive();
+
+    vi.mocked(fetch).mockImplementation(async () =>
+      ({ ok: false, status: 500, json: async () => ({ error: "boom" }) }) as Response
+    );
+    hint(["securities"]);
+
+    expect(await screen.findByText("Could not refresh security.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Vanguard Total Stock Market" })).toBeInTheDocument();
+    expect(screen.getByText("manual")).toBeInTheDocument();
+  });
+it("ends the first load when a part other than the header fails", async () => {
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/securities/4/detail") {
+        return { ok: true, json: async () => ({ security, positionsByAccount: [] }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/securities/4/prices?limit=50&")) {
+        return { ok: false, status: 500, json: async () => ({ error: "boom" }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/securities/4/prices?")) {
+        return { ok: true, json: async () => ({ prices: [], totalCount: 0 }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/securities/4/splits?")) {
+        return { ok: true, json: async () => ({ splits: [], totalCount: 0 }) } as Response;
+      }
+      return { ok: true, json: async () => [] } as Response;
+    }));
+    render(<ToastProvider><BookChangesProvider><SecurityDetailPage /></BookChangesProvider></ToastProvider>);
+
+    expect(await screen.findByRole("heading", { name: "Vanguard Total Stock Market" })).toBeInTheDocument();
+  });
+
+  it("does not let a load more cancel a live reload of the price list", async () => {
+    // 51 prices: the table shows 50, and a load more gets the last one.
+    const day = (n: number) => `2024-0${1 + Math.floor(n / 28)}-${String(1 + (n % 28)).padStart(2, "0")}`;
+    const older = Array.from({ length: 51 }, (_, n) => ({ priceDate: day(50 - n), priceMicros: 1_000_000, source: "manual" }));
+    let rows: unknown[] = older;
+    let hold: Promise<void> | null = null;
+    let release = () => {};
+    let observed: IntersectionObserverCallback | null = null;
+    vi.stubGlobal("IntersectionObserver", class {
+      constructor(callback: IntersectionObserverCallback) { observed = callback; }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/b/1/securities/4/detail") {
+        return { ok: true, json: async () => ({ security, positionsByAccount: [] }) } as Response;
+      }
+      if (url.startsWith(CHART_PREFIX)) {
+        return { ok: true, json: async () => ({ prices: [], totalCount: 0 }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/securities/4/prices?")) {
+        const params = new URL(url, "http://localhost").searchParams;
+        const offset = Number(params.get("offset"));
+        const limit = Number(params.get("limit"));
+        const captured = rows;
+        if (offset === 0 && hold) await hold;
+        return { ok: true, json: async () => ({ prices: captured.slice(offset, offset + limit), totalCount: captured.length }) } as Response;
+      }
+      if (url.startsWith("/api/b/1/securities/4/splits?")) {
+        return { ok: true, json: async () => ({ splits: [], totalCount: 0 }) } as Response;
+      }
+      return { ok: true, json: async () => [] } as Response;
+    }));
+    render(<ToastProvider><BookChangesProvider><SecurityDetailPage /></BookChangesProvider></ToastProvider>);
+    await screen.findByRole("heading", { name: "Vanguard Total Stock Market" });
+    await waitFor(() => expect(screen.getAllByText("manual")).toHaveLength(50));
+    await settle();
+
+    // Another client records a new price. The live reload is in flight when
+    // the user scrolls to the end of the list.
+    rows = [newPrice, ...older];
+    hold = new Promise<void>((resolve) => { release = resolve; });
+    hint(["security_prices"]);
+    await settle();
+    const intersect = observed as IntersectionObserverCallback | null;
+    act(() => {
+      intersect?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+    await act(async () => { release(); hold = null; });
+
+    expect(await screen.findByText("Yahoo Finance")).toBeInTheDocument();
+    // The reload gave the first 50 rows of the new list: the new price and
+    // 49 old prices. No row shows two times.
+    const dates = Array.from(document.querySelectorAll("tr")).map((row) => row.textContent ?? "");
+    expect(new Set(dates).size).toBe(dates.length);
   });
 });

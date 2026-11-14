@@ -3,7 +3,7 @@ import { ACCESS_REDIRECT, accessExpired, renewAccessSession } from "./access-ses
 /**
  * The single client-side entry point for talking to this app's API.
  *
- * Script fetches (lib/plaid.ts, lib/posthog-query.ts) call EXTERNAL services
+ * Script fetches (lib/plaid.ts) call EXTERNAL services
  * with their own auth and error shapes. They do not belong here and must not
  * be migrated to it.
  */

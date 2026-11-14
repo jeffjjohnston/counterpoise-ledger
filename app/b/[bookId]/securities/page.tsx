@@ -1,7 +1,7 @@
 "use client";
 
 import { Link } from "@/lib/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
@@ -13,6 +13,8 @@ import { formatCurrency } from "@/lib/wasm-client";
 import { csvEscape, datedCsvFilename, triggerDownload } from "@/lib/csv";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
+import { useLiveReload } from "@/components/BookChangesProvider";
+import { useLatestRequest } from "@/hooks/useLatestRequest";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { Security } from "@/types/db";
@@ -34,6 +36,14 @@ type SecurityWithPosition = Security & {
 
 const MICROS_PER_SHARE = 1_000_000;
 
+// The tables that the list reads: the securities, their positions (the
+// investment splits and lots), their latest prices, and their income (the
+// cash splits of dividend transactions and the types of their accounts).
+const SECURITY_TABLES = [
+  "securities", "security_prices", "investment_splits", "investment_lots",
+  "transactions", "transaction_splits", "accounts",
+];
+
 export default function SecuritiesPage() {
   const bookId = useBookId();
   const { canWrite } = useBookRole();
@@ -46,30 +56,50 @@ export default function SecuritiesPage() {
   const [showUpdatePricesModal, setShowUpdatePricesModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
 
-  const fetchSecurities = useCallback(async (showLoading: boolean) => {
+  // A live update can start a refresh while another is in flight. Only the
+  // latest request may publish its answer.
+  const securitiesRequest = useLatestRequest();
+  // Whether this book's list has rendered. A live refresh can overtake the
+  // first load, so the first answer, not the first request, decides between
+  // the full-page error and a toast.
+  const securitiesShown = useRef(false);
+
+  const fetchSecurities = useCallback(async () => {
+    const isLatest = securitiesRequest();
     try {
       const data = await apiGet<SecurityWithPosition[]>(`/api/b/${bookId}/securities`);
+      if (!isLatest()) return;
       setSecurities(Array.isArray(data) ? data : []);
       setError(null);
+      securitiesShown.current = true;
+      setLoading(false);
     } catch {
-      if (showLoading) {
+      if (!isLatest()) return;
+      if (!securitiesShown.current) {
         // Nothing has rendered yet — the full-page error state is correct.
         setError("Could not load securities.");
+        setLoading(false);
       } else {
-        // A background refresh (after a create/update/delete or a price
-        // update) failed. The already-rendered securities list is still
-        // correct, so keep it on screen rather than blanking the page —
-        // surface it the way this page already does for a failed write.
+        // A background refresh (after a create/update/delete, a price
+        // update, or a change by another client) failed. The
+        // already-rendered securities list is still correct, so keep it on
+        // screen rather than blanking the page — surface it the way this
+        // page already does for a failed write.
         toast.error("Could not refresh securities.");
       }
-    } finally {
-      if (showLoading) {
-        setLoading(false);
-      }
     }
-  }, [bookId, toast]);
+  }, [bookId, toast, securitiesRequest]);
 
-  const activeSecurities = securities.filter((s) => s.sharesMicros > 0);
+  // Another client (an MCP tool, another tab, a scheduled job) changed the
+  // book. The edit form and the Update prices modal take their fields from
+  // the list, so the reload waits until they close.
+  useLiveReload(SECURITY_TABLES, () => void fetchSecurities(), {
+    paused: editingSecurity !== null || showUpdatePricesModal,
+  });
+
+  // Memoized: the Update prices modal gets this list, and a new array on
+  // each render made the modal start again.
+  const activeSecurities = useMemo(() => securities.filter((s) => s.sharesMicros > 0), [securities]);
   const inactiveSecurities = securities.filter((s) => s.sharesMicros === 0);
 
   const normalizedSearchTerm = searchTerm.trim().toLowerCase();
@@ -94,7 +124,8 @@ export default function SecuritiesPage() {
   };
 
   useEffect(() => {
-    void fetchSecurities(true);
+    securitiesShown.current = false;
+    void fetchSecurities();
   }, [fetchSecurities]);
 
   const handleCreate = async (data: {
@@ -106,7 +137,7 @@ export default function SecuritiesPage() {
     try {
       await apiPost(`/api/b/${bookId}/securities`, data);
       setShowModal(false);
-      void fetchSecurities(false);
+      void fetchSecurities();
     } catch (e) {
       // This site had no failure branch before this migration — a failed
       // create was silently swallowed (the modal just stayed open with no
@@ -126,7 +157,7 @@ export default function SecuritiesPage() {
     try {
       await apiPut(`/api/b/${bookId}/securities/${editingSecurity.id}`, data);
       setEditingSecurity(null);
-      void fetchSecurities(false);
+      void fetchSecurities();
     } catch (e) {
       // Same missing-failure-branch bug as handleCreate above.
       toast.error(toMessage(e, "Failed to update security"));
@@ -171,7 +202,7 @@ export default function SecuritiesPage() {
 
     try {
       await apiDelete(`/api/b/${bookId}/securities/${id}`);
-      void fetchSecurities(false);
+      void fetchSecurities();
     } catch (e) {
       toast.error(toMessage(e, "Failed to delete security"));
     }
@@ -445,7 +476,7 @@ export default function SecuritiesPage() {
         isOpen={showUpdatePricesModal && canWrite}
         onClose={() => setShowUpdatePricesModal(false)}
         securities={activeSecurities}
-        onUpdate={() => void fetchSecurities(false)}
+        onUpdate={() => void fetchSecurities()}
       />
     </div>
   );

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams, useRouter } from "@/lib/navigation";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
@@ -17,7 +17,9 @@ import {
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
-import { apiDelete, apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
+import { useLiveReload } from "@/components/BookChangesProvider";
+import { useLatestRequest, useReloadsInFlight } from "@/hooks/useLatestRequest";
+import { ApiError, apiDelete, apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import {
   putTransaction,
   deleteTransactionRequest,
@@ -41,6 +43,14 @@ import type {
 const HISTORY_PAGE_SIZE = 12;
 
 const PREVIEW_COUNT = 3;
+
+// The tables that the page reads: the rule, its template splits, and the
+// accounts and payees that they name; and the history, which is the rule's
+// transactions with their splits, investment splits and securities.
+const RULE_TABLES = [
+  "recurring_rules", "recurring_template_splits", "accounts", "payees",
+  "transactions", "transaction_splits", "investment_splits", "securities",
+];
 
 type ProcessResult = {
   transactionsCreated: number;
@@ -118,13 +128,29 @@ export default function RecurringRuleDetailPage() {
     useState<TransactionWithSplits | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  // A live update can start a reload while another is in flight, and the
+  // answers can arrive in either order. Only the latest reload may publish.
+  const latestRequest = useLatestRequest();
+  // Counts the reloads that started. A Load more answer that arrives after a
+  // later reload started is old, because the reload replaces the history.
+  const reloads = useRef(0);
+  // Whether a reload is in flight. Load more waits for it.
+  const inFlight = useReloadsInFlight();
+  // Whether this rule has rendered. A live reload can overtake the first
+  // load, so the first answer, not the first request, decides between the
+  // full-page error and a toast.
+  const shown = useRef(false);
+  // The number of history rows on the screen. A reload asks for all of them,
+  // so that the rows from Load more and the scroll position stay.
+  const loadedRows = useRef(0);
+
   const fetchHistoryPage = useCallback(
-    async (offset: number, append: boolean) => {
+    async (offset: number, limit: number) => {
       // The shared transactions endpoint, filtered by rule — the same one the
       // payee detail page pages through. There is no per-rule history route.
       const query = new URLSearchParams({
         recurringRuleId: ruleId.toString(),
-        limit: HISTORY_PAGE_SIZE.toString(),
+        limit: limit.toString(),
         offset: offset.toString(),
         includeMeta: "true",
       });
@@ -135,74 +161,123 @@ export default function RecurringRuleDetailPage() {
       }>(`/api/b/${bookId}/transactions?${query.toString()}`);
 
       const page = data.transactions ?? [];
-      setTransactions((prev) => (append ? [...prev, ...page] : page));
-      setTotalCount(data.totalCount ?? page.length);
+      return { page, total: data.totalCount ?? page.length };
     },
     [bookId, ruleId]
   );
 
   const refreshData = useCallback(
     async (showLoading: boolean) => {
+      const isLatest = latestRequest();
+      reloads.current++;
       if (!Number.isFinite(ruleId)) {
         setLoading(false);
         return;
       }
 
       if (showLoading) setLoading(true);
+      const end = inFlight.begin();
 
       try {
-        // Each read degrades on its own. A missing rule is "not found" (the
-        // view below), and a missing account list only costs the edit form its
-        // options — neither is the full-page error state.
+        // Each read degrades on its own. A missing rule (404, or 400 for an id
+        // that this book does not own) is "not found" (the view below). This
+        // includes a rule that another client deleted. A missing account list
+        // only costs the edit form its options. Neither is the full-page error
+        // state. Another failure of the rule read is an error, so that a
+        // failed reload does not say that the rule is gone.
         const [ruleData, accountsData] = await Promise.all([
           apiGet<RecurringRuleWithSplits>(`/api/b/${bookId}/recurring/${ruleId}`).catch(
-            () => null
+            (e: unknown) => {
+              if (e instanceof ApiError && (e.status === 404 || e.status === 400)) return null;
+              throw e;
+            }
           ),
           apiGet<AccountWithBalance[]>(
             `/api/b/${bookId}/accounts?includeInactive=true`
           ).catch(() => null),
         ]);
 
-        setRule(ruleData);
-        setAccounts(accountsData ? flattenAccounts(accountsData) : []);
-
         // A rule deleted elsewhere still has transactions — recurringRuleId is
         // ON DELETE SET NULL — but nothing to show them under, and the history
         // read would 400 on an id this book no longer owns.
+        // The rule can also go between the two reads. Then the history read
+        // gives 400, and the page shows "not found".
+        let rulePresent = ruleData;
+        let history: { page: TransactionWithSplits[]; total: number } = { page: [], total: 0 };
         if (ruleData) {
-          await fetchHistoryPage(0, false);
-        } else {
-          setTransactions([]);
-          setTotalCount(0);
+          try {
+            history = await fetchHistoryPage(0, Math.max(HISTORY_PAGE_SIZE, loadedRows.current));
+          } catch (e) {
+            if (!(e instanceof ApiError && e.status === 400)) throw e;
+            rulePresent = null;
+          }
         }
+
+        if (!isLatest()) return;
+        setRule(rulePresent);
+        // A failed account read keeps the accounts that are on the screen.
+        if (accountsData) setAccounts(flattenAccounts(accountsData));
+        setTransactions(history.page);
+        setTotalCount(history.total);
+        loadedRows.current = history.page.length;
         setError(null);
+        shown.current = true;
+        setLoading(false);
       } catch {
-        if (showLoading) {
+        if (!isLatest()) return;
+        if (!shown.current) {
           setError("Could not load this recurring rule.");
+          setLoading(false);
         } else {
           // The rule and history already on screen are still correct; keep
           // them rather than blanking the page.
           toast.error("Could not refresh this recurring rule.");
         }
       } finally {
-        if (showLoading) setLoading(false);
+        end();
       }
     },
-    [bookId, fetchHistoryPage, ruleId, toast]
+    [bookId, fetchHistoryPage, inFlight, latestRequest, ruleId, toast]
   );
 
   useEffect(() => {
+    shown.current = false;
+    loadedRows.current = 0;
     // refreshData catches its own errors into `error`; it cannot reject.
     void refreshData(true);
   }, [refreshData]);
 
+  const reload = useCallback(() => { void refreshData(false); }, [refreshData]);
+  // Another client (an MCP tool, another tab, the scheduled processing)
+  // changed the book. The two forms get their fields from the loaded data, so
+  // the reload waits while one of them is open, and runs when it closes.
+  useLiveReload(RULE_TABLES, reload, {
+    paused: (editing && canWrite) || editingTransaction !== null,
+  });
+
   const handleLoadMore = async () => {
     if (loadingMore || transactions.length >= totalCount) return;
+    // A reload is in flight: its history replaces the rows on the screen, so
+    // rows after the old list do not fit. Wait for it and add nothing. The
+    // button stays when more rows remain.
+    const reload = inFlight.settled();
+    if (reload) {
+      setLoadingMore(true);
+      await reload;
+      setLoadingMore(false);
+      return;
+    }
 
+    const reloadsBefore = reloads.current;
     setLoadingMore(true);
     try {
-      await fetchHistoryPage(transactions.length, true);
+      const history = await fetchHistoryPage(transactions.length, HISTORY_PAGE_SIZE);
+      if (reloads.current !== reloadsBefore) return;
+      setTransactions((prev) => [...prev, ...history.page]);
+      setTotalCount(history.total);
+      loadedRows.current += history.page.length;
     } catch (e) {
+      if (reloads.current !== reloadsBefore) return;
       // The rows already on screen stay; the button stays too, so the user can
       // try again without reloading the page.
       toast.error(toMessage(e, "Could not load more transactions"));

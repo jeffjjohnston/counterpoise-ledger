@@ -212,7 +212,9 @@ describe("auth HTTP parity", () => {
     const listed = await request("/api/auth/api-keys", { headers: { cookie } });
     expect(await listed.json()).toMatchObject([{ id: key.id, name: "Phone", keyPrefix: key.keyPrefix }]);
     const whitespaceName = await request("/api/auth/api-keys", json("POST", { name: "\uFEFF" }, cookie));
-    expect([whitespaceName.status, await whitespaceName.json()]).toEqual([400, { error: "Name is required" }]);
+    expect([whitespaceName.status, await whitespaceName.json()]).toEqual([400, { error: "name: must not be blank" }]);
+    const noName = await request("/api/auth/api-keys", json("POST", {}, cookie));
+    expect([noName.status, await noName.json()]).toEqual([400, { error: "missing field `name`" }]);
     const oversizedId = await request("/api/auth/api-keys/99999999999", { method: "DELETE", headers: { cookie } });
     expect([oversizedId.status, await oversizedId.json()]).toEqual([500, { error: "Failed to delete API key" }]);
     const bearer = { authorization: `Bearer ${key.key}` };
@@ -312,7 +314,16 @@ describe("auth HTTP parity", () => {
     const malformed = await request("/api/auth/login", { method: "POST", body: "{", headers: { "content-type": "application/json" } });
     expect([malformed.status, await malformed.json()]).toEqual([500, { error: "Failed to log in" }]);
     const invalid = await request("/api/auth/login", json("POST", { username: {}, password: "password123" }));
-    expect([invalid.status, await invalid.json()]).toEqual([400, { error: "Username and password must be strings" }]);
+    expect([invalid.status, await invalid.json()]).toEqual([400, { error: "username: invalid type: map, expected a string" }]);
+    for (const [body, error] of [
+      [{ username: "", password: "password123" }, "username: must not be empty"],
+      [{ username: "admin", password: "" }, "password: must not be empty"],
+      [{ username: "admin" }, "missing field `password`"],
+      [[], "The request body must be a JSON object"],
+    ] as const) {
+      const refused = await request("/api/auth/login", json("POST", body));
+      expect([refused.status, await refused.json()]).toEqual([400, { error }]);
+    }
     // An absent user gets the same body as a wrong password.
     for (let attempt = 0; attempt < 5; attempt++) {
       const response = await request("/api/auth/login", json("POST", { username: "nobody", password: "password123" }));

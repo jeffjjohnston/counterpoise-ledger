@@ -13,7 +13,8 @@ import { exec, insert, scalar, type Row } from "@/tests/helpers/sql";
  * Some references from one book row to another have a single-column foreign
  * key, so the key does not stop a row of another book. Migration 0006
  * (rust-api/db/migrations/0006_book_reference_checks.sql) adds a trigger on
- * insert and on update for each of them.
+ * insert and on update for each of them, and 0020 adds the triggers of
+ * plaid_transaction_reconciliation.linked_account_id.
  *
  * Each case asserts both halves, as book-scoped-composite-fks.test.ts does: a
  * row in the same book is accepted, a row of another book is refused. The
@@ -122,6 +123,13 @@ describe("book reference triggers", () => {
     },
     {
       table: "plaid_transaction_reconciliation", column: "matched_transaction_id", kind: "transaction", nullable: true,
+      row: () => ({
+        bookId: 1, plaidAccountLinkId: ids.plaidAccount.mine, plaidTransactionId: `txn-${Math.random()}`,
+        date: "2026-03-01", amountCents: 100, name: "Coffee", rawJson: "{}",
+      }),
+    },
+    {
+      table: "plaid_transaction_reconciliation", column: "linked_account_id", kind: "account", nullable: true,
       row: () => ({
         bookId: 1, plaidAccountLinkId: ids.plaidAccount.mine, plaidTransactionId: `txn-${Math.random()}`,
         date: "2026-03-01", amountCents: 100, name: "Coffee", rawJson: "{}",

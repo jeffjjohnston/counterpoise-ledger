@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import path from "node:path";
 import { promisify } from "node:util";
 import { workerDatabasePath } from "./test-database";
+import { rustBinary } from "./rust-binaries";
 
 const run = promisify(execFile);
-const CLI = path.resolve("rust-api/target/debug/ledger-cli");
+const CLI = rustBinary("ledger-cli");
 
 /** The date that the seed tests pin. The household rows at this date are the rows of the fixed 2023-2025 seed. */
 export const PINNED_TODAY = "2025-12-31";

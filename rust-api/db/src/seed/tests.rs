@@ -7,7 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// The hash of the household rows at 2025-12-31, before the dates became
 /// relative. Tasks that only move code must not change it.
-const HOUSEHOLD_2025_12_31: &str = "a4deeaa638739f69";
+const HOUSEHOLD_2025_12_31: &str = "cb8b0b074ca4eb6b";
 
 #[test]
 fn mulberry32_matches_javascript() {
@@ -140,7 +140,7 @@ fn the_household_rows_at_2025_12_31_do_not_change() {
 }
 
 /// The hash of the household rows at 2026-09-15.
-const HOUSEHOLD_2026_09_15: &str = "b87e61f08ab1c292";
+const HOUSEHOLD_2026_09_15: &str = "2e8ec5f012b1b59e";
 
 #[test]
 fn the_household_rows_at_2026_09_15_do_not_change() {
@@ -329,7 +329,7 @@ fn the_household_keeps_the_invariants_on_every_today() {
 }
 
 /// The hash of the single dataset at 2026-09-15.
-const SINGLE_2026_09_15: &str = "9835d5da35190ded";
+const SINGLE_2026_09_15: &str = "009a982d4b966c29";
 
 #[test]
 fn the_single_rows_at_2026_09_15_do_not_change() {

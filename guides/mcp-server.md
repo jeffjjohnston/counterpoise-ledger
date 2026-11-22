@@ -16,7 +16,7 @@ Every tool requires a credential. Over stdio it is an API key in
 an API key, or an OAuth access token when OAuth is on (see
 [OAuth for custom connectors](#oauth-for-custom-connectors)).
 
-1. A user creates an API key in the UI at `/account` (ApiKeyManager component).
+1. A user creates an API key in the UI at `/settings#api-keys` (ApiKeyManager component).
 2. The key is `cpk_` + 48 hex chars; only the scrypt hash is stored in the
    `apiKeys` table.
 3. The user gives the key to their MCP client.
@@ -212,7 +212,7 @@ key passed by `-e`:
 ```
 
 **Prerequisites:**
-- Generate an API key at `/account` in the web UI
+- Generate an API key at `/settings#api-keys` in the web UI
 - The `rust-api` container must be running
   (`docker compose --env-file .env.production.local up -d` — the service-level
   `env_file` does not feed the compose file's own `${VAR}` interpolation). The
@@ -578,5 +578,5 @@ get the same validation, the same lot rebuild, and the same messages.
 
 - **Routes**: `GET`/`POST /api/auth/api-keys` and `DELETE /api/auth/api-keys/[id]`, served by `list_keys()`, `create_key()` and `delete_key()` in `rust-api/server/src/routes/auth.rs`. They accept the cookie session only, so a key cannot mint or revoke keys
 - **Verification**: `principal()` in `rust-api/server/src/auth.rs` checks a bearer key: its shape, then the scrypt hash of the candidates with the same `keyPrefix`
-- **UI**: `/components/account/ApiKeyManager.tsx` on the `/account` page
+- **UI**: `/components/account/ApiKeyManager.tsx` in the Account group of the settings page (`/settings`)
 - **Tests**: `tests/helpers/api-keys.ts` mints and hashes keys in the stored format — `generateApiKey()`, `hashApiKey()`, `verifyApiKey()`, `getKeyPrefix()`

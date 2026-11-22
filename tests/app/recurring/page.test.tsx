@@ -344,6 +344,45 @@ describe("RecurringPage calendar", () => {
     expect(within(dayGrid).getByRole("button", { name: "Last" })).toBeInTheDocument();
   });
 
+  it("shows no occurrence after the rule's end date, and shows the one on the end date", async () => {
+    // Weekly on Monday from 2026-02-09. The rule ends on Monday 2026-02-16,
+    // so the server makes the 9th and the 16th and nothing after.
+    const endingRule = { ...recurringPayload[0], endDate: "2026-02-16" };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/b/1/recurring") {
+        return { ok: true, json: async () => [endingRule] } as Response;
+      }
+
+      if (url.startsWith("/api/b/1/accounts")) {
+        return { ok: true, json: async () => accountPayload } as Response;
+      }
+
+      if (url.startsWith("/api/b/1/recurring/transactions")) {
+        return { ok: true, json: async () => [] } as Response;
+      }
+
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<RecurringPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Recurring Transactions")).toBeInTheDocument();
+    });
+
+    const pillOn = (date: string) =>
+      within(screen.getByTestId(`calendar-day-cell-${date}`)).queryByText(longRuleName);
+    expect(pillOn("2026-02-09")).toBeInTheDocument();
+    expect(pillOn("2026-02-16")).toBeInTheDocument();
+    expect(pillOn("2026-02-23")).not.toBeInTheDocument();
+    expect(pillOn("2026-03-02")).not.toBeInTheDocument();
+  });
+
   it("shows a business-days-only rule's next occurrence on the shifted date", async () => {
     // 2026-02-14 is a Saturday; the occurrence is observed on Monday the 16th.
     const weekendRule = {

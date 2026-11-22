@@ -28,6 +28,9 @@ let version = 1;
 let hold: Promise<void> | undefined;
 let getCount = 0;
 let failPath: string | undefined;
+// Requests to a path with this ending wait until `releasePanel` runs.
+let holdPath: string | undefined;
+let releasePanel: () => void = () => {};
 const requests: string[] = [];
 function Fixture() {
   useBookChanges(notified);
@@ -75,12 +78,13 @@ async function advance(ms: number) {
 }
 beforeEach(() => {
   unstableRenders = -1;
-  version = 1; hold = undefined; failPath = undefined; toast.error.mockClear(); getCount = 0; requests.length = 0; scroll.mockClear(); notified.mockClear();
+  version = 1; hold = undefined; failPath = undefined; holdPath = undefined; toast.error.mockClear(); getCount = 0; requests.length = 0; scroll.mockClear(); notified.mockClear();
   FakeWebSocket.instances = []; vi.stubGlobal("WebSocket", FakeWebSocket);
   vi.stubGlobal("fetch", vi.fn(async (input: string) => {
     requests.push(input);
     const url = new URL(input, "http://localhost");
     if (url.pathname.endsWith(failPath ?? "never-matches")) throw new Error("Injected endpoint failure");
+    if (url.pathname.endsWith(holdPath ?? "never-matches")) await new Promise<void>((release) => { releasePanel = release; });
     const captured = version;
     let data: unknown = [];
     if (url.pathname.endsWith("/accounts")) data = [1, 2].map((id) => ({ id, name: `Account ${id}`, type: "asset", subtype: "bank", isActive: true, children: [] }));
@@ -116,6 +120,21 @@ describe("transaction live refresh", () => {
     expect(screen.getByLabelText("rows")).toHaveTextContent("100");
     expect(screen.getByLabelText("positions")).toHaveTextContent("2");
     expect(scroll).not.toHaveBeenCalled();
+  });
+
+  // The page needs the account list before the transaction request (for the
+  // cash account of an investment account). It needs no other panel first.
+  it("asks for the transactions while a slow optional panel is still loading", async () => {
+    vi.useFakeTimers();
+    holdPath = "/payees";
+    render(<BookChangesProvider><Fixture /></BookChangesProvider>);
+    await advance(0);
+    expect(requests.some((request) => request.includes("/api/b/1/transactions?"))).toBe(true);
+    // The snapshot is still published whole: nothing shows before the panel.
+    expect(screen.getByLabelText("rows")).toHaveTextContent("0");
+    releasePanel();
+    await advance(0);
+    expect(screen.getByLabelText("register")).toHaveTextContent("v1-account1");
   });
 
   it("defers during editing and runs a trailing refresh for an event during a fetch", async () => {

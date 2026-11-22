@@ -87,7 +87,7 @@ struct AccountRow {
 struct AccountNode {
     #[serde(flatten)]
     account: AccountRow,
-    balance: i32,
+    balance: i64,
     has_transactions: bool,
     children: Vec<AccountNode>,
 }
@@ -97,7 +97,7 @@ struct AccountNode {
 struct AccountDetail {
     #[serde(flatten)]
     account: AccountRow,
-    balance: i32,
+    balance: i64,
     has_transactions: bool,
     children: Vec<AccountRow>,
 }
@@ -432,7 +432,7 @@ pub(crate) async fn get_account(
         "Failed to fetch account",
     )?
     .ok_or_else(|| error(StatusCode::NOT_FOUND, "Account not found"))?;
-    let (balance, count): (i32, i32) = state
+    let (balance, count): (i64, i32) = state
         .database
         .query_row(
             "SELECT COALESCE(CAST(SUM(amount) AS integer), 0), CAST(COUNT(*) AS integer)
@@ -451,8 +451,8 @@ pub(crate) async fn get_account(
     ))
 }
 
-fn account_tree(rows: Vec<AccountRow>, balances: Vec<(i32, i32, i32)>) -> Vec<AccountNode> {
-    let totals: HashMap<i32, (i32, i32)> = balances
+fn account_tree(rows: Vec<AccountRow>, balances: Vec<Balance>) -> Vec<AccountNode> {
+    let totals: HashMap<i32, (i64, i32)> = balances
         .into_iter()
         .map(|(id, sum, count)| (id, (sum, count)))
         .collect();
@@ -502,8 +502,9 @@ fn account_tree(rows: Vec<AccountRow>, balances: Vec<(i32, i32, i32)>) -> Vec<Ac
         .collect()
 }
 
-/// An account ID, its split total and its split count.
-type Balance = (i32, i32, i32);
+/// An account ID, its split total and its split count. The total of many
+/// splits can be larger than one split can hold, so it is an `i64`.
+type Balance = (i32, i64, i32);
 
 /// The accounts that `query` selects, ordered by type and then name, and the
 /// balance of each account that has splits.
@@ -568,7 +569,7 @@ pub(crate) fn accounts_with_balances(
     query: &AccountQuery,
 ) -> Result<Vec<Value>, store::Error> {
     let (rows, balances) = account_rows(sql, book_id, query)?;
-    let totals: HashMap<i32, (i32, i32)> = balances
+    let totals: HashMap<i32, (i64, i32)> = balances
         .into_iter()
         .map(|(id, sum, count)| (id, (sum, count)))
         .collect();

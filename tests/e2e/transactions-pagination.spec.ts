@@ -7,7 +7,8 @@ test("paginates transactions for a selected account", async ({ page, bookId }) =
   await page.getByRole("link", { name: "Checking" }).first().click();
   await expect(page.getByRole("table", { name: "Transactions" }).getByRole("columnheader", { name: "Balance" })).toBeVisible();
 
-  const rows = page.getByRole("table", { name: "Transactions" }).locator("tbody tr");
+  // The year attribute selects the transaction rows only, not the year dividers.
+  const rows = page.getByRole("table", { name: "Transactions" }).locator("tbody tr[data-effective-year]");
   await expect(rows).toHaveCount(50);
 
   // Scroll to bottom to trigger infinite scroll loading

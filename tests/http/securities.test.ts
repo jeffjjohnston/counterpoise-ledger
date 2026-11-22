@@ -111,12 +111,15 @@ describe("security HTTP parity", () => {
     await expectError("/api/b/1/securities", json("POST", { name: "Again", symbol: " VTi ", securityType: "etf" }),
       409, `A security with symbol "VTi" already exists (id ${scenario.vti.id})`);
     for (const [body, error] of [
-      [[], "Name is required"],
-      [{ name: " ", symbol: "X", securityType: "etf" }, "Name is required"],
-      [{ name: "A" }, "Symbol is required"],
-      [{ name: "A", symbol: "B" }, "securityType must be one of: etf, mutual_fund, stock"],
-      [{ name: "A", symbol: "B", securityType: "etf", fetchPrices: null }, "fetchPrices must be a boolean"],
-      [{ name: "A", symbol: "B", securityType: "etf", fixedPriceMicros: 1.5 }, "fixedPriceMicros must be a positive whole number of micros"],
+      [[], "The request body must be a JSON object"],
+      [{ name: " ", symbol: "X", securityType: "etf" }, "name: must not be blank"],
+      [{ name: 5, symbol: "X", securityType: "etf" }, "name: invalid type: number, expected a string"],
+      [{ name: "A" }, "missing field `symbol`"],
+      [{ name: "A", symbol: "B" }, "missing field `securityType`"],
+      [{ name: "A", symbol: "B", securityType: "bond" }, "securityType: must be one of: etf, mutual_fund, stock"],
+      [{ name: "A", symbol: "B", securityType: "etf", fetchPrices: null }, "fetchPrices: invalid type: null, expected a boolean"],
+      [{ name: "A", symbol: "B", securityType: "etf", fixedPriceMicros: 1.5 }, "fixedPriceMicros: must be a positive integer"],
+      [{ name: "A", symbol: "B", securityType: "etf", fixedPriceMicros: 0 }, "fixedPriceMicros: must be a positive integer"],
     ] as const) {
       await expectError("/api/b/1/securities", json("POST", body), 400, error);
     }
@@ -142,11 +145,13 @@ describe("security HTTP parity", () => {
     securitySchema.parse(cleared);
     expect(cleared).toMatchObject({ fetchPrices: false, fixedPriceMicros: null });
     for (const [id, body, status, error] of [
-      [scenario.idle.id, null, 400, "Invalid input: expected object, received null"],
+      [scenario.idle.id, null, 400, "The request body must be a JSON object"],
       [scenario.idle.id, {}, 400, "No fields to update"],
-      [scenario.idle.id, { symbol: " " }, 400, "Symbol is required"],
-      [scenario.idle.id, { fetchPrices: "x" }, 400, "Fetch prices must be a boolean"],
-      [scenario.idle.id, { securityType: null }, 400, "securityType must be one of: etf, mutual_fund, stock"],
+      [scenario.idle.id, { symbol: " " }, 400, "symbol: must not be blank"],
+      [scenario.idle.id, { name: null }, 400, "name: invalid type: null, expected a string"],
+      [scenario.idle.id, { fixedPriceMicros: 0 }, 400, "fixedPriceMicros: must be a positive integer"],
+      [scenario.idle.id, { fetchPrices: "x" }, 400, "fetchPrices: invalid type: string \"x\", expected a boolean"],
+      [scenario.idle.id, { securityType: null }, 400, "securityType: must be one of: etf, mutual_fund, stock"],
       [scenario.idle.id, { symbol: "vti" }, 409, `A security with symbol "vti" already exists (id ${scenario.vti.id})`],
       ["abc", { name: "X" }, 400, "Invalid security id"],
       ["abc", null, 400, "Invalid security id"],

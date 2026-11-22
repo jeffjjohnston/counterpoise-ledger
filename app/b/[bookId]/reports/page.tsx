@@ -46,6 +46,7 @@ export default function ReportsPage() {
   const [allAccounts, setAllAccounts] = useState<AccountWithBalance[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasRun, setHasRun] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // A live update can start a request while another is in flight. Only the
   // latest request of each kind may publish its answer.
@@ -54,6 +55,8 @@ export default function ReportsPage() {
   // The query of the last report that the user asked for. A live reload runs
   // this query again, not the config that the user edits and did not apply.
   const reportQuery = useRef<string | null>(null);
+  // The query of the report that is on the screen.
+  const shownQuery = useRef<string | null>(null);
 
   // Fetch accounts for autocomplete. A non-2xx JSON error body (e.g.
   // {error: "..."}) would otherwise parse without throwing and land in
@@ -75,7 +78,10 @@ export default function ReportsPage() {
 
   // Gets the report for `query`. A background request (a live reload) does
   // not show the loading state, so the report stays on the screen and the
-  // scroll position does not change. If it fails, the old report stays.
+  // scroll position does not change. If a request fails, a report for the
+  // same query stays: it is only a little old. A report for a different
+  // query does not stay, because it would show under a config that it does
+  // not belong to. An error message replaces it.
   const loadReport = useCallback(async (query: string, background: boolean) => {
     const isLatest = startReportRequest();
     if (!background) setLoading(true);
@@ -86,11 +92,14 @@ export default function ReportsPage() {
       if (!isLatest()) return;
       setRawSplits(data.splits);
       setReportAccounts(data.accounts);
+      shownQuery.current = query;
+      setError(null);
       setHasRun(true);
       setLoading(false);
     } catch (err) {
       if (!isLatest()) return;
       console.error("Failed to fetch report data:", err);
+      if (shownQuery.current !== query) setError("Could not load the report. Select Generate Report to try again.");
       setLoading(false);
     }
   }, [bookId, startReportRequest]);
@@ -151,7 +160,13 @@ export default function ReportsPage() {
         loading={loading}
       />
 
-      {hasRun && !loading && (
+      {error && !loading && (
+        <p role="alert" className="bg-surface rounded-lg border border-border p-6 text-fg-secondary">
+          {error}
+        </p>
+      )}
+
+      {hasRun && !loading && !error && (
         <>
           <ReportChart groups={grouped} dimensions={config.groupings} />
           <ReportTable

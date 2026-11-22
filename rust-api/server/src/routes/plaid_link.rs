@@ -15,6 +15,7 @@
 //! or change the bank credentials of the book.
 
 use crate::{
+    body::{Nullable, NullablePositiveInt, present, typed_body},
     book_auth::{AccessLevel, authenticate_book},
     book_scope::{BookAccess, Owner},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
@@ -27,7 +28,7 @@ use crate::{
     },
     routes::transactions::now_millis,
     state::AppState,
-    validation::{js_number, parse_json_body},
+    validation::parse_json_body,
 };
 use axum::{
     Json,
@@ -40,7 +41,9 @@ use ledger_db::{
     Sql,
     store::{self, params},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
+use utoipa::ToSchema;
 
 /// A session expires four hours after it starts, or when its link token
 /// expires, if that is earlier.
@@ -67,9 +70,6 @@ const SAVE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5
 
 const INVALID_SESSION_ID: &str = "Invalid link session id";
 const SESSION_NOT_FOUND: &str = "Link session not found";
-const BODY_NOT_OBJECT: &str = "The request body must be a JSON object";
-const TOKEN_ID_INVALID: &str = "tokenId must be a positive integer or null";
-const RESTART_INVALID: &str = "restart must be a boolean";
 const DEMO_TOKEN: &str = "A demo connection cannot be reconnected";
 const SAVE_FAILED: &str = "The bank connection could not be saved. The server log has the cause.";
 /// The name of a new connection when Plaid does not name the institution.
@@ -148,39 +148,36 @@ fn plaid_failure(message: String) -> ApiError {
     error_owned(status, message)
 }
 
-/// The body of `POST sync/link-sessions`.
-struct LinkBody {
-    /// Absent or null for a new connection, and a positive integer for
-    /// update mode.
-    token_id: Option<f64>,
-    /// True stops the open sessions and starts a new one. Absent or false
-    /// continues the newest open session, if there is one.
-    restart: bool,
+// The body of `POST sync/link-sessions`, and `CreatePlaidLinkSessionBody` in
+// the API contract: see `crate::body`. The route writes no other field.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreatePlaidLinkSessionBody {
+    /// Omit it, or send null, to connect a new bank. Send the ID of a connection of this book to reconnect it in update mode.
+    // No `present`: `null` and a field that is not there both mean a new
+    // connection.
+    #[serde(default)]
+    #[schema(inline, nullable = false)]
+    token_id: Option<NullablePositiveInt>,
+    /// Omit it, or send false, to continue the newest open session of the same connection: the response has the same id and hostedLinkUrl, or the saved connection when the user finished at Plaid. Send true to stop the open sessions and start a new one. A session that the server completes at that moment does not stop: the response is that session, and its next check shows the saved connection.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(nullable = false)]
+    restart: Option<bool>,
 }
 
-/// Reads `tokenId` and `restart`, the two fields of the body. The route
-/// writes no other field.
-fn validate_link_body(body: &Value) -> Result<LinkBody, ApiError> {
-    let object = body
-        .as_object()
-        .ok_or_else(|| bad_request(BODY_NOT_OBJECT))?;
-    let token_id = match object.get("tokenId") {
-        None | Some(Value::Null) => None,
-        Some(Value::Number(number)) => {
-            let value = js_number(number);
-            if value.fract() != 0.0 || value <= 0.0 || value > 9_007_199_254_740_991.0 {
-                return Err(bad_request(TOKEN_ID_INVALID));
-            }
-            Some(value)
+impl CreatePlaidLinkSessionBody {
+    /// The connection to reconnect, or `None` for a new connection.
+    fn token_id(&self) -> Option<i64> {
+        match &self.token_id {
+            Some(Nullable::Value(token_id)) => Some(token_id.get()),
+            _ => None,
         }
-        _ => return Err(bad_request(TOKEN_ID_INVALID)),
-    };
-    let restart = match object.get("restart") {
-        None => false,
-        Some(Value::Bool(restart)) => *restart,
-        _ => return Err(bad_request(RESTART_INVALID)),
-    };
-    Ok(LinkBody { token_id, restart })
+    }
+
+    /// True stops the open sessions and starts a new one.
+    fn restart(&self) -> bool {
+        self.restart.unwrap_or(false)
+    }
 }
 
 /// The open sessions of one connection of a book, newest first. A session
@@ -240,9 +237,11 @@ pub(crate) async fn create_link_session(
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Owner, FAILURE).await?;
     let access = book.owner()?;
     let body = parse_json_body(&body, FAILURE)?;
-    let LinkBody { token_id, restart } = validate_link_body(&body)?;
-    let token_id = match token_id {
-        Some(token_id) => Some(database_id(token_id, FAILURE)?),
+    let body: CreatePlaidLinkSessionBody = typed_body(&body)?;
+    let restart = body.restart();
+    let token_id = match body.token_id() {
+        // Each integer of the body is exact in an f64.
+        Some(token_id) => Some(database_id(token_id as f64, FAILURE)?),
         None => None,
     };
 
@@ -823,31 +822,29 @@ mod tests {
 
     #[test]
     fn the_body_names_only_token_id_and_restart() {
-        let check = |body: Value| match validate_link_body(&body) {
-            Ok(LinkBody { token_id, restart }) => format!("{token_id:?} {restart}"),
-            Err(error) => format!("{error:?}"),
+        let check = |body: Value| match typed_body::<CreatePlaidLinkSessionBody>(&body) {
+            Ok(body) => format!("{:?} {}", body.token_id(), body.restart()),
+            Err(error) => error.message().to_owned(),
         };
         assert_eq!(check(json!({})), "None false");
         assert_eq!(check(json!({ "tokenId": null })), "None false");
-        assert_eq!(
-            check(json!({ "tokenId": 7, "bookId": 2 })),
-            "Some(7.0) false"
-        );
+        assert_eq!(check(json!({ "tokenId": 7, "bookId": 2 })), "Some(7) false");
         assert_eq!(check(json!({ "restart": true })), "None true");
         assert_eq!(
             check(json!({ "tokenId": 7, "restart": false })),
-            "Some(7.0) false"
+            "Some(7) false"
         );
-        assert!(check(json!([])).contains(BODY_NOT_OBJECT));
+        assert_eq!(check(json!([])), "The request body must be a JSON object");
         for invalid in [json!(0), json!(-1), json!(1.5), json!("7"), json!(true)] {
-            assert!(
-                check(json!({ "tokenId": invalid })).contains(TOKEN_ID_INVALID),
+            assert_eq!(
+                check(json!({ "tokenId": invalid })),
+                "tokenId: must be a positive integer",
                 "{invalid}"
             );
         }
         for invalid in [json!(null), json!(1), json!("true"), json!({})] {
             assert!(
-                check(json!({ "restart": invalid })).contains(RESTART_INVALID),
+                check(json!({ "restart": invalid })).starts_with("restart: invalid type: "),
                 "{invalid}"
             );
         }

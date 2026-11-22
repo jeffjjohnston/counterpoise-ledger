@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import { resolve } from "node:path";
 import { promisify } from "node:util";
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import {
@@ -18,11 +17,12 @@ import { connectMcpTestClient, type McpTestClient } from "@/tests/helpers/mcp-cl
 import { count, row } from "@/tests/helpers/sql";
 import { workerDatabasePath } from "@/tests/helpers/test-database";
 import type { Security } from "@/types/db";
+import { rustBinary } from "../helpers/rust-binaries";
 
 let mcp: McpTestClient;
 
 const run = promisify(execFile);
-const CLI = resolve("rust-api/target/debug/ledger-cli");
+const CLI = rustBinary("ledger-cli");
 
 /**
  * Rebuilds the lots of every pair with the Rust `ledger-cli`, on this worker's

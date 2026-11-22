@@ -72,7 +72,8 @@ describe("WeeklyReviewCard", () => {
   it("invites an editor to turn it on, and shows a viewer nothing", async () => {
     mockFetch(() => state({ enabled: false, latest: null }));
     const { unmount } = render(<WeeklyReviewCard bookId="1" />);
-    expect(await screen.findByRole("button", { name: /turn it on/i })).toBeInTheDocument();
+    // The link opens the Features section of the settings page.
+    expect(await screen.findByRole("link", { name: /turn it on/i })).toHaveAttribute("href", "/b/1/settings#features");
     unmount();
     vi.mocked(useBookRole).mockReturnValue({ canWrite: false } as ReturnType<typeof useBookRole>);
     const { container } = render(<WeeklyReviewCard bookId="1" />);
@@ -173,7 +174,7 @@ describe("WeeklyReviewCard", () => {
     let enabled = false;
     mockFetch(() => state({ enabled, latest: null }));
     render(<WeeklyReviewCard bookId="1" />);
-    expect(await screen.findByRole("button", { name: /turn it on/i })).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: /turn it on/i })).toBeInTheDocument();
     enabled = true;
     act(() => { notifyWeeklyReviewSettings("1"); });
     expect(await screen.findByRole("button", { name: /review now/i })).toBeInTheDocument();

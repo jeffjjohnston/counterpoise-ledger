@@ -29,7 +29,10 @@ Organized by domain:
 - `/components/dashboard/` - Dashboard cards (NetWorthCard)
 - `/components/sync/` - Plaid sync (ReconciliationModal)
 - `/components/layout/` - Navigation (BookNavbar, PriceEntryPill)
-- `/components/ThemeProvider.tsx` - Root theme provider. The settings modal in BookNavbar sets the theme
+- `/components/ThemeProvider.tsx` - Root theme provider. The "This device" group of the settings page sets the theme
+- `/components/settings/` - The settings page (`SettingsPage`), at `/b/:bookId/settings` and `/settings`. It has three groups, each named with its scope: **This book** (Features, General, Members, Delete; only inside a book), **Account** (profile, password, API keys, connected apps) and **This device** (theme, save chord). Each section has an id, so a link can open it (`/b/1/settings#features`). `/account` redirects to `/settings#account`.
+  - To add an optional book feature, add it to `BOOK_FEATURES` in `/lib/features.ts` and render its component in `BookFeaturesSettings`. Its settings GET must return `{ enabled, configured }`. The feature then shows a "New" badge for 60 days from the first time a user who can write sees it in a browser, and the navbar and the "Features" item of the side menu show a dot (`useNewFeatureDot`) while it is new, off, configured and the user can write. A feature with a second switch is on when one of its switches is on (`isFeatureOn`). Reading the Features section clears the dot in that browser: the section must be the active one (`useActiveSection`), so a page opened at `#api-keys` keeps the dot. `isFeatureNew` only reads; `recordFirstSeen` starts the 60 days, from an effect.
+  - The side menu marks the active section with `aria-current="location"`. A page opened at a section holds that section in place while content above it loads, until the first user action or the first scroll that moves the section.
 - `/components/KeyboardShortcutProvider.tsx` + `/components/ui/KeyboardShortcutOverlay.tsx` - Global keyboard shortcut system. Register shortcuts in client components via `useRegisterShortcuts()` from `/hooks/useRegisterShortcuts.ts`; press `?` to view the overlay.
   - A shortcut's `category` is typed from `SHORTCUT_CATEGORIES` in the provider, which is also the order the overlay lists categories in. **One list, on purpose.** The overlay used to keep a second ordering array and *filter* through it, so a category registered but not listed there lost its shortcuts with no error — the price entry pill's `P` never appeared in the overlay for that reason. Adding a category means adding it to `SHORTCUT_CATEGORIES`; nothing else compiles until you do.
 - `/components/ReportIssueModal.tsx` - In-app issue reporting (writes to the `issue_reports` table, which is read when triaging reports)
@@ -295,9 +298,16 @@ Every book page that shows data reloads it on a hint. A change made elsewhere
 page outside the book layout (account, login, register, OAuth consent) has no
 socket.
 
-For a new page, use `useLiveReload(tables, reload, { paused })` from
+For a new page whose data is one answer (one request, or some requests that
+go on the screen together), use `useBookResource` from
+`hooks/useBookResource.ts`. It gives `{ data, loading, error, reload,
+setData }` and follows each rule below: give it a stable `load` function,
+the `tables`, the two error texts and `paused`. The payee list, the
+securities list and the recurring page use it. A page with more than one
+resource, with "load more", or with a "not found" state uses the two parts
+directly: `useLiveReload(tables, reload, { paused })` from
 `components/BookChangesProvider.tsx`, and `useLatestRequest()` from
-`hooks/useLatestRequest.ts`:
+`hooks/useLatestRequest.ts`. The rules:
 
 - `tables` holds the tables that the page's routes read. Read the Rust route
   to find them: for example, a payee count reads `transactions`, and the

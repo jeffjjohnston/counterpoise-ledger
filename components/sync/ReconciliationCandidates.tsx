@@ -3,21 +3,74 @@
 import { Button } from "@/components/ui/Button";
 import { formatCurrency, formatDate } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
-import type { SyncMatchCandidate } from "@/types";
+import type { SyncMatchCandidate, SyncReconciliationItem } from "@/types";
 
 export type MatchAction = { transactionId: number; action: "match" | "match_update_amount" };
 
 /**
+ * A link always joins equal amounts (the server refuses any other link). On
+ * a candidate with a different amount, the match must also change the amount
+ * to the bank amount (match_update_amount). The server can change it only on
+ * a transaction with 2 splits that is not an investment transaction. On any
+ * other transaction the user must change the splits first, so there is no
+ * match action: `null`.
+ */
+export function candidateAction(candidate: SyncMatchCandidate): MatchAction["action"] | null {
+  if (candidate.amountDelta === 0) return "match";
+  return candidate.splitCount === 2 && !candidate.isInvestment ? "match_update_amount" : null;
+}
+
+/** The penalty that `score()` in rust-api/server/src/routes/reconcile.rs gives an already-linked candidate. */
+const ALREADY_LINKED_PENALTY = 80;
+
+/**
+ * After a decision links `transactionId` on link `linkId`, the candidates of
+ * the other loaded rows on that link are stale: they show the transaction as
+ * free, and the server refuses a second link to it. This marks it as linked
+ * on those rows and ranks the candidates again as `match_candidates()` does
+ * (score, then amount difference, then day difference). Without it, two equal
+ * bank rows (two equal charges on one day) both offer the same transaction.
+ */
+export function markCandidateLinked(
+  items: SyncReconciliationItem[],
+  linkId: number,
+  transactionId: number,
+  resolvedId: number
+): SyncReconciliationItem[] {
+  return items.map((item) => {
+    if (item.id === resolvedId || item.plaidAccountLinkId !== linkId) return item;
+    if (!item.candidates.some((c) => c.transactionId === transactionId && !c.alreadyLinked)) return item;
+    const candidates = item.candidates
+      .map((c) =>
+        c.transactionId === transactionId && !c.alreadyLinked
+          ? { ...c, alreadyLinked: true, score: c.score - ALREADY_LINKED_PENALTY, scoreTags: [...c.scoreTags, "already_linked"] }
+          : c
+      )
+      .sort((a, b) => b.score - a.score || a.amountDelta - b.amountDelta || Math.abs(a.dayDelta) - Math.abs(b.dayDelta));
+    return { ...item, candidates };
+  });
+}
+
+/** Why a candidate with a different amount cannot be matched. */
+export function cannotMatchTitle(candidate: SyncMatchCandidate): string {
+  return candidate.isInvestment
+    ? "The amounts are different, and this is an investment transaction. Change its amount to the bank amount first."
+    : "The amounts are different, and this transaction has more than 2 splits. Change the splits to the bank amount first.";
+}
+
+/**
  * The main action on the transaction that a row the bank changed is still
  * linked to. Match there would keep the same link, so the choice is between
- * Keep (keep_local: the flag goes, the transaction does not change) and,
- * when the bank amount differs and the amount can be rewritten, Update
- * (match_update_amount: the same link, with the bank amount). Update comes
- * first then, so the flag cannot go while the amounts disagree. Enter in the
- * modal does the same action.
+ * Keep (keep_local: the flag goes, the transaction does not change) when the
+ * amounts are equal, and Update (match_update_amount: the same link, with the
+ * bank amount) when they are different. Keep is not available when the
+ * amounts are different, and with more than 2 splits there is no action:
+ * the user changes the splits or unlinks. Enter in the modal does the same
+ * action.
  */
-export function linkedAction(candidate: SyncMatchCandidate): "keep_local" | "match_update_amount" {
-  return candidate.amountDelta !== 0 && candidate.splitCount === 2 ? "match_update_amount" : "keep_local";
+export function linkedAction(candidate: SyncMatchCandidate): "keep_local" | "match_update_amount" | null {
+  const action = candidateAction(candidate);
+  return action === "match" ? "keep_local" : action;
 }
 
 type MatchActionsProps = {
@@ -37,39 +90,34 @@ function MatchActions({ candidate, submitting, matchingAction, onMatch, linkedTr
   const matching = matchingAction?.transactionId === candidate.transactionId ? matchingAction.action : null;
   const update = `${formatCurrency(Math.abs(candidate.expectedAmount))}`;
   if (candidate.transactionId === linkedTransactionId) {
-    const keep = (secondary: boolean) => (
-      <Button size={secondary ? "sm" : size} variant={secondary ? "secondary" : undefined} disabled={submitting}
-        title="Keep the link and leave this transaction as it is" onClick={onKeep}>
-        Keep
-      </Button>
-    );
-    if (linkedAction(candidate) === "keep_local") {
-      return <div className="flex flex-col gap-1.5 shrink-0">{keep(false)}</div>;
+    const linked = linkedAction(candidate);
+    if (linked === "keep_local") {
+      return (
+        <div className="flex flex-col gap-1.5 shrink-0">
+          <Button size={size} disabled={submitting} title="Keep the link and leave this transaction as it is" onClick={onKeep}>
+            Keep
+          </Button>
+        </div>
+      );
     }
     return (
       <div className="flex flex-col gap-1.5 shrink-0">
-        <Button size={size} disabled={submitting} title="Keep the link and change the amount to the bank amount"
+        <Button size={size} disabled={submitting || linked === null}
+          title={linked === null ? cannotMatchTitle(candidate) : "Keep the link and change the amount to the bank amount"}
           onClick={() => onMatch({ action: "match_update_amount", transactionId: candidate.transactionId })}>
           {matching === "match_update_amount" ? "Updating…" : `Update to ${update}`}
         </Button>
-        {keep(true)}
       </div>
     );
   }
+  const action = candidateAction(candidate);
   return (
     <div className="flex flex-col gap-1.5 shrink-0">
-      {(
-        <Button size={size} disabled={disabled} title={title}
-          onClick={() => onMatch({ action: "match", transactionId: candidate.transactionId })}>
-          {matching === "match" ? "Matching…" : "Match"}
-        </Button>
-      )}
-      {candidate.amountDelta !== 0 && candidate.splitCount === 2 && (
-        <Button size="sm" variant="secondary" disabled={disabled} title={title}
-          onClick={() => onMatch({ action: "match_update_amount", transactionId: candidate.transactionId })}>
-          {matching === "match_update_amount" ? "Matching…" : `Match & Update ${update}`}
-        </Button>
-      )}
+      <Button size={size} disabled={disabled || action === null}
+        title={action === null ? cannotMatchTitle(candidate) : title}
+        onClick={() => action && onMatch({ action, transactionId: candidate.transactionId })}>
+        {matching ? "Matching…" : action === "match_update_amount" ? `Match & Update ${update}` : "Match"}
+      </Button>
     </div>
   );
 }

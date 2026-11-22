@@ -1,13 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import { Link } from "@/lib/navigation";
 import { Input } from "@/components/ui/Input";
 import { formatDate } from "@/lib/wasm-client";
 import { useBookId } from "@/hooks/useBookId";
-import { useLatestRequest } from "@/hooks/useLatestRequest";
-import { useLiveReload } from "@/components/BookChangesProvider";
-import { useToast } from "@/components/ui/ToastProvider";
+import { useBookResource } from "@/hooks/useBookResource";
 import { apiGet } from "@/lib/api-client";
 
 type PayeeSummary = {
@@ -29,52 +27,23 @@ const compareNames = (a: string, b: string) =>
 
 export default function PayeesPage() {
   const bookId = useBookId();
-  const [payees, setPayees] = useState<PayeeSummary[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [sortColumn, setSortColumn] = useState<SortColumn>("name");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const toast = useToast();
-  // A live update can start a reload while another is in flight. Only the
-  // latest request may publish its answer.
-  const nextRequest = useLatestRequest();
-  // Whether this book's list has rendered. A live reload can overtake the
-  // first load, so the first answer, not the first request, decides between
-  // the full-page error and a toast.
-  const shown = useRef(false);
 
-  const fetchPayees = useCallback(async () => {
-    const isLatest = nextRequest();
-    try {
-      const data = await apiGet<PayeeSummary[]>(`/api/b/${bookId}/payees`);
-      if (!isLatest()) return;
-      setPayees(Array.isArray(data) ? data : []);
-      setError(null);
-      shown.current = true;
-      setLoading(false);
-    } catch {
-      if (!isLatest()) return;
-      if (!shown.current) {
-        // Nothing has rendered yet, so the full-page error is correct.
-        setError("Could not load payees.");
-        setLoading(false);
-      } else {
-        // A background reload failed. The list on the screen is still
-        // correct, so keep it and tell the user.
-        toast.error("Could not refresh payees.");
-      }
-    }
-  }, [bookId, nextRequest, toast]);
-
-  useEffect(() => {
-    shown.current = false;
-    void fetchPayees();
-  }, [fetchPayees]);
-
-  // Another client changed the book. The reload keeps the search text and
-  // the sort order, and does not show the loading skeleton.
-  useLiveReload(PAYEE_LIST_TABLES, () => void fetchPayees());
+  const loadPayees = useCallback(async () => {
+    const data = await apiGet<PayeeSummary[]>(`/api/b/${bookId}/payees`);
+    return Array.isArray(data) ? data : [];
+  }, [bookId]);
+  // A reload after a change by another client keeps the search text and the
+  // sort order, and does not show the loading skeleton.
+  const { data: payees, loading, error } = useBookResource<PayeeSummary[]>({
+    initial: [],
+    load: loadPayees,
+    tables: PAYEE_LIST_TABLES,
+    loadError: "Could not load payees.",
+    refreshError: "Could not refresh payees.",
+  });
 
   const normalizedSearchTerm = searchTerm.trim().toLowerCase();
   const filteredPayees = payees

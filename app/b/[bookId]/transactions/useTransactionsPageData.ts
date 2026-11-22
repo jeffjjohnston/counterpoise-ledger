@@ -117,14 +117,17 @@ async function fetchRefreshSnapshot(context: RefreshContext, request: RefreshReq
     const target = preferredAccountId(flattenAccounts(await accountList), bookId);
     if (target !== null) return { redirectTo: target } as const;
   }
-  const [accountRows, values, payeeRows, projected, pending] = await Promise.all([
-    accountList,
+  // The optional panels start now and are awaited below, with the page.
+  const panels = Promise.all([
     apiGet<AccountMarketValue[]>(`${prefix}/investments/account-values?asOfDate=${today}`, init).catch(() => []),
     apiGet<Array<{ id: number; name: string }>>(`${prefix}/payees`, init).catch(() => []),
     showUpcoming ? apiGet<DisplayTransaction[]>(`${prefix}/recurring/projected${accountQuery}`, init).catch(() => []) : Promise.resolve([]),
     apiGet<DisplayTransaction[]>(`${prefix}/sync/pending-transactions${accountQuery}`, init).catch(() => []),
   ]);
-  const accounts = flattenAccounts(accountRows);
+  // The transaction request needs only the account list: an investment
+  // account also shows the rows of its cash account. It does not wait for
+  // the panels.
+  const accounts = flattenAccounts(await accountList);
   const selected = accounts.find((a) => a.id === accountId);
   const investment = selected?.type === "asset" && selected.subtype === "investment";
   const cashId = investment ? accounts.find((a) => a.parentId === accountId && a.isInvestmentCash)?.id ?? null : null;
@@ -132,7 +135,10 @@ async function fetchRefreshSnapshot(context: RefreshContext, request: RefreshReq
     selectedAccountId: accountId, isInvestmentAccount: investment,
     investmentCashAccountId: cashId, startDate, endDate, selectedPayeeId, ensureId: request.ensureId,
   });
-  const page = await apiGet<PageResponse>(`${prefix}/transactions?${params}`, init);
+  const [page, [values, payeeRows, projected, pending]] = await Promise.all([
+    apiGet<PageResponse>(`${prefix}/transactions?${params}`, init),
+    panels,
+  ]);
   const transactions = page.transactions ?? [];
   return {
     redirectTo: null, accounts, transactions,

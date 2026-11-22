@@ -14,7 +14,10 @@ interface PlaidBannerProps {
   bookId: string;
   transactionId: number;
   onUnlinked: () => void;
-  /** A viewer has no write access. Hide the unlink action — the server would refuse it. */
+  /**
+   * Hide the unlink action. A viewer has no write access, so the server would
+   * refuse it. An editor with a save conflict would lose its kept edits.
+   */
   readOnly?: boolean;
 }
 

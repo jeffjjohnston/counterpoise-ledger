@@ -318,7 +318,8 @@ fn fail(database: &Database, book_id: i32, review_id: i64, code: &str) -> Result
 
 /// Deletes the reviews of the book beyond the newest `KEEP_REVIEWS`. Their
 /// items go with them (cascade). A review that holds a dismissed item stays:
-/// its fingerprint keeps that item out of later reviews.
+/// its fingerprint keeps that item out of later reviews. "Newest" is the
+/// order of the ids, not of `started_at`: see `newest` in the routes.
 fn prune(database: &Database, book_id: i32) -> Result<(), store::Error> {
     database
         .execute(
@@ -328,7 +329,7 @@ fn prune(database: &Database, book_id: i32) -> Result<(), store::Error> {
                                WHERE i.review_id = weekly_reviews.id AND i.dismissed_at IS NOT NULL)
                AND id NOT IN (
                SELECT id FROM weekly_reviews WHERE book_id = ?1
-               ORDER BY started_at DESC, id DESC LIMIT ?2)",
+               ORDER BY id DESC LIMIT ?2)",
             &params![book_id, KEEP_REVIEWS],
         )
         .map(|_| ())

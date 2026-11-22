@@ -70,7 +70,7 @@ as a fractional value while the user types.
 Every browser request to the API goes through this module:
 - `apiFetch()`, `apiGet()`, `apiPost()`, `apiPut()`, `apiDelete()`
 - `ApiError` - carries the status and the server's `error` message
-- `toMessage(error)` - the text to show for any thrown value
+- `toMessage(error, fallback)` - the text to show for any thrown value
 
 ### `/lib/access-session.ts`
 Cloudflare Access in front of a deployment. An expired Access token turns
@@ -221,8 +221,7 @@ enforces every level regardless of what the client shows
 
 These run outside the web server. Do not import them from a component.
 - `/lib/payees.ts` - `normalizePayeeName()`, for the TypeSafe questions
-- `/lib/typesafe/questions.ts`, `/lib/typesafe/report.ts`,
-  `/lib/typesafe/settings.ts` - the question builders and the report of
+- `/lib/typesafe/questions.ts`, `/lib/typesafe/report.ts` - the question builders and the report of
   `npm run typesafe:report`, which reads the database file with
   `node:sqlite`. The server's copies are
   `rust-api/server/src/typesafe_questions.rs` and `typesafe.rs`. Only the
@@ -349,8 +348,11 @@ Shared server modules:
 - `validation.rs` - the parsers that keep the input rules of the former
   TypeScript routes: `parse_json_body()`, `first_query_values()`,
   `query_date_param()`, `parse_int_prefix()`, `database_integer()`,
-  `js_number_string()`, `js_stringify()`, and the account and payee
-  validators
+  `js_number_string()`, `js_stringify()`, and the account validators
+- `body.rs` - typed request bodies, for 10 of the 17 bodies of the contract:
+  `typed_body()`, `schema_of()`, and the field types that carry a rule and
+  its schema keyword (`NonBlank`, `NonEmpty`, `IntRange`, `PositiveInt`, `Nullable`,
+  `string_enum!`)
 - `transaction_input.rs`, `recurring_input.rs` - the transaction and
   recurring-rule input rules, including `expected_updated_at()`
 - `db_scope.rs` - `write_transaction()` and `read_transaction()` run a
@@ -455,8 +457,8 @@ One module per route area. `routes/mod.rs` registers each entry of
 | `/rust-api/db/migrations/` | The schema: `0001_baseline.sql` and each later numbered file. Never edit one that has run |
 | `/rust-api/db/src/database.rs` | Opening the file: pragmas, limits, the server lock, the embedded migrations |
 | `/types/db.ts` | The TypeScript row types that the client and the test helpers use |
-| `/rust-api/routes.json` | The routes that `routes/mod.rs` registers from its handler table |
-| `/rust-api/server/src/routes/mod.rs` | The Axum router, and the routes that it registers by name (`/health`, `/api/health`, `/api/mcp`, WebMCP) |
+| `/rust-api/routes.json` | The method, path and name of each route, written from the route table in `routes/mod.rs`. Tests read it; do not edit it by hand |
+| `/rust-api/server/src/routes/mod.rs` | The route table and the Axum router, and the routes that it registers by name (`/health`, `/api/health`, `/api/mcp`, WebMCP) |
 | `/rust-api/server/src/book_auth.rs` | Book access at a level |
 | `/rust-api/db/src/lots.rs` | The lot rebuild. Lots and allocations are derived state |
 | `/rust-api/cli/src/main.rs` | `ledger-cli`: `migrate`, `seed [--book-id N \| --reset]`, `list-books`, `rebuild-lots [--force]`, `import-moneydance`, `backup [--dir D]`. Each uses `DATABASE_PATH` (default `data/counterpoise.db`) |

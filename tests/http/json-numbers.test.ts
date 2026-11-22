@@ -59,7 +59,7 @@ describe("JSON numbers outside the double range", () => {
       results[label] = await send(method, path, body);
     }
     expect(results["security name"]).toEqual({
-      status: 400, body: { error: "Invalid input: expected string, received Infinity" },
+      status: 400, body: { error: "name: invalid type: number, expected a string" },
     });
     expect(results["negative split amount"]).toEqual({
       status: 400, body: { error: "Invalid input: expected number, received -Infinity" },

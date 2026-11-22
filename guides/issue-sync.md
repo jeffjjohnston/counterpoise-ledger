@@ -231,7 +231,9 @@ stay manual.
 
 - A ruleset on `dev`: require a pull request with 0 approvals (the pull
   requests come from the owner's token, and the owner cannot approve their
-  own), and require the CI checks.
+  own), and require each CI check, with the job that tests the Worker
+  target. Without that job, auto-merge can merge a fix that fails on the
+  Worker target.
 - The account of `ISSUE_FIX_TOKEN` must not be a bypass actor on that
   ruleset. For a bypass actor, auto-merge can merge the pull request before
   the CI checks pass. If the owner must push to `dev` directly,

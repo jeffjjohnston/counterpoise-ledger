@@ -14,9 +14,10 @@ import {
 import { count as countWhere, insert, rows, scalar, script } from "../helpers/sql";
 import { workerDatabasePath } from "../helpers/test-database";
 import { dumpTables } from "../helpers/table-dump";
+import { rustBinary } from "../helpers/rust-binaries";
 
 const run = promisify(execFile);
-const CLI = path.resolve("rust-api/target/debug/ledger-cli");
+const CLI = rustBinary("ledger-cli");
 const TIMEOUT = 60_000;
 const FIXTURES = ["moneydance-sample.json", "moneydance-edge-cases.json"];
 

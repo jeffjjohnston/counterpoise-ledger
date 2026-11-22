@@ -14,7 +14,7 @@ import { SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
 import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useTypeSafeSuggestion } from "@/hooks/useTypeSafeSuggestion";
 import { TypeSafeSuggestion } from "@/components/sync/TypeSafeSuggestion";
-import { DisclosureChevron, ReconciliationCandidates, linkedAction, type MatchAction } from "./ReconciliationCandidates";
+import { DisclosureChevron, ReconciliationCandidates, candidateAction, linkedAction, markCandidateLinked, type MatchAction } from "./ReconciliationCandidates";
 import { cn } from "@/lib/utils";
 import { useRegisterShortcuts } from "@/hooks/useRegisterShortcuts";
 import type { ShortcutDef } from "@/components/KeyboardShortcutProvider";
@@ -186,7 +186,6 @@ export function ReconciliationModal({
   // applies only to a row that the bank changed: a row that the bank removed
   // has nothing to keep. Unlink applies only to a row that is linked. The
   // server refuses each of them in any other state.
-  const canKeep = selectedItem?.reviewReason === "plaid_modified";
   const canUnlink = selectedItem != null && selectedItem.resolutionStatus !== "pending";
   const position = items.findIndex((item) => item.id === selectedId) + 1;
   const selectedLinkId = selectedItem?.plaidAccountLinkId ?? null;
@@ -204,18 +203,41 @@ export function ReconciliationModal({
     linkedTransactionId === null
       ? null
       : selectedItem?.candidates.find((candidate) => candidate.transactionId === linkedTransactionId) ?? null;
-  const linkedHint =
-    linkedCandidate === null
-      ? "Keep local keeps this link. Match or Create moves it to another transaction."
-      : linkedAction(linkedCandidate) === "match_update_amount"
-        ? "The bank amount is different. Update changes your amount to the bank amount and keeps this link. Keep leaves your amount as it is."
-        : "Keep keeps this link. Match on another transaction, or Create, moves it.";
   const [linkedState, setLinkedState] = useState<{
     id: number;
     transaction: TransactionWithSplits;
   } | null>(null);
   const linkedTransaction =
     linkedState !== null && linkedState.id === linkedTransactionId ? linkedState.transaction : null;
+  // The account that the link was made on. The bank account can have been
+  // mapped to another account since then.
+  const linkedAccountId = selectedItem?.linkedAccountId ?? selectedLink?.counterpoiseAccountId ?? null;
+  // The candidates hold only the transactions near the bank date, so the
+  // linked transaction can be missing from them. Its total on the linked
+  // account then comes from the transaction itself (null: not loaded yet).
+  const linkedTotalDiffers =
+    linkedCandidate === null && linkedTransaction !== null && selectedItem !== null
+      ? linkedTransaction.splits
+        .filter((split) => split.accountId === linkedAccountId)
+        .reduce((sum, split) => sum + split.amount, 0) !== -selectedItem.amountCents
+      : false;
+  // Keep cannot keep a link whose amounts are now different (the server
+  // refuses it too).
+  const canKeep =
+    selectedItem?.reviewReason === "plaid_modified" &&
+    (linkedCandidate === null ? !linkedTotalDiffers : linkedAction(linkedCandidate) === "keep_local");
+  const linkedHint =
+    linkedCandidate === null
+      ? linkedTotalDiffers
+        ? "The bank amount is different. Change your transaction to the bank amount, or unlink."
+        : "Keep local keeps this link. Match or Create moves it to another transaction."
+      : linkedAction(linkedCandidate) === "match_update_amount"
+        ? "The bank amount is different. Update changes your amount to the bank amount and keeps this link. Unlink removes the link."
+        : linkedAction(linkedCandidate) === null
+          ? linkedCandidate.isInvestment
+            ? "The bank amount is different, and this is an investment transaction. Change its amount to the bank amount, or unlink."
+            : "The bank amount is different, and this transaction has more than 2 splits. Change the splits to the bank amount, or unlink."
+          : "Keep keeps this link. Match on another transaction, or Create, moves it.";
   // The row is part of the pending Create, so the confirmation can only
   // write to the row that it was opened for.
   const [pendingCreate, setPendingCreate] = useState<{
@@ -408,9 +430,15 @@ export function ReconciliationModal({
         // pure: React re-invokes it under StrictMode and may replay it while
         // rendering concurrently, so a fetch fired from inside would issue two
         // competing GETs whose responses both land in setItems.
-        const next = isUnresolved(updatedItem)
+        const replaced = isUnresolved(updatedItem)
           ? items.map((item) => (item.id === updatedItem.id ? updatedItem : item))
           : items.filter((item) => item.id !== updatedItem.id);
+        const linked = updatedItem.resolutionStatus === "matched" || updatedItem.resolutionStatus === "created"
+          ? updatedItem.matchedTransactionId
+          : null;
+        const next = linked === null
+          ? replaced
+          : markCandidateLinked(replaced, updatedItem.plaidAccountLinkId, linked, updatedItem.id);
 
         setItems(next);
 
@@ -484,14 +512,14 @@ export function ReconciliationModal({
           if (!bestMatch || bestMatch.alreadyLinked || submitting) return;
           // On the linked transaction, Enter does its main action (Keep or Update).
           if (bestMatch.transactionId === linkedTransactionId) {
-            void resolveSelected(
-              linkedAction(bestMatch) === "keep_local"
-                ? { action: "keep_local" }
-                : { action: "match_update_amount", transactionId: bestMatch.transactionId }
-            );
+            const linked = linkedAction(bestMatch);
+            if (linked === "keep_local") void resolveSelected({ action: "keep_local" });
+            else if (linked) void resolveSelected({ action: linked, transactionId: bestMatch.transactionId });
             return;
           }
-          void resolveSelected({ action: "match", transactionId: bestMatch.transactionId });
+          // A different amount is matched only with the bank amount.
+          const action = candidateAction(bestMatch);
+          if (action) void resolveSelected({ action, transactionId: bestMatch.transactionId });
         },
       },
       {
@@ -730,7 +758,7 @@ export function ReconciliationModal({
                           <p className="text-fg">
                             Linked to{" "}
                             {linkedTransaction
-                              ? linkedSummary(linkedTransaction, selectedLink?.counterpoiseAccountId ?? null)
+                              ? linkedSummary(linkedTransaction, linkedAccountId)
                               : `transaction #${linkedTransactionId}`}
                           </p>
                           <p className="text-xs text-fg-tertiary mt-1">

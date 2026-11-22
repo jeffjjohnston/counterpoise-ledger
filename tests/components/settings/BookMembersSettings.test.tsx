@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BookMembersSettings } from "@/components/settings/BookMembersSettings";
 import { useBookRole, type BookMemberSummary } from "@/components/BookRoleProvider";
 import { ToastProvider } from "@/components/ui/ToastProvider";
+import { UpcomingDaysSaves } from "@/components/settings/UpcomingDaysSettings";
 
 const pushMock = vi.fn();
 vi.mock("@/lib/navigation", async () =>
@@ -33,7 +34,7 @@ function setRole(
   const refresh = vi.fn();
   vi.mocked(useBookRole).mockReturnValue({
     books: [], currentBook: { id: 1, name: "B", upcomingDays: 30, userId: 1 }, currentUserId: userId, role, status: "ready",
-    canWrite: role === "owner", isOwner: role === "owner", members: memberList, refresh,
+    canWrite: role === "owner", isOwner: role === "owner", members: memberList, refresh, applyBook: vi.fn(), upcomingSaves: new UpcomingDaysSaves(),
   } as ReturnType<typeof useBookRole>);
   return refresh;
 }

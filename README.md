@@ -844,7 +844,7 @@ migration's checksum and refuses to start when a file changes. See
 ```
 /app
   /page.tsx                       # Home / book list
-  /login, /register, /account     # Auth pages
+  /login, /register, /settings    # Auth and settings pages
   /b/[bookId]/                    # Book-scoped pages
     /page.tsx                     # Dashboard
     /accounts, /transactions      # Core accounting

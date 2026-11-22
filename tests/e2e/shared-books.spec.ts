@@ -16,8 +16,9 @@ test("an owner adds a viewer, and the viewer sees the book read-only", async ({ 
     // The owner (the default E2E user) adds the viewer from Settings.
     await page.goto(`/b/${bookId}/transactions`);
     await page.getByLabel("Open user menu").click();
-    await page.getByRole("button", { name: "Settings" }).click();
-    await page.getByLabel("Username").fill(username);
+    await page.getByRole("link", { name: "Settings" }).click();
+    // exact: the Account group also has a "New username" field.
+    await page.getByLabel("Username", { exact: true }).fill(username);
     await page.getByLabel("New member role").selectOption("viewer");
     await page.getByRole("button", { name: "Add member" }).click();
     await expect(page.getByText(username)).toBeVisible();

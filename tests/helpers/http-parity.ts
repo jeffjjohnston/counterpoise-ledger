@@ -6,6 +6,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { insert } from "./sql";
 import { LEDGER_OBJECT_FILE, workerDatabasePath, workerPersistDirectory } from "./test-database";
+import { assertResponseContract, inContract } from "./contract";
+import { rustBinary } from "./rust-binaries";
 
 async function freePort(): Promise<number> {
   const socket = createServer();
@@ -143,7 +145,7 @@ export async function startHttpTestServerOn(
   if (onWorker) return startWorkerOnce(port, overrides, options);
   const baseUrl = `http://127.0.0.1:${port}`;
   const settings = typeof overrides === "function" ? overrides(baseUrl) : overrides;
-  const child = spawn(resolve("rust-api/target/debug/counterpoise-rust-api"), [], {
+  const child = spawn(rustBinary("counterpoise-rust-api"), [], {
     cwd: resolve("."),
     env: {
       ...process.env,
@@ -199,15 +201,46 @@ export async function sessionHttpClient(baseUrl: string, userId = 1) {
   return {
     /** The session's `Cookie` header, for a client that is not `fetch`. */
     cookie: `counterpoise_session=${token}`,
-    request(path: string, init: RequestInit = {}) {
+    /**
+     * A request with the session. `{ contract: false }` turns off the check
+     * of the response contract, for a request that itself breaks the
+     * contract on purpose (a number where the contract has a string): the
+     * server then answers with values that the contract does not describe.
+     */
+    request(path: string, init: RequestInit = {}, options: { contract?: boolean } = {}) {
       const headers = new Headers(init.headers);
       headers.set("cookie", `counterpoise_session=${token}`);
-      return fetch(new URL(path, baseUrl), { ...init, headers });
+      const url = new URL(path, baseUrl);
+      return options.contract === false ? fetch(url, { ...init, headers }) : checkedFetch(url, { ...init, headers });
     },
     anonymous(path: string, init: RequestInit = {}) {
-      return fetch(new URL(path, baseUrl), init);
+      return checkedFetch(new URL(path, baseUrl), init);
     },
   };
+}
+
+/**
+ * `fetch`, and a check of the contract: when the request is an operation of
+ * openapi/openapi.json and the response is a success, its body must match
+ * the schema of the operation, with no key that the schema does not declare.
+ * So each HTTP test checks the contract of the routes it calls, also when
+ * the test itself looks at one field only. The caller gets the response
+ * unread.
+ */
+async function checkedFetch(url: URL, init: RequestInit): Promise<Response> {
+  const response = await fetch(url, init);
+  const method = init.method ?? "GET";
+  if (response.ok && inContract(method, url.pathname)) {
+    const text = await response.clone().text();
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new Error(`The ${response.status} body of ${method} ${url.pathname} is not JSON: ${text.slice(0, 200)}`);
+    }
+    assertResponseContract(method, url.pathname, response.status, body);
+  }
+  return response;
 }
 
 const WORKER_ROOT = resolve("rust-api/worker");

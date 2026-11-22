@@ -53,7 +53,7 @@ pub(super) async fn income_statement(
     let (mut income, mut expenses) = (Vec::new(), Vec::new());
     let (mut total_income, mut total_expenses) = (0_i64, 0_i64);
     for row in rows {
-        let display = display_balance(i64::from(row.balance), &row.account_type);
+        let display = display_balance(row.balance, &row.account_type);
         if display == 0 {
             continue;
         }

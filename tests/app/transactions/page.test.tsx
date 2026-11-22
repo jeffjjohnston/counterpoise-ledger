@@ -1147,16 +1147,90 @@ describe("TransactionsPage", () => {
     expect(putBodies[0].expectedUpdatedAt).toBe(reloaded.updatedAt.toISOString());
   });
 
-  it("shows the conflict toast and closes the modal on a 409 save", async () => {
+  it("keeps the editor open on a 409 save, blocks the save, and reloads the latest version", async () => {
     const editing = makeTransaction({
       id: 8,
       updatedAt: new Date("2024-06-01T00:00:00.000Z"),
+    });
+    const latest = makeTransaction({
+      id: 8,
+      description: "Changed by another user",
+      updatedAt: new Date("2024-06-02T00:00:00.000Z"),
     });
 
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const method = (init?.method ?? "GET").toUpperCase();
       if (url === "/api/b/1/transactions/8" && method === "PUT") {
+        return {
+          ok: false,
+          status: 409,
+          json: async () => ({ error: TRANSACTION_CONFLICT_MESSAGE }),
+        } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions/8/plaid")) {
+        return { ok: true, json: async () => null } as Response;
+      }
+      if (url === "/api/b/1/transactions/8") {
+        return { ok: true, json: async () => latest } as Response;
+      }
+      if (url.startsWith("/api/b/1/transactions")) {
+        return { ok: true, json: async () => transactionsPayload } as Response;
+      }
+      const standard = standardFetchResponse(url);
+      if (standard) return standard;
+      throw new Error(`Unexpected fetch url: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TransactionsPage />);
+
+    await waitFor(() => expect(transactionListProps?.onEdit).toBeTypeOf("function"));
+
+    act(() => {
+      (transactionListProps!.onEdit as (t: TransactionWithSplits) => void)(editing);
+    });
+
+    await waitFor(() => expect(transactionFormProps?.onSubmit).toBeTypeOf("function"));
+    expect(screen.getByTestId("edit-transaction-form")).toBeInTheDocument();
+    expect(transactionFormProps!.conflict).toBe(false);
+
+    let saved: unknown;
+    await act(async () => {
+      saved = await (transactionFormProps!.onSubmit as (data: unknown) => Promise<unknown>)({
+        date: editing.date,
+        description: editing.description ?? "",
+        splits: [],
+      });
+    });
+
+    // `false` tells the form that the save failed, so the form keeps the edits.
+    expect(saved).toBe(false);
+    expect(screen.getByTestId("edit-transaction-form")).toBeInTheDocument();
+    expect(transactionFormProps!.conflict).toBe(true);
+    expect(transactionFormProps!.editingTransaction).toBe(editing);
+    // The form shows the message. A toast would say "Showing the latest version".
+    expect(toast.error).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await (transactionFormProps!.onReloadLatest as () => Promise<void>)();
+    });
+
+    expect(screen.getByTestId("edit-transaction-form")).toBeInTheDocument();
+    expect(transactionFormProps!.conflict).toBe(false);
+    expect(
+      (transactionFormProps!.editingTransaction as TransactionWithSplits).description
+    ).toBe("Changed by another user");
+  });
+
+  it("keeps the editor open on a 409 delete", async () => {
+    const editing = makeTransaction({ id: 8 });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.startsWith("/api/b/1/transactions/8?") && method === "DELETE") {
         return {
           ok: false,
           status: 409,
@@ -1178,26 +1252,17 @@ describe("TransactionsPage", () => {
     render(<TransactionsPage />);
 
     await waitFor(() => expect(transactionListProps?.onEdit).toBeTypeOf("function"));
-
     act(() => {
       (transactionListProps!.onEdit as (t: TransactionWithSplits) => void)(editing);
     });
-
-    await waitFor(() => expect(transactionFormProps?.onSubmit).toBeTypeOf("function"));
-    expect(screen.getByTestId("edit-transaction-form")).toBeInTheDocument();
+    await waitFor(() => expect(transactionFormProps?.onDelete).toBeTypeOf("function"));
 
     await act(async () => {
-      await (transactionFormProps!.onSubmit as (data: unknown) => Promise<void>)({
-        date: editing.date,
-        description: editing.description ?? "",
-        splits: [],
-      });
+      await (transactionFormProps!.onDelete as () => Promise<void>)();
     });
 
-    expect(toast.error).toHaveBeenCalledWith(TRANSACTION_CONFLICT_MESSAGE);
-    await waitFor(() =>
-      expect(screen.queryByTestId("edit-transaction-form")).not.toBeInTheDocument()
-    );
+    expect(screen.getByTestId("edit-transaction-form")).toBeInTheDocument();
+    expect(transactionFormProps!.conflict).toBe(true);
   });
 
   it("merges the reconcile toggle's updatedAt, so the next save is not treated as a conflict", async () => {
@@ -1344,6 +1409,42 @@ describe("TransactionsPage", () => {
       (transactionListProps!.onToggleReconciled as (id: number, reconciled: boolean) => Promise<void>)(9, reconciled);
     const move = () =>
       (transactionListProps!.onMoveToNextBusinessDay as (id: number) => Promise<void>)(9);
+
+    // TransactionList is memoized. A page render that changes no list input
+    // must give it the same props, or it sorts and draws every row again.
+    it("gives the list the same props when only the sidebar width changes", async () => {
+      stubRowFetch(conflict);
+      const { container } = render(<TransactionsPage />);
+      await waitFor(() => expect(shownRow()).toBeDefined());
+      await waitFor(() => expect(transactionListProps!.isLoading).toBe(false));
+      await act(async () => {});
+      const before = { ...transactionListProps! };
+
+      fireEvent.mouseDown(container.querySelector(".cursor-ew-resize")!);
+      fireEvent.mouseMove(document, { clientX: 345 });
+      const sidebar = container.querySelector<HTMLElement>(".cursor-ew-resize")!.parentElement!;
+      expect(sidebar.style.width).toBe("345px");
+
+      const changed = Object.keys(before).filter((key) => !Object.is(before[key], transactionListProps![key]));
+      expect(changed).toEqual([]);
+    });
+
+    it("stores the sidebar width when the drag ends, not on each move", async () => {
+      stubRowFetch(conflict);
+      const { container } = render(<TransactionsPage />);
+      await waitFor(() => expect(shownRow()).toBeDefined());
+      const setItem = vi.spyOn(Storage.prototype, "setItem");
+      try {
+        fireEvent.mouseDown(container.querySelector(".cursor-ew-resize")!);
+        fireEvent.mouseMove(document, { clientX: 300 });
+        fireEvent.mouseMove(document, { clientX: 345 });
+        expect(setItem.mock.calls.filter(([key]) => key === "transactionsSidebarWidth")).toEqual([]);
+        fireEvent.mouseUp(document);
+        expect(setItem.mock.calls.filter(([key]) => key === "transactionsSidebarWidth")).toEqual([["transactionsSidebarWidth", "345"]]);
+      } finally {
+        setItem.mockRestore();
+      }
+    });
 
     it("shows the conflict and reloads the register when the reconcile toggle gets a 409", async () => {
       const { putBodies, fetchMock } = stubRowFetch(conflict);

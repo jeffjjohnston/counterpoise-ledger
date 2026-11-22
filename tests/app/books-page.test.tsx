@@ -142,7 +142,7 @@ describe("BookSelectorPage", () => {
     vi.restoreAllMocks();
   });
 
-  it("opens an edit modal from the books list with warning text", async () => {
+  it("the Edit link goes to the book's general settings", async () => {
     stubFetch([
       {
         id: 1,
@@ -158,87 +158,11 @@ describe("BookSelectorPage", () => {
       expect(screen.getByText("Family Finances")).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit Family Finances" }));
-
-    expect(screen.getByRole("heading", { name: "Edit Book" })).toBeInTheDocument();
-    expect(screen.getByLabelText("Book name")).toHaveValue("Family Finances");
-    expect(screen.getByText("Danger zone")).toBeInTheDocument();
-    expect(screen.getByText(/cannot be undone/i)).toBeInTheDocument();
-  });
-
-  it("renames a book from the edit modal", async () => {
-    const fetchMock = stubFetch([
-      {
-        id: 1,
-        name: "Family Finances",
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      },
-    ]);
-
-    render(<BookSelectorPage />);
-
-    await waitFor(() => {
-      expect(screen.getByText("Family Finances")).toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Edit Family Finances" }));
-    fireEvent.change(screen.getByLabelText("Book name"), {
-      target: { value: "Household Ledger" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() => {
-      expect(screen.queryByRole("heading", { name: "Edit Book" })).not.toBeInTheDocument();
-    });
-
-    expect(screen.getByText("Household Ledger")).toBeInTheDocument();
-    expect(
-      fetchMock.mock.calls.some(
-        ([url, init]) => url === "/api/books/1" && (init as RequestInit | undefined)?.method === "PUT"
-      )
-    ).toBe(true);
-  });
-
-  it("requires a second confirmation step before deleting a book", async () => {
-    const fetchMock = stubFetch([
-      {
-        id: 1,
-        name: "Family Finances",
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      },
-    ]);
-    const confirmMock = vi.fn(() => true);
-    vi.stubGlobal("confirm", confirmMock);
-
-    render(<BookSelectorPage />);
-
-    await waitFor(() => {
-      expect(screen.getByText("Family Finances")).toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Edit Family Finances" }));
-    fireEvent.click(screen.getByRole("button", { name: "Delete book..." }));
-
-    expect(confirmMock).not.toHaveBeenCalled();
-    expect(screen.getByText(/Final confirmation required/i)).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Yes, permanently delete" }));
-
-    await waitFor(() => {
-      expect(confirmMock).toHaveBeenCalledTimes(1);
-    });
-    await waitFor(() => {
-      expect(screen.queryByText("Family Finances")).not.toBeInTheDocument();
-    });
-
-    expect(
-      fetchMock.mock.calls.some(
-        ([url, init]) =>
-          url === "/api/books/1" && (init as RequestInit | undefined)?.method === "DELETE"
-      )
-    ).toBe(true);
+    expect(screen.getByRole("link", { name: "Edit Family Finances" })).toHaveAttribute(
+      "href",
+      "/b/1/settings#general"
+    );
+    expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/settings");
   });
 
   describe("demo book", () => {

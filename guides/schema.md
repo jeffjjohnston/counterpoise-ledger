@@ -58,7 +58,7 @@ enforces this in two ways:
   `recurring_rules.payee_id`, `plaid_accounts.token_id`,
   `plaid_accounts.counterpoise_account_id`,
   `plaid_transaction_reconciliation.plaid_account_link_id` and
-  `.matched_transaction_id`, and `plaid_link_sessions.token_id` and
+  `.matched_transaction_id` (and `.linked_account_id`, migration 0020), and `plaid_link_sessions.token_id` and
   `.result_token_id`. Its error text starts with `cross-book reference:`.
   `tests/db/book-reference-triggers.test.ts` tests them.
 
@@ -122,7 +122,7 @@ writes their references.
   - Types: `asset`, `liability`, `equity`, `income`, `expense`
   - Subtypes: `bank`, `credit_card`, `loan`, `investment`, `cash`, `other`
   - Special field: `isInvestmentCash` for auto-created investment cash accounts
-  - `icon` (nullable): one emoji grapheme. **`null` means "inherit from the parent account" — never "no icon".** Resolved at render time by `resolveAccountIcon()`/`resolveAccountIconSource()`; only `income`/`expense` accounts show a picker or resolve an icon for display
+  - `icon` (nullable): one emoji grapheme. **`null` means "inherit from the parent account" — never "no icon".** Resolved at render time by `resolveAccountIconSource()`; only `income`/`expense` accounts show a picker or resolve an icon for display
 
 - **payees**: `name` keeps the case that was first typed, but a name matches
   without letter case: `payees_name_book_unique` refuses an exact repeat, and
@@ -229,6 +229,7 @@ writes their references.
     - `reviewReason`: NULL, `plaid_modified` or `plaid_removed` (flags items needing human review)
     - CHECK constraints (migration 0019) limit both columns to these values. A write of another value fails with `CHECK constraint failed`. To add a value, add a migration that makes the table again with the new list (see [database-management.md](database-management.md#making-a-table-again)), and change the Rust code that reads the column in the same release
     - `matchedTransactionId`: FK to local transaction when matched (manually or auto-matched)
+    - `linkedAccountId` (migration 0020): the Counterpoise account that the link was made on. Each writer that links a row (the reconcile decisions and the auto-matcher) sets it, and each writer that removes a link (`UNLINK_SET`, Ignore, the transaction delete) sets it to NULL. The amount checks of a link (`LINK_AMOUNTS` in `reconcile.rs`, Keep) use it, not the current `plaidAccounts.counterpoiseAccountId`: a remap of the bank account to another account must not break the old links. A NULL on a linked row (a deleted account, or a row a test wrote) falls back to the current mapping. It has the cross-book triggers of 0006
   - `weeklyReviews` (migration 0007): one run of the weekly review
     ([weekly-review.md](weekly-review.md)). `source` is `schedule` or `manual`
     (not `trigger`, an SQL keyword). `status` is `running`, `complete` or

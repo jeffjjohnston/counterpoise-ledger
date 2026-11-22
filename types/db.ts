@@ -298,6 +298,8 @@ export interface PlaidTransactionReconciliation {
   reviewMetadataJson: string | null;
   matchedTransactionId: number | null;
   resolvedAt: Date | null;
+  /** The account that the link was made on (migration 0020). Null when no link. */
+  linkedAccountId: number | null;
   firstSeenAt: Date;
   lastSeenAt: Date;
   createdAt: Date;

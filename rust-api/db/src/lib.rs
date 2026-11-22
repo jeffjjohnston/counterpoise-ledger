@@ -19,6 +19,8 @@ pub mod folds;
 pub mod jobs;
 #[cfg(feature = "native")]
 mod limits;
+#[cfg(all(test, feature = "native"))]
+mod link_account_tests;
 pub mod locks;
 pub mod lots;
 pub mod migrations;

@@ -6,6 +6,7 @@ import { useToast } from "@/components/ui/ToastProvider";
 import { useBookId } from "@/hooks/useBookId";
 import { apiGet } from "@/lib/api-client";
 import { roleSatisfies, type BookRole } from "@/lib/book-roles";
+import { UpcomingDaysSaves } from "@/components/settings/UpcomingDaysSettings";
 
 export type BookSummary = { id: number; name: string; upcomingDays: number; userId: number; role?: BookRole };
 export type BookMemberSummary = { userId: number; username: string; role: BookRole; createdAt: string };
@@ -28,6 +29,16 @@ export type BookRoleValue = {
   isOwner: boolean;
   members: BookMemberSummary[];
   refresh: () => void;
+  /**
+   * Puts a book that the server returned after a change into the cache at
+   * once, so a reader does not see the old value until the next read ends.
+   * Call refresh() after it: a read that started before the change is then
+   * dropped.
+   */
+  applyBook: (book: Pick<BookSummary, "id" | "name" | "upcomingDays">) => void;
+  /** The upcoming-days saves in flight. It lives here, in the book layout,
+   * because a save continues after the settings page unmounts. */
+  upcomingSaves: UpcomingDaysSaves;
 };
 
 // Outside a book layout (isolated component tests, non-book pages) the hook
@@ -35,7 +46,8 @@ export type BookRoleValue = {
 // enforces every level.
 const OUTSIDE_PROVIDER: BookRoleValue = {
   books: [], currentBook: null, currentUserId: null, role: "owner", status: "ready",
-  canWrite: true, isOwner: true, members: [], refresh: () => {},
+  canWrite: true, isOwner: true, members: [], refresh: () => {}, applyBook: () => {},
+  upcomingSaves: new UpcomingDaysSaves(),
 };
 
 const BookRoleContext = createContext<BookRoleValue>(OUTSIDE_PROVIDER);
@@ -47,7 +59,12 @@ export function BookRoleProvider({ children }: { children: ReactNode }) {
   const [currentUserId, setCurrentUserId] = useState<number | null>(null);
   const [status, setStatus] = useState<BookRoleStatus>("loading");
   const [version, setVersion] = useState(0);
+  const [upcomingSaves] = useState(() => new UpcomingDaysSaves());
   const refresh = useCallback(() => setVersion((v) => v + 1), []);
+  const applyBook = useCallback((book: Pick<BookSummary, "id" | "name" | "upcomingDays">) => {
+    setBooks((current) => current.map((b) =>
+      b.id === book.id ? { ...b, name: book.name, upcomingDays: book.upcomingDays } : b));
+  }, []);
   const toast = useToast();
   // True after the first good load of the role.
   const loadedOnce = useRef(false);
@@ -69,7 +86,8 @@ export function BookRoleProvider({ children }: { children: ReactNode }) {
       membersErrorShown = true;
       toast.error("Could not load the members of this book.");
     };
-    apiGet<BookSummary[]>("/api/books")
+    const booksRead = apiGet<BookSummary[]>("/api/books");
+    booksRead
       .then((d) => { if (active) { loadedOnce.current = true; setBooks(d); setStatus("ready"); } })
       .catch(() => {
         if (!active || loadedOnce.current) return;
@@ -78,7 +96,15 @@ export function BookRoleProvider({ children }: { children: ReactNode }) {
       });
     apiGet<BookMemberSummary[]>(`/api/books/${bookId}/members`)
       .then((d) => { if (active) setMembers(d); })
-      .catch(membersFailed);
+      .catch(() => {
+        // A book that the books list no longer has was deleted (for
+        // example from its own settings page). Its members cannot load,
+        // and that is not an error to show.
+        booksRead.then(
+          (list) => { if (list.some((b) => b.id === Number(bookId))) membersFailed(); },
+          membersFailed,
+        );
+      });
     apiGet<{ id: number }>("/api/auth/me")
       .then((d) => { if (active) setCurrentUserId(d.id); })
       .catch(membersFailed);
@@ -100,9 +126,9 @@ export function BookRoleProvider({ children }: { children: ReactNode }) {
     return {
       books, currentBook, currentUserId, role, status,
       canWrite: roleSatisfies(role, "write"), isOwner: role === "owner",
-      members, refresh,
+      members, refresh, applyBook, upcomingSaves,
     };
-  }, [books, bookId, currentUserId, members, refresh, status]);
+  }, [applyBook, upcomingSaves, books, bookId, currentUserId, members, refresh, status]);
 
   return <BookRoleContext.Provider value={value}>{children}</BookRoleContext.Provider>;
 }

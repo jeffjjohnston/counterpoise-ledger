@@ -30,6 +30,7 @@ use axum::{
 };
 use chrono::{Days, NaiveDate, NaiveDateTime};
 use ledger_db::locks::FOR_UPDATE;
+use ledger_db::lots::{collect_affected_pairs, rebuild_lots_for_pairs};
 use ledger_db::store::{self, Sql, params};
 use ledger_db::{
     Database,
@@ -115,7 +116,7 @@ pub(crate) fn reconcilable_link(
 const ROW_COLUMNS: &str = "r.id, r.book_id, r.plaid_account_link_id, r.plaid_transaction_id,
     r.date, r.authorized_date, r.amount_cents, r.name, r.merchant_name, r.original_description,
     r.resolution_status, r.review_reason, r.matched_transaction_id, r.pending, r.first_seen_at,
-    r.last_seen_at, r.review_metadata_json";
+    r.last_seen_at, r.review_metadata_json, r.linked_account_id";
 
 #[derive(ledger_db::store::FromRow)]
 pub(crate) struct ReconRow {
@@ -136,6 +137,9 @@ pub(crate) struct ReconRow {
     pub(crate) first_seen_at: NaiveDateTime,
     pub(crate) last_seen_at: NaiveDateTime,
     pub(crate) review_metadata_json: Option<String>,
+    /// The account that the link was made on. The mapping of the bank
+    /// account can change after the link.
+    pub(crate) linked_account_id: Option<i32>,
 }
 
 impl ReconRow {
@@ -251,7 +255,9 @@ struct CandidateRow {
     description: Option<String>,
     payee_name: Option<String>,
     check_number: Option<String>,
-    linked_split_amount: i32,
+    /// The total of the transaction's splits on the mapped account, the
+    /// same amount that the resolver compares with the bank amount.
+    linked_split_amount: i64,
 }
 
 /// `findMatchCandidates`: the five best transactions on the mapped account
@@ -270,7 +276,9 @@ pub(crate) fn match_candidates(
     let rows: Vec<CandidateRow> = sql.query(
         &format!(
             "SELECT t.id AS transaction_id, {EFFECTIVE_DATE} AS date, t.description,
-                p.name AS payee_name, t.check_number, s.amount AS linked_split_amount
+                p.name AS payee_name, t.check_number,
+                (SELECT SUM(x.amount) FROM transaction_splits x
+                 WHERE x.transaction_id = t.id AND x.account_id = ?1) AS linked_split_amount
          FROM transaction_splits s
          JOIN transactions t ON s.transaction_id = t.id
          LEFT JOIN payees p ON t.payee_id = p.id
@@ -320,6 +328,19 @@ pub(crate) fn match_candidates(
         )?
         .into_iter()
         .collect();
+    // `match_update_amount` refuses an investment transaction, so the client
+    // must not offer it there.
+    let investment: HashSet<i32> = sql
+        .query::<i32>(
+            &format!(
+                "SELECT DISTINCT transaction_id FROM investment_splits
+         WHERE book_id = ?1 AND transaction_id {in2}",
+                in2 = in_integers("?2")
+            ),
+            &params![row.book_id, json_array(&ids)],
+        )?
+        .into_iter()
+        .collect();
 
     let target = row.merchant();
     let mut candidates: Vec<(i64, i64, i64, Value)> = Vec::new();
@@ -332,7 +353,7 @@ pub(crate) fn match_candidates(
             .filter(|(account_id, _)| *account_id != mapped_account_id)
             .map(|(_, name)| name.as_str())
             .collect();
-        let amount_delta = (i64::from(candidate.linked_split_amount) - expected).abs();
+        let amount_delta = (candidate.linked_split_amount - expected).abs();
         let days = day_delta(bank_date, &candidate.date).unwrap_or(0);
         let already_linked = linked.contains(&candidate.transaction_id);
         let (score, tags) = score(
@@ -359,6 +380,7 @@ pub(crate) fn match_candidates(
                 "dayDelta": days,
                 "counterpartAccountNames": counterparts,
                 "splitCount": splits.len(),
+                "isInvestment": investment.contains(&candidate.transaction_id),
                 "score": score,
                 "scoreTags": tags,
                 "alreadyLinked": already_linked,
@@ -454,6 +476,7 @@ pub(crate) fn load_item(
         "resolutionStatus": row.resolution_status,
         "reviewReason": row.review_reason,
         "matchedTransactionId": row.matched_transaction_id,
+        "linkedAccountId": row.linked_account_id,
         "pending": row.pending,
         "firstSeenAt": iso_timestamp(row.first_seen_at),
         "lastSeenAt": iso_timestamp(row.last_seen_at),
@@ -878,9 +901,16 @@ fn mark_matched(
             pick_matched_date(row.authorized_date.as_deref(), &row.date)
         ],
     )?;
-    updated
-        .map(|_| ())
-        .ok_or(ReconcileError::NotFound("Transaction not found"))
+    if updated.is_none() {
+        return Err(ReconcileError::NotFound("Transaction not found"));
+    }
+    if settle {
+        // Lots are derived from the effective date, which the settlement
+        // changed: rebuild every pair of the transaction.
+        let pairs = collect_affected_pairs(sql, book_id, transaction_id)?;
+        rebuild_lots_for_pairs(sql, book_id, &pairs)?;
+    }
+    Ok(())
 }
 
 /// A write of a decision changed no row: the row is not in a state that the
@@ -904,18 +934,28 @@ fn resolve_row(
     row: &ReconRow,
     action: Action,
     status: &str,
-    matched_transaction_id: Option<i32>,
+    linked: Option<(i32, i32)>,
     now: NaiveDateTime,
 ) -> Result<(), ReconcileError> {
+    // `linked`: the transaction and the account that the link is made on.
+    let (matched_transaction_id, linked_account_id) = linked.unzip();
     let rows = sql.execute(
         &format!(
             "UPDATE plaid_transaction_reconciliation
-             SET resolution_status = ?3, matched_transaction_id = ?4, review_reason = NULL,
-                 review_metadata_json = NULL, resolved_at = ?5, updated_at = ?5
+             SET resolution_status = ?3, matched_transaction_id = ?4, linked_account_id = ?6,
+                 review_reason = NULL, review_metadata_json = NULL, resolved_at = ?5,
+                 updated_at = ?5
              WHERE id = ?1 AND book_id = ?2 AND {}",
             action.allowed_from()
         ),
-        &params![row.id, row.book_id, status, matched_transaction_id, now],
+        &params![
+            row.id,
+            row.book_id,
+            status,
+            matched_transaction_id,
+            now,
+            linked_account_id
+        ],
     )?;
     changed(rows, action)
 }
@@ -927,6 +967,7 @@ fn resolve_row(
 /// transaction unlink route (`sync.rs`) uses the same columns. `?3` is the
 /// time.
 pub(crate) const UNLINK_SET: &str = "resolution_status = 'pending', matched_transaction_id = NULL,
+    linked_account_id = NULL,
     review_metadata_json = CASE WHEN review_reason = 'plaid_removed'
                                 THEN review_metadata_json END,
     review_reason = CASE WHEN review_reason = 'plaid_removed' THEN review_reason END,
@@ -950,6 +991,119 @@ fn linked_elsewhere(
                           AND id <> ?3)",
         &params![link.link_id, transaction_id, row.id],
     )
+}
+
+/// The total of the transaction's splits on `account_id`, or `None` when the
+/// transaction has no split on that account. A link requires this total to
+/// be the negation of the bank amount.
+pub(crate) fn linked_amount(
+    sql: &impl Sql,
+    transaction_id: i32,
+    account_id: i32,
+    book_id: i32,
+) -> Result<Option<i64>, store::Error> {
+    sql.query_row(
+        "SELECT SUM(amount) FROM transaction_splits
+         WHERE transaction_id = ?1 AND account_id = ?2 AND book_id = ?3",
+        &params![transaction_id, account_id, book_id],
+    )
+}
+
+/// One bank row that links a transaction, with the bank amount and the
+/// transaction's total on the linked account (`None`: no split there).
+#[derive(ledger_db::store::FromRow)]
+pub(crate) struct LinkAmounts {
+    pub(crate) reconciliation_id: i32,
+    pub(crate) matched_transaction_id: i32,
+    pub(crate) account_id: i32,
+    pub(crate) bank_cents: i32,
+    pub(crate) linked_cents: Option<i64>,
+}
+
+impl LinkAmounts {
+    /// The link joins equal amounts.
+    pub(crate) fn agrees(&self) -> bool {
+        self.linked_cents == Some(-i64::from(self.bank_cents))
+    }
+}
+
+// A bank account with no Counterpoise account assigned has no linked
+// account to compare, so its rows are left out. The account is the one that
+// the link was made on (`linked_account_id`), so a remap of the bank account
+// to another account does not break the old links. A row with no stored
+// account (a deleted account) uses the current mapping.
+const LINK_AMOUNTS: &str = "SELECT r.id AS reconciliation_id, r.matched_transaction_id,
+           COALESCE(r.linked_account_id, pa.counterpoise_account_id) AS account_id,
+           r.amount_cents AS bank_cents,
+           (SELECT SUM(s.amount) FROM transaction_splits s
+            WHERE s.transaction_id = r.matched_transaction_id
+              AND s.account_id = COALESCE(r.linked_account_id, pa.counterpoise_account_id)
+              AND s.book_id = r.book_id)
+             AS linked_cents
+    FROM plaid_transaction_reconciliation r
+    JOIN plaid_accounts pa ON pa.id = r.plaid_account_link_id AND pa.book_id = r.book_id
+    WHERE r.book_id = ?1 AND r.resolution_status IN ('matched', 'created')
+      AND r.matched_transaction_id IS NOT NULL
+      AND pa.counterpoise_account_id IS NOT NULL";
+
+/// The bank rows that link `transaction_id`, with their amounts.
+pub(crate) fn link_amounts(
+    sql: &impl Sql,
+    book_id: i32,
+    transaction_id: i32,
+) -> Result<Vec<LinkAmounts>, store::Error> {
+    sql.query(
+        &format!("{LINK_AMOUNTS} AND r.matched_transaction_id = ?2 ORDER BY r.id"),
+        &params![book_id, transaction_id],
+    )
+}
+
+/// Every link in the book whose amounts are different.
+pub(crate) fn mismatched_links(
+    sql: &impl Sql,
+    book_id: i32,
+) -> Result<Vec<LinkAmounts>, store::Error> {
+    let rows: Vec<LinkAmounts> =
+        sql.query(&format!("{LINK_AMOUNTS} ORDER BY r.id"), &params![book_id])?;
+    Ok(rows.into_iter().filter(|row| !row.agrees()).collect())
+}
+
+/// The refusal when a transaction edit would make a link join different
+/// amounts. An edit that removes every split on the linked account cannot be
+/// corrected with an amount, so that message tells the user to unlink.
+pub(crate) fn broken_link_message(link: &LinkAmounts) -> String {
+    let bank = dollars(-i64::from(link.bank_cents));
+    if link.linked_cents.is_none() {
+        return format!(
+            "This transaction is linked to a bank transaction for {bank} on the account that \
+             the edit removes. Unlink the bank transaction first, or keep a split on that account"
+        );
+    }
+    format!(
+        "This transaction is linked to a bank transaction for {bank}. Change the amount on the \
+         linked account to that amount, or unlink the bank transaction first"
+    )
+}
+
+/// The refusal when the amount cannot be changed to the bank amount.
+/// `match_update_amount` keeps its earlier message. `match` tells the user
+/// what to do.
+fn cannot_update(action: Action, update_refusal: &str, reason: &str, bank_cents: i32) -> String {
+    match action {
+        Action::MatchUpdateAmount => update_refusal.to_owned(),
+        _ => format!(
+            "The amounts are different, and the amount cannot be changed here because {reason}. \
+             Change the amount on this account to the bank amount ({}) first, then match",
+            dollars(-i64::from(bank_cents))
+        ),
+    }
+}
+
+/// Cents as a dollar amount for a message, for example `-$4.50`.
+fn dollars(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let abs = cents.unsigned_abs();
+    format!("{sign}${}.{:02}", abs / 100, abs % 100)
 }
 
 /// The row no longer links `previous`. A transfer is matched on both of its
@@ -1034,83 +1188,91 @@ pub(crate) fn apply(
     // stores any 64-bit value, and every reader decodes a split amount as a
     // 32-bit integer. The negation of i32::MIN does not fit, so refuse it
     // before any write, as PostgreSQL refused it at the insert.
-    if matches!(input.action, Action::MatchUpdateAmount | Action::Create)
-        && row.amount_cents.checked_neg().is_none()
+    if matches!(
+        input.action,
+        Action::Match | Action::MatchUpdateAmount | Action::Create
+    ) && row.amount_cents.checked_neg().is_none()
     {
         return Err(invalid(AMOUNT_OUT_OF_RANGE));
     }
     let amount = i64::from(row.amount_cents);
     match input.action {
-        Action::Match => {
+        // A link always joins equal amounts. `match` therefore changes the
+        // amount to the bank amount when the two are different, as
+        // `match_update_amount` does. It refuses when it cannot change the
+        // amount (more than 2 splits, or an investment transaction).
+        Action::Match | Action::MatchUpdateAmount => {
             let transaction_id = body_id(input.transaction().map_err(invalid)?)?;
-            let on_account: bool = sql.query_row(
-                "SELECT EXISTS (SELECT 1 FROM transaction_splits
-                                WHERE transaction_id = ?1 AND account_id = ?2 AND book_id = ?3)",
-                &params![transaction_id, link.account_id, book_id],
-            )?;
-            if !on_account {
-                return Err(invalid(NOT_ON_LINKED_ACCOUNT));
-            }
-            if linked_elsewhere(sql, link, transaction_id, &row)? {
-                return Err(invalid(LINKED_ELSEWHERE));
-            }
-            mark_matched(sql, access, transaction_id, &row, now, actor)?;
-            relink(sql, access, &row, transaction_id, now, actor)?;
-            resolve_row(
-                sql,
-                &row,
-                input.action,
-                "matched",
-                Some(transaction_id),
-                now,
-            )?;
-        }
-        Action::MatchUpdateAmount => {
-            let transaction_id = body_id(input.transaction().map_err(invalid)?)?;
+            let current = linked_amount(sql, transaction_id, link.account_id, book_id)?
+                .ok_or_else(|| invalid(NOT_ON_LINKED_ACCOUNT))?;
+            let update = input.action == Action::MatchUpdateAmount || current != -amount;
             let splits: Vec<(i32, i32)> = sql.query(
                 "SELECT id, account_id FROM transaction_splits
                  WHERE transaction_id = ?1 AND book_id = ?2 ORDER BY id",
                 &params![transaction_id, book_id],
             )?;
-            if !splits
-                .iter()
-                .any(|(_, account)| *account == link.account_id)
-            {
-                return Err(invalid(NOT_ON_LINKED_ACCOUNT));
-            }
-            if splits.len() != 2 {
-                return Err(invalid(
+            if update && splits.len() != 2 {
+                return Err(invalid(&cannot_update(
+                    input.action,
                     "Amount update is only supported for transactions with exactly 2 splits",
-                ));
+                    "the transaction has more than 2 splits",
+                    row.amount_cents,
+                )));
             }
-            let investment: bool = sql.query_row(
-                "SELECT EXISTS (SELECT 1 FROM investment_splits
-                                WHERE transaction_id = ?1 AND book_id = ?2)",
-                &params![transaction_id, book_id],
-            )?;
-            if investment {
-                return Err(invalid(
-                    "Amount update is not supported for investment transactions",
-                ));
+            if update {
+                let investment: bool = sql.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM investment_splits
+                                    WHERE transaction_id = ?1 AND book_id = ?2)",
+                    &params![transaction_id, book_id],
+                )?;
+                if investment {
+                    return Err(invalid(&cannot_update(
+                        input.action,
+                        "Amount update is not supported for investment transactions",
+                        "it is an investment transaction",
+                        row.amount_cents,
+                    )));
+                }
             }
             if linked_elsewhere(sql, link, transaction_id, &row)? {
                 return Err(invalid(LINKED_ELSEWHERE));
             }
-            let linked = splits
-                .iter()
-                .find(|(_, account)| *account == link.account_id)
-                .expect("checked above");
-            let counter = splits
-                .iter()
-                .find(|(_, account)| *account != link.account_id)
-                .ok_or_else(|| {
-                    invalid("Transaction has no counterpart split on a different account")
-                })?;
-            for (split_id, split_amount) in [(linked.0, -amount), (counter.0, amount)] {
-                sql.execute(
-                    "UPDATE transaction_splits SET amount = ?3 WHERE id = ?1 AND book_id = ?2",
-                    &params![split_id, book_id, split_amount],
-                )?;
+            if update {
+                let linked = splits
+                    .iter()
+                    .find(|(_, account)| *account == link.account_id)
+                    .expect("linked_amount found a split on the account");
+                let counter = splits
+                    .iter()
+                    .find(|(_, account)| *account != link.account_id)
+                    .ok_or_else(|| {
+                        invalid("Transaction has no counterpart split on a different account")
+                    })?;
+                // A transfer can also be linked on its other account. The
+                // rewrite changes both splits, so it must not break that
+                // link.
+                let before = link_amounts(sql, book_id, transaction_id)?;
+                for (split_id, split_amount) in [(linked.0, -amount), (counter.0, amount)] {
+                    sql.execute(
+                        "UPDATE transaction_splits SET amount = ?3 WHERE id = ?1 AND book_id = ?2",
+                        &params![split_id, book_id, split_amount],
+                    )?;
+                }
+                let after = link_amounts(sql, book_id, transaction_id)?;
+                if let Some(broken) = after.iter().find(|other| {
+                    other.reconciliation_id != row.id
+                        && !other.agrees()
+                        && before.iter().any(|old| {
+                            old.reconciliation_id == other.reconciliation_id && old.agrees()
+                        })
+                }) {
+                    return Err(invalid(&format!(
+                        "The amounts are different, and this transaction is also linked to a bank \
+                         transaction for {} on its other account. Changing the amount would break \
+                         that link. Unlink it first, or match another transaction",
+                        dollars(-i64::from(broken.bank_cents))
+                    )));
+                }
             }
             mark_matched(sql, access, transaction_id, &row, now, actor)?;
             relink(sql, access, &row, transaction_id, now, actor)?;
@@ -1119,7 +1281,7 @@ pub(crate) fn apply(
                 &row,
                 input.action,
                 "matched",
-                Some(transaction_id),
+                Some((transaction_id, link.account_id)),
                 now,
             )?;
         }
@@ -1177,7 +1339,7 @@ pub(crate) fn apply(
                 &row,
                 input.action,
                 "created",
-                Some(transaction_id),
+                Some((transaction_id, link.account_id)),
                 now,
             )?;
         }
@@ -1190,6 +1352,21 @@ pub(crate) fn apply(
             }
         }
         Action::KeepLocal => {
+            // Keep leaves the transaction as it is. It cannot keep a link
+            // whose amounts are now different. The amount is on the account
+            // that the link was made on.
+            let linked = matches!(row.resolution_status.as_str(), "matched" | "created");
+            if let (true, Some(transaction_id)) = (linked, row.matched_transaction_id) {
+                let account_id = row.linked_account_id.unwrap_or(link.account_id);
+                let current = linked_amount(sql, transaction_id, account_id, book_id)?;
+                if current != Some(-amount) {
+                    return Err(invalid(&format!(
+                        "The bank amount is now {}, and Keep cannot keep a link with a different \
+                         amount. Update the amount to the bank amount, or unlink",
+                        dollars(-amount)
+                    )));
+                }
+            }
             let rows = sql.execute(
                 &format!(
                     "UPDATE plaid_transaction_reconciliation

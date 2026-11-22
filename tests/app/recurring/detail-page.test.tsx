@@ -600,6 +600,42 @@ describe("RecurringRuleDetailPage live updates", () => {
     expect(screen.getByTestId("transaction-count")).toHaveTextContent("20");
   });
 
+  it("a Load more click during a reload loads the next rows after the reload", async () => {
+    history = Array.from({ length: 20 }, (_, i) => buildTransaction(i + 1));
+    await renderLive();
+    await waitFor(() => {
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("12");
+    });
+
+    // Hold the history read of the reload until the test releases it.
+    let release: () => void = () => undefined;
+    let hold = true;
+    const serve = fetchMock.getMockImplementation() as (input: RequestInfo | URL) => Promise<Response>;
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL): Promise<Response> => {
+      if (hold && String(input).startsWith("/api/b/1/transactions?")) {
+        hold = false;
+        await new Promise<void>((resolve) => { release = resolve; });
+      }
+      return serve(input);
+    });
+    const historyReads = () => urls().filter((url) => url.startsWith("/api/b/1/transactions?")).length;
+    const before = historyReads();
+    // Another client adds a transaction at the top of the history.
+    history = [buildTransaction(99), ...history];
+    hint(["transactions"]);
+    await waitFor(() => expect(historyReads()).toBe(before + 1));
+
+    // One click. The user does not click again after the reload.
+    fireEvent.click(screen.getByRole("button", { name: /load/i }));
+    await act(async () => { release(); });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("21");
+    });
+    // The page after the reload starts at the end of the new list.
+    expect(urls().at(-1)).toBe("/api/b/1/transactions?recurringRuleId=7&limit=12&offset=12&includeMeta=true");
+  });
+
   it("does not reload for a table that it does not read", async () => {
     await renderLive();
     const before = ruleReads();

@@ -1,6 +1,7 @@
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import packageJson from "./package.json" with { type: "json" };
 
@@ -51,6 +52,23 @@ function devPageGate(): Plugin {
 }
 
 /**
+ * The browser copy of the Rust core, `lib/wasm/generated/`, is not in git.
+ * Build it before the first module is read, for `vite` and for `vite build`.
+ * The script starts no tool when the core did not change, and with
+ * `CORE_WASM_PREBUILT=1` (the image build) it uses the module it was given.
+ */
+export function buildCoreWasm(): Plugin {
+  return {
+    name: "counterpoise-build-core-wasm",
+    buildStart() {
+      execFileSync(process.execPath, [path.resolve(import.meta.dirname, "scripts/build-core-wasm.mjs")], {
+        stdio: "inherit",
+      });
+    },
+  };
+}
+
+/**
  * wasm-bindgen writes a default load path into `ledger_core.js`:
  * `new URL('ledger_core_bg.wasm', import.meta.url)`. Vite sees that pattern
  * and emits the 1.4 MB `.wasm` file into the build. Nothing loads the file,
@@ -86,7 +104,7 @@ export default defineConfig(({ mode }) => {
   const inline = (value: string | undefined) => (value ? JSON.stringify(value) : "undefined");
 
   return {
-    plugins: [react(), tailwindcss(), devPageGate(), dropUnusedWasmAsset()],
+    plugins: [buildCoreWasm(), react(), tailwindcss(), devPageGate(), dropUnusedWasmAsset()],
     resolve: { alias: { "@": path.resolve(import.meta.dirname, ".") } },
     define: {
       "process.env.NEXT_PUBLIC_APP_VERSION": JSON.stringify(packageJson.version),

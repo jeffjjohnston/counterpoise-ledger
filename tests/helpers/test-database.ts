@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { rustBinary } from "./rust-binaries";
 
 /**
  * The SQLite files of the tests. Each Vitest run has a directory of its own
@@ -104,7 +105,7 @@ export function removeDatabase(path: string): void {
   }
 }
 
-export const LEDGER_CLI = resolve("rust-api/target/debug/ledger-cli");
+export const LEDGER_CLI = rustBinary("ledger-cli");
 
 /**
  * Runs `ledger-cli` on the database at `path`. Throws with its output when it

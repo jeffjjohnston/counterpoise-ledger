@@ -24,8 +24,8 @@ import {
   putTransaction,
   deleteTransactionRequest,
   isTransactionConflict,
-  TRANSACTION_CONFLICT_MESSAGE,
 } from "@/lib/transaction-requests";
+import { useEditConflict } from "@/hooks/useEditConflict";
 import { useToast } from "@/components/ui/ToastProvider";
 import type {
   AccountWithBalance,
@@ -126,6 +126,7 @@ export default function RecurringRuleDetailPage() {
   const [editing, setEditing] = useState(false);
   const [editingTransaction, setEditingTransaction] =
     useState<TransactionWithSplits | null>(null);
+  const editConflict = useEditConflict(bookId, editingTransaction, setEditingTransaction);
   const [deleting, setDeleting] = useState(false);
 
   // A live update can start a reload while another is in flight, and the
@@ -143,6 +144,8 @@ export default function RecurringRuleDetailPage() {
   // The number of history rows on the screen. A reload asks for all of them,
   // so that the rows from Load more and the scroll position stay.
   const loadedRows = useRef(0);
+  // The number of history rows that the server has for this rule.
+  const totalRows = useRef(0);
 
   const fetchHistoryPage = useCallback(
     async (offset: number, limit: number) => {
@@ -220,6 +223,7 @@ export default function RecurringRuleDetailPage() {
         setTransactions(history.page);
         setTotalCount(history.total);
         loadedRows.current = history.page.length;
+        totalRows.current = history.total;
         setError(null);
         shown.current = true;
         setLoading(false);
@@ -243,6 +247,7 @@ export default function RecurringRuleDetailPage() {
   useEffect(() => {
     shown.current = false;
     loadedRows.current = 0;
+    totalRows.current = 0;
     // refreshData catches its own errors into `error`; it cannot reject.
     void refreshData(true);
   }, [refreshData]);
@@ -257,30 +262,28 @@ export default function RecurringRuleDetailPage() {
 
   const handleLoadMore = async () => {
     if (loadingMore || transactions.length >= totalCount) return;
-    // A reload is in flight: its history replaces the rows on the screen, so
-    // rows after the old list do not fit. Wait for it and add nothing. The
-    // button stays when more rows remain.
-    const reload = inFlight.settled();
-    if (reload) {
-      setLoadingMore(true);
-      await reload;
-      setLoadingMore(false);
-      return;
-    }
-
-    const reloadsBefore = reloads.current;
     setLoadingMore(true);
     try {
-      const history = await fetchHistoryPage(transactions.length, HISTORY_PAGE_SIZE);
-      if (reloads.current !== reloadsBefore) return;
-      setTransactions((prev) => [...prev, ...history.page]);
-      setTotalCount(history.total);
-      loadedRows.current += history.page.length;
-    } catch (e) {
-      if (reloads.current !== reloadsBefore) return;
-      // The rows already on screen stay; the button stays too, so the user can
-      // try again without reloading the page.
-      toast.error(toMessage(e, "Could not load more transactions"));
+      // A reload is in flight: its history replaces the rows on the screen, so
+      // rows after the old list do not fit. Wait for it, then continue from
+      // the end of the new list. Another reload can start during the wait.
+      for (let reload = inFlight.settled(); reload; reload = inFlight.settled()) await reload;
+      if (loadedRows.current >= totalRows.current) return;
+
+      const reloadsBefore = reloads.current;
+      try {
+        const history = await fetchHistoryPage(loadedRows.current, HISTORY_PAGE_SIZE);
+        if (reloads.current !== reloadsBefore) return;
+        setTransactions((prev) => [...prev, ...history.page]);
+        setTotalCount(history.total);
+        totalRows.current = history.total;
+        loadedRows.current += history.page.length;
+      } catch (e) {
+        if (reloads.current !== reloadsBefore) return;
+        // The rows already on screen stay; the button stays too, so the user can
+        // try again without reloading the page.
+        toast.error(toMessage(e, "Could not load more transactions"));
+      }
     } finally {
       setLoadingMore(false);
     }
@@ -307,8 +310,9 @@ export default function RecurringRuleDetailPage() {
       return true;
     } catch (e) {
       if (isTransactionConflict(e)) {
-        toast.error(TRANSACTION_CONFLICT_MESSAGE);
-        setEditingTransaction(null);
+        // Keep the editor open with the user's edits. The list shows the
+        // latest rows.
+        editConflict.flagConflict();
         await refreshData(false);
         return false;
       }
@@ -327,8 +331,9 @@ export default function RecurringRuleDetailPage() {
       await refreshData(false);
     } catch (e) {
       if (isTransactionConflict(e)) {
-        toast.error(TRANSACTION_CONFLICT_MESSAGE);
-        setEditingTransaction(null);
+        // Keep the editor open with the user's edits. The list shows the
+        // latest rows.
+        editConflict.flagConflict();
         await refreshData(false);
         return;
       }
@@ -599,6 +604,9 @@ export default function RecurringRuleDetailPage() {
             onSubmit={handleUpdateTransaction}
             onCancel={() => setEditingTransaction(null)}
             onDelete={handleDeleteTransaction}
+            conflict={editConflict.conflict}
+            onReloadLatest={editConflict.reloadLatest}
+            reloadingLatest={editConflict.reloading}
             onAccountsUpdate={() => refreshData(false)}
             readOnly={!canWrite}
           />

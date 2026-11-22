@@ -11,7 +11,15 @@ all-features = true
 # unsound crate or a yanked version. To accept one, add its ID here with the
 # reason and the date.
 yanked = "deny"
-ignore = []
+ignore = [
+  # 2026-11-17: chrono is unmaintained (no vulnerability, and no fixed
+  # version). The workspace uses chrono in about 80 files.
+  # 2026-11-22: rmcp (3.11.0) and worker (0.9.0) need chrono in their latest
+  # releases, so a move of this workspace to jiff does not remove chrono from
+  # the build. Do the move when those two crates no longer need it.
+  # chrono-tz is gone: jiff gives the zone rules (ledger_db::clock).
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; rmcp and worker need it" },
+]
 
 [sources]
 # Crates come only from crates.io. A git source or another registry fails.

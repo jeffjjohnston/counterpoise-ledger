@@ -56,7 +56,7 @@ describe("book member HTTP parity", () => {
     expect(await unknown.json()).toEqual({ error: "Cannot add that user" });
     const invalid = await client.request("/api/books/1/members", body("POST", { username: "Member", role: "admin" }));
     expect(invalid.status).toBe(400);
-    expect(await invalid.json()).toEqual({ error: "role must be owner, editor or viewer" });
+    expect(await invalid.json()).toEqual({ error: "role: must be one of: owner, editor, viewer" });
     const demote = await client.request("/api/books/1/members/1", body("PUT", { role: "viewer" }));
     expect(demote.status).toBe(400);
     expect(await demote.json()).toEqual({ error: "A book must keep at least one owner" });

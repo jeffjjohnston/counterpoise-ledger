@@ -100,6 +100,9 @@ raw HTTP: Anthropic has no Rust SDK.
      an item that a user dismissed; an item with no ID cannot be matched;
    - it keeps the first 12.
 4. `prune()` keeps the newest 12 reviews of the book. Their items go with them.
+   "Newest" is the order of the ids, here and in the read route. `started_at`
+   is the system clock, and a clock that steps back gives a later review an
+   earlier time. The prune runs after the save commits.
    A review that holds a dismissed item stays, so that its fingerprint keeps
    the item out of later reviews.
 
@@ -185,8 +188,8 @@ client must not start, and a dismissal is the user's judgment in the card.
 
 ## Client
 
-- `components/settings/WeeklyReviewSettings.tsx`: the opt-in in the book
-  settings modal, for editors and owners.
+- `components/settings/WeeklyReviewSettings.tsx`: the opt-in in the Features
+  section of the book settings page, for editors and owners.
 - `components/dashboard/WeeklyReviewCard.tsx`: the card, above the net worth
   chart. It loads on mount and on window focus, and asks every 5 seconds while
   a review runs. Each item of the GET route has `transactions: [{id,

@@ -347,13 +347,18 @@ export default function SecurityDetailPage() {
   }, [bookId, securityId, lotsRequest]);
 
   // Before the security has rendered, a failure shows the full-page error.
-  // A security that another client deleted shows the not-found state. After
-  // that, a failed reload keeps the data on the screen: only a failure of
-  // the header (`notify`) shows a toast, so that one failure does not show
-  // four toasts.
+  // A security that does not exist (404), which includes one that another
+  // client deleted, shows the not-found view, not the error text. After the
+  // security has rendered, a failed reload keeps the data on the screen:
+  // only a failure of the header (`notify`) shows a toast, so that one
+  // failure does not show four toasts.
   const loadFailed = useCallback(
     (fetchError: unknown, notify: boolean) => {
-      if (!detailShown.current || (fetchError instanceof ApiError && fetchError.status === 404)) {
+      if (fetchError instanceof ApiError && fetchError.status === 404) {
+        setSecurity(null);
+        setError(null);
+        setLoading(false);
+      } else if (!detailShown.current) {
         console.error("Error loading security detail:", fetchError);
         setError(toMessage(fetchError, "Failed to load security"));
         setLoading(false);

@@ -349,7 +349,7 @@ describe("SecurityDetailPage live updates", () => {
     deleted = true;
     hint(["securities"]);
 
-    expect(await screen.findByText("Security not found")).toBeInTheDocument();
+    expect(await screen.findByText("Security not found.")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Back to Securities/ })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Vanguard Total Stock Market" })).not.toBeInTheDocument();
   });

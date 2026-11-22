@@ -1,4 +1,5 @@
 use crate::{
+    body::{NonBlank, string_enum, typed_body},
     book_auth::{AccessLevel, BookRole, authenticate_book},
     db_scope::write_transaction,
     error::{ApiError, ApiResult, error, internal_error},
@@ -17,7 +18,9 @@ use axum::{
 use chrono::{NaiveDateTime, SecondsFormat};
 use ledger_db::locks::FOR_UPDATE;
 use ledger_db::store::{Sql, params};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use utoipa::ToSchema;
 
 const CANNOT_ADD: &str = "Cannot add that user";
 const LAST_OWNER: &str = "A book must keep at least one owner";
@@ -72,16 +75,34 @@ fn member_json(row: MemberRow) -> Value {
     })
 }
 
-fn role(value: Option<&Value>) -> Result<&str, ApiError> {
-    value
-        .and_then(Value::as_str)
-        .filter(|value| ["owner", "editor", "viewer"].contains(value))
-        .ok_or_else(|| {
-            error(
-                StatusCode::BAD_REQUEST,
-                "role must be owner, editor or viewer",
-            )
-        })
+string_enum! {
+    /// What a member can do in a book.
+    pub(crate) enum Role {
+        Owner = "owner",
+        Editor = "editor",
+        Viewer = "viewer",
+    }
+}
+
+// The body of `POST /api/books/{bookId}/members`, and `AddBookMemberBody` in
+// the API contract: see `crate::body`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct AddBookMemberBody {
+    /// The exact username of an existing user. Case matters.
+    #[schema(inline)]
+    username: NonBlank,
+    /// owner: everything, including members, rename, delete and bank connections. editor: read and change the ledger. viewer: read only.
+    #[schema(inline)]
+    role: Role,
+}
+
+// The body of `PUT /api/books/{bookId}/members/{userId}`, and
+// `UpdateBookMemberBody` in the API contract.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct UpdateBookMemberBody {
+    /// owner: everything, including members, rename, delete and bank connections. editor: read and change the ledger. viewer: read only.
+    #[schema(inline)]
+    role: Role,
 }
 
 fn target_id(raw: &str) -> Result<i32, ApiError> {
@@ -174,14 +195,9 @@ pub(crate) async fn add_member(
             "Failed to add member",
         )
         .await?;
-        let body = parse_json_body(body, "Failed to add member")?;
-        let username = body
-            .get("username")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| error(StatusCode::BAD_REQUEST, "username is required"))?;
-        let role = role(body.get("role"))?;
+        let body: AddBookMemberBody = typed_body(&parse_json_body(body, "Failed to add member")?)?;
+        let (username, role) = (body.username.into_string(), body.role.as_str());
+        let username = username.as_str();
         let user_key = format!("uid:{}", auth.user_id());
         let keys = Keys {
             username: Some(&user_key),
@@ -245,8 +261,9 @@ pub(crate) async fn change_member(
     )
     .await?;
     let target = target_id(&user_id)?;
-    let body = parse_json_body(&body, "Failed to change member")?;
-    let new_role = role(body.get("role"))?;
+    let body: UpdateBookMemberBody =
+        typed_body(&parse_json_body(&body, "Failed to change member")?)?;
+    let new_role = body.role.as_str();
     const FAILURE: &str = "Failed to change member";
     let member = write_transaction(&state.database, FAILURE, |tx| {
         let rows = lock_members(tx, auth.book_id(), FAILURE)?;

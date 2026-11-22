@@ -5,7 +5,7 @@
 # scheduled jobs and the backups.
 
 # --- Compile the shared Rust core for the browser ---
-FROM rust:1.99@sha256:edc584c5d2f915bcc5b08049987e7a492ccb8ab188444daf0a870b3ef82a3b2e AS wasm-builder
+FROM rust:1.100@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31 AS wasm-builder
 WORKDIR /app
 RUN rustup target add wasm32-unknown-unknown
 RUN cargo install wasm-bindgen-cli --version 0.2.130 --locked
@@ -34,7 +34,7 @@ COPY --from=wasm-builder /wasm-pkg/ledger_core.js /wasm-pkg/ledger_core.d.ts \
 RUN CORE_WASM_PREBUILT=1 npm run build
 
 # --- Build the server and ledger-cli ---
-FROM rust:1.99-alpine@sha256:f432d4b8663fbc50b29e33846bf6a1fb9f17f142023598899d641cddf57c6b22 AS builder
+FROM rust:1.100-alpine@sha256:de1e0058543a81ed7b046629167db587c67a94bdf37cce14eb27f0ec83baaffb AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY package.json ./package.json
@@ -59,7 +59,7 @@ RUN --mount=type=cache,id=counterpoise-rust-registry,target=/usr/local/cargo/reg
 # --- Runtime ---
 # No Node and no shell tools are needed: the binaries are static (musl), and
 # reqwest carries its own TLS roots. Alpine gives `sh` for `docker exec`.
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 # chrono::Local reads TZ from these files. Without them it uses UTC in silence.
 RUN apk add --no-cache tzdata
 # The server runs as uid 1000. /data holds counterpoise.db with its -wal,

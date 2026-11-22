@@ -7,6 +7,10 @@ import { ApiError, apiDelete, apiPut } from "@/lib/api-client";
 export const TRANSACTION_CONFLICT_MESSAGE =
   "Another user changed this transaction. Showing the latest version.";
 
+/** The editor's message. It keeps the user's edits, so it does not show the latest version. */
+export const TRANSACTION_EDIT_CONFLICT_MESSAGE =
+  "Another user changed this transaction. Your edits are still here, but you cannot save them. Copy what you need, then reload the latest version.";
+
 type Loaded = { id: number; updatedAt: Date | string };
 
 const iso = (value: Date | string) => (value instanceof Date ? value.toISOString() : value);

@@ -1,12 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import AccountPage from "@/app/account/page";
+import { AccountSettings } from "@/components/settings/AccountSettings";
 
 vi.mock("@/lib/navigation", async () =>
   (await import("@/tests/helpers/navigation")).mockNavigation()
 );
 
-describe("AccountPage", () => {
+describe("AccountSettings", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -34,7 +34,7 @@ describe("AccountPage", () => {
 
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<AccountPage />);
+    render(<AccountSettings />);
 
     await waitFor(() => {
       expect(screen.getByText("Signed in as alice")).toBeInTheDocument();
@@ -87,7 +87,7 @@ describe("AccountPage", () => {
 
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<AccountPage />);
+    render(<AccountSettings />);
 
     await waitFor(() => {
       expect(screen.getByText("Signed in as alice")).toBeInTheDocument();
@@ -125,7 +125,7 @@ describe("AccountPage", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<AccountPage />);
+    render(<AccountSettings />);
     await waitFor(() => {
       expect(screen.getByText("Signed in as admin")).toBeInTheDocument();
     });
@@ -152,7 +152,7 @@ describe("AccountPage", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<AccountPage />);
+    render(<AccountSettings />);
     await waitFor(() => {
       expect(screen.getByText("Signed in as admin")).toBeInTheDocument();
     });

@@ -1,5 +1,6 @@
 use crate::{
     auth::session_user,
+    body::{IntRange, NonBlank, present, typed_body},
     book_auth::{AccessLevel, authenticate_book_membership, parse_book_id},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
     platform,
@@ -15,7 +16,9 @@ use axum::{
 use chrono::{NaiveDateTime, SecondsFormat};
 use ledger_db::seed::{DemoDataset, SeedError, seed_book};
 use ledger_db::store::{FromRow, Row, Sql, params};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use utoipa::ToSchema;
 
 #[derive(ledger_db::store::FromRow)]
 struct BookRow {
@@ -50,38 +53,41 @@ fn book_json(row: BookRow, role: Option<&str>) -> Value {
     value
 }
 
-fn book_input(
-    body: &Bytes,
-    failure: &'static str,
-    update: bool,
-) -> Result<(String, Option<i32>), ApiError> {
-    let body = parse_json_body(body, failure)?;
-    let name = body
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Book name is required"))?
-        .to_owned();
-    let upcoming = if update {
-        match body.get("upcomingDays") {
-            None => None,
-            Some(value) => Some(
-                value
-                    .as_f64()
-                    .filter(|value| value.fract() == 0.0 && (1.0..=365.0).contains(value))
-                    .ok_or_else(|| {
-                        error(
-                            StatusCode::BAD_REQUEST,
-                            "upcomingDays must be an integer between 1 and 365",
-                        )
-                    })? as i32,
-            ),
+// The body of `POST /api/books`. This struct is the validator and the source
+// of `CreateBookBody` in the API contract: see `crate::body`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateBookBody {
+    /// The book's name, shown in the book switcher and page titles.
+    #[schema(inline)]
+    name: NonBlank,
+}
+
+// The body of `PUT /api/books/{bookId}`, and `UpdateBookBody` in the API
+// contract. A settings form sends only its own field, so that it does not
+// send back a name that another device changed.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateBookBody {
+    /// The book's name, shown in the book switcher and page titles. Omit to leave it unchanged; the body must then hold upcomingDays.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(inline, nullable = false)]
+    name: Option<NonBlank>,
+    /// How many days ahead recurring transactions are projected on the dashboard (integer, 1-365). Omit to leave it unchanged.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(inline, nullable = false)]
+    upcoming_days: Option<IntRange<1, 365>>,
+}
+
+impl UpdateBookBody {
+    /// The one rule that is not the rule of a field: an update names a field.
+    fn read(body: &Value) -> Result<Self, ApiError> {
+        let update: Self = typed_body(body)?;
+        if update.name.is_none() && update.upcoming_days.is_none() {
+            return Err(error(StatusCode::BAD_REQUEST, "Send name or upcomingDays"));
         }
-    } else {
-        None
-    };
-    Ok((name, upcoming))
+        Ok(update)
+    }
 }
 
 const BOOK_COLUMNS: &str = "id, user_id, name, upcoming_days, typesafe_reconciliation_enabled, typesafe_revision, created_at, updated_at";
@@ -118,7 +124,8 @@ pub(crate) async fn create_book(
     body: Bytes,
 ) -> ApiResult {
     let user_id = session_user(&state, &headers, "Failed to create book").await?;
-    let (name, _) = book_input(&body, "Failed to create book", false)?;
+    let body: CreateBookBody = typed_body(&parse_json_body(&body, "Failed to create book")?)?;
+    let name = body.name.into_string();
     let sql = format!(
         "INSERT INTO books (user_id, name, created_at, updated_at) VALUES ($1, $2, $3, $3) RETURNING {BOOK_COLUMNS}"
     );
@@ -137,7 +144,9 @@ pub(crate) async fn update_book(
 ) -> ApiResult {
     let user_id = session_user(&state, &headers, "Failed to update book").await?;
     let book_id = parse_book_id(&raw_book_id)?;
-    let (name, upcoming) = book_input(&body, "Failed to update book", true)?;
+    let update = UpdateBookBody::read(&parse_json_body(&body, "Failed to update book")?)?;
+    let name = update.name.map(NonBlank::into_string);
+    let upcoming = update.upcoming_days.map(|days| days.get());
     let book_id = database_integer(book_id, "Failed to update book")?;
     let authenticated = authenticate_book_membership(
         &state,
@@ -148,7 +157,7 @@ pub(crate) async fn update_book(
     )
     .await?;
     let sql = format!(
-        "UPDATE books SET name = $1, upcoming_days = COALESCE($2, upcoming_days), updated_at = $3 WHERE id = $4 RETURNING {BOOK_COLUMNS}"
+        "UPDATE books SET name = COALESCE($1, name), upcoming_days = COALESCE($2, upcoming_days), updated_at = $3 WHERE id = $4 RETURNING {BOOK_COLUMNS}"
     );
     let row = state
         .database
@@ -315,23 +324,43 @@ pub(crate) async fn list_demo_datasets(
 
 #[cfg(test)]
 mod tests {
-    use super::{book_input, next_demo_book_name, parse_book_id};
+    use super::{NonBlank, UpdateBookBody, next_demo_book_name, parse_book_id};
     use axum::body::Bytes;
+    use serde_json::json;
 
     #[test]
-    fn book_inputs_keep_the_node_validation_order() {
+    fn a_book_id_keeps_the_node_parse() {
         assert_eq!(parse_book_id("  +12tail").unwrap(), 12);
         assert!(parse_book_id("invalid").is_err());
+    }
+
+    #[test]
+    fn an_update_can_leave_out_the_name_but_must_change_something() {
+        let read = |body: serde_json::Value| {
+            UpdateBookBody::read(&body).map(|update| {
+                (
+                    update.name.map(NonBlank::into_string),
+                    update.upcoming_days.map(|days| days.get()),
+                )
+            })
+        };
         assert_eq!(
-            book_input(
-                &Bytes::from_static(br#"{"name":"  Ledger  ","upcomingDays":7}"#),
-                "failed",
-                true
-            )
-            .unwrap(),
-            ("Ledger".into(), Some(7))
+            read(json!({"name": "  Ledger  ", "upcomingDays": 7})).unwrap(),
+            (Some("Ledger".into()), Some(7))
         );
-        assert!(book_input(&Bytes::from_static(br#"{"name":"  "}"#), "failed", false).is_err());
+        assert_eq!(read(json!({"upcomingDays": 14})).unwrap(), (None, Some(14)));
+        assert_eq!(
+            read(json!({"name": "A"})).unwrap(),
+            (Some("A".into()), None)
+        );
+        assert_eq!(
+            read(json!({})).unwrap_err().message(),
+            "Send name or upcomingDays"
+        );
+        // A key that the body does not name does not count as a change.
+        assert!(read(json!({"userId": 2})).is_err());
+        assert!(read(json!({"name": "  ", "upcomingDays": 14})).is_err());
+        assert!(read(json!({"name": null, "upcomingDays": 14})).is_err());
     }
 
     #[test]

@@ -113,8 +113,9 @@ says so with `onWorker`.
   one-time PostgreSQL converter is only in v1.50.0 to v1.53.0; see
   [upgrade-to-sqlite.md](upgrade-to-sqlite.md).
 
-`rust-api/routes.json` lists the method and path pattern of each route that
-the Axum router registers from its handler table. A few routes are registered
+The route table in `rust-api/server/src/routes/mod.rs` holds each route of
+the Axum router: its method, its path pattern and its handler.
+`rust-api/routes.json` is written from that table, for the tests that read it. A few routes are registered
 by name instead: `/health`, `/api/health`, `/api/mcp` and WebMCP. The Rust
 code runs its SQL through `ledger_db::store`, checked when it runs, so a
 build needs no database and no query metadata.

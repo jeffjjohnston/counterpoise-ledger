@@ -534,6 +534,129 @@ mod tests {
         assert!(cursors.iter().any(|cursor| cursor.book_id == 2));
     }
 
+    /// Random trade histories in two books, with trades that share a date
+    /// and stock splits. For each history and each step size, the stepped
+    /// rebuild writes the lots that the rebuild of each book's pairs in one
+    /// transaction writes. The histories come from a fixed seed.
+    #[test]
+    fn a_stepped_rebuild_of_random_histories_writes_the_lots_of_a_whole_rebuild() {
+        const DATES: [&str; 5] = [
+            "2024-01-15",
+            "2024-01-16",
+            "2024-06-30",
+            "2024-12-31",
+            "2025-03-09",
+        ];
+        // SplitMix64, as in the property tests of the core.
+        let mut state = 0x10_75_u64;
+        let mut random = move |low: i64, high: i64| {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            low + ((z ^ (z >> 31)) % ((high - low) as u64 + 1)) as i64
+        };
+
+        let file = crate::testing::TempDatabase::new();
+        let database = file.database();
+        let mut setup = String::from(
+            "INSERT INTO users (id, username, password_hash, created_at)
+               VALUES (1, 'u', 'h', '2025-01-01 00:00:00');",
+        );
+        for book in [1, 2] {
+            setup += &format!(
+                "INSERT INTO books (id, user_id, name, created_at, updated_at)
+                   VALUES ({book}, 1, 'B{book}', '2025-01-01 00:00:00', '2025-01-01 00:00:00');"
+            );
+            for item in 1..=3 {
+                // Book 2 has the smaller IDs: a cursor that compared pairs
+                // without the book would skip its pairs.
+                let id = (3 - book) * 10 + item;
+                setup += &format!(
+                    "INSERT INTO accounts (id, book_id, name, type, created_at, updated_at)
+                       VALUES ({id}, {book}, 'A{id}', 'asset', '2025-01-01 00:00:00', '2025-01-01 00:00:00');
+                     INSERT INTO securities (id, book_id, name, symbol, security_type, created_at)
+                       VALUES ({id}, {book}, 'S{id}', 'S{id}', 'stock', '2025-01-01 00:00:00');"
+                );
+            }
+        }
+        database.exec_batch(&setup).unwrap();
+
+        for round in 0..6 {
+            let mut history = String::from(
+                "DELETE FROM investment_lot_allocations; DELETE FROM investment_lots;
+                 DELETE FROM investment_splits; DELETE FROM transactions;",
+            );
+            for transaction in 1..=random(20, 60) {
+                let book = random(1, 2);
+                let date = DATES[random(0, 4) as usize];
+                let base = (3 - book) * 10;
+                let (account, security) = (base + random(1, 3), base + random(1, 3));
+                let (shares, price, fees) = (
+                    random(1, 100_000_000),
+                    random(1, 500_000_000),
+                    random(0, 500),
+                );
+                history += &format!(
+                    "INSERT INTO transactions (id, book_id, date, created_at, updated_at)
+                       VALUES ({transaction}, {book}, '{date}', '2025-01-01 00:00:00', '2025-01-01 00:00:00');"
+                );
+                history += &match random(0, 19) {
+                    0 => format!(
+                        "INSERT INTO investment_splits (book_id, transaction_id, account_id,
+                           security_id, action, shares_micros, price_micros, split_numerator,
+                           split_denominator)
+                         VALUES ({book}, {transaction}, NULL, {security}, 'split', 0, 0, {}, {});",
+                        random(1, 3),
+                        random(1, 2)
+                    ),
+                    kind => format!(
+                        "INSERT INTO investment_splits (book_id, transaction_id, account_id,
+                           security_id, action, shares_micros, price_micros, fees_cents)
+                         VALUES ({book}, {transaction}, {account}, {security}, '{}', {shares},
+                           {price}, {fees});",
+                        if kind < 12 { "buy" } else { "sell" }
+                    ),
+                };
+            }
+            database.exec_batch(&history).unwrap();
+
+            let mut pair_count = 0;
+            for book in [1, 2] {
+                database
+                    .transaction(|tx| {
+                        let pairs = super::find_all_lot_pairs(tx, book)?;
+                        pair_count += pairs.len();
+                        super::rebuild_lots_for_pairs(tx, book, &pairs)
+                    })
+                    .unwrap();
+            }
+            let whole = crate::testing::lot_rows(database);
+            assert!(whole.len() > 1, "round {round}: the history has lots");
+
+            for limit in [1, 2, random(3, 7) as usize, pair_count + 1] {
+                database
+                    .exec_batch(
+                        "DELETE FROM investment_lot_allocations; DELETE FROM investment_lots;",
+                    )
+                    .unwrap();
+                let mut steps = 1;
+                let mut after = None;
+                while let Some(next) = super::rebuild_lots_step(database, after, limit).unwrap() {
+                    assert!(after.is_none_or(|after| after < next));
+                    after = Some(next);
+                    steps += 1;
+                }
+                assert_eq!(
+                    crate::testing::lot_rows(database),
+                    whole,
+                    "round {round}, {limit} pairs in a step"
+                );
+                assert_eq!(steps, pair_count.div_ceil(limit).max(1), "round {round}");
+            }
+        }
+    }
+
     /// A file whose trades are all buys has lots and no allocation: the
     /// backfill guard reads it as missing its lots, the hosted guard does
     /// not. Nor does the hosted guard ask a rebuild for sells alone.

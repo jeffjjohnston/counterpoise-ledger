@@ -919,7 +919,27 @@ pub(crate) async fn stale_unmatched(
         )
         .map_err(|cause| internal_error(cause, FAILURE))?;
     let total: i64 = rows.iter().map(|row| i64::from(row.count)).sum();
-    Ok(Json(json!({ "totalCount": total, "accounts": rows })))
+    // Links whose amounts are different. The reconcile and edit paths refuse
+    // to make one, so each entry is from before that rule, and the user
+    // must correct it.
+    let mismatched: Vec<Value> =
+        crate::routes::reconcile::mismatched_links(&state.database, book.book_id())
+            .map_err(|cause| internal_error(cause, FAILURE))?
+            .into_iter()
+            .map(|link| {
+                json!({
+                    "transactionId": link.matched_transaction_id,
+                    "accountId": link.account_id,
+                    "bankAmount": -i64::from(link.bank_cents),
+                    "linkedAmount": link.linked_cents,
+                })
+            })
+            .collect();
+    Ok(Json(json!({
+        "totalCount": total,
+        "accounts": rows,
+        "mismatchedLinks": mismatched,
+    })))
 }
 
 // ---------------------------------------------------------------------------

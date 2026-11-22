@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useEffect, useCallback, useRef } from "react";
+import { Fragment, memo, useMemo, useState, useEffect, useCallback, useRef } from "react";
 import { accountHierarchyNames, buildAccountHierarchyName, buildCategoryLabelMap, getEffectiveDate } from "@/lib/wasm-client";
 import { formatCurrency, formatDate, formatDateShort, toDateString } from "@/lib/wasm-client";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { CategoryIcon } from "@/components/ui/CategoryIcon";
 import { NoteIndicator } from "./NoteIndicator";
+import { ROW_YEAR_ATTRIBUTE, useTopVisibleYear } from "./top-visible-year";
 
 const TRANSACTION_TABLE_COLUMN_WIDTHS = {
   status: "w-[2.25rem]",
@@ -57,24 +58,29 @@ const INVESTMENT_TABLE_COLUMN_WIDTHS = {
  * every row after the first of a day repeats a date the eye has just read. Only
  * the first row of each day prints one.
  *
- * The year is dropped, because a register almost always sits inside a single
- * one and the active filter says which -- but it comes back on the row where
- * the year actually changes, so a register scrolling into last year still says
- * so rather than silently renumbering.
+ * The year is not printed: the sticky Date header shows the year of the top
+ * visible row (`useTopVisibleYear`), and a divider row with the year comes
+ * before the first row of each subsequent year. A full date is also wider than
+ * the column, and it touched the payee text.
  *
- * A repeat still carries its full date for assistive technology: the cell is
- * blank to the eye, not to a screen reader reading the row on its own.
+ * A row gives its full date to assistive technology when the eye does not get
+ * one from the row: a repeat (the cell is blank), the first row, and the row
+ * where the year changes. The header year is hidden from assistive technology,
+ * so these rows are where a screen reader gets the year.
  */
 function dateCellFor(effectiveDate: string, previousEffectiveDate: string | null) {
   if (effectiveDate === previousEffectiveDate) {
-    return { visible: null, screenReaderOnly: formatDate(effectiveDate) };
+    return { visible: null, screenReaderOnly: formatDate(effectiveDate), dividerYear: null };
   }
   const yearChanged =
     previousEffectiveDate === null ||
     effectiveDate.slice(0, 4) !== previousEffectiveDate.slice(0, 4);
   return {
-    visible: yearChanged ? formatDate(effectiveDate) : formatDateShort(effectiveDate),
-    screenReaderOnly: null,
+    visible: formatDateShort(effectiveDate),
+    screenReaderOnly: yearChanged ? formatDate(effectiveDate) : null,
+    // The header gives the year of the first row, so that row has no divider.
+    dividerYear:
+      yearChanged && previousEffectiveDate !== null ? effectiveDate.slice(0, 4) : null,
   };
 }
 
@@ -178,7 +184,10 @@ function balanceTextClass(isProjected: boolean, isPlaidPending: boolean, isFutur
   return "text-fg-danger";
 }
 
-export function TransactionList({
+// Memoized: with the same props, a render of the parent does not sort and
+// draw the rows again. A parent must thus keep the identity of each prop
+// (useMemo, useCallback) while its inputs do not change.
+export const TransactionList = memo(function TransactionList({
   transactions,
   accounts,
   selectedAccountId,
@@ -1090,6 +1099,18 @@ export function TransactionList({
     return sorted;
   }, [transactions]);
 
+  // The year in the sticky Date header. Only the first row of a year prints
+  // its year, and that row scrolls away, so the header keeps the year of the
+  // top visible row on screen. Before the first measurement, the top visible
+  // row is the first row.
+  const { headerRef: dateHeaderRef, bodyRef: registerBodyRef, year: measuredYear } =
+    useTopVisibleYear(displayTransactions);
+  const headerYear =
+    measuredYear ??
+    (displayTransactions.length > 0 ? getEffectiveDate(displayTransactions[0]).slice(0, 4) : null);
+  const registerColumnCount =
+    (isInvestmentRegister ? 6 : 5) + (selectedAccountId ? 1 : 0) + (hasRowActions ? 1 : 0);
+
   if (isLoading) {
     return (
       <table aria-label="Transactions" className="w-full table-fixed">
@@ -1527,7 +1548,21 @@ export function TransactionList({
         </colgroup>
         <thead>
           <tr className="text-left text-xs font-medium text-fg-tertiary uppercase tracking-wider">
-            <th className={cn(STICKY_HEADER_CELL, "px-4 py-3 whitespace-nowrap")}>Date</th>
+            {/* No right padding: the year uses that space. The year is hidden
+                from assistive technology because it follows the scroll
+                position, not the row that a screen reader reads. */}
+            <th ref={dateHeaderRef} className={cn(STICKY_HEADER_CELL, "pl-4 pr-0 py-3 whitespace-nowrap")}>
+              Date
+              {headerYear && (
+                <span
+                  aria-hidden
+                  data-testid="register-header-year"
+                  className="ml-1 font-normal tracking-normal tabular-nums"
+                >
+                  {headerYear}
+                </span>
+              )}
+            </th>
             {isInvestmentRegister ? (
               <>
                 <th className={cn(STICKY_HEADER_CELL, "px-4 py-3")}>Activity</th>
@@ -1548,18 +1583,32 @@ export function TransactionList({
             {hasRowActions && <th className={cn(STICKY_HEADER_CELL, "px-2 py-2")} aria-label="Actions" />}
           </tr>
         </thead>
-        <tbody className="divide-y divide-border-secondary">
+        <tbody ref={registerBodyRef} className="divide-y divide-border-secondary">
           {displayTransactions.map((transaction, index) => {
             const { isProjected, isPlaidPending, amount, isPositive, balance, isFuture, isHighlightTarget } =
               renderTransactionRow(transaction);
+            const effectiveDate = getEffectiveDate(transaction);
             const dateCell = dateCellFor(
-              getEffectiveDate(transaction),
+              effectiveDate,
               index > 0 ? getEffectiveDate(displayTransactions[index - 1]) : null
             );
 
             return (
+              <Fragment key={transaction.id}>
+              {/* The year divider. It has no year attribute, thus the header
+                  measurement uses the transaction row below it. */}
+              {dateCell.dividerYear && (
+                <tr data-testid="register-year-divider" className="bg-surface-secondary">
+                  <td
+                    colSpan={registerColumnCount}
+                    className="px-4 py-1 text-xs font-medium text-fg-tertiary tabular-nums"
+                  >
+                    {dateCell.dividerYear}
+                  </td>
+                </tr>
+              )}
               <tr
-                key={transaction.id}
+                {...{ [ROW_YEAR_ATTRIBUTE]: effectiveDate.slice(0, 4) }}
                 ref={isHighlightTarget ? highlightRef : undefined}
                 onClick={() => handleRowClick(transaction)}
                 onMouseDown={isProjected || isPlaidPending ? undefined : handleRowMouseDown}
@@ -1585,7 +1634,13 @@ export function TransactionList({
                   "px-4 py-3 text-sm whitespace-nowrap",
                   isProjected ? "text-fg-tertiary italic" : "text-fg-secondary"
                 )}>
-                  {dateCell.visible}
+                  {/* With a full date for the screen reader, the short date
+                      is for the eye only. If not, a reader hears two dates. */}
+                  {dateCell.visible && dateCell.screenReaderOnly ? (
+                    <span aria-hidden>{dateCell.visible}</span>
+                  ) : (
+                    dateCell.visible
+                  )}
                   {dateCell.screenReaderOnly && (
                     <span className="sr-only">{dateCell.screenReaderOnly}</span>
                   )}
@@ -1676,6 +1731,7 @@ export function TransactionList({
                   </td>
                 )}
               </tr>
+              </Fragment>
             );
           })}
         </tbody>
@@ -1685,4 +1741,4 @@ export function TransactionList({
       {renderRowMenu()}
     </>
   );
-}
+});

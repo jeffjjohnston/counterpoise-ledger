@@ -252,11 +252,14 @@ fn review_json(row: &ReviewRow, items: Vec<Value>) -> Value {
     })
 }
 
+/// The review of this status that started last. The order is the id, which
+/// is the order of the starts. `started_at` is the system clock, and a clock
+/// that steps back gives a later review an earlier time.
 fn newest(sql: &impl Sql, book_id: i32, status: &str) -> Result<Option<ReviewRow>, ApiError> {
     sql.query_optional(
         &format!(
             "SELECT {REVIEW_COLUMNS} FROM weekly_reviews WHERE book_id = ?1 AND status = ?2
-             ORDER BY started_at DESC, id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT 1"
         ),
         &params![book_id, status],
     )
@@ -317,11 +320,7 @@ pub(crate) async fn get_weekly_review(
                 })
             });
         let last_failure = newest(snapshot, book_id, "failed")?
-            .filter(|failure| {
-                complete
-                    .as_ref()
-                    .is_none_or(|row| (failure.started_at, failure.id) > (row.started_at, row.id))
-            })
+            .filter(|failure| complete.as_ref().is_none_or(|row| failure.id > row.id))
             .map(|row| {
                 json!({
                     "id": row.id,

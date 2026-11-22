@@ -210,7 +210,7 @@ Auto-match runs automatically after every sync (both manual and cron). It uses a
 1. **Build payee map**: Query all `matched` reconciliation rows to create a map of normalized Plaid merchant names → Counterpoise payee IDs
 2. **For each pending row** (without `reviewReason`):
    - Look up the Plaid merchant name in the payee map
-   - Find candidate transactions with: exact amount match, matching payee ID, on the mapped Counterpoise account
+   - Find candidate transactions with: a total on the mapped Counterpoise account equal to the bank amount (the sum of the transaction's splits on that account, not one split), and a matching payee ID
    - Drop a candidate that is already reconciled (`isReconciled`), unless a bank row links it. The match stamps the date of its transaction, and a transaction that the user reconciled by hand must keep its date. A transaction that a bank row links is a transfer that the other link matched: it stays a candidate, and the per-link rule below keeps it off its own link
    - Filter candidates to ±1 day of **either** the Plaid authorization date **or** the posted date (the union keeps delayed settlements in range — a transaction the user entered on the posted date matches even when the authorization date is 7+ days earlier — without matching anything in the gap between the two dates)
    - If any candidates remain, pick the one whose date is CLOSEST to the date the match will stamp (`pick_matched_date()`). Candidates are ordered by date then ID, and that ordering breaks ties at equal distance. Nearest-to-stamped avoids re-dating an earlier transaction and stranding the real posted-date one
@@ -307,7 +307,7 @@ Rules that the table follows:
 
 ### Rules of the resolver
 
-Eight things about it are easy to get wrong:
+Eight things about it are easy to get wrong (and see "A link always joins equal amounts" below):
 
 - **It does not take a session lock**, unlike `sync_token()`. It changes one staged row by id inside one database transaction, and that transaction is the whole concurrency story. The transaction opens with `BEGIN IMMEDIATE` (`Database::transaction`), which holds the write lock of the database file before `apply()` reads the staged row (`load_row()`). Without that lock, two resolves of one row that run at the same time (two tabs, or the ordinary route and a TypeSafe confirmation) both read it as pending, both insert a transaction, and the second UPDATE overwrites the link, so the first transaction is left orphaned. With the lock, the second resolve waits, reads the row as linked, and the already-linked guard refuses it. Do not open this transaction with a plain `BEGIN`: a deferred transaction reads without the lock.
 - **The route checks the action's required field before it loads the row.** `validate_reconcile()` runs on the body first, so the route reports `"transactionId is required for match"` (400) ahead of `"Reconciliation row not found"` (404). `apply()` expects a validated decision: it does not check the field again. The TypeSafe confirmation builds its decision itself, from a stored candidate or proposal, so it must give the id that the action needs.
@@ -317,6 +317,70 @@ Eight things about it are easy to get wrong:
 - **Matching a floating transaction settles it**: `isFloating` is cleared and `date` stamped with `pick_matched_date()` (shared with the auto-matcher, not reimplemented). A floating transaction's stored date is its original entry date, so clearing the flag alone would snap it backwards in the register. A non-floating transaction keeps its date untouched — see the auto-match date rule above.
 - **There are two queue reads, and they sort differently.** `link_queue()` reads one link, for `sync/accounts/[id]/reconcile`. `book_queue()` reads the whole book, or one link with `linkId`, for `GET sync/reconcile`. The Sync page's review modal uses only the book-wide read, so it can show one list across all accounts. Both put rows that need review first. After that, the per-link read sorts by `lastSeenAt` and the book-wide read sorts by the bank date (`authorizedDate`, else `date`), newest first. A list that mixes accounts is easy to scan only in date order. The book-wide read keeps a link only when it maps to an asset or liability account, which is the rule `reconcilable_link()` applies to one link. There is no book-wide write: the modal posts each decision to `sync/accounts/[id]/reconcile` with the row's own `plaidAccountLinkId`.
 - **The action list is kept in step by hand** in `Action` and `validate_reconcile()` in `reconcile.rs`, the decision branches of `apply()`, `SyncResolveActionPayload` in `types/index.ts`, and the MCP tool's schema in `rust-api/server/mcp-tools.json`. A new action needs all of them.
+
+### A link always joins equal amounts
+
+A bank row that is `matched` or `created` links a transaction. The total of
+that transaction's splits on the linked account must be the negation of the
+bank amount (`LinkAmounts::agrees()` in `reconcile.rs`). Each path that makes
+or keeps a link enforces this:
+
+- **`match` changes a different amount to the bank amount**, as
+  `match_update_amount` does. It refuses a transaction with more than 2
+  splits, or an investment transaction, because it cannot know which split
+  to change. The user changes the splits first, then matches. Auto-match
+  requires an equal total on the account, not an equal split. A transfer can be linked on both of its
+  accounts, and the rewrite changes both splits, so `match` also refuses a
+  rewrite that would break the link on the other account.
+- **A candidate's amount is the total on the linked account**
+  (`linked_split_amount` in `match_candidates()`), the same total that the
+  resolver compares. One split of several would give a wrong
+  `amountDelta`, and the client would disable a correct Match.
+- **`keep_local` refuses a linked row whose bank amount is now different.**
+  The user updates the amount (`match_update_amount`), or unlinks.
+- **A transaction edit that changes the amount on a linked account to a
+  different amount is refused (400)** in `update()` in `transactions.rs`.
+  It is not a 409: the client reads every 409 on a transaction write as a
+  conflict with another user's change, and shows that message. The
+  check compares the link amounts before and after the new splits, inside the
+  write transaction. An edit that leaves a wrong amount as it was is allowed,
+  so a link from before this rule can still be edited and corrected. The MCP
+  `update_transaction` tool goes through the same route. An edit that removes
+  every split on the linked account gets its own message, which tells the
+  user to unlink: no amount can correct it (`broken_link_message()`).
+- **The client offers only the actions that keep the rule.**
+  `candidateAction()` in `ReconciliationCandidates.tsx` gives Match for equal
+  amounts, Match & Update for a different amount on 2 splits, and nothing
+  otherwise. A candidate with `isInvestment` gets no Match & Update: the
+  server refuses an amount update on an investment transaction. The Enter key
+  uses the same function. Keep is disabled on a linked candidate with a
+  different amount. When the linked transaction is not among the candidates,
+  the modal compares its total on the linked account from the transaction
+  itself, and disables Keep when the total is different.
+- **A decision that links a transaction marks it as linked on the other
+  loaded rows of that link.** `ReconciliationModal` replaces only the row
+  that the decision returns, so the candidates of the other rows are from
+  before the decision. `markCandidateLinked()` in
+  `ReconciliationCandidates.tsx` sets `alreadyLinked` on those rows and ranks
+  them again with the `score()` penalty. Without it, two equal bank rows (two
+  equal charges on one day) both offered the same
+  transaction, and Match on the second row failed with "This transaction is
+  already linked to a different Plaid transaction for the same account".
+- **A link is compared on the account that it was made on**
+  (`linkedAccountId`, migration 0020), not on the current mapping of the
+  bank account. Before it, a remap of a bank account to another account made
+  every old link show in `mismatchedLinks` with no split. The queue item
+  returns `linkedAccountId`, and the modal compares the linked total there.
+- **`GET sync/stale-unmatched` lists the links that break the rule**
+  (`mismatchedLinks`, from `mismatched_links()`). `StaleSyncBanner` shows
+  them in the register with a link to each transaction.
+
+Why: before this rule, a plain Match on an "amount close" candidate, the
+Enter key, Keep on a changed bank amount, or a later edit could each leave a
+reconciled transaction with an amount that was not the bank's. The register
+then showed the transaction as reconciled, and its balance did not agree
+with the bank. A plain Match on an "amount close" candidate is sufficient
+to make such a link, with a difference of a few cents.
 
 ## Rust routes
 
@@ -395,8 +459,8 @@ cipher (XChaCha20-Poly1305, pure Rust, so it also builds for wasm32), and
 - **Never log a key or a token.** The messages name the variable or the key ID.
 
 ## Key Functions
-- `sync_token(state, book_id, token_id)` in `routes/plaid_sync.rs` — Main sync entry point, returns `SyncResult` with counts of added/modified/removed/auto-matched. Serialized per token by a lease (`leases::plaid_sync(token_id)`, a row of `job_leases`), so the scheduled job, the MCP process and a manual click cannot fetch the same Plaid pages twice; the loser gets a 409 refusal rather than waiting. The whole sync therefore runs on one reserved connection
+- `sync_token(state, access, token_id)` in `routes/plaid_sync.rs` — Main sync entry point, returns `SyncResult` with counts of added/modified/removed/auto-matched. Serialized per token by a lease (`leases::plaid_sync(token_id)`, a row of `job_leases`), so the scheduled job, the MCP process and a manual click cannot fetch the same Plaid pages twice; the loser gets a 409 refusal rather than waiting. The whole sync therefore runs on one reserved connection
 - `connection_lease(database, token_id)` in `routes/plaid_sync.rs` — Takes that lease. The sync, the reset, the edit and the delete of a connection call it (see "The connection lease and the cursor")
 - `SyncError` — `Refused` carries an HTTP status (404 token not found, 400 invalid config, 409 sync already running, 409 the cursor changed during the sync); `Failed` carries any other failure
 - `auto_match(database, access, link_ids)` — Builds the learned payee map from historical matches, then returns the count of successful auto-matches
-- `Plaid::is_configured()` in `plaid.rs` — Checks if all three Plaid env vars are set
+- `Plaid::missing_setting()` in `plaid.rs` — Names the first of the three Plaid env vars that is not set; `None` when all three are set

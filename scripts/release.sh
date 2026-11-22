@@ -91,7 +91,7 @@ fi
 if [[ $SKIP_CHECKS == 0 ]]; then
   echo "==> Running pre-release checks..."
   # Fresh checkouts have no ignored WASM bindings. Type checking imports them
-  # before npm test's pretest hook would build them.
+  # before the Vitest global setup would build them.
   npm run core:wasm:build
   npm run lint
 

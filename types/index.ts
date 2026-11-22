@@ -168,6 +168,8 @@ export type SyncMatchCandidate = {
   dayDelta: number;
   counterpartAccountNames: string[];
   splitCount: number;
+  /** The transaction has investment splits. The server cannot change its amount. */
+  isInvestment: boolean;
   score: number;
   scoreTags: string[];
   alreadyLinked: boolean;
@@ -186,6 +188,8 @@ export type SyncReconciliationItem = {
   resolutionStatus: SyncReconciliationStatus;
   reviewReason: SyncReviewReason | null;
   matchedTransactionId: number | null;
+  /** The account that the link was made on. A remap of the bank account can change the current one. */
+  linkedAccountId: number | null;
   pending: boolean;
   firstSeenAt: string;
   lastSeenAt: string;

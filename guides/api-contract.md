@@ -18,12 +18,17 @@ The source is `rust-api/server/src/openapi/`:
   `null` for a nullable field, and a required nullable field where the
   contract has one. The utoipa derive macros write other shapes, and a
   client's generated types follow the shape.
+  Ten request bodies have another source (books, securities, payee create,
+  book members, login, API key create, Plaid link session): `schema_of`
+  derives them from the structs that validate the bodies, with field types
+  that keep the shape. See Typed bodies in
+  [guides/api-route-patterns.md](api-route-patterns.md).
 - `operations.rs` — the list of routes in the contract. Every path
   placeholder is a required integer path parameter, except `{date}`: a
   required `YYYY-MM-DD` string. An error status that a
   client must handle as a different case goes in the operation's `errors`
   list. An example is the 409 on transaction `PUT` and `DELETE`. A unit test
-  fails when an operation is not a route in `rust-api/routes.json`.
+  fails when an operation is not in the route table of `routes/mod.rs`.
 - `mod.rs` — builds the OpenAPI 3.1 document, and the `openapi` command.
 - `lib/api-contract.ts` — `API_CONTRACT`, the number a client compares. The
   Rust server reads it at build time, with the package version.

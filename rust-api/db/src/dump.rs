@@ -1043,6 +1043,21 @@ mod tests {
         for row in slots["rows"].as_array_mut().unwrap() {
             row.as_array_mut().unwrap().pop();
         }
+        // Migration 20 added `plaid_transaction_reconciliation.linked_account_id`,
+        // the last column.
+        let staged = first["tables"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|table| table["name"] == "plaid_transaction_reconciliation")
+            .unwrap();
+        assert_eq!(
+            staged["columns"].as_array_mut().unwrap().pop(),
+            Some(json!("linked_account_id"))
+        );
+        for row in staged["rows"].as_array_mut().unwrap() {
+            row.as_array_mut().unwrap().pop();
+        }
         let (target, path) = empty_file();
         load(&target, &first.to_string()).unwrap();
         let attempts: i64 = target
@@ -1052,6 +1067,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempts, 1);
+        let linked_account: i64 = target
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('plaid_transaction_reconciliation')
+                 WHERE name = 'linked_account_id'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(linked_account, 1);
         let versions: i64 = target
             .query_row("SELECT COUNT(*) FROM schema_migrations", &[])
             .unwrap();

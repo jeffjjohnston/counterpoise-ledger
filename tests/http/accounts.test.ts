@@ -3,12 +3,15 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { API_CONTRACT } from "../../lib/api-contract";
 import {
   createAccount,
+  createInvestmentSplit,
+  createSecurity,
   createTransactionWithSplits,
   resetTestDatabase,
   setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
 import { contract, type Contract } from "../helpers/contract";
+import { insertRows } from "../helpers/sql";
 
 const accountDetailSchema = contract("AccountDetail");
 const accountNodeListSchema = contract("AccountNodeList");
@@ -110,6 +113,68 @@ describe("account HTTP parity", () => {
     const missing = await client.request("/api/b/1/accounts/999999");
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({ error: "Account not found" });
+  });
+
+  // One split holds at most 2,147,483,647 cents. A total of splits has no
+  // such limit: two deposits of 2,000,000,000 cents total 4,000,000,000.
+  describe("a total above the 32-bit range", () => {
+    const BIG = 2_000_000_000;
+
+    async function json(path: string) {
+      const response = await client.request(path);
+      expect(response.status, path).toBe(200);
+      return response.json();
+    }
+
+    async function deposits() {
+      const checking = await createAccount({ name: "Checking", type: "asset" });
+      const salary = await createAccount({ name: "Salary", type: "income" });
+      for (const date of ["2025-01-01", "2025-02-01", "2025-03-01"]) {
+        await createTransactionWithSplits({ date, splits: [{ accountId: checking.id, amount: BIG }, { accountId: salary.id, amount: -BIG }] });
+      }
+      return { checking, salary };
+    }
+
+    it("is the balance of the account in the list and in the detail", async () => {
+      const { checking } = await deposits();
+      expect((await accounts()).find((account) => account.id === checking.id)).toMatchObject({ balance: 3 * BIG });
+      expect((await accounts("?asOfDate=2025-02-15")).find((account) => account.id === checking.id)).toMatchObject({ balance: 2 * BIG });
+      const detail = await json(`/api/b/1/accounts/${checking.id}`);
+      expectShape(accountDetailSchema, detail);
+      expect(detail.balance).toBe(3 * BIG);
+    });
+
+    it("is the starting balance below a register page", async () => {
+      const { checking } = await deposits();
+      const page = await json(`/api/b/1/transactions?includeMeta=true&accountId=${checking.id}&limit=1`);
+      expect(page.startingBalance).toBe(2 * BIG);
+    });
+
+    it("is the balance of an account in the income statement", async () => {
+      const { salary } = await deposits();
+      const statement = await json("/api/b/1/reports/income-statement");
+      expect(JSON.stringify(statement)).toContain(String(-3 * BIG));
+      expect(JSON.stringify(statement)).toContain(`"accountId":${salary.id}`);
+    });
+
+    it("is the cost basis of a position", async () => {
+      const cash = await createAccount({ name: "Cash", type: "asset" });
+      const brokerage = await createAccount({ name: "Brokerage", type: "asset", subtype: "investment" });
+      const security = await createSecurity({ name: "Fund", symbol: "FND", securityType: "stock" });
+      for (const date of ["2025-01-01", "2025-02-01"]) {
+        const buy = await createTransactionWithSplits({ date, splits: [{ accountId: cash.id, amount: -BIG }, { accountId: brokerage.id, amount: BIG }] });
+        await createInvestmentSplit({ transactionId: buy.id, accountId: brokerage.id, securityId: security.id, action: "buy", sharesMicros: 1_000_000, priceMicros: BIG * 10_000 });
+        await insertRows("investment_lots", [{
+          book_id: 1, security_id: security.id, account_id: brokerage.id, opened_transaction_id: buy.id, created_at: "2025-01-01 00:00:00",
+          acquired_date: date, original_shares_micros: 1_000_000, original_basis_cents: BIG, remaining_shares_micros: 1_000_000, remaining_basis_cents: BIG,
+        }]);
+      }
+      const positions = await json("/api/b/1/investments/positions");
+      expect(positions).toHaveLength(1);
+      expect(positions[0].costBasisCents).toBe(2 * BIG);
+      const detail = await json(`/api/b/1/securities/${security.id}/detail`);
+      expect(detail.positionsByAccount).toMatchObject([{ accountId: brokerage.id, costBasisCents: 2 * BIG }]);
+    });
   });
 
   it("orders roots and nests child accounts", async () => {

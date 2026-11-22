@@ -6,9 +6,13 @@ import { toDateString } from "@/lib/formatters";
 
 // Controllable mobile flag so we can exercise both the desktop table and the mobile
 // card layouts. Defaults to desktop (matches jsdom, which lacks matchMedia).
-const isMobileRef = vi.hoisted(() => ({ value: false }));
+// The list calls the hook one time in each render, so `calls` counts its renders.
+const isMobileRef = vi.hoisted(() => ({ value: false, calls: 0 }));
 vi.mock("@/hooks/useIsMobile", () => ({
-  useIsMobile: () => isMobileRef.value,
+  useIsMobile: () => {
+    isMobileRef.calls += 1;
+    return isMobileRef.value;
+  },
 }));
 
 afterEach(() => {
@@ -1680,11 +1684,12 @@ describe("TransactionList", () => {
       (row) => row.querySelectorAll("td")[0]?.textContent?.trim() || ""
     );
 
-    // The register prints the year on its first row and the day alone after
-    // that, and blanks a date that repeats the row above -- the last row here
-    // reads as empty to the eye and carries an sr-only date for a reader.
+    // This is the text content, which joins what the eye sees and the
+    // sr-only date. The first row prints the day and carries the full date
+    // for a reader. A date that repeats the row above is blank to the eye and
+    // carries an sr-only date: the last row here.
     expect(rowDates).toEqual([
-      "Apr 1, 2026",
+      "Apr 1Apr 1, 2026",
       "Mar 27",
       "Mar 23",
       "Mar 19",
@@ -2068,10 +2073,17 @@ describe("TransactionList", () => {
       ],
     });
 
+    // What the eye sees and what a screen reader reads, for each row.
     const dateCells = (container: HTMLElement) =>
-      [...container.querySelectorAll("tbody tr")].map(
-        (row) => row.querySelectorAll("td")[0]?.textContent ?? ""
-      );
+      [...container.querySelectorAll("tbody tr[data-effective-year]")].map((row) => {
+        const cell = row.querySelectorAll("td")[0];
+        const spoken = cell.querySelector(".sr-only")?.textContent ?? null;
+        const seen = [...cell.childNodes]
+          .filter((node) => !(node instanceof HTMLElement && node.classList.contains("sr-only")))
+          .map((node) => node.textContent)
+          .join("");
+        return { seen, spoken };
+      });
 
     it("prints the date once per day and drops the year", () => {
       const { container } = render(
@@ -2084,17 +2096,16 @@ describe("TransactionList", () => {
       );
 
       const [first, second, third] = dateCells(container);
-      // First row of the register carries the year; the next day does not.
-      expect(first).toBe("Feb 2, 2024");
-      expect(second).toBe("Feb 1");
+      // The header gives the year. The first row gives it to a screen reader.
+      expect(first).toEqual({ seen: "Feb 2", spoken: "Feb 2, 2024" });
+      expect(second).toEqual({ seen: "Feb 1", spoken: null });
       // Same day as the row above: blank to the eye, still dated for a reader.
-      expect(third).toBe("Feb 1, 2024");
-      expect(
-        container.querySelectorAll("tbody tr")[2].querySelector(".sr-only")
-      ).toHaveTextContent("Feb 1, 2024");
+      expect(third).toEqual({ seen: "", spoken: "Feb 1, 2024" });
+      // A reader must not hear the short date and then the full date.
+      expect(container.querySelector("tbody tr td span[aria-hidden]")).toHaveTextContent("Feb 2");
     });
 
-    it("brings the year back on the row where it changes", () => {
+    it("prints the short date on the row where the year changes, with the year for a screen reader", () => {
       const { container } = render(
         <TransactionList
           transactions={[onDate(1, "2024-01-02"), onDate(2, "2023-12-31")]}
@@ -2104,7 +2115,101 @@ describe("TransactionList", () => {
         />
       );
 
-      expect(dateCells(container)).toEqual(["Jan 2, 2024", "Dec 31, 2023"]);
+      expect(dateCells(container)).toEqual([
+        { seen: "Jan 2", spoken: "Jan 2, 2024" },
+        { seen: "Dec 31", spoken: "Dec 31, 2023" },
+      ]);
+    });
+
+    it("puts a year divider before the first row of each subsequent year", () => {
+      const { container } = render(
+        <TransactionList
+          transactions={[
+            onDate(1, "2024-01-02"),
+            onDate(2, "2023-12-31"),
+            onDate(3, "2023-03-01"),
+            onDate(4, "2021-06-15"),
+          ]}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={vi.fn()}
+        />
+      );
+
+      // The header gives 2024, so the first row has no divider.
+      const rows = [...container.querySelectorAll("tbody tr")].map((row) =>
+        row.matches("[data-testid='register-year-divider']")
+          ? `divider ${row.textContent}`
+          : row.getAttribute("data-effective-year")
+      );
+      expect(rows).toEqual(["2024", "divider 2023", "2023", "2023", "divider 2021", "2021"]);
+
+      // The divider is one cell across all the columns.
+      const headerCells = container.querySelectorAll("thead th").length;
+      const dividerCell = screen.getAllByTestId("register-year-divider")[0].querySelector("td")!;
+      expect(dividerCell.colSpan).toBe(headerCells);
+    });
+
+    it("does not open the editor when the year divider is clicked", () => {
+      const onEdit = vi.fn();
+      render(
+        <TransactionList
+          transactions={[onDate(1, "2024-01-02"), onDate(2, "2023-12-31")]}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={onEdit}
+        />
+      );
+
+      fireEvent.click(screen.getByTestId("register-year-divider"));
+
+      expect(onEdit).not.toHaveBeenCalled();
+    });
+
+    // jsdom has no layout, so no row measures as below the header. The header
+    // then shows the year of the first row.
+    it("shows the year of the first row in the Date header", () => {
+      const { container } = render(
+        <TransactionList
+          transactions={[onDate(1, "2024-01-02"), onDate(2, "2023-12-31")]}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={vi.fn()}
+        />
+      );
+
+      expect(screen.getByTestId("register-header-year")).toHaveTextContent("2024");
+      // The year is not part of the header's accessible name.
+      expect(screen.getByRole("columnheader", { name: "Date" })).toBeInTheDocument();
+      expect(
+        [...container.querySelectorAll("tbody tr[data-effective-year]")].map((row) =>
+          row.getAttribute("data-effective-year")
+        )
+      ).toEqual(["2024", "2023"]);
+    });
+
+    it("follows the top visible row when the page scrolls", async () => {
+      const { container } = render(
+        <TransactionList
+          transactions={[onDate(1, "2024-01-02"), onDate(2, "2023-12-31")]}
+          accounts={mockAccounts}
+          selectedAccountId={1}
+          onEdit={vi.fn()}
+        />
+      );
+      const rect = (bottom: number) => () => ({ bottom }) as DOMRect;
+      // The header bottom is at 50. The 2024 row is above it; the 2023 row shows.
+      container.querySelector("thead th")!.getBoundingClientRect = rect(50);
+      const [first, divider, second] = container.querySelectorAll<HTMLElement>("tbody tr");
+      first.getBoundingClientRect = rect(40);
+      // The divider is the top visible row. It gives its turn to the 2023 row.
+      divider.getBoundingClientRect = rect(60);
+      second.getBoundingClientRect = rect(80);
+
+      // A scroll event does not bubble: send it from a container, not from the document.
+      fireEvent.scroll(container);
+
+      expect(await screen.findByText("2023", { selector: "[data-testid='register-header-year']" })).toBeInTheDocument();
     });
   });
 
@@ -2547,6 +2652,27 @@ describe("TransactionList", () => {
         screen.getByRole("menuitem", { name: "Reconciled" })
       ).toBeInTheDocument();
     });
+  });
+});
+
+describe("TransactionList memoization", () => {
+  // The register page renders for many reasons that do not change the list
+  // (a sidebar drag, a modal). With the same props, the list must not render
+  // again: a render sorts and draws every row.
+  it("does not render again when its parent renders with the same props", () => {
+    const transactions: TransactionWithSplits[] = [];
+    const onEdit = vi.fn();
+    const tree = () => (
+      <TransactionList transactions={transactions} accounts={mockAccounts} selectedAccountId={1} onEdit={onEdit} />
+    );
+    const { rerender } = render(tree());
+    const afterMount = isMobileRef.calls;
+    expect(afterMount).toBeGreaterThan(0);
+    rerender(tree());
+    expect(isMobileRef.calls).toBe(afterMount);
+    // A changed prop does render it.
+    rerender(<TransactionList transactions={[]} accounts={mockAccounts} selectedAccountId={1} onEdit={onEdit} />);
+    expect(isMobileRef.calls).toBeGreaterThan(afterMount);
   });
 });
 

@@ -485,13 +485,6 @@ pub(crate) fn validate_account_update(body: &Value) -> Result<AccountUpdate, Api
 
 /// The Node payee-create schema checks that `name` is a string that is not
 /// empty after `trim()`, and reports every failure with one message.
-pub(crate) fn validate_payee_create(body: &Value) -> Result<&str, ApiError> {
-    body.get("name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.trim_matches(is_js_whitespace).is_empty())
-        .ok_or_else(|| bad_request("Name is required"))
-}
-
 /// Node binds a JavaScript number to an `integer` column. PostgreSQL rejects
 /// a value outside the int4 range, and the route returns its 500 message.
 pub(crate) fn database_integer(value: i64, failure_message: &'static str) -> Result<i32, ApiError> {
@@ -917,23 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn payee_name_uses_javascript_trim() {
-        assert_eq!(
-            validate_payee_create(&json!({"name": " A "})).unwrap(),
-            " A "
-        );
-        assert_eq!(
-            validate_payee_create(&json!({"name": "\u{85}"})).unwrap(),
-            "\u{85}"
-        );
-        for body in [
-            json!(null),
-            json!([]),
-            json!({"name": 5}),
-            json!({"name": "\u{feff} "}),
-        ] {
-            assert!(validate_payee_create(&body).is_err());
-        }
+    fn a_database_integer_is_an_int4() {
         assert!(database_integer(i64::from(i32::MAX), "failed").is_ok());
         assert!(database_integer(i64::from(i32::MAX) + 1, "failed").is_err());
     }

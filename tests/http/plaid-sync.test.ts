@@ -4,11 +4,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { toDateString } from "../../lib/formatters";
 import type { PlaidToken, PlaidTransactionReconciliation, Transaction } from "../../types/db";
 import {
-  addBookMember, createAccount, createBook, createPayee, createPlaidAccount, createPlaidReconciliation,
-  createPlaidToken, createTransactionWithSplits, createUser, resetTestDatabase, setupTestDatabase,
+  addBookMember, createAccount, createBook, createInvestmentSplit, createPayee, createPlaidAccount, createPlaidReconciliation,
+  createPlaidToken, createSecurity, createTransactionWithSplits, createUser, resetTestDatabase, setupTestDatabase,
 } from "../helpers/db-utils";
 import { sessionHttpClient, startHttpTestServer } from "../helpers/http-parity";
-import { exec, row, rows } from "../helpers/sql";
+import { exec, insert, row, rows } from "../helpers/sql";
 
 type Client = Awaited<ReturnType<typeof sessionHttpClient>>;
 type Reply = { status: number; body?: unknown; raw?: string };
@@ -194,7 +194,7 @@ describe("Plaid sync HTTP parity", () => {
     }]);
     const base = {
       bookId: 1, pending: false, pendingTransactionId: null, isoCurrencyCode: "USD", unofficialCurrencyCode: null,
-      resolutionStatus: "pending", reviewReason: null, reviewMetadataJson: null, matchedTransactionId: null, resolved: false,
+      resolutionStatus: "pending", reviewReason: null, reviewMetadataJson: null, matchedTransactionId: null, linkedAccountId: null, resolved: false,
     };
     expect(await stagedRows()).toEqual([
       {
@@ -539,7 +539,7 @@ describe("Plaid sync HTTP parity", () => {
     const byId = Object.fromEntries((await stagedRows()).map((staged) => [staged.plaidTransactionId, staged]));
     expect(byId.delayed).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: postedDay.id, resolved: true });
     expect(byId.floating).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: floating.id });
-    expect(byId.grocery).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: grocery.id });
+    expect(byId.grocery).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: grocery.id, linkedAccountId: card.id });
     expect(byId.far).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
     expect(byId.stranger).toMatchObject({ resolutionStatus: "pending" });
     expect(byId.reconciled).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
@@ -550,5 +550,55 @@ describe("Plaid sync HTTP parity", () => {
     expect(local[grocery.id]).toMatchObject({ isReconciled: true, date: "2025-03-05" });
     expect(local[tooFar.id]).toMatchObject({ isReconciled: false, date: "2025-03-01" });
     expect(local[reconciled.id]).toMatchObject({ isReconciled: true, date: "2025-04-01" });
+  });
+
+  // Lots are derived from the effective date. An automatic match that settles
+  // a floating trade changes that date, so the write must rebuild the pair.
+  it("rebuilds the lots of a floating investment transaction that it settles", async () => {
+    const { checking, checkingLink, path } = await connection({ syncCursor: "cursor-0" });
+    const food = await createAccount({ name: "Food", type: "expense" });
+    const brokerage = await createAccount({ name: "Brokerage", type: "asset", subtype: "investment" });
+    const security = await createSecurity({ name: "Fund", symbol: "FND", securityType: "stock" });
+    const broker = await createPayee({ name: "Broker" });
+    const earlier = await createTransactionWithSplits({ date: "2024-12-01", payeeId: broker.id, splits: [{ accountId: checking.id, amount: -300 }, { accountId: food.id, amount: 300 }] });
+    await createPlaidReconciliation({ plaidAccountLinkId: checkingLink.id, plaidTransactionId: "h1", date: "2024-12-01", amountCents: 300, name: "BROKER", merchantName: "Broker", resolutionStatus: "matched", matchedTransactionId: earlier.id });
+    const trade = await createTransactionWithSplits({ date: "2025-01-01", payeeId: broker.id, isFloating: true, splits: [{ accountId: checking.id, amount: -725 }, { accountId: brokerage.id, amount: 725 }] });
+    await createInvestmentSplit({ transactionId: trade.id, accountId: brokerage.id, securityId: security.id, action: "buy", sharesMicros: 1_000_000, priceMicros: 7_250_000 });
+    // The stale lot of an earlier rebuild, made while the trade was floating.
+    await insert("investment_lots", {
+      book_id: 1, security_id: security.id, account_id: brokerage.id, opened_transaction_id: trade.id, created_at: "2025-01-01 00:00:00",
+      acquired_date: "2025-01-02", original_shares_micros: 1_000_000, original_basis_cents: 725, remaining_shares_micros: 1_000_000, remaining_basis_cents: 725,
+    });
+    plaid.reply("access-1", "cursor-0", page({ added: [
+      plaidItem({ transaction_id: "trade", merchant_name: "Broker", amount: 7.25, authorized_date: daysAgo(1), date: daysAgo(0) }),
+    ] }));
+
+    expect(await sync(path)).toMatchObject({ autoMatched: 1 });
+    expect(await row<Transaction>("SELECT * FROM transactions WHERE id = $1", [trade.id])).toMatchObject({ isFloating: false, date: daysAgo(1) });
+    const lots = await rows<{ acquiredDate: string; remainingSharesMicros: number }>("SELECT acquired_date, remaining_shares_micros FROM investment_lots WHERE account_id = $1", [brokerage.id]);
+    expect(lots).toEqual([{ acquiredDate: daysAgo(1), remainingSharesMicros: 1_000_000 }]);
+  });
+
+  // A link joins equal totals on the linked account. A transaction with two
+  // splits on the account (-30.00 and -20.00) totals -50.00, so a 20.00 bank
+  // row must not match it on its -20.00 split, and a 50.00 row must.
+  it("matches on the total of the linked account, not on one split", async () => {
+    const { checking, checkingLink, path } = await connection({ syncCursor: "cursor-0" });
+    const food = await createAccount({ name: "Food", type: "expense" });
+    const coffee = await createPayee({ name: "Blue Bottle" });
+    const earlier = await createTransactionWithSplits({ date: "2024-12-01", payeeId: coffee.id, splits: [{ accountId: checking.id, amount: -300 }, { accountId: food.id, amount: 300 }] });
+    await createPlaidReconciliation({ plaidAccountLinkId: checkingLink.id, plaidTransactionId: "h1", date: "2024-12-01", amountCents: 300, name: "BLUE BOTTLE", merchantName: "Blue Bottle", resolutionStatus: "matched", matchedTransactionId: earlier.id });
+    const split = await createTransactionWithSplits({ date: "2025-02-10", payeeId: coffee.id, splits: [
+      { accountId: checking.id, amount: -3000 }, { accountId: checking.id, amount: -2000 }, { accountId: food.id, amount: 5000 },
+    ] });
+    plaid.reply("access-1", "cursor-0", page({ added: [
+      plaidItem({ transaction_id: "one-split", merchant_name: "Blue Bottle", amount: 20, date: "2025-02-10" }),
+      plaidItem({ transaction_id: "total", merchant_name: "Blue Bottle", amount: 50, date: "2025-02-10" }),
+    ] }));
+
+    expect(await sync(path)).toMatchObject({ autoMatched: 1 });
+    const byId = Object.fromEntries((await stagedRows()).map((staged) => [staged.plaidTransactionId, staged]));
+    expect(byId["one-split"]).toMatchObject({ resolutionStatus: "pending", matchedTransactionId: null });
+    expect(byId.total).toMatchObject({ resolutionStatus: "matched", matchedTransactionId: split.id });
   });
 });

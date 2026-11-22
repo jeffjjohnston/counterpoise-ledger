@@ -51,7 +51,7 @@ pub(crate) struct IncomeRow {
     pub(crate) name: String,
     #[serde(rename = "type")]
     pub(crate) account_type: String,
-    pub(crate) balance: i32,
+    pub(crate) balance: i64,
 }
 
 /// The filters of [`report_splits`]. An empty list or a `None` filters nothing.
@@ -292,9 +292,9 @@ pub(crate) async fn income_statement(
     let mut expense: i64 = 0;
     for row in &rows {
         if row.account_type == "income" {
-            income += i64::from(row.balance);
+            income += row.balance;
         } else {
-            expense += i64::from(row.balance);
+            expense += row.balance;
         }
     }
     Ok(Json(
@@ -311,7 +311,7 @@ mod tests {
         pool: &ledger_db::Database,
         range: Option<(&str, &str)>,
         include_inactive: bool,
-    ) -> Vec<(i32, String, i32)> {
+    ) -> Vec<(i32, String, i64)> {
         income_rows(pool, 1, range, include_inactive)
             .unwrap()
             .into_iter()

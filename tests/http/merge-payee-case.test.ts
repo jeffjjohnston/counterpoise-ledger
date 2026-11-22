@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import path from "node:path";
 import { promisify } from "node:util";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -8,9 +7,10 @@ import {
 } from "../helpers/db-utils";
 import { insert, rows, scalar } from "../helpers/sql";
 import { workerDatabasePath } from "../helpers/test-database";
+import { rustBinary } from "../helpers/rust-binaries";
 
 const run = promisify(execFile);
-const CLI = path.resolve("rust-api/target/debug/ledger-cli");
+const CLI = rustBinary("ledger-cli");
 
 /** Runs `ledger-cli merge-payee-case` on this worker's database; a failure resolves with its code. */
 async function merge(...args: string[]) {

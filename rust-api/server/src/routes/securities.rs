@@ -1,12 +1,12 @@
 use super::investments::{EFFECTIVE_DATE, MAX_SAFE_INTEGER, positions};
 use crate::{
+    body::{NonBlank, Nullable, NullablePositiveInt, present, string_enum, typed_body},
     book_auth::{AccessLevel, authenticate_book},
     error::{ApiError, ApiResult, error, error_owned, internal_error},
     platform,
     state::AppState,
     validation::{
-        expected, first_query_values, is_js_whitespace, local_today, parse_int_prefix,
-        parse_js_number, parse_json_body,
+        first_query_values, local_today, parse_int_prefix, parse_js_number, parse_json_body,
     },
 };
 use axum::{
@@ -19,15 +19,13 @@ use chrono::{NaiveDateTime, SecondsFormat};
 use ledger_core::{accounting::round_js, collation::compare_names, investments::fixed_price_row};
 use ledger_db::sql;
 use ledger_db::store::{self, Builder, Sql, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json, to_value};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
 const SECURITY_COLUMNS: &str =
     "id, book_id, name, symbol, security_type, fetch_prices, created_at, fixed_price_micros";
-const SECURITY_TYPES: [&str; 3] = ["etf", "mutual_fund", "stock"];
-const SECURITY_TYPE_MESSAGE: &str = "securityType must be one of: etf, mutual_fund, stock";
-const FIXED_PRICE_MESSAGE: &str = "fixedPriceMicros must be a positive whole number of micros";
 
 #[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,10 +50,6 @@ fn serialize_timestamp<S: serde::Serializer>(
 
 fn bad_request(message: &'static str) -> ApiError {
     error(StatusCode::BAD_REQUEST, message)
-}
-
-fn js_trim(value: &str) -> &str {
-    value.trim_matches(is_js_whitespace)
 }
 
 fn account_label(account_id: Option<i32>, name: Option<String>) -> String {
@@ -85,135 +79,116 @@ pub(super) fn find_security(
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Security not found"))
 }
 
-/// `fixedPriceMicrosSchema`: absent is `None`, JSON null is `Some(None)`.
-fn fixed_price_micros(value: Option<&Value>) -> Result<Option<Option<i64>>, ApiError> {
-    match value {
-        None => Ok(None),
-        Some(Value::Null) => Ok(Some(None)),
-        Some(value) => value
-            .as_f64()
-            .filter(|number| number.fract() == 0.0 && *number > 0.0 && *number <= MAX_SAFE_INTEGER)
-            .map(|number| Some(Some(number as i64)))
-            .ok_or_else(|| bad_request(FIXED_PRICE_MESSAGE)),
+string_enum! {
+    /// The type of a security, as the body and the `security_type` column
+    /// hold it.
+    pub(crate) enum SecurityType {
+        Etf = "etf",
+        MutualFund = "mutual_fund",
+        Stock = "stock",
     }
 }
 
-fn security_type(value: Option<&Value>) -> Result<String, ApiError> {
-    value
-        .and_then(Value::as_str)
-        .filter(|value| SECURITY_TYPES.contains(value))
-        .map(str::to_owned)
-        .ok_or_else(|| bad_request(SECURITY_TYPE_MESSAGE))
-}
-
-#[derive(Debug, PartialEq)]
-struct SecurityCreate {
-    name: String,
-    symbol: String,
-    security_type: String,
+// The body of `POST /api/b/{bookId}/securities`. This struct is the validator
+// and the source of `CreateSecurityBody` in the API contract: see
+// `crate::body`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateSecurityBody {
+    /// Name of the security. Leading and trailing white space is removed. It must not be empty after that.
+    #[schema(inline)]
+    name: NonBlank,
+    /// Ticker symbol. Leading and trailing white space is removed. The book must not have another security with this symbol, compared without case.
+    #[schema(inline)]
+    symbol: NonBlank,
+    #[schema(inline)]
+    security_type: SecurityType,
+    /// True to fetch prices for this security. The default is true. A fixed price turns it off.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(nullable = false)]
     fetch_prices: Option<bool>,
-    fixed_price_micros: Option<i64>,
+    /// A fixed price per share, in micros, for a security that has no price feed, such as a money market fund. It must be at most 9007199254740991. When set, the server stores fetchPrices as false.
+    // No `present`: on a create, `null` and a field that is not there both
+    // mean no fixed price.
+    #[serde(default)]
+    #[schema(inline, nullable = false)]
+    fixed_price_micros: Option<NullablePositiveInt>,
 }
 
-/// `createSecuritySchema`, then the trims and checks of `createSecurity()`.
-fn validate_create(body: &Value) -> Result<SecurityCreate, ApiError> {
-    let object = body
-        .as_object()
-        .ok_or_else(|| bad_request("Name is required"))?;
-    let required = |key: &str, message: &'static str| {
-        object
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| bad_request(message))
-    };
-    let name = required("name", "Name is required")?;
-    let symbol = required("symbol", "Symbol is required")?;
-    let security_type = security_type(object.get("securityType"))?;
-    let fetch_prices = object
-        .get("fetchPrices")
-        .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| bad_request("fetchPrices must be a boolean"))
-        })
-        .transpose()?;
-    let fixed_price_micros = fixed_price_micros(object.get("fixedPriceMicros"))?.flatten();
-    let (name, symbol) = (js_trim(name), js_trim(symbol));
-    if name.is_empty() {
-        return Err(bad_request("Name is required"));
+impl CreateSecurityBody {
+    fn fixed_price_micros(&self) -> Option<i64> {
+        match &self.fixed_price_micros {
+            Some(Nullable::Value(price)) => Some(price.get()),
+            _ => None,
+        }
     }
-    if symbol.is_empty() {
-        return Err(bad_request("Symbol is required"));
+
+    /// A fixed price has no feed, so it turns fetching off.
+    fn fetch_prices(&self) -> bool {
+        self.fixed_price_micros().is_none() && self.fetch_prices.unwrap_or(true)
     }
-    Ok(SecurityCreate {
-        name: name.to_owned(),
-        symbol: symbol.to_owned(),
-        security_type,
-        fetch_prices,
-        fixed_price_micros,
-    })
 }
 
+// The body of `PUT /api/b/{bookId}/securities/{id}`, and
+// `UpdateSecurityBody` in the API contract.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateSecurityBody {
+    /// New name. Leading and trailing white space is removed. It must not be empty after that.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(inline, nullable = false)]
+    name: Option<NonBlank>,
+    /// New ticker symbol. Leading and trailing white space is removed. Another security of the book must not have it, compared without case.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(inline, nullable = false)]
+    symbol: Option<NonBlank>,
+    #[serde(default, deserialize_with = "present")]
+    #[schema(inline, nullable = false)]
+    security_type: Option<SecurityType>,
+    /// True to fetch prices for this security.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(nullable = false)]
+    fetch_prices: Option<bool>,
+    /// A new fixed price per share, in micros. It must be at most 9007199254740991. Setting it turns fetchPrices off. Send null to remove the fixed price; fetchPrices stays as it is.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(inline, nullable = false)]
+    fixed_price_micros: Option<NullablePositiveInt>,
+}
+
+/// The changes of an update, after the rules across its fields.
 #[derive(Debug, Default, PartialEq)]
 struct SecurityUpdate {
     name: Option<String>,
     symbol: Option<String>,
-    security_type: Option<String>,
+    security_type: Option<SecurityType>,
     fetch_prices: Option<bool>,
+    /// `Some(None)` removes the fixed price.
     fixed_price_micros: Option<Option<i64>>,
 }
 
-/// `updateSecuritySchema`, then the trims and checks of `updateSecurity()`
-/// that run before it reads the database.
-fn validate_update(body: &Value) -> Result<SecurityUpdate, ApiError> {
-    let object = body.as_object().ok_or_else(|| expected("object", body))?;
-    let text = |key: &str| {
-        object
-            .get(key)
-            .map(|value| value.as_str().ok_or_else(|| expected("string", value)))
-            .transpose()
-    };
-    let name = text("name")?;
-    let symbol = text("symbol")?;
-    let security_type = object
-        .get("securityType")
-        .map(|value| security_type(Some(value)))
-        .transpose()?;
-    let fetch_prices = object
-        .get("fetchPrices")
-        .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| bad_request("Fetch prices must be a boolean"))
-        })
-        .transpose()?;
-    let fixed_price_micros = fixed_price_micros(object.get("fixedPriceMicros"))?;
-    let name = name.map(js_trim);
-    let symbol = symbol.map(js_trim);
-    if name == Some("") {
-        return Err(bad_request("Name is required"));
+impl UpdateSecurityBody {
+    fn read(body: &Value) -> Result<SecurityUpdate, ApiError> {
+        let body: Self = typed_body(body)?;
+        let fixed_price_micros = body
+            .fixed_price_micros
+            .map(|price| price.into_option().map(|price| price.get()));
+        let update = SecurityUpdate {
+            name: body.name.map(NonBlank::into_string),
+            symbol: body.symbol.map(NonBlank::into_string),
+            security_type: body.security_type,
+            // Setting a fixed price turns fetching off. Clearing it leaves
+            // fetching as it is.
+            fetch_prices: match fixed_price_micros {
+                Some(Some(_)) => Some(false),
+                _ => body.fetch_prices,
+            },
+            fixed_price_micros,
+        };
+        if update == SecurityUpdate::default() {
+            return Err(bad_request("No fields to update"));
+        }
+        Ok(update)
     }
-    if symbol == Some("") {
-        return Err(bad_request("Symbol is required"));
-    }
-    // Setting a fixed price turns fetching off. Clearing it leaves fetching
-    // as it is.
-    let fetch_prices = match fixed_price_micros {
-        Some(Some(_)) => Some(false),
-        _ => fetch_prices,
-    };
-    let update = SecurityUpdate {
-        name: name.map(str::to_owned),
-        symbol: symbol.map(str::to_owned),
-        security_type,
-        fetch_prices,
-        fixed_price_micros,
-    };
-    if update == SecurityUpdate::default() {
-        return Err(bad_request("No fields to update"));
-    }
-    Ok(update)
 }
 
 /// The income of each dividend or capital-gain transaction in
@@ -318,29 +293,22 @@ pub(crate) async fn create_security(
     const FAILURE: &str = "Failed to create security";
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
-    let input = validate_create(&parse_json_body(&body, FAILURE)?)?;
+    let input: CreateSecurityBody = typed_body(&parse_json_body(&body, FAILURE)?)?;
+    let (fixed_price_micros, fetch_prices) = (input.fixed_price_micros(), input.fetch_prices());
+    let (name, symbol) = (input.name.into_string(), input.symbol.into_string());
     let existing: Option<i32> = state
         .database
         .query_optional(
             "SELECT id FROM securities WHERE book_id = ?1 AND symbol_fold = ?2 LIMIT 1",
-            &params![book.book_id(), ledger_db::folds::fold(&input.symbol)],
+            &params![book.book_id(), ledger_db::folds::fold(&symbol)],
         )
         .map_err(|cause| internal_error(cause, FAILURE))?;
     if let Some(existing) = existing {
         return Err(error_owned(
             StatusCode::CONFLICT,
-            format!(
-                "A security with symbol \"{}\" already exists (id {existing})",
-                input.symbol
-            ),
+            format!("A security with symbol \"{symbol}\" already exists (id {existing})"),
         ));
     }
-    // A fixed price has no feed, so it turns fetching off.
-    let fetch_prices = if input.fixed_price_micros.is_some() {
-        false
-    } else {
-        input.fetch_prices.unwrap_or(true)
-    };
     let query = format!(
         "INSERT INTO securities
            (book_id, name, symbol, security_type, fixed_price_micros, fetch_prices, created_at,
@@ -353,13 +321,13 @@ pub(crate) async fn create_security(
             &query,
             &params![
                 book.book_id(),
-                &input.name,
-                &input.symbol,
-                &input.security_type,
-                input.fixed_price_micros,
+                &name,
+                &symbol,
+                input.security_type.as_str(),
+                fixed_price_micros,
                 fetch_prices,
                 platform::timestamp(),
-                ledger_db::folds::fold(&input.symbol)
+                ledger_db::folds::fold(&symbol)
             ],
         )
         .map_err(|cause| internal_error(cause, FAILURE))?;
@@ -408,7 +376,7 @@ pub(crate) async fn update_security(
     let body = parse_json_body(&body, FAILURE)?;
     let security_id =
         parse_int_prefix(&raw_id).ok_or_else(|| bad_request("Invalid security id"))?;
-    let input = validate_update(&body)?;
+    let input = UpdateSecurityBody::read(&body)?;
     let security_id = i32::try_from(security_id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, FAILURE))?;
     find_security(&*state.database, book.book_id(), security_id, FAILURE)?;
@@ -431,8 +399,8 @@ pub(crate) async fn update_security(
         fields.push(("symbol", symbol.into()));
         fields.push(("symbol_fold", ledger_db::folds::fold(symbol).into()));
     }
-    if let Some(security_type) = &input.security_type {
-        fields.push(("security_type", security_type.into()));
+    if let Some(security_type) = input.security_type {
+        fields.push(("security_type", security_type.as_str().into()));
     }
     if let Some(fetch_prices) = input.fetch_prices {
         fields.push(("fetch_prices", fetch_prices.into()));
@@ -602,7 +570,7 @@ pub(crate) async fn security_detail(
         .database
         .query(&query, &params![security_id, book.book_id()])
         .map_err(failed)?;
-    let basis: HashMap<i32, i32> = state
+    let basis: HashMap<i32, i64> = state
         .database
         .query(
             "SELECT account_id, CAST(COALESCE(SUM(remaining_basis_cents), 0) AS integer)
@@ -834,67 +802,51 @@ mod tests {
         body["error"].as_str().unwrap().to_owned()
     }
 
-    #[tokio::test]
-    async fn create_and_update_inputs_match_node() {
-        for (body, expected) in [
-            (json!([]), "Name is required"),
-            (
-                json!({"name": 5, "symbol": 5, "securityType": "x"}),
-                "Name is required",
-            ),
-            (json!({"name": " "}), "Symbol is required"),
-            (json!({"name": "A", "symbol": "B"}), SECURITY_TYPE_MESSAGE),
-            (
-                json!({"name": "A", "symbol": "B", "securityType": "etf", "fetchPrices": null}),
-                "fetchPrices must be a boolean",
-            ),
-            (
-                json!({"name": "A", "symbol": "B", "securityType": "etf", "fixedPriceMicros": 9007199254740992_i64}),
-                FIXED_PRICE_MESSAGE,
-            ),
-            (
-                json!({"name": " ", "symbol": "B", "securityType": "etf"}),
-                "Name is required",
-            ),
-        ] {
-            assert_eq!(message(validate_create(&body)).await, expected, "{body}");
-        }
+    #[test]
+    fn a_create_reads_its_fields_and_a_fixed_price_turns_fetching_off() {
+        let create = |body: Value| typed_body::<CreateSecurityBody>(&body).unwrap();
+        let fixed = create(json!({
+            "name": "\u{feff} Fund ", "symbol": " VTI", "securityType": "mutual_fund",
+            "fixedPriceMicros": 1_000_000, "fetchPrices": true, "bookId": 9
+        }));
+        assert_eq!(fixed.security_type.as_str(), "mutual_fund");
+        assert_eq!(fixed.fixed_price_micros(), Some(1_000_000));
+        assert!(!fixed.fetch_prices());
         assert_eq!(
-            validate_create(&json!({
-                "name": "\u{feff} Fund ", "symbol": " VTI", "securityType": "etf",
-                "fixedPriceMicros": 1_000_000, "bookId": 9
-            }))
-            .unwrap(),
-            SecurityCreate {
-                name: "Fund".into(),
-                symbol: "VTI".into(),
-                security_type: "etf".into(),
-                fetch_prices: None,
-                fixed_price_micros: Some(1_000_000),
-            }
+            (fixed.name.into_string(), fixed.symbol.into_string()),
+            ("Fund".to_owned(), "VTI".to_owned())
         );
-        for (body, expected) in [
-            (json!(null), "Invalid input: expected object, received null"),
-            (
-                json!({"name": 5, "fetchPrices": "x"}),
-                "Invalid input: expected string, received number",
-            ),
-            (json!({"securityType": null}), SECURITY_TYPE_MESSAGE),
-            (
-                json!({"fetchPrices": "x"}),
-                "Fetch prices must be a boolean",
-            ),
-            (json!({"fixedPriceMicros": 0}), FIXED_PRICE_MESSAGE),
-            (json!({}), "No fields to update"),
-            (json!({"symbol": " "}), "Symbol is required"),
-        ] {
-            assert_eq!(message(validate_update(&body)).await, expected, "{body}");
-        }
-        let update = validate_update(&json!({"fixedPriceMicros": 5, "fetchPrices": true})).unwrap();
+        // Fetching is on unless the body turns it off. A null price is no price.
+        let plain = create(
+            json!({"name": "A", "symbol": "B", "securityType": "etf", "fixedPriceMicros": null}),
+        );
+        assert_eq!(plain.fixed_price_micros(), None);
+        assert!(plain.fetch_prices());
+        let off = create(
+            json!({"name": "A", "symbol": "B", "securityType": "stock", "fetchPrices": false}),
+        );
+        assert!(!off.fetch_prices());
+    }
+
+    #[tokio::test]
+    async fn an_update_applies_the_rules_across_its_fields() {
+        let read = |body: Value| UpdateSecurityBody::read(&body);
+        assert_eq!(message(read(json!({}))).await, "No fields to update");
+        // A key that the body does not name is not a change.
+        assert_eq!(
+            message(read(json!({"bookId": 2}))).await,
+            "No fields to update"
+        );
+        let update = read(json!({"fixedPriceMicros": 5, "fetchPrices": true})).unwrap();
         assert_eq!(update.fetch_prices, Some(false));
-        let cleared = validate_update(&json!({"fixedPriceMicros": null})).unwrap();
+        assert_eq!(update.fixed_price_micros, Some(Some(5)));
+        let cleared = read(json!({"fixedPriceMicros": null})).unwrap();
         assert_eq!(cleared.fixed_price_micros, Some(None));
         assert_eq!(cleared.fetch_prices, None);
+        let renamed = read(json!({"name": " New ", "securityType": "stock"})).unwrap();
+        assert_eq!(renamed.name.as_deref(), Some("New"));
+        assert_eq!(renamed.security_type, Some(SecurityType::Stock));
+        assert_eq!(renamed.fixed_price_micros, None);
     }
 
     #[test]

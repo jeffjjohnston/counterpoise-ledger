@@ -8,7 +8,7 @@ use crate::{
         split_accounts,
     },
     db_scope::write_transaction,
-    error::{ApiError, ApiResult, error, internal_error},
+    error::{ApiError, ApiResult, error, error_owned, internal_error},
     platform,
     state::AppState,
     transaction_input::{
@@ -586,7 +586,7 @@ pub(crate) async fn list_transactions(
         return Ok(Json(Value::Array(transactions)));
     }
 
-    let mut starting_balance = 0;
+    let mut starting_balance = 0_i64;
     if let (Some(account_ids), Some(oldest)) = (&filters.account_ids, rows.last()) {
         // Everything the register prints below the page: the inverse of
         // REGISTER_ORDER. The date filters do not apply.
@@ -603,7 +603,7 @@ pub(crate) async fn list_transactions(
         if let Some(payee_id) = filters.payee_id {
             balance.push(" AND t.payee_id = ").push_bind(payee_id);
         }
-        starting_balance = balance.query_row::<i32>(sql).map_err(db_error)?;
+        starting_balance = balance.query_row::<i64>(sql).map_err(db_error)?;
     }
 
     Ok(Json(json!({
@@ -1180,12 +1180,35 @@ fn update(
         set.execute(tx).map_err(database_error(failure))?;
 
         if let Some(splits) = &splits {
+            let before = crate::routes::reconcile::link_amounts(tx, book_id, transaction_id)
+                .map_err(database_error(failure))?;
             tx.execute(
                 "DELETE FROM transaction_splits WHERE transaction_id = ?1 AND book_id = ?2",
                 &params![transaction_id, book_id],
             )
             .map_err(database_error(failure))?;
             insert_splits(tx, access, transaction_id, splits, failure)?;
+            // A link always joins equal amounts. An edit that changes the
+            // amount on a linked account to a different amount is refused.
+            // An edit that leaves that amount as it was is allowed, so the
+            // user can still edit a transaction that this rule did not yet
+            // protect.
+            let after = crate::routes::reconcile::link_amounts(tx, book_id, transaction_id)
+                .map_err(database_error(failure))?;
+            for link in &after {
+                let unchanged = before.iter().any(|old| {
+                    old.reconciliation_id == link.reconciliation_id
+                        && old.linked_cents == link.linked_cents
+                });
+                if !link.agrees() && !unchanged {
+                    // 400, not 409: the client reads every 409 as a
+                    // conflict with another user's change.
+                    return Err(error_owned(
+                        StatusCode::BAD_REQUEST,
+                        crate::routes::reconcile::broken_link_message(link),
+                    ));
+                }
+            }
         }
         if investment_splits.is_some() {
             tx.execute(
@@ -1276,8 +1299,8 @@ fn delete(
         let now = now_millis();
         tx.execute(
             "UPDATE plaid_transaction_reconciliation
-         SET resolution_status = 'pending', matched_transaction_id = NULL, resolved_at = NULL,
-             updated_at = ?1
+         SET resolution_status = 'pending', matched_transaction_id = NULL,
+             linked_account_id = NULL, resolved_at = NULL, updated_at = ?1
          WHERE matched_transaction_id = ?2 AND book_id = ?3",
             &params![now, transaction_id, book_id],
         )

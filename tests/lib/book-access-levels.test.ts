@@ -7,14 +7,13 @@ import routes from "@/rust-api/routes.json";
 const ROUTES_DIR = "rust-api/server/src/routes";
 
 /**
- * The handler function of each route, from the match arms in `routes/mod.rs`.
- * An arm has the form
- * `("GET", "/api/b/[bookId]/things", "things.list") => router.route("...", get(list_things))`.
+ * The handler function of each route, from the lines of the route table in
+ * `routes/mod.rs`. A line has the form
+ * `GET "/api/b/[bookId]/things" "things.list" => list_things,`.
  */
 function routeHandlers(source: string): Map<string, string> {
-  const arm =
-    /\(\s*"(GET|POST|PUT|PATCH|DELETE)",\s*"([^"]+)",\s*"[\w.]+",?\s*\)\s*=>\s*(?:\{\s*)?router\s*\.\s*route\(\s*[^,]+,\s*(?:axum::routing::)?(?:get|post|put|patch|delete)\((\w+)\)/g;
-  return new Map([...source.matchAll(arm)].map(([, method, path, handler]) => [`${method} ${path}`, handler]));
+  const line = /^\s*(GET|POST|PUT|PATCH|DELETE) "([^"]+)" "[\w.]+" => (\w+),$/gm;
+  return new Map([...source.matchAll(line)].map(([, method, path, handler]) => [`${method} ${path}`, handler]));
 }
 
 /**
@@ -93,16 +92,14 @@ describe("Rust book routes declare their access level", () => {
 });
 
 describe("route scan", () => {
-  it("reads the handler of a one-line and a wrapped arm", () => {
+  it("reads the handler of each line of the route table", () => {
     const source = `
-      ("GET", "/api/b/[bookId]/things", "things.list") => {
-          router.route("/api/b/{book_id}/things", get(list_things))
-      }
-      ("PUT", "/api/b/[bookId]/things/[id]", "things.update") => router
-          .route(
-              "/api/b/{book_id}/things/{id}",
-              axum::routing::put(update_thing),
-          ),`;
+    route_table![
+        GET "/api/b/[bookId]/things" "things.list" => list_things,
+        // A comment between two routes.
+        #[cfg(feature = "native")]
+        PUT "/api/b/[bookId]/things/[id]" "things.update" => update_thing,
+    ]`;
     expect(routeHandlers(source)).toEqual(
       new Map([
         ["GET /api/b/[bookId]/things", "list_things"],

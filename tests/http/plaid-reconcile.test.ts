@@ -205,6 +205,24 @@ describe("Plaid reconciliation HTTP parity", () => {
     expect(local).toMatchObject({ isReconciled: true, isFloating: false, date: "2025-03-09" });
   });
 
+  // Lots are derived from the effective date. A match that settles a floating
+  // trade changes that date, so the write must rebuild the pair.
+  it("rebuilds the lots of a floating investment transaction that it settles", async () => {
+    const f = await fixture();
+    const brokerage = await createAccount({ name: "Brokerage", type: "asset", subtype: "investment" });
+    const security = await createSecurity({ name: "Fund", symbol: "FND", securityType: "stock" });
+    const trade = await createTransactionWithSplits({ date: "2025-01-15", isFloating: true, splits: [{ accountId: f.checking.id, amount: -450 }, { accountId: brokerage.id, amount: 450 }] });
+    await createInvestmentSplit({ transactionId: trade.id, accountId: brokerage.id, securityId: security.id, action: "buy", sharesMicros: 1_000_000, priceMicros: 4_500_000 });
+    // The stale lot of an earlier rebuild, made while the trade was floating.
+    await insert("investment_lots", {
+      book_id: 1, security_id: security.id, account_id: brokerage.id, opened_transaction_id: trade.id, created_at: "2025-01-15 00:00:00",
+      acquired_date: "2025-02-20", original_shares_micros: 1_000_000, original_basis_cents: 450, remaining_shares_micros: 1_000_000, remaining_basis_cents: 450,
+    });
+    await ok(client, `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`, json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: trade.id }));
+    const lots = await rows<{ acquiredDate: string; remainingSharesMicros: number }>("SELECT acquired_date, remaining_shares_micros FROM investment_lots WHERE account_id = $1", [brokerage.id]);
+    expect(lots).toEqual([{ acquiredDate: "2025-03-09", remainingSharesMicros: 1_000_000 }]);
+  });
+
   it("matches and rewrites the amount of a two-split transaction", async () => {
     const f = await fixture();
     const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
@@ -218,6 +236,10 @@ describe("Plaid reconciliation HTTP parity", () => {
     const trade = await createTransactionWithSplits({ date: "2025-03-02", splits: [{ accountId: f.checking.id, amount: -100 }, { accountId: brokerage.id, amount: 100 }] });
     await createInvestmentSplit({ transactionId: trade.id, accountId: brokerage.id, securityId: security.id, action: "buy", sharesMicros: 1_000_000, priceMicros: 100_000_000 });
     await expectError(client, path, body(trade.id), 400, "Amount update is not supported for investment transactions");
+    // The candidate says so, and the client then offers no amount update.
+    const queued = (await ok(client, path)).items.find((entry: { id: number }) => entry.id === f.rentRow.id);
+    const flags = Object.fromEntries(queued.candidates.map((entry: { transactionId: number; isInvestment: boolean }) => [entry.transactionId, entry.isInvestment]));
+    expect([flags[trade.id], flags[three.id]]).toEqual([true, false]);
     const offAccount = await createTransactionWithSplits({ date: "2025-03-02", splits: [{ accountId: f.food.id, amount: -3 }, { accountId: f.rent.id, amount: 3 }] });
     await expectError(client, path, body(offAccount.id), 400, "Selected transaction does not include the linked account");
 
@@ -523,5 +545,160 @@ describe("Plaid reconciliation HTTP parity", () => {
         suggestionVisible: false, acceptedSuggestion: false, proposalPayeeKept: null, proposalCategoryKept: null, activeReviewMs: null, recent: true,
       },
     ]);
+  });
+
+  describe("a link always joins equal amounts", () => {
+    const splitsOf = (transactionId: number) =>
+      rows<TransactionSplit>("SELECT * FROM transaction_splits WHERE transaction_id = $1 ORDER BY id", [transactionId]);
+
+    it("changes the amount to the bank amount on a plain match", async () => {
+      const f = await fixture();
+      const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+      // The bank row is $1,505.00 and the transaction is $1,500.00.
+      await ok(client, path, json("POST", { reconciliationId: f.rentRow.id, action: "match", transactionId: f.rentPaid.id }));
+      expect((await splitsOf(f.rentPaid.id)).map((split) => [split.accountId, split.amount])).toEqual([
+        [f.checking.id, -150500], [f.rent.id, 150500],
+      ]);
+    });
+
+    it("refuses a match with a different amount that it cannot change", async () => {
+      const f = await fixture();
+      const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+      const split = await createTransactionWithSplits({
+        date: "2025-03-09",
+        splits: [{ accountId: f.checking.id, amount: -500 }, { accountId: f.food.id, amount: 300 }, { accountId: f.rent.id, amount: 200 }],
+      });
+      await expectError(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: split.id }), 400,
+        "The amounts are different, and the amount cannot be changed here because the transaction has more than 2 splits. " +
+        "Change the amount on this account to the bank amount (-$4.50) first, then match");
+      expect((await splitsOf(split.id)).map((s) => s.amount)).toEqual([-500, 300, 200]);
+      expect(await scalar("SELECT resolution_status FROM plaid_transaction_reconciliation WHERE id = $1", [f.coffeeRow.id])).toBe("pending");
+      // With the amounts equal, the same transaction matches.
+      await exec("UPDATE transaction_splits SET amount = amount + 50 WHERE transaction_id = $1 AND account_id = $2", [split.id, f.checking.id]);
+      await exec("UPDATE transaction_splits SET amount = amount - 50 WHERE transaction_id = $1 AND account_id = $2", [split.id, f.food.id]);
+      await ok(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: split.id }));
+    });
+
+    it("refuses Keep when the bank changed the amount", async () => {
+      const f = await fixture();
+      const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+      await exec("UPDATE plaid_transaction_reconciliation SET amount_cents = 470 WHERE id = $1", [f.reviewRow.id]);
+      await expectError(client, path, json("POST", { reconciliationId: f.reviewRow.id, action: "keep_local" }), 400,
+        "The bank amount is now -$4.70, and Keep cannot keep a link with a different amount. Update the amount to the bank amount, or unlink");
+      expect(await scalar("SELECT review_reason FROM plaid_transaction_reconciliation WHERE id = $1", [f.reviewRow.id])).toBe("plaid_modified");
+      await ok(client, path, json("POST", { reconciliationId: f.reviewRow.id, action: "match_update_amount", transactionId: f.coffeeLater.id }));
+      expect((await splitsOf(f.coffeeLater.id)).map((s) => s.amount)).toEqual([-470, 470]);
+    });
+
+    it("refuses a transaction edit that changes a linked amount", async () => {
+      const f = await fixture();
+      await ok(client, `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`,
+        json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: f.coffeeSameDay.id }));
+      const edit = (amount: number, counter = f.food.id) => json("PUT", {
+        splits: [{ accountId: f.checking.id, amount: -amount }, { accountId: counter, amount }],
+      });
+      await expectError(client, `/api/b/1/transactions/${f.coffeeSameDay.id}`, edit(500), 400,
+        "This transaction is linked to a bank transaction for -$4.50. Change the amount on the linked account to that amount, or unlink the bank transaction first");
+      expect((await splitsOf(f.coffeeSameDay.id)).map((s) => s.amount)).toEqual([-450, 450]);
+      // Another account, the same amount: allowed.
+      await ok(client, `/api/b/1/transactions/${f.coffeeSameDay.id}`, edit(450, f.rent.id));
+      // A link from before this rule: an edit that keeps the amount, or
+      // corrects it, is allowed. One that changes it to another wrong amount
+      // is refused.
+      await exec("UPDATE transaction_splits SET amount = CASE WHEN amount < 0 THEN -460 ELSE 460 END WHERE transaction_id = $1", [f.coffeeSameDay.id]);
+      await ok(client, `/api/b/1/transactions/${f.coffeeSameDay.id}`, edit(460, f.food.id));
+      await expectError(client, `/api/b/1/transactions/${f.coffeeSameDay.id}`, edit(470), 400,
+        "This transaction is linked to a bank transaction for -$4.50. Change the amount on the linked account to that amount, or unlink the bank transaction first");
+      await ok(client, `/api/b/1/transactions/${f.coffeeSameDay.id}`, edit(450));
+      // An edit that moves the transaction off the linked account cannot be
+      // corrected with an amount: the message tells the user to unlink.
+      await expectError(client, `/api/b/1/transactions/${f.coffeeSameDay.id}`,
+        json("PUT", { splits: [{ accountId: f.rent.id, amount: -450 }, { accountId: f.food.id, amount: 450 }] }), 400,
+        "This transaction is linked to a bank transaction for -$4.50 on the account that the edit removes. Unlink the bank transaction first, or keep a split on that account");
+    });
+
+    it("refuses a rewrite that would break the transfer's link on its other account", async () => {
+      const f = await fixture();
+      const savingsLink = await createPlaidAccount({
+        tokenId: f.token.id, plaidAccountId: "pa-savings", name: "pa-savings", type: "depository", counterpoiseAccountId: f.savings.id,
+      });
+      // The withdrawal is matched on checking: $50.00 = $50.00.
+      await ok(client, `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`,
+        json("POST", { reconciliationId: f.transferRow.id, action: "match", transactionId: f.transfer.id }));
+      // The deposit at the bank is $50.10.
+      const deposit = await createPlaidReconciliation({
+        plaidAccountLinkId: savingsLink.id, plaidTransactionId: "deposit", date: "2025-03-10", amountCents: -5010, name: "Deposit",
+      });
+      const refusal =
+        "The amounts are different, and this transaction is also linked to a bank transaction for -$50.00 on its other account. " +
+        "Changing the amount would break that link. Unlink it first, or match another transaction";
+      for (const action of ["match", "match_update_amount"]) {
+        await expectError(client, `/api/b/1/sync/accounts/${savingsLink.id}/reconcile`,
+          json("POST", { reconciliationId: deposit.id, action, transactionId: f.transfer.id }), 400, refusal);
+      }
+      expect((await splitsOf(f.transfer.id)).map((s) => s.amount)).toEqual([-5000, 5000]);
+      expect(await scalar("SELECT resolution_status FROM plaid_transaction_reconciliation WHERE id = $1", [deposit.id])).toBe("pending");
+    });
+
+    it("leaves out a bank account with no Counterpoise account", async () => {
+      const f = await fixture();
+      // The "done" row links coffeeFar with a different amount.
+      await exec("UPDATE plaid_accounts SET counterpoise_account_id = NULL WHERE id = $1", [f.checkingLink.id]);
+      expect((await ok(client, "/api/b/1/sync/stale-unmatched")).mismatchedLinks).toEqual([]);
+      await ok(client, `/api/b/1/transactions/${f.coffeeFar.id}`, json("PUT", {
+        splits: [{ accountId: f.checking.id, amount: -999 }, { accountId: f.food.id, amount: 999 }],
+      }));
+    });
+
+    it("compares the total on the linked account for a candidate", async () => {
+      const f = await fixture();
+      const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+      const twoLegs = await createTransactionWithSplits({
+        date: "2025-03-09",
+        splits: [{ accountId: f.checking.id, amount: -300 }, { accountId: f.checking.id, amount: -150 }, { accountId: f.food.id, amount: 450 }],
+      });
+      const queue = await ok(client, path);
+      const item = queue.items.find((entry: { id: number }) => entry.id === f.coffeeRow.id);
+      const candidate = item.candidates.find((entry: { transactionId: number }) => entry.transactionId === twoLegs.id);
+      expect([candidate.linkedSplitAmount, candidate.amountDelta]).toEqual([-450, 0]);
+      await ok(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: twoLegs.id }));
+      expect((await splitsOf(twoLegs.id)).map((s) => s.amount)).toEqual([-300, -150, 450]);
+    });
+
+    // A link records the account that it was made on. A remap of the bank
+    // account to another account must not make the old links "no split".
+    it("compares a link on its own account after the bank account is remapped", async () => {
+      const f = await fixture();
+      const path = `/api/b/1/sync/accounts/${f.checkingLink.id}/reconcile`;
+      await ok(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "match", transactionId: f.coffeeSameDay.id }));
+      expect(await scalar("SELECT linked_account_id FROM plaid_transaction_reconciliation WHERE id = $1", [f.coffeeRow.id])).toBe(f.checking.id);
+
+      const newChecking = await createAccount({ name: "New Checking", type: "asset", subtype: "bank" });
+      await exec("UPDATE plaid_accounts SET counterpoise_account_id = $1 WHERE id = $2", [newChecking.id, f.checkingLink.id]);
+      const mismatched = (await ok(client, "/api/b/1/sync/stale-unmatched")).mismatchedLinks;
+      expect(mismatched.filter((entry: { transactionId: number }) => entry.transactionId === f.coffeeSameDay.id)).toEqual([]);
+      // The edit check still protects the link, on the old account.
+      await expectError(client, `/api/b/1/transactions/${f.coffeeSameDay.id}`, json("PUT", {
+        splits: [{ accountId: f.checking.id, amount: -500 }, { accountId: f.food.id, amount: 500 }],
+      }), 400, "This transaction is linked to a bank transaction for -$4.50. Change the amount on the linked account to that amount, or unlink the bank transaction first");
+
+      // Unlink clears the stored account.
+      await ok(client, path, json("POST", { reconciliationId: f.coffeeRow.id, action: "unlink" }));
+      expect(await scalar("SELECT linked_account_id FROM plaid_transaction_reconciliation WHERE id = $1", [f.coffeeRow.id])).toBeNull();
+    });
+
+    it("lists the links whose amounts are different", async () => {
+      const f = await fixture();
+      // The fixture's "done" row (bank $1.00) links coffeeFar ($4.50).
+      expect((await ok(client, "/api/b/1/sync/stale-unmatched")).mismatchedLinks).toEqual([
+        { transactionId: f.coffeeFar.id, accountId: f.checking.id, bankAmount: -100, linkedAmount: -450 },
+      ]);
+      await exec("UPDATE plaid_transaction_reconciliation SET amount_cents = 450 WHERE plaid_transaction_id = 'done'", []);
+      expect((await ok(client, "/api/b/1/sync/stale-unmatched")).mismatchedLinks).toEqual([]);
+      await exec("UPDATE plaid_transaction_reconciliation SET amount_cents = 447 WHERE plaid_transaction_id = 'done'", []);
+      expect((await ok(client, "/api/b/1/sync/stale-unmatched")).mismatchedLinks).toEqual([
+        { transactionId: f.coffeeFar.id, accountId: f.checking.id, bankAmount: -447, linkedAmount: -450 },
+      ]);
+    });
   });
 });

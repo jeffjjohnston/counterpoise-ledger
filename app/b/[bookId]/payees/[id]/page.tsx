@@ -17,8 +17,8 @@ import {
   putTransaction,
   deleteTransactionRequest,
   isTransactionConflict,
-  TRANSACTION_CONFLICT_MESSAGE,
 } from "@/lib/transaction-requests";
+import { useEditConflict } from "@/hooks/useEditConflict";
 import { useToast } from "@/components/ui/ToastProvider";
 import type {
   AccountWithBalance,
@@ -56,6 +56,7 @@ export default function PayeeDetailPage() {
   const [totalCount, setTotalCount] = useState(0);
   const [editingTransaction, setEditingTransaction] =
     useState<TransactionWithSplits | null>(null);
+  const editConflict = useEditConflict(bookId, editingTransaction, setEditingTransaction);
   const [loading, setLoading] = useState(true);
   const [chartVersion, setChartVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -150,7 +151,8 @@ export default function PayeeDetailPage() {
         : { transactions: [], totalCount: 0 };
       if (!isLatest()) return;
       setPayee(payeeData);
-      setAccounts(accountsData ? flattenAccounts(accountsData) : []);
+      // A failed account read keeps the accounts that are on the screen.
+      if (accountsData) setAccounts(flattenAccounts(accountsData));
       setTransactions(page.transactions);
       setTotalCount(page.totalCount);
       setLoadMoreFailed(false);
@@ -275,10 +277,12 @@ export default function PayeeDetailPage() {
     { paused: editingTransaction !== null },
   );
 
-  // A save or a delete changes the monthly totals, so the chart fetches them again.
+  // A save or a delete changes the monthly totals, so the chart fetches them
+  // again. The list loads the number of rows that it shows, so that it keeps
+  // its length and the scroll position stays.
   const refreshAfterChange = async () => {
     setChartVersion((version) => version + 1);
-    await refreshData(false);
+    await refreshData(false, Math.max(PAGE_SIZE, transactions.length));
   };
 
   const handleUpdateTransaction = async (data: {
@@ -302,8 +306,9 @@ export default function PayeeDetailPage() {
       return true;
     } catch (e) {
       if (isTransactionConflict(e)) {
-        toast.error(TRANSACTION_CONFLICT_MESSAGE);
-        setEditingTransaction(null);
+        // Keep the editor open with the user's edits. The list shows the
+        // latest rows.
+        editConflict.flagConflict();
         await refreshAfterChange();
         return false;
       }
@@ -325,8 +330,9 @@ export default function PayeeDetailPage() {
       await refreshAfterChange();
     } catch (e) {
       if (isTransactionConflict(e)) {
-        toast.error(TRANSACTION_CONFLICT_MESSAGE);
-        setEditingTransaction(null);
+        // Keep the editor open with the user's edits. The list shows the
+        // latest rows.
+        editConflict.flagConflict();
         await refreshAfterChange();
         return;
       }
@@ -461,6 +467,9 @@ export default function PayeeDetailPage() {
             onSubmit={handleUpdateTransaction}
             onCancel={() => setEditingTransaction(null)}
             onDelete={handleDeleteTransaction}
+            conflict={editConflict.conflict}
+            onReloadLatest={editConflict.reloadLatest}
+            reloadingLatest={editConflict.reloading}
             onAccountsUpdate={() => refreshData(false)}
             readOnly={!canWrite}
           />

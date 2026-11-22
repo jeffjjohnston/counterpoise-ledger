@@ -9,7 +9,6 @@ import {
   WEEKLY_REVIEW_SETTINGS_EVENT,
   errorText,
   formatPeriod,
-  openBookSettings,
   readHidden,
   writeHidden,
 } from "@/lib/weekly-review";
@@ -116,9 +115,9 @@ export function WeeklyReviewCard({ bookId }: { bookId: string }) {
     return (
       <Card className="mb-6 md:mb-8 px-4 md:px-6 py-3 text-sm text-fg-secondary">
         A weekly AI review can check this book for duplicates and missed payments.{" "}
-        <button type="button" className="text-fg-accent font-medium" onClick={openBookSettings}>
+        <Link href={`/b/${bookId}/settings#features`} className="text-fg-accent font-medium">
           Turn it on
-        </button>
+        </Link>
       </Card>
     );
   }

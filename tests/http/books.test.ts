@@ -69,13 +69,40 @@ describe("book HTTP parity", () => {
     expect((bookListSchema.parse(await (await client.request("/api/books")).json())).map((book) => book.id)).not.toContain(created.id);
   });
 
+  it("changes only upcomingDays when the update leaves out the name", async () => {
+    // A settings form sends only its own field, so a rename from another
+    // device stays.
+    const renamed = await client.request("/api/books/1", { ...json({ name: "Renamed Elsewhere" }), method: "PUT" });
+    expect(renamed.status).toBe(200);
+    const response = await client.request("/api/books/1", { ...json({ upcomingDays: 14 }), method: "PUT" });
+    expect(response.status).toBe(200);
+    expect(bookSchema.parse(await response.json())).toMatchObject({ id: 1, name: "Renamed Elsewhere", upcomingDays: 14 });
+
+    for (const [body, error] of [
+      [{}, "Send name or upcomingDays"],
+      [{ name: null, upcomingDays: 14 }, "name: invalid type: null, expected a string"],
+      [{ name: " ", upcomingDays: 14 }, "name: must not be blank"],
+      [{ upcomingDays: null }, "upcomingDays: must be an integer from 1 to 365"],
+    ] as const) {
+      const refused = await client.request("/api/books/1", { ...json(body), method: "PUT" });
+      expect(refused.status).toBe(400);
+      expect(await refused.json()).toEqual({ error });
+    }
+    // A refused update changed nothing.
+    const after = await client.request("/api/books");
+    expect((await after.json()).find((book: { id: number }) => book.id === 1)).toMatchObject({ name: "Renamed Elsewhere", upcomingDays: 14 });
+  });
+
   it("keeps validation and owner denials", async () => {
     for (const [path, init, status, body] of [
-      ["/api/books", json({ name: " " }), 400, { error: "Book name is required" }],
+      ["/api/books", json({ name: " " }), 400, { error: "name: must not be blank" }],
+      ["/api/books", json({}), 400, { error: "missing field `name`" }],
+      ["/api/books", json({ upcomingDays: 14 }), 400, { error: "missing field `name`" }],
+      ["/api/books", json([]), 400, { error: "The request body must be a JSON object" }],
       ["/api/books/not-a-book", { ...json({ name: "X" }), method: "PUT" }, 400, { error: "Invalid book ID" }],
-      ["/api/books/1", { ...json({ name: "X", upcomingDays: 0 }), method: "PUT" }, 400, { error: "upcomingDays must be an integer between 1 and 365" }],
+      ["/api/books/1", { ...json({ name: "X", upcomingDays: 0 }), method: "PUT" }, 400, { error: "upcomingDays: must be an integer from 1 to 365" }],
       ["/api/books/999999", { method: "DELETE" }, 404, { error: "Book not found" }],
-      ["/api/books/99999999999", { ...json({ name: " " }), method: "PUT" }, 400, { error: "Book name is required" }],
+      ["/api/books/99999999999", { ...json({ name: " " }), method: "PUT" }, 400, { error: "name: must not be blank" }],
       ["/api/books/99999999999", { ...json({ name: "X" }), method: "PUT" }, 500, { error: "Failed to update book" }],
       ["/api/books/99999999999", { method: "DELETE" }, 500, { error: "Failed to delete book" }],
     ] as const) {

@@ -8,9 +8,10 @@ import {
 } from "../helpers/db-utils";
 import { rows, scalar, script } from "../helpers/sql";
 import { workerDatabasePath } from "../helpers/test-database";
+import { rustBinary } from "../helpers/rust-binaries";
 
 const run = promisify(execFile);
-const CLI = path.resolve("rust-api/target/debug/ledger-cli");
+const CLI = rustBinary("ledger-cli");
 
 /** Run a `ledger-cli` command against this worker's database, in this process's zone. */
 async function cli(...args: string[]) {

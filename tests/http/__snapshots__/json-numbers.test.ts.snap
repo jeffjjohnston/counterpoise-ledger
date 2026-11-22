@@ -10,7 +10,7 @@ exports[`JSON numbers outside the double range > get the zod issue for Infinity,
   },
   "fixed price": {
     "body": {
-      "error": "fixedPriceMicros must be a positive whole number of micros",
+      "error": "fixedPriceMicros: must be a positive integer",
     },
     "status": 400,
   },
@@ -28,7 +28,7 @@ exports[`JSON numbers outside the double range > get the zod issue for Infinity,
   },
   "negative security name": {
     "body": {
-      "error": "Invalid input: expected string, received -Infinity",
+      "error": "name: invalid type: number, expected a string",
     },
     "status": 400,
   },
@@ -40,7 +40,7 @@ exports[`JSON numbers outside the double range > get the zod issue for Infinity,
   },
   "payee name": {
     "body": {
-      "error": "Name is required",
+      "error": "name: invalid type: number, expected a string",
     },
     "status": 400,
   },
@@ -52,7 +52,7 @@ exports[`JSON numbers outside the double range > get the zod issue for Infinity,
   },
   "security name": {
     "body": {
-      "error": "Invalid input: expected string, received Infinity",
+      "error": "name: invalid type: number, expected a string",
     },
     "status": 400,
   },
@@ -64,13 +64,13 @@ exports[`JSON numbers outside the double range > get the zod issue for Infinity,
   },
   "top-level body": {
     "body": {
-      "error": "Invalid input: expected object, received Infinity",
+      "error": "The request body must be a JSON object",
     },
     "status": 400,
   },
   "upcoming days": {
     "body": {
-      "error": "upcomingDays must be an integer between 1 and 365",
+      "error": "upcomingDays: must be an integer from 1 to 365",
     },
     "status": 400,
   },

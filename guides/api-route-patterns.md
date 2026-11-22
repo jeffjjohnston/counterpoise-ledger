@@ -21,9 +21,12 @@ path that no route matches gets 404. See "Security layers" in
 
 1. Write the handler in the route area under
    `rust-api/server/src/routes/` (for example `payees.rs`).
-2. Add an arm for it to the match in `routes()` in `routes/mod.rs`, and add
-   its method, path and handler name to `rust-api/routes.json`. The router
-   registers a route only when both agree.
+2. Add one line for it to the route table in `routes/mod.rs`
+   (`GET "/api/b/[bookId]/things" "things.list" => list_things,`). Then write
+   `rust-api/routes.json` again from the table:
+   `UPDATE_ROUTES_JSON=1 cargo test --manifest-path rust-api/Cargo.toml -p
+   counterpoise-rust-api routes_json`. Do not edit the JSON file by hand: a
+   Rust test fails when it does not match the table.
 3. Add HTTP cases to `tests/http/` (see [testing.md](testing.md)). When a
    native client uses the route, add it to the contract too: see
    [api-contract.md](api-contract.md).
@@ -104,7 +107,7 @@ other handler gives `AccessLevel::Write`.
 
 A static test, `tests/lib/book-access-levels.test.ts`, reads each
 `/api/b/[bookId]` route in `rust-api/routes.json`, finds its handler through
-the match arms in `routes/mod.rs`, and checks the `AccessLevel::` in the
+the lines of the route table in `routes/mod.rs`, and checks the `AccessLevel::` in the
 handler's body against the level its method implies (GET → `Read`,
 everything else → `Write`, unless the route is one of the owner-only Plaid
 routes below). A level in a private helper is not seen. A route that
@@ -311,8 +314,6 @@ Node rules:
 - `PUT` on a missing transaction is a 404, unless the body has splits. Then
   the split insert fails its foreign key and the route returns its 500
   message. `DELETE` commits the Plaid sweep also when it deletes no row.
-- The routes send `transaction_created`, `transaction_updated` with the
-  `diffTransactionFields` result, and `transaction_deleted`.
 
 `tests/http/transactions.test.ts` and `transaction-writes.test.ts` compare full
 bodies and lot rows with snapshots.
@@ -642,6 +643,58 @@ null, as `JSON.stringify` does. `tests/http/json-numbers.test.ts` compares
 these cases.
 
 Every Rust write handler uses these helpers, account `POST` included.
+
+#### Typed bodies
+
+`rust-api/server/src/body.rs` is a second way to validate a body. These
+bodies of the API contract use it: books, securities, payee create, book
+members, login, API key create and the Plaid link session. The other routes
+still use the validators above: accounts, transactions, security prices, and
+each body that is not in the contract (registration, recurring rules, bank
+sync). The move goes one domain at a time, each with the owner's agreement.
+
+A body is a struct that derives `Deserialize` and `ToSchema`
+(`CreateBookBody` in `routes/books.rs`, `UpdateSecurityBody` in
+`routes/securities.rs`). The struct is the validator, and
+`openapi/schemas.rs` gets the component schema from the same struct with
+`schema_of`. A rule is the type of a field, so the rule and its schema
+keyword cannot differ:
+
+| Field type | It refuses | In the schema |
+| --- | --- | --- |
+| `NonBlank` | Text that is empty after a trim of JavaScript white space | `minLength` 1 |
+| `NonEmpty` | Empty text. It does not trim: for a password | `minLength` 1 |
+| `IntRange<1, 365>` | A number outside the range, or not an integer | `minimum`, `maximum` |
+| `PositiveInt` | Zero, a negative number, a fraction, a number above 2^53 - 1 | `exclusiveMinimum` 0 |
+| An enum from `string_enum!` | Text that is not one of its texts | `enum` |
+| `Nullable<T>` | What `T` refuses; it takes `null` | `anyOf` of `T` and `null` |
+
+- Read the body with `typed_body(&parse_json_body(...)?)`. Malformed JSON
+  still gets the route's 500 message, from `parse_json_body`.
+- A refusal is a 400. Its message starts with the field name:
+  `name: must not be blank`, `securityType: must be one of: etf,
+  mutual_fund, stock`. A required field that is not there gives serde's
+  ``missing field `name` ``. The native clients show the message and branch
+  only on the status, so the text is free to change; the status is not.
+- A key that the struct does not name is ignored, as before. Do not add
+  `deny_unknown_fields`: a client can send a field of a newer contract.
+- For a field that a client can leave out, use `Option<T>` with
+  `#[serde(default, deserialize_with = "present")]`, so that `null` is
+  refused and not read as "left out". `Option<Nullable<T>>` with `present`
+  keeps three cases apart, for an update where `null` removes a value.
+- Do not derive `Debug` on a body that holds a secret: see `LoginBody`.
+- A rule across two fields is code after the read: see
+  `UpdateBookBody::read` and `UpdateSecurityBody::read`.
+- A new field type with its own message must read any value first and apply
+  its rule after (see `number` in `body.rs`). If it replaces each serde error
+  with its message, it hides "missing field".
+- A derived schema must have the shape of the contract. The module text of
+  `body.rs` lists the traps (a doc comment on the struct, `null` in the
+  type of an optional field, `format` on an integer, a generic field type).
+  `npm run openapi:check` fails when a struct changes
+  `openapi/openapi.json`.
+- The MCP manifest (`mcp-tools.json`) and its message table in
+  `mcp/mod.rs` still hold their own copy of each rule.
 
 ### Rust rate limiting
 

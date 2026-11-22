@@ -1,12 +1,12 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { resolve } from "node:path";
 import { generateApiKey, getKeyPrefix, hashApiKey } from "./api-keys";
 import { count, insert } from "./sql";
 import { startHttpTestServer } from "./http-parity";
 import { workerDatabasePath } from "./test-database";
 import { callMcpTool, type McpCallResult } from "./mcp";
+import { rustBinary } from "./rust-binaries";
 
 /** The text and error flag of a tool result, undecoded. */
 export type RawToolResult = { isError: boolean; text: string };
@@ -26,7 +26,7 @@ export function mcpTestTransport(): "http" | "stdio" {
 }
 
 /** The Rust server binary that `cargo build -p counterpoise-rust-api` writes. */
-export const RUST_SERVER_BINARY = resolve("rust-api/target/debug/counterpoise-rust-api");
+export const RUST_SERVER_BINARY = rustBinary("counterpoise-rust-api");
 
 /**
  * The environment of a Rust stdio server: this worker's database, the key, and

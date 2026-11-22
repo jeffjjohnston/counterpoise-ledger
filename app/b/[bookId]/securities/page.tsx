@@ -1,7 +1,7 @@
 "use client";
 
 import { Link } from "@/lib/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
@@ -13,8 +13,7 @@ import { formatCurrency } from "@/lib/wasm-client";
 import { csvEscape, datedCsvFilename, triggerDownload } from "@/lib/csv";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
-import { useLiveReload } from "@/components/BookChangesProvider";
-import { useLatestRequest } from "@/hooks/useLatestRequest";
+import { useBookResource } from "@/hooks/useBookResource";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { Security } from "@/types/db";
@@ -48,52 +47,26 @@ export default function SecuritiesPage() {
   const bookId = useBookId();
   const { canWrite } = useBookRole();
   const toast = useToast();
-  const [securities, setSecurities] = useState<SecurityWithPosition[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [editingSecurity, setEditingSecurity] = useState<SecurityWithPosition | null>(null);
   const [showUpdatePricesModal, setShowUpdatePricesModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
 
-  // A live update can start a refresh while another is in flight. Only the
-  // latest request may publish its answer.
-  const securitiesRequest = useLatestRequest();
-  // Whether this book's list has rendered. A live refresh can overtake the
-  // first load, so the first answer, not the first request, decides between
-  // the full-page error and a toast.
-  const securitiesShown = useRef(false);
-
-  const fetchSecurities = useCallback(async () => {
-    const isLatest = securitiesRequest();
-    try {
-      const data = await apiGet<SecurityWithPosition[]>(`/api/b/${bookId}/securities`);
-      if (!isLatest()) return;
-      setSecurities(Array.isArray(data) ? data : []);
-      setError(null);
-      securitiesShown.current = true;
-      setLoading(false);
-    } catch {
-      if (!isLatest()) return;
-      if (!securitiesShown.current) {
-        // Nothing has rendered yet — the full-page error state is correct.
-        setError("Could not load securities.");
-        setLoading(false);
-      } else {
-        // A background refresh (after a create/update/delete, a price
-        // update, or a change by another client) failed. The
-        // already-rendered securities list is still correct, so keep it on
-        // screen rather than blanking the page — surface it the way this
-        // page already does for a failed write.
-        toast.error("Could not refresh securities.");
-      }
-    }
-  }, [bookId, toast, securitiesRequest]);
-
-  // Another client (an MCP tool, another tab, a scheduled job) changed the
-  // book. The edit form and the Update prices modal take their fields from
-  // the list, so the reload waits until they close.
-  useLiveReload(SECURITY_TABLES, () => void fetchSecurities(), {
+  const loadSecurities = useCallback(async () => {
+    const data = await apiGet<SecurityWithPosition[]>(`/api/b/${bookId}/securities`);
+    return Array.isArray(data) ? data : [];
+  }, [bookId]);
+  // Another client (an MCP tool, another tab, a scheduled job) can change
+  // the book. The edit form and the Update prices modal take their fields
+  // from the list, so a live reload waits until they close. A reload that
+  // fails (after a create, update or delete, a price update, or a live
+  // change) keeps the list on the screen and shows a toast.
+  const { data: securities, loading, error, reload: fetchSecurities } = useBookResource<SecurityWithPosition[]>({
+    initial: [],
+    load: loadSecurities,
+    tables: SECURITY_TABLES,
+    loadError: "Could not load securities.",
+    refreshError: "Could not refresh securities.",
     paused: editingSecurity !== null || showUpdatePricesModal,
   });
 
@@ -123,10 +96,6 @@ export default function SecuritiesPage() {
     return formatCurrency(Math.round((priceMicros / MICROS_PER_SHARE) * 100));
   };
 
-  useEffect(() => {
-    securitiesShown.current = false;
-    void fetchSecurities();
-  }, [fetchSecurities]);
 
   const handleCreate = async (data: {
     name: string;

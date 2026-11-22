@@ -291,16 +291,7 @@ mod tests {
 
     #[test]
     fn every_operation_is_a_rust_route() {
-        #[derive(serde::Deserialize)]
-        struct Route {
-            method: String,
-            path: String,
-        }
-        let routes: Vec<Route> = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../routes.json"
-        )))
-        .expect("valid route manifest");
+        let routes = crate::routes::table();
         for op in OPERATIONS {
             let method = match op.method {
                 HttpMethod::Get => "GET",
@@ -315,7 +306,7 @@ mod tests {
                 routes
                     .iter()
                     .any(|route| route.method == method && route.path == path),
-                "{method} {path} is not in rust-api/routes.json"
+                "{method} {path} is not in the route table of routes/mod.rs"
             );
         }
     }

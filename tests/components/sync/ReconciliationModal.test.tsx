@@ -48,6 +48,7 @@ function makeCandidate(
     dayDelta: 0,
     counterpartAccountNames: ["Groceries"],
     splitCount: 2,
+    isInvestment: false,
     score: 10,
     scoreTags: [],
     alreadyLinked: false,
@@ -71,6 +72,7 @@ function makeItem(
     resolutionStatus: "pending",
     reviewReason: null,
     matchedTransactionId: null,
+    linkedAccountId: null,
     pending: false,
     firstSeenAt: "2026-02-09T00:00:00.000Z",
     lastSeenAt: "2026-02-09T00:00:00.000Z",
@@ -217,6 +219,7 @@ describe("ReconciliationModal", () => {
       resolutionStatus: "pending",
       reviewReason: null,
       matchedTransactionId: null,
+      linkedAccountId: null,
       pending: false,
       firstSeenAt: "2026-02-09T00:00:00.000Z",
       lastSeenAt: "2026-02-09T00:00:00.000Z",
@@ -353,6 +356,37 @@ describe("ReconciliationModal", () => {
     );
   });
 
+  // Two equal bank rows (two equal charges on one day) get the
+  // same candidates. After the first row links transaction 7, the second row
+  // must not offer 7 again: the server refuses that link.
+  it("does not offer a transaction that another row on the link has just matched", async () => {
+    const candidates = [
+      makeCandidate({ transactionId: 7, score: 155 }),
+      makeCandidate({ transactionId: 8, score: 150 }),
+    ];
+    const first = makeItem({ id: 1, plaidTransactionId: "plaid-1", candidates });
+    const second = makeItem({ id: 2, plaidTransactionId: "plaid-2", candidates });
+    const fetchMock = stubQueueList([first, second], (body) => {
+      const { reconciliationId, transactionId } = body as { reconciliationId: number; transactionId: number };
+      const row = reconciliationId === 1 ? first : second;
+      return new Response(
+        JSON.stringify({ ...row, resolutionStatus: "matched", matchedTransactionId: transactionId })
+      );
+    });
+
+    render(<ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />);
+    await screen.findByTestId("queue-item-1");
+    await flushEffects();
+
+    fireEvent.click(screen.getByRole("button", { name: "Match" }));
+    await waitFor(() => expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument());
+    await flushEffects();
+
+    fireEvent.click(screen.getByRole("button", { name: "Match" }));
+    await waitFor(() => expect(reconcilePosts(fetchMock)).toHaveLength(2));
+    expect(reconcilePosts(fetchMock).map((post) => post.transactionId)).toEqual([7, 8]);
+  });
+
   it("shows in-flight feedback on the Match button while submitting", async () => {
     const item = makeItem({
       candidates: [makeCandidate({ alreadyLinked: false })],
@@ -484,7 +518,8 @@ describe("ReconciliationModal", () => {
     // No disclosure to open first -- the only candidate is the decision
     // block itself.
     const best = await screen.findByTestId("best-match");
-    expect(within(best).getByRole("button", { name: "Match" })).toBeInTheDocument();
+    // A link always joins equal amounts: a plain Match is not offered.
+    expect(within(best).queryByRole("button", { name: "Match" })).toBeNull();
     const updateButton = within(best).getByRole("button", { name: /^Match & Update/ });
     expect(updateButton).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /other candidate/i })).toBeNull();
@@ -499,6 +534,79 @@ describe("ReconciliationModal", () => {
       action: "match_update_amount",
       transactionId: 42,
     });
+  });
+
+  it("sends the amount update for Enter when the best candidate's amount differs", async () => {
+    const item = makeItem({
+      candidates: [makeCandidate({ transactionId: 42, amountDelta: 3, splitCount: 2 })],
+    });
+    const postSpy = vi.fn();
+    stubQueueFetch(item, (body) => {
+      postSpy(body);
+      return { ok: true, json: async () => ({ ...item, resolutionStatus: "matched", matchedTransactionId: 42 }) } as Response;
+    });
+    render(
+      <KeyboardShortcutProvider>
+        <ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />
+      </KeyboardShortcutProvider>
+    );
+    await screen.findByTestId("best-match");
+    await flushEffects();
+    fireEvent.keyDown(document, { key: "Enter" });
+    await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(1));
+    expect(postSpy.mock.calls[0][0]).toMatchObject({ action: "match_update_amount", transactionId: 42 });
+  });
+
+  it("offers no match when the amounts differ on a transaction with more than 2 splits", async () => {
+    const item = makeItem({
+      candidates: [makeCandidate({ transactionId: 42, amountDelta: 3, splitCount: 3 })],
+    });
+    const postSpy = vi.fn();
+    stubQueueFetch(item, (body) => {
+      postSpy(body);
+      return { ok: true, json: async () => item } as Response;
+    });
+    render(
+      <KeyboardShortcutProvider>
+        <ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />
+      </KeyboardShortcutProvider>
+    );
+    const best = await screen.findByTestId("best-match");
+    const match = within(best).getByRole("button", { name: "Match" });
+    expect(match).toBeDisabled();
+    expect(match).toHaveAttribute("title", expect.stringContaining("Change the splits to the bank amount"));
+    expect(within(best).queryByRole("button", { name: /Match & Update/ })).toBeNull();
+    await flushEffects();
+    fireEvent.keyDown(document, { key: "Enter" });
+    await flushEffects();
+    expect(postSpy).not.toHaveBeenCalled();
+  });
+
+  // The server refuses an amount update on an investment transaction, even
+  // with 2 splits.
+  it("offers no match when the amounts differ on an investment transaction", async () => {
+    const item = makeItem({
+      candidates: [makeCandidate({ transactionId: 42, amountDelta: 3, splitCount: 2, isInvestment: true })],
+    });
+    const postSpy = vi.fn();
+    stubQueueFetch(item, (body) => {
+      postSpy(body);
+      return { ok: true, json: async () => item } as Response;
+    });
+    render(
+      <KeyboardShortcutProvider>
+        <ReconciliationModal isOpen links={[baseRow]} initialLinkId={11} onClose={vi.fn()} />
+      </KeyboardShortcutProvider>
+    );
+    const best = await screen.findByTestId("best-match");
+    const match = within(best).getByRole("button", { name: "Match" });
+    expect(match).toBeDisabled();
+    expect(match).toHaveAttribute("title", expect.stringContaining("investment transaction"));
+    expect(within(best).queryByRole("button", { name: /Match & Update/ })).toBeNull();
+    await flushEffects();
+    fireEvent.keyDown(document, { key: "Enter" });
+    await flushEffects();
+    expect(postSpy).not.toHaveBeenCalled();
   });
 
   // The guard on flushEffects for the disclosures, the twin of the keyboard
@@ -837,6 +945,30 @@ describe("ReconciliationModal", () => {
       expect(keep).toHaveClass("bg-accent");
     });
 
+    // The linked transaction is not among the candidates, and the bank
+    // amount is now different. The server refuses Keep for that link.
+    it("disables Keep local when the linked total differs and the transaction is not a candidate", async () => {
+      const changed = { ...linked, amountCents: 990 };
+      stubQueueList([changed], undefined, undefined, transactions);
+      render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      const box = await screen.findByTestId("linked-transaction");
+      await waitFor(() => expect(box).toHaveTextContent("Wall Street Journal"));
+      const keep = within(screen.getByTestId("resolve-footer")).getByRole("button", { name: /Keep local/ });
+      expect(keep).toBeDisabled();
+      expect(screen.getByText(/Change your transaction to the bank amount, or unlink/)).toBeInTheDocument();
+    });
+
+    // The bank account is now mapped to account 5. The link was made on
+    // account 1, where its total is still the bank amount.
+    it("compares a remapped link on the account that the link was made on", async () => {
+      stubQueueList([{ ...linked, linkedAccountId: 1 }], undefined, undefined, transactions);
+      render(<ReconciliationModal isOpen links={[{ ...row, counterpoiseAccountId: 5 }]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
+      const box = await screen.findByTestId("linked-transaction");
+      await waitFor(() => expect(box).toHaveTextContent("−$8.80"));
+      const keep = within(screen.getByTestId("resolve-footer")).getByRole("button", { name: /Keep local/ });
+      expect(keep).toBeEnabled();
+    });
+
     it("asks before Create adds a second transaction", async () => {
       const posts: unknown[] = [];
       stubQueueList([linked], (body) => {
@@ -949,10 +1081,11 @@ describe("ReconciliationModal", () => {
       render(<ReconciliationModal isOpen links={[row]} initialLinkId={row.plaidLinkId} onClose={vi.fn()} />);
       const best = await screen.findByTestId("best-match");
       const buttons = within(best).getAllByRole("button").map((button) => button.textContent);
-      expect(buttons).toEqual(["Update to $8.80", "Keep"]);
-      // Only one main action: the footer's Keep local steps back.
+      // Keep cannot keep a link whose amounts are different.
+      expect(buttons).toEqual(["Update to $8.80"]);
       const footerKeep = within(screen.getByTestId("resolve-footer")).getByRole("button", { name: /Keep local/ });
       expect(footerKeep).not.toHaveClass("bg-accent");
+      expect(footerKeep).toBeDisabled();
       expect(screen.getByTestId("linked-transaction")).toHaveTextContent(
         "The bank amount is different. Update changes your amount to the bank amount and keeps this link."
       );

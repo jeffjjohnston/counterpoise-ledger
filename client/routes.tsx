@@ -3,6 +3,7 @@ import { createBrowserRouter, type RouteObject } from "react-router";
 import RootLayout from "@/app/layout";
 import { NotFound } from "./NotFound";
 import { RouteError } from "./RouteError";
+import { AccountRedirect } from "./AccountRedirect";
 
 /**
  * The route table of the client. Each page is a separate chunk, which loads
@@ -34,7 +35,8 @@ export const routes: RouteObject[] = [
       { index: true, ...page(() => import("@/app/page")) },
       { path: "login", ...page(() => import("@/app/login/page")) },
       { path: "register", ...page(() => import("@/app/register/page")) },
-      { path: "account", ...page(() => import("@/app/account/page")) },
+      { path: "account", Component: AccountRedirect },
+      { path: "settings", ...page(() => import("@/app/settings/page")) },
       { path: "oauth/consent", ...page(() => import("@/app/oauth/consent/page")) },
       {
         path: "b/:bookId",
@@ -55,6 +57,7 @@ export const routes: RouteObject[] = [
             path: "reports/realized-gains",
             ...page(() => import("@/app/b/[bookId]/reports/realized-gains/page")),
           },
+          { path: "settings", ...page(() => import("@/app/b/[bookId]/settings/page")) },
           { path: "search", ...page(() => import("@/app/b/[bookId]/search/page")) },
           { path: "securities", ...page(() => import("@/app/b/[bookId]/securities/page")) },
           { path: "securities/:id", ...page(() => import("@/app/b/[bookId]/securities/[id]/page")) },

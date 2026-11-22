@@ -2,15 +2,15 @@ mod access_handoff;
 pub(crate) mod account_balance;
 pub(crate) mod accounts;
 pub(crate) mod auth;
-mod books;
+pub(crate) mod books;
 pub(crate) mod cron;
 mod entry_suggestion;
 pub(crate) mod investments;
 mod issue_reports;
-mod members;
+pub(crate) mod members;
 pub(crate) mod net_worth;
 pub(crate) mod payees;
-mod plaid_link;
+pub(crate) mod plaid_link;
 pub(crate) mod plaid_sync;
 pub(crate) mod realized_gains;
 pub(crate) mod reconcile;
@@ -91,29 +91,236 @@ use self::{
 };
 use crate::state::AppState;
 use axum::{Router, routing::get};
-use serde::Deserialize;
 
-#[derive(Deserialize)]
-struct ManifestRoute {
-    method: String,
-    path: String,
-    handler: String,
+/// One route of the table: its method, its path in the form of the manifest
+/// (`/api/b/[bookId]/payees/[id]`), its name in the manifest, and the
+/// function that adds its handler to the router.
+pub(crate) struct Route {
+    // The method and the name go only to `routes.json` and to the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) method: &'static str,
+    pub(crate) path: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
+    name: &'static str,
+    add: fn(Router<AppState>, &str) -> Router<AppState>,
+}
+
+macro_rules! method_router {
+    (GET) => {
+        axum::routing::get
+    };
+    (POST) => {
+        axum::routing::post
+    };
+    (PUT) => {
+        axum::routing::put
+    };
+    (PATCH) => {
+        axum::routing::patch
+    };
+    (DELETE) => {
+        axum::routing::delete
+    };
+}
+
+/// Makes the route table from lines of the form
+/// `GET "/api/b/[bookId]/things" "things.list" => list_things,`.
+/// `tests/lib/book-access-levels.test.ts` reads these lines to find the
+/// handler of each book route: keep one route on one line.
+macro_rules! route_table {
+    ($( $(#[$attr:meta])* $method:ident $path:literal $name:literal => $handler:path ),* $(,)?) => {{
+        let mut table: Vec<Route> = Vec::new();
+        $(
+            $(#[$attr])*
+            table.push(Route {
+                method: stringify!($method),
+                path: $path,
+                name: $name,
+                add: |router, path| router.route(path, method_router!($method)($handler)),
+            });
+        )*
+        table
+    }};
+}
+
+/// THE ROUTE TABLE: each route of the API, one line each. To add a route,
+/// add its line here, then write `rust-api/routes.json` again from the table
+/// (the test below says how). The tests in `tests/` read that file.
+///
+/// A route with two methods on one path has two lines. The order is the
+/// order of `routes.json`.
+#[rustfmt::skip]
+pub(crate) fn table() -> Vec<Route> {
+    route_table![
+        GET "/api/version" "version.get" => version,
+        GET "/api/system/status" "system.status" => status,
+        GET "/api/books" "books.list" => list_books,
+        POST "/api/books" "books.create" => create_book,
+        POST "/api/books/demo" "books.demo" => create_demo_book,
+        GET "/api/books/demo/datasets" "books.datasets" => list_demo_datasets,
+        PUT "/api/books/[bookId]" "books.update" => update_book,
+        DELETE "/api/books/[bookId]" "books.delete" => delete_book,
+        GET "/api/books/[bookId]/members" "members.list" => list_members,
+        POST "/api/books/[bookId]/members" "members.add" => add_member,
+        PUT "/api/books/[bookId]/members/[userId]" "members.change" => change_member,
+        DELETE "/api/books/[bookId]/members/[userId]" "members.remove" => remove_member,
+        GET "/api/issue-reports" "issues.list" => list_reports,
+        POST "/api/issue-reports" "issues.create" => create_report,
+        PUT "/api/issue-reports/[id]" "issues.update" => update_report,
+        DELETE "/api/issue-reports/[id]" "issues.delete" => delete_report,
+        GET "/api/b/[bookId]/accounts" "accounts.list" => list_accounts,
+        POST "/api/b/[bookId]/accounts" "accounts.create" => create_account,
+        GET "/api/b/[bookId]/accounts/[id]" "accounts.get" => get_account,
+        PUT "/api/b/[bookId]/accounts/[id]" "accounts.update" => update_account,
+        DELETE "/api/b/[bookId]/accounts/[id]" "accounts.delete" => delete_account,
+        GET "/api/b/[bookId]/accounts/[id]/balance-history" "accounts.balancehistory" => account_balance_history,
+        // The native socket. A Durable Object serves the path with its own API.
+        #[cfg(feature = "native")]
+        GET "/api/b/[bookId]/socket" "events.socket" => book_socket,
+        POST "/api/b/[bookId]/sync/accounts/[id]/reconcile/suggestion" "typesafe.suggest" => request_route,
+        PATCH "/api/b/[bookId]/sync/accounts/[id]/reconcile/suggestion" "typesafe.display" => display_route,
+        PUT "/api/b/[bookId]/sync/accounts/[id]/reconcile/suggestion" "typesafe.confirm" => confirm_route,
+        GET "/api/b/[bookId]/settings/typesafe" "typesafe.settings" => get_settings,
+        PATCH "/api/b/[bookId]/settings/typesafe" "typesafe.update" => update_settings,
+        DELETE "/api/b/[bookId]/settings/typesafe" "typesafe.clear" => clear_settings,
+        GET "/api/b/[bookId]/settings/weekly-review" "weeklyreview.settings" => get_weekly_review_settings,
+        PATCH "/api/b/[bookId]/settings/weekly-review" "weeklyreview.update" => update_weekly_review_settings,
+        DELETE "/api/b/[bookId]/settings/weekly-review" "weeklyreview.clear" => clear_weekly_review_settings,
+        GET "/api/b/[bookId]/weekly-review" "weeklyreview.get" => get_weekly_review,
+        POST "/api/b/[bookId]/weekly-review/run" "weeklyreview.run" => run_weekly_review_now,
+        POST "/api/b/[bookId]/weekly-review/items/[id]/dismiss" "weeklyreview.dismiss" => dismiss_weekly_review_item,
+        POST "/api/b/[bookId]/weekly-review/items/[id]/restore" "weeklyreview.restore" => restore_weekly_review_item,
+        GET "/api/cron/typesafe-cleanup" "typesafe.cleanup" => cleanup_route,
+        GET "/api/cron/plaid-sync" "cron.plaidsync" => plaid_sync_cron,
+        GET "/api/cron/price-sync" "cron.pricesync" => price_sync_cron,
+        GET "/api/cron/recurring" "cron.recurring" => recurring_cron,
+        GET "/api/cron/backup" "cron.backup" => backup_cron,
+        GET "/api/cron/weekly-review" "weeklyreview.cron" => weekly_review_cron,
+        GET "/api/b/[bookId]/sync/pending-count" "sync.pendingcount" => pending_count,
+        GET "/api/b/[bookId]/sync/tokens" "sync.tokens" => list_tokens,
+        POST "/api/b/[bookId]/sync/tokens" "sync.createtoken" => create_token,
+        PUT "/api/b/[bookId]/sync/tokens/[id]" "sync.updatetoken" => update_token,
+        DELETE "/api/b/[bookId]/sync/tokens/[id]" "sync.deletetoken" => delete_token,
+        GET "/api/b/[bookId]/sync/tokens/[id]/accounts" "sync.tokenaccounts" => list_token_accounts,
+        PUT "/api/b/[bookId]/sync/tokens/[id]/accounts" "sync.assignaccounts" => set_token_accounts,
+        POST "/api/b/[bookId]/sync/tokens/[id]/accounts/refresh" "sync.refreshaccounts" => refresh_token_accounts,
+        DELETE "/api/b/[bookId]/sync/tokens/[id]/sync" "sync.clear" => clear_sync_data,
+        POST "/api/b/[bookId]/sync/tokens/[id]/sync" "sync.run" => sync_now,
+        POST "/api/b/[bookId]/sync/link-sessions" "sync.createlinksession" => create_link_session,
+        POST "/api/b/[bookId]/sync/link-sessions/[id]/check" "sync.checklinksession" => check_link_session,
+        GET "/api/b/[bookId]/sync/reconcile" "sync.bookqueue" => book_queue,
+        GET "/api/b/[bookId]/sync/accounts/[id]/reconcile" "sync.linkqueue" => link_queue,
+        POST "/api/b/[bookId]/sync/accounts/[id]/reconcile" "sync.resolve" => resolve_route,
+        GET "/api/b/[bookId]/sync/assigned-accounts" "sync.assigned" => assigned_accounts,
+        GET "/api/b/[bookId]/sync/pending-transactions" "sync.pendingtransactions" => pending_transactions,
+        GET "/api/b/[bookId]/sync/stale-unmatched" "sync.stale" => stale_unmatched,
+        GET "/api/b/[bookId]/transactions/[id]/plaid" "transactions.plaidlink" => transaction_plaid_link,
+        POST "/api/b/[bookId]/transactions/[id]/plaid/unlink" "transactions.plaidunlink" => unlink_transaction,
+        GET "/api/b/[bookId]/payees" "payees.list" => list_payees,
+        POST "/api/b/[bookId]/payees" "payees.create" => create_payee,
+        GET "/api/b/[bookId]/payees/[id]" "payees.get" => get_payee,
+        DELETE "/api/b/[bookId]/payees/[id]" "payees.delete" => delete_payee,
+        GET "/api/b/[bookId]/payees/[id]/last-account" "payees.lastaccount" => last_account,
+        GET "/api/b/[bookId]/payees/[id]/entry-patterns" "entrysuggestion.patterns" => get_entry_patterns,
+        POST "/api/b/[bookId]/entry-suggestion" "entrysuggestion.request" => request_entry_suggestion,
+        POST "/api/b/[bookId]/entry-suggestion/outcome" "entrysuggestion.outcome" => record_entry_outcome,
+        GET "/api/b/[bookId]/reports/data" "reports.data" => report_data,
+        GET "/api/b/[bookId]/reports/income-statement" "reports.income" => income_statement,
+        GET "/api/b/[bookId]/search" "search.get" => search,
+        GET "/api/b/[bookId]/investments/positions" "investments.positions" => get_positions,
+        GET "/api/b/[bookId]/investments/account-values" "investments.accountvalues" => account_values,
+        GET "/api/b/[bookId]/securities" "securities.list" => list_securities,
+        POST "/api/b/[bookId]/securities" "securities.create" => create_security,
+        GET "/api/b/[bookId]/securities/[id]" "securities.get" => get_security,
+        PUT "/api/b/[bookId]/securities/[id]" "securities.update" => update_security,
+        DELETE "/api/b/[bookId]/securities/[id]" "securities.delete" => delete_security,
+        GET "/api/b/[bookId]/securities/[id]/detail" "securities.detail" => security_detail,
+        GET "/api/b/[bookId]/securities/[id]/lots" "securities.lots" => security_lots,
+        GET "/api/b/[bookId]/securities/[id]/splits" "securities.splits" => security_splits,
+        GET "/api/b/[bookId]/reports/realized-gains" "reports.realizedgains" => realized_gains,
+        GET "/api/b/[bookId]/reports/net-worth-history" "reports.networth" => net_worth_history,
+        GET "/api/b/[bookId]/securities/[id]/prices" "prices.history" => price_history,
+        PUT "/api/b/[bookId]/securities/[id]/prices/[date]" "prices.update" => update_price,
+        DELETE "/api/b/[bookId]/securities/[id]/prices/[date]" "prices.delete" => delete_price,
+        GET "/api/b/[bookId]/securities/prices-due" "prices.due" => prices_due,
+        POST "/api/b/[bookId]/security-prices/bulk" "prices.bulk" => bulk_prices,
+        POST "/api/b/[bookId]/security-prices/tiingo" "prices.tiingo" => tiingo_prices,
+        GET "/api/b/[bookId]/transactions" "transactions.list" => list_transactions,
+        POST "/api/b/[bookId]/transactions" "transactions.create" => create_transaction,
+        GET "/api/b/[bookId]/transactions/changes" "transactions.changes" => list_transaction_changes,
+        GET "/api/b/[bookId]/transactions/[id]" "transactions.get" => get_transaction,
+        PUT "/api/b/[bookId]/transactions/[id]" "transactions.update" => update_transaction,
+        DELETE "/api/b/[bookId]/transactions/[id]" "transactions.delete" => delete_transaction,
+        GET "/api/b/[bookId]/recurring" "recurring.list" => list_rules,
+        POST "/api/b/[bookId]/recurring" "recurring.create" => create_rule,
+        GET "/api/b/[bookId]/recurring/[id]" "recurring.get" => get_rule,
+        PUT "/api/b/[bookId]/recurring/[id]" "recurring.update" => update_rule,
+        DELETE "/api/b/[bookId]/recurring/[id]" "recurring.delete" => delete_rule,
+        POST "/api/b/[bookId]/recurring/process" "recurring.process" => process_rules,
+        GET "/api/b/[bookId]/recurring/projected" "recurring.projected" => projected,
+        GET "/api/b/[bookId]/recurring/transactions" "recurring.transactions" => rule_transactions,
+        GET "/api/auth/registration-open" "auth.registration" => registration_status,
+        POST "/api/auth/login" "auth.login" => login,
+        POST "/api/auth/register" "auth.register" => register,
+        POST "/api/auth/logout" "auth.logout" => logout,
+        GET "/api/auth/me" "auth.me" => me,
+        PUT "/api/auth/password" "auth.password" => change_password,
+        PUT "/api/auth/username" "auth.username" => change_username,
+        GET "/api/auth/api-keys" "auth.keys" => list_keys,
+        POST "/api/auth/api-keys" "auth.create" => create_key,
+        DELETE "/api/auth/api-keys/[id]" "auth.delete" => delete_key,
+    ]
+}
+
+/// The axum form of a manifest path: `[bookId]` becomes `{book_id}`.
+fn axum_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 4);
+    let mut in_parameter = false;
+    for character in path.chars() {
+        match character {
+            '[' => {
+                in_parameter = true;
+                out.push('{');
+            }
+            ']' => {
+                in_parameter = false;
+                out.push('}');
+            }
+            upper if in_parameter && upper.is_ascii_uppercase() => {
+                out.push('_');
+                out.push(upper.to_ascii_lowercase());
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The text of `rust-api/routes.json`: the method, path and name of each
+/// route of the table.
+#[cfg(test)]
+fn manifest_json() -> String {
+    let rows: Vec<String> = table()
+        .iter()
+        .map(|route| {
+            format!(
+                r#"  {{ "method": "{}", "path": "{}", "handler": "{}" }}"#,
+                route.method, route.path, route.name
+            )
+        })
+        .collect();
+    format!("[\n{}\n]\n", rows.join(",\n"))
 }
 
 pub(crate) fn routes() -> Router<AppState> {
-    let manifest: Vec<ManifestRoute> = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../routes.json"
-    )))
-    .expect("valid Rust route manifest");
-    manifest.into_iter().fold(
+    table().into_iter().fold(
         Router::new()
             .route("/health", get(health))
             .route("/api/health", get(api_health))
-            // Not in routes.json: that manifest lists the routes that had a
-            // Next fallback, and MCP over HTTP and WebMCP never had one.
+            // Not in the table: MCP over HTTP and WebMCP take each method on
+            // one path, and the tests that read routes.json do not cover them.
             .route(crate::mcp::PATH, axum::routing::any(crate::mcp::http))
-            // Not in routes.json either: only a server behind Cloudflare Access
+            // Not in the table either: only a server behind Cloudflare Access
             // answers it, and no browser page calls it.
             .route(
                 "/api/auth/access-handoff",
@@ -125,484 +332,51 @@ pub(crate) fn routes() -> Router<AppState> {
             )
             // OAuth for MCP: the discovery documents and /api/oauth/*.
             .merge(crate::oauth::routes()),
-        |router, route| match (
-            route.method.as_str(),
-            route.path.as_str(),
-            route.handler.as_str(),
-        ) {
-            ("GET", "/api/version", "version.get") => router.route(&route.path, get(version)),
-            ("GET", "/api/system/status", "system.status") => {
-                router.route(&route.path, get(status))
-            }
-            ("GET", "/api/books", "books.list") => router.route(&route.path, get(list_books)),
-            ("POST", "/api/books", "books.create") => {
-                router.route(&route.path, axum::routing::post(create_book))
-            }
-            ("POST", "/api/books/demo", "books.demo") => {
-                router.route(&route.path, axum::routing::post(create_demo_book))
-            }
-            ("GET", "/api/books/demo/datasets", "books.datasets") => {
-                router.route(&route.path, get(list_demo_datasets))
-            }
-            ("PUT", "/api/books/[bookId]", "books.update") => {
-                router.route("/api/books/{book_id}", axum::routing::put(update_book))
-            }
-            ("DELETE", "/api/books/[bookId]", "books.delete") => {
-                router.route("/api/books/{book_id}", axum::routing::delete(delete_book))
-            }
-            ("GET", "/api/books/[bookId]/members", "members.list") => {
-                router.route("/api/books/{book_id}/members", get(list_members))
-            }
-            ("POST", "/api/books/[bookId]/members", "members.add") => router.route(
-                "/api/books/{book_id}/members",
-                axum::routing::post(add_member),
-            ),
-            ("PUT", "/api/books/[bookId]/members/[userId]", "members.change") => router.route(
-                "/api/books/{book_id}/members/{user_id}",
-                axum::routing::put(change_member),
-            ),
-            ("DELETE", "/api/books/[bookId]/members/[userId]", "members.remove") => router.route(
-                "/api/books/{book_id}/members/{user_id}",
-                axum::routing::delete(remove_member),
-            ),
-            ("GET", "/api/issue-reports", "issues.list") => {
-                router.route(&route.path, get(list_reports))
-            }
-            ("POST", "/api/issue-reports", "issues.create") => {
-                router.route(&route.path, axum::routing::post(create_report))
-            }
-            ("PUT", "/api/issue-reports/[id]", "issues.update") => {
-                router.route("/api/issue-reports/{id}", axum::routing::put(update_report))
-            }
-            ("DELETE", "/api/issue-reports/[id]", "issues.delete") => router.route(
-                "/api/issue-reports/{id}",
-                axum::routing::delete(delete_report),
-            ),
-            ("GET", "/api/b/[bookId]/accounts", "accounts.list") => {
-                router.route("/api/b/{book_id}/accounts", get(list_accounts))
-            }
-            ("POST", "/api/b/[bookId]/accounts", "accounts.create") => router.route(
-                "/api/b/{book_id}/accounts",
-                axum::routing::post(create_account),
-            ),
-            ("GET", "/api/b/[bookId]/accounts/[id]", "accounts.get") => {
-                router.route("/api/b/{book_id}/accounts/{id}", get(get_account))
-            }
-            ("PUT", "/api/b/[bookId]/accounts/[id]", "accounts.update") => router.route(
-                "/api/b/{book_id}/accounts/{id}",
-                axum::routing::put(update_account),
-            ),
-            ("DELETE", "/api/b/[bookId]/accounts/[id]", "accounts.delete") => router.route(
-                "/api/b/{book_id}/accounts/{id}",
-                axum::routing::delete(delete_account),
-            ),
-            ("GET", "/api/b/[bookId]/accounts/[id]/balance-history", "accounts.balancehistory") => {
-                router.route(
-                    "/api/b/{book_id}/accounts/{id}/balance-history",
-                    get(account_balance_history),
-                )
-            }
-            (
-                "POST",
-                "/api/b/[bookId]/sync/accounts/[id]/reconcile/suggestion",
-                "typesafe.suggest",
-            ) => router.route(
-                "/api/b/{book_id}/sync/accounts/{id}/reconcile/suggestion",
-                axum::routing::post(request_route),
-            ),
-            (
-                "PATCH",
-                "/api/b/[bookId]/sync/accounts/[id]/reconcile/suggestion",
-                "typesafe.display",
-            ) => router.route(
-                "/api/b/{book_id}/sync/accounts/{id}/reconcile/suggestion",
-                axum::routing::patch(display_route),
-            ),
-            (
-                "PUT",
-                "/api/b/[bookId]/sync/accounts/[id]/reconcile/suggestion",
-                "typesafe.confirm",
-            ) => router.route(
-                "/api/b/{book_id}/sync/accounts/{id}/reconcile/suggestion",
-                axum::routing::put(confirm_route),
-            ),
-            ("GET", "/api/b/[bookId]/settings/typesafe", "typesafe.settings") => {
-                router.route("/api/b/{book_id}/settings/typesafe", get(get_settings))
-            }
-            ("PATCH", "/api/b/[bookId]/settings/typesafe", "typesafe.update") => router.route(
-                "/api/b/{book_id}/settings/typesafe",
-                axum::routing::patch(update_settings),
-            ),
-            ("DELETE", "/api/b/[bookId]/settings/typesafe", "typesafe.clear") => router.route(
-                "/api/b/{book_id}/settings/typesafe",
-                axum::routing::delete(clear_settings),
-            ),
-            ("GET", "/api/b/[bookId]/settings/weekly-review", "weeklyreview.settings") => router
-                .route(
-                    "/api/b/{book_id}/settings/weekly-review",
-                    get(get_weekly_review_settings),
-                ),
-            ("PATCH", "/api/b/[bookId]/settings/weekly-review", "weeklyreview.update") => router
-                .route(
-                    "/api/b/{book_id}/settings/weekly-review",
-                    axum::routing::patch(update_weekly_review_settings),
-                ),
-            ("DELETE", "/api/b/[bookId]/settings/weekly-review", "weeklyreview.clear") => router
-                .route(
-                    "/api/b/{book_id}/settings/weekly-review",
-                    axum::routing::delete(clear_weekly_review_settings),
-                ),
-            ("GET", "/api/b/[bookId]/weekly-review", "weeklyreview.get") => {
-                router.route("/api/b/{book_id}/weekly-review", get(get_weekly_review))
-            }
-            ("POST", "/api/b/[bookId]/weekly-review/run", "weeklyreview.run") => router.route(
-                "/api/b/{book_id}/weekly-review/run",
-                axum::routing::post(run_weekly_review_now),
-            ),
-            (
-                "POST",
-                "/api/b/[bookId]/weekly-review/items/[id]/dismiss",
-                "weeklyreview.dismiss",
-            ) => router.route(
-                "/api/b/{book_id}/weekly-review/items/{id}/dismiss",
-                axum::routing::post(dismiss_weekly_review_item),
-            ),
-            (
-                "POST",
-                "/api/b/[bookId]/weekly-review/items/[id]/restore",
-                "weeklyreview.restore",
-            ) => router.route(
-                "/api/b/{book_id}/weekly-review/items/{id}/restore",
-                axum::routing::post(restore_weekly_review_item),
-            ),
-            ("GET", "/api/cron/typesafe-cleanup", "typesafe.cleanup") => {
-                router.route(&route.path, get(cleanup_route))
-            }
-            ("GET", "/api/cron/plaid-sync", "cron.plaidsync") => {
-                router.route(&route.path, get(plaid_sync_cron))
-            }
-            ("GET", "/api/cron/price-sync", "cron.pricesync") => {
-                router.route(&route.path, get(price_sync_cron))
-            }
-            ("GET", "/api/cron/recurring", "cron.recurring") => {
-                router.route(&route.path, get(recurring_cron))
-            }
-            ("GET", "/api/cron/backup", "cron.backup") => {
-                router.route(&route.path, get(backup_cron))
-            }
-            ("GET", "/api/cron/weekly-review", "weeklyreview.cron") => {
-                router.route(&route.path, get(weekly_review_cron))
-            }
-            #[cfg(feature = "native")]
-            ("GET", "/api/b/[bookId]/socket", "events.socket") => {
-                router.route("/api/b/{book_id}/socket", get(book_socket))
-            }
-            #[cfg(not(feature = "native"))]
-            ("GET", "/api/b/[bookId]/socket", "events.socket") => router,
-            ("GET", "/api/b/[bookId]/sync/pending-count", "sync.pendingcount") => {
-                router.route("/api/b/{book_id}/sync/pending-count", get(pending_count))
-            }
-            ("GET", "/api/b/[bookId]/sync/tokens", "sync.tokens") => {
-                router.route("/api/b/{book_id}/sync/tokens", get(list_tokens))
-            }
-            ("POST", "/api/b/[bookId]/sync/tokens", "sync.createtoken") => router.route(
-                "/api/b/{book_id}/sync/tokens",
-                axum::routing::post(create_token),
-            ),
-            ("PUT", "/api/b/[bookId]/sync/tokens/[id]", "sync.updatetoken") => router.route(
-                "/api/b/{book_id}/sync/tokens/{id}",
-                axum::routing::put(update_token),
-            ),
-            ("DELETE", "/api/b/[bookId]/sync/tokens/[id]", "sync.deletetoken") => router.route(
-                "/api/b/{book_id}/sync/tokens/{id}",
-                axum::routing::delete(delete_token),
-            ),
-            ("GET", "/api/b/[bookId]/sync/tokens/[id]/accounts", "sync.tokenaccounts") => router
-                .route(
-                    "/api/b/{book_id}/sync/tokens/{id}/accounts",
-                    get(list_token_accounts),
-                ),
-            (
-                "POST",
-                "/api/b/[bookId]/sync/tokens/[id]/accounts/refresh",
-                "sync.refreshaccounts",
-            ) => router.route(
-                "/api/b/{book_id}/sync/tokens/{id}/accounts/refresh",
-                axum::routing::post(refresh_token_accounts),
-            ),
-            ("PUT", "/api/b/[bookId]/sync/tokens/[id]/accounts", "sync.assignaccounts") => router
-                .route(
-                    "/api/b/{book_id}/sync/tokens/{id}/accounts",
-                    axum::routing::put(set_token_accounts),
-                ),
-            ("DELETE", "/api/b/[bookId]/sync/tokens/[id]/sync", "sync.clear") => router.route(
-                "/api/b/{book_id}/sync/tokens/{id}/sync",
-                axum::routing::delete(clear_sync_data),
-            ),
-            ("POST", "/api/b/[bookId]/sync/tokens/[id]/sync", "sync.run") => router.route(
-                "/api/b/{book_id}/sync/tokens/{id}/sync",
-                axum::routing::post(sync_now),
-            ),
-            ("POST", "/api/b/[bookId]/sync/link-sessions", "sync.createlinksession") => router
-                .route(
-                    "/api/b/{book_id}/sync/link-sessions",
-                    axum::routing::post(create_link_session),
-                ),
-            ("POST", "/api/b/[bookId]/sync/link-sessions/[id]/check", "sync.checklinksession") => {
-                router.route(
-                    "/api/b/{book_id}/sync/link-sessions/{id}/check",
-                    axum::routing::post(check_link_session),
-                )
-            }
-            ("GET", "/api/b/[bookId]/sync/reconcile", "sync.bookqueue") => {
-                router.route("/api/b/{book_id}/sync/reconcile", get(book_queue))
-            }
-            ("GET", "/api/b/[bookId]/sync/accounts/[id]/reconcile", "sync.linkqueue") => router
-                .route(
-                    "/api/b/{book_id}/sync/accounts/{id}/reconcile",
-                    get(link_queue),
-                ),
-            ("POST", "/api/b/[bookId]/sync/accounts/[id]/reconcile", "sync.resolve") => router
-                .route(
-                    "/api/b/{book_id}/sync/accounts/{id}/reconcile",
-                    axum::routing::post(resolve_route),
-                ),
-            ("GET", "/api/b/[bookId]/sync/assigned-accounts", "sync.assigned") => router.route(
-                "/api/b/{book_id}/sync/assigned-accounts",
-                get(assigned_accounts),
-            ),
-            ("GET", "/api/b/[bookId]/sync/pending-transactions", "sync.pendingtransactions") => {
-                router.route(
-                    "/api/b/{book_id}/sync/pending-transactions",
-                    get(pending_transactions),
-                )
-            }
-            ("GET", "/api/b/[bookId]/sync/stale-unmatched", "sync.stale") => router.route(
-                "/api/b/{book_id}/sync/stale-unmatched",
-                get(stale_unmatched),
-            ),
-            ("GET", "/api/b/[bookId]/transactions/[id]/plaid", "transactions.plaidlink") => router
-                .route(
-                    "/api/b/{book_id}/transactions/{id}/plaid",
-                    get(transaction_plaid_link),
-                ),
-            (
-                "POST",
-                "/api/b/[bookId]/transactions/[id]/plaid/unlink",
-                "transactions.plaidunlink",
-            ) => router.route(
-                "/api/b/{book_id}/transactions/{id}/plaid/unlink",
-                axum::routing::post(unlink_transaction),
-            ),
-            ("GET", "/api/b/[bookId]/payees", "payees.list") => {
-                router.route("/api/b/{book_id}/payees", get(list_payees))
-            }
-            ("POST", "/api/b/[bookId]/payees", "payees.create") => {
-                router.route("/api/b/{book_id}/payees", axum::routing::post(create_payee))
-            }
-            ("GET", "/api/b/[bookId]/payees/[id]", "payees.get") => {
-                router.route("/api/b/{book_id}/payees/{id}", get(get_payee))
-            }
-            ("DELETE", "/api/b/[bookId]/payees/[id]", "payees.delete") => router.route(
-                "/api/b/{book_id}/payees/{id}",
-                axum::routing::delete(delete_payee),
-            ),
-            ("GET", "/api/b/[bookId]/payees/[id]/last-account", "payees.lastaccount") => router
-                .route(
-                    "/api/b/{book_id}/payees/{id}/last-account",
-                    get(last_account),
-                ),
-            ("GET", "/api/b/[bookId]/payees/[id]/entry-patterns", "entrysuggestion.patterns") => {
-                router.route(
-                    "/api/b/{book_id}/payees/{id}/entry-patterns",
-                    get(get_entry_patterns),
-                )
-            }
-            ("POST", "/api/b/[bookId]/entry-suggestion", "entrysuggestion.request") => router
-                .route(
-                    "/api/b/{book_id}/entry-suggestion",
-                    axum::routing::post(request_entry_suggestion),
-                ),
-            ("POST", "/api/b/[bookId]/entry-suggestion/outcome", "entrysuggestion.outcome") => {
-                router.route(
-                    "/api/b/{book_id}/entry-suggestion/outcome",
-                    axum::routing::post(record_entry_outcome),
-                )
-            }
-            ("GET", "/api/b/[bookId]/reports/data", "reports.data") => {
-                router.route("/api/b/{book_id}/reports/data", get(report_data))
-            }
-            ("GET", "/api/b/[bookId]/reports/income-statement", "reports.income") => router.route(
-                "/api/b/{book_id}/reports/income-statement",
-                get(income_statement),
-            ),
-            ("GET", "/api/b/[bookId]/search", "search.get") => {
-                router.route("/api/b/{book_id}/search", get(search))
-            }
-            ("GET", "/api/b/[bookId]/investments/positions", "investments.positions") => {
-                router.route("/api/b/{book_id}/investments/positions", get(get_positions))
-            }
-            ("GET", "/api/b/[bookId]/investments/account-values", "investments.accountvalues") => {
-                router.route(
-                    "/api/b/{book_id}/investments/account-values",
-                    get(account_values),
-                )
-            }
-            ("GET", "/api/b/[bookId]/securities", "securities.list") => {
-                router.route("/api/b/{book_id}/securities", get(list_securities))
-            }
-            ("POST", "/api/b/[bookId]/securities", "securities.create") => router.route(
-                "/api/b/{book_id}/securities",
-                axum::routing::post(create_security),
-            ),
-            ("GET", "/api/b/[bookId]/securities/[id]", "securities.get") => {
-                router.route("/api/b/{book_id}/securities/{id}", get(get_security))
-            }
-            ("PUT", "/api/b/[bookId]/securities/[id]", "securities.update") => router.route(
-                "/api/b/{book_id}/securities/{id}",
-                axum::routing::put(update_security),
-            ),
-            ("DELETE", "/api/b/[bookId]/securities/[id]", "securities.delete") => router.route(
-                "/api/b/{book_id}/securities/{id}",
-                axum::routing::delete(delete_security),
-            ),
-            ("GET", "/api/b/[bookId]/securities/[id]/detail", "securities.detail") => router.route(
-                "/api/b/{book_id}/securities/{id}/detail",
-                get(security_detail),
-            ),
-            ("GET", "/api/b/[bookId]/securities/[id]/lots", "securities.lots") => {
-                router.route("/api/b/{book_id}/securities/{id}/lots", get(security_lots))
-            }
-            ("GET", "/api/b/[bookId]/securities/[id]/splits", "securities.splits") => router.route(
-                "/api/b/{book_id}/securities/{id}/splits",
-                get(security_splits),
-            ),
-            ("GET", "/api/b/[bookId]/securities/[id]/prices", "prices.history") => router.route(
-                "/api/b/{book_id}/securities/{id}/prices",
-                get(price_history),
-            ),
-            ("PUT", "/api/b/[bookId]/securities/[id]/prices/[date]", "prices.update") => router
-                .route(
-                    "/api/b/{book_id}/securities/{id}/prices/{date}",
-                    axum::routing::put(update_price),
-                ),
-            ("DELETE", "/api/b/[bookId]/securities/[id]/prices/[date]", "prices.delete") => router
-                .route(
-                    "/api/b/{book_id}/securities/{id}/prices/{date}",
-                    axum::routing::delete(delete_price),
-                ),
-            ("GET", "/api/b/[bookId]/securities/prices-due", "prices.due") => {
-                router.route("/api/b/{book_id}/securities/prices-due", get(prices_due))
-            }
-            ("POST", "/api/b/[bookId]/security-prices/bulk", "prices.bulk") => router.route(
-                "/api/b/{book_id}/security-prices/bulk",
-                axum::routing::post(bulk_prices),
-            ),
-            ("POST", "/api/b/[bookId]/security-prices/tiingo", "prices.tiingo") => router.route(
-                "/api/b/{book_id}/security-prices/tiingo",
-                axum::routing::post(tiingo_prices),
-            ),
-            ("GET", "/api/b/[bookId]/reports/realized-gains", "reports.realizedgains") => router
-                .route(
-                    "/api/b/{book_id}/reports/realized-gains",
-                    get(realized_gains),
-                ),
-            ("GET", "/api/b/[bookId]/reports/net-worth-history", "reports.networth") => router
-                .route(
-                    "/api/b/{book_id}/reports/net-worth-history",
-                    get(net_worth_history),
-                ),
-            ("GET", "/api/b/[bookId]/transactions", "transactions.list") => {
-                router.route("/api/b/{book_id}/transactions", get(list_transactions))
-            }
-            ("POST", "/api/b/[bookId]/transactions", "transactions.create") => router.route(
-                "/api/b/{book_id}/transactions",
-                axum::routing::post(create_transaction),
-            ),
-            ("GET", "/api/b/[bookId]/transactions/changes", "transactions.changes") => router
-                .route(
-                    "/api/b/{book_id}/transactions/changes",
-                    get(list_transaction_changes),
-                ),
-            ("GET", "/api/b/[bookId]/transactions/[id]", "transactions.get") => {
-                router.route("/api/b/{book_id}/transactions/{id}", get(get_transaction))
-            }
-            ("PUT", "/api/b/[bookId]/transactions/[id]", "transactions.update") => router.route(
-                "/api/b/{book_id}/transactions/{id}",
-                axum::routing::put(update_transaction),
-            ),
-            ("DELETE", "/api/b/[bookId]/transactions/[id]", "transactions.delete") => router.route(
-                "/api/b/{book_id}/transactions/{id}",
-                axum::routing::delete(delete_transaction),
-            ),
-            ("GET", "/api/b/[bookId]/recurring", "recurring.list") => {
-                router.route("/api/b/{book_id}/recurring", get(list_rules))
-            }
-            ("POST", "/api/b/[bookId]/recurring", "recurring.create") => router.route(
-                "/api/b/{book_id}/recurring",
-                axum::routing::post(create_rule),
-            ),
-            ("GET", "/api/b/[bookId]/recurring/[id]", "recurring.get") => {
-                router.route("/api/b/{book_id}/recurring/{id}", get(get_rule))
-            }
-            ("PUT", "/api/b/[bookId]/recurring/[id]", "recurring.update") => router.route(
-                "/api/b/{book_id}/recurring/{id}",
-                axum::routing::put(update_rule),
-            ),
-            ("DELETE", "/api/b/[bookId]/recurring/[id]", "recurring.delete") => router.route(
-                "/api/b/{book_id}/recurring/{id}",
-                axum::routing::delete(delete_rule),
-            ),
-            ("POST", "/api/b/[bookId]/recurring/process", "recurring.process") => router.route(
-                "/api/b/{book_id}/recurring/process",
-                axum::routing::post(process_rules),
-            ),
-            ("GET", "/api/b/[bookId]/recurring/projected", "recurring.projected") => {
-                router.route("/api/b/{book_id}/recurring/projected", get(projected))
-            }
-            ("GET", "/api/b/[bookId]/recurring/transactions", "recurring.transactions") => router
-                .route(
-                    "/api/b/{book_id}/recurring/transactions",
-                    get(rule_transactions),
-                ),
-            ("GET", "/api/auth/registration-open", "auth.registration") => {
-                router.route(&route.path, get(registration_status))
-            }
-            ("POST", "/api/auth/login", "auth.login") => {
-                router.route(&route.path, axum::routing::post(login))
-            }
-            ("POST", "/api/auth/register", "auth.register") => {
-                router.route(&route.path, axum::routing::post(register))
-            }
-            ("POST", "/api/auth/logout", "auth.logout") => {
-                router.route(&route.path, axum::routing::post(logout))
-            }
-            ("GET", "/api/auth/me", "auth.me") => router.route(&route.path, get(me)),
-            ("PUT", "/api/auth/password", "auth.password") => {
-                router.route(&route.path, axum::routing::put(change_password))
-            }
-            ("PUT", "/api/auth/username", "auth.username") => {
-                router.route(&route.path, axum::routing::put(change_username))
-            }
-            ("GET", "/api/auth/api-keys", "auth.keys") => router.route(&route.path, get(list_keys)),
-            ("POST", "/api/auth/api-keys", "auth.create") => {
-                router.route(&route.path, axum::routing::post(create_key))
-            }
-            ("DELETE", "/api/auth/api-keys/[id]", "auth.delete") => {
-                router.route("/api/auth/api-keys/{id}", axum::routing::delete(delete_key))
-            }
-            _ => panic!(
-                "no Rust handler for {} {} ({})",
-                route.method, route.path, route.handler
-            ),
-        },
+        |router, route| (route.add)(router, &axum_path(route.path)),
     )
 }
 
 #[cfg(test)]
 mod tests {
+    /// axum refuses two handlers for one method and path, so building the
+    /// router proves that the table has no such pair.
     #[test]
-    fn every_manifest_entry_has_a_registered_handler() {
+    fn the_router_takes_every_route_of_the_table() {
         let _ = super::routes();
+    }
+
+    #[test]
+    fn a_manifest_path_becomes_an_axum_path() {
+        assert_eq!(super::axum_path("/api/version"), "/api/version");
+        assert_eq!(
+            super::axum_path("/api/books/[bookId]/members/[userId]"),
+            "/api/books/{book_id}/members/{user_id}"
+        );
+        assert_eq!(
+            super::axum_path("/api/b/[bookId]/securities/[id]/prices/[date]"),
+            "/api/b/{book_id}/securities/{id}/prices/{date}"
+        );
+    }
+
+    /// `rust-api/routes.json` is written from the table. The tests in
+    /// `tests/` read it (the access levels, the MCP route coverage), and so
+    /// does the OpenAPI check. To write it again after a change to the table:
+    ///
+    /// ```text
+    /// UPDATE_ROUTES_JSON=1 cargo test -p counterpoise-rust-api routes_json
+    /// ```
+    #[test]
+    fn routes_json_lists_the_route_table() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../routes.json");
+        let expected = super::manifest_json();
+        if std::env::var_os("UPDATE_ROUTES_JSON").is_some() {
+            std::fs::write(path, &expected).expect("write routes.json");
+        }
+        let actual = std::fs::read_to_string(path).expect("read routes.json");
+        assert!(
+            actual == expected,
+            "rust-api/routes.json does not match the route table in routes/mod.rs. \
+             Run: UPDATE_ROUTES_JSON=1 cargo test -p counterpoise-rust-api routes_json"
+        );
     }
 }

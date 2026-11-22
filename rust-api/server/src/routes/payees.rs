@@ -1,4 +1,5 @@
 use crate::{
+    body::{NonBlank, typed_body},
     book_auth::{AccessLevel, authenticate_book},
     book_scope::{BookAccess, Write},
     error::{ApiError, ApiResult, error, internal_error},
@@ -6,7 +7,6 @@ use crate::{
     state::AppState,
     validation::{
         first_query_values, local_today, parse_int_prefix_number, parse_js_number, parse_json_body,
-        validate_payee_create,
     },
 };
 use axum::{
@@ -17,8 +17,9 @@ use axum::{
 };
 use chrono::{NaiveDateTime, SecondsFormat};
 use ledger_db::{Sql, store::params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, to_value};
+use utoipa::ToSchema;
 
 #[derive(ledger_db::store::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +156,15 @@ fn payee_path_id(raw: &str, failure_message: &'static str) -> Result<i32, ApiErr
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, failure_message))
 }
 
+// The body of `POST /api/b/{bookId}/payees`, and `CreatePayeeBody` in the API
+// contract: see `crate::body`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CreatePayeeBody {
+    /// The payee's name. Normalized on save: whitespace runs collapse to one space and curly quotes straighten to '. Case is NOT changed — "IKEA" and "Ikea" stay two different payees.
+    #[schema(inline)]
+    name: NonBlank,
+}
+
 pub(crate) async fn create_payee(
     State(state): State<AppState>,
     Path(raw_book_id): Path<String>,
@@ -165,8 +175,8 @@ pub(crate) async fn create_payee(
     let book =
         authenticate_book(&state, &headers, &raw_book_id, AccessLevel::Write, FAILURE).await?;
     let access = book.write()?;
-    let body = parse_json_body(&body, FAILURE)?;
-    let name = normalize_name(validate_payee_create(&body)?);
+    let body: CreatePayeeBody = typed_body(&parse_json_body(&body, FAILURE)?)?;
+    let name = normalize_name(&body.name.into_string());
 
     // The form's "new payee" field treats a case variant as the same payee
     // and returns the stored row: the folded name matches `name_fold`.

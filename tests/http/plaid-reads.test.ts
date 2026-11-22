@@ -139,11 +139,12 @@ describe("Plaid read HTTP parity", () => {
         { accountId: checking.account.id, accountName: "Checking", count: 2, oldestDate: daysAgo(59) },
         { accountId: savings.account.id, accountName: "Savings", count: 2, oldestDate: daysAgo(40) },
       ],
+      mismatchedLinks: [],
     });
   });
 
   it("returns an empty stale list and an empty pending list for a book without sync", async () => {
-    expect(await ok(client, "/api/b/1/sync/stale-unmatched")).toEqual({ totalCount: 0, accounts: [] });
+    expect(await ok(client, "/api/b/1/sync/stale-unmatched")).toEqual({ totalCount: 0, accounts: [], mismatchedLinks: [] });
     expect(await ok(client, "/api/b/1/sync/pending-transactions")).toEqual([]);
     expect(await ok(client, "/api/b/1/sync/assigned-accounts")).toEqual([]);
   });

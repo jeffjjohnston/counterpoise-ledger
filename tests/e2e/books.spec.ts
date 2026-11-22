@@ -31,13 +31,16 @@ test.describe("book management", () => {
     await page.getByRole("button", { name: "Create" }).click();
     await expect(page.getByRole("heading", { name: originalName })).toBeVisible();
 
-    await page.getByRole("button", { name: `Edit ${originalName}` }).click();
-    await expect(page.getByText("Edit Book")).toBeVisible();
+    // Edit opens the book's General settings.
+    await page.getByRole("link", { name: `Edit ${originalName}` }).click();
+    await expect(page).toHaveURL(/\/b\/\d+\/settings#general$/);
 
     await page.getByLabel("Book name").clear();
     await page.getByLabel("Book name").fill(updatedName);
-    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Rename" }).click();
+    await expect(page.getByRole("heading", { name: `This book: ${updatedName}` })).toBeVisible();
 
+    await page.goto("/");
     await expect(page.getByRole("heading", { name: updatedName })).toBeVisible();
   });
 
@@ -50,18 +53,19 @@ test.describe("book management", () => {
     await page.getByRole("button", { name: "Create" }).click();
     await expect(page.getByRole("heading", { name: bookName })).toBeVisible();
 
-    await page.getByRole("button", { name: `Edit ${bookName}` }).click();
+    await page.getByRole("link", { name: `Edit ${bookName}` }).click();
     await page.getByRole("button", { name: "Delete book..." }).click();
 
     page.on("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Yes, permanently delete" }).click();
+    await expect(page).toHaveURL(/\/$/);
 
     await expect(page.getByRole("heading", { name: bookName })).toHaveCount(0);
   });
 
   test("navigates into a book", async ({ page }) => {
     await page.goto("/");
-    await page.getByRole("link", { name: "Test Book" }).click();
+    await page.getByRole("link", { name: /^Test Book/ }).click();
 
     await expect(page).toHaveURL(/\/b\/1$/);
     await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();

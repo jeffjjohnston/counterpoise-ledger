@@ -6,21 +6,15 @@ import { useIsMobile } from "@/hooks/useIsMobile";
 import { cn } from "@/lib/utils";
 import { useEffect, useRef, useState } from "react";
 import { useTheme } from "@/components/ThemeProvider";
-import { Input } from "@/components/ui/Input";
-import { Modal } from "@/components/ui/Modal";
-import { Select } from "@/components/ui/Select";
 import { ReportIssueModal } from "@/components/ReportIssueModal";
 import { PriceEntryPill } from "@/components/layout/PriceEntryPill";
 import { JobHealthIndicator } from "@/components/layout/JobHealthIndicator";
-import { TypeSafeSettings } from "@/components/settings/TypeSafeSettings";
-import { WeeklyReviewSettings } from "@/components/settings/WeeklyReviewSettings";
-import { SaveChordSettings } from "@/components/settings/SaveChordSettings";
-import { OPEN_BOOK_SETTINGS_EVENT } from "@/lib/weekly-review";
-import { BookMembersSettings } from "@/components/settings/BookMembersSettings";
+import { useNewFeatureDot } from "@/components/settings/useNewFeatureDot";
+import { NewFeatureDot } from "@/components/settings/NewFeatureDot";
 import { useBookChanges, useBookChangesLive } from "@/components/BookChangesProvider";
 import { useBookRole } from "@/components/BookRoleProvider";
 import { BOOK_SESSION_ENDED_EVENT, SYNC_QUEUE_CHANGED_EVENT } from "@/lib/events";
-import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
+import { apiGet, apiPost, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 
 type NavItem = {
@@ -34,29 +28,24 @@ export function BookNavbar() {
   const router = useRouter();
   const bookId = useBookId();
   const toast = useToast();
-  const { books, currentBook, canWrite, isOwner, status: roleStatus } = useBookRole();
-  const { theme, setTheme, resolvedTheme } = useTheme();
+  const { books, currentBook, canWrite, status: roleStatus } = useBookRole();
+  const { resolvedTheme } = useTheme();
   const logoSrc = resolvedTheme === "dark" ? "/favicon-dark-64x64.png" : "/favicon-64x64.png";
   const [showBookMenu, setShowBookMenu] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false);
-  const [showAccountModal, setShowAccountModal] = useState(false);
-
-  // The dashboard card opens the book settings with this event.
-  useEffect(() => {
-    const open = () => setShowAccountModal(true);
-    window.addEventListener(OPEN_BOOK_SETTINGS_EVENT, open);
-    return () => window.removeEventListener(OPEN_BOOK_SETTINGS_EVENT, open);
-  }, []);
+  // A new feature that the user can turn on. The Settings links then open
+  // the Features section.
+  const featureDot = useNewFeatureDot(bookId, canWrite);
   const [showReportModal, setShowReportModal] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [upcomingDays, setUpcomingDays] = useState(30);
   const [syncPendingCount, setSyncPendingCount] = useState(0);
   const bookMenuRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
 
   const prefix = `/b/${bookId}`;
+  const settingsHref = `${prefix}/settings${featureDot ? "#features" : ""}`;
 
   const primaryNavItems = [
     { href: `${prefix}`, label: "Dashboard" },
@@ -76,10 +65,6 @@ export function BookNavbar() {
     { href: `${prefix}/reports/realized-gains`, label: "Realized Gains" },
     { href: `${prefix}/reports`, label: "Custom Report", exact: true },
   ];
-
-  useEffect(() => {
-    if (currentBook) setUpcomingDays(currentBook.upcomingDays);
-  }, [currentBook]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -440,23 +425,23 @@ export function BookNavbar() {
                     aria-label="Open user menu"
                     aria-haspopup="true"
                     aria-expanded={showUserMenu}
-                    className="p-2 text-fg-secondary hover:text-fg rounded-md hover:bg-surface-tertiary transition-colors"
+                    className="p-2 relative text-fg-secondary hover:text-fg rounded-md hover:bg-surface-tertiary transition-colors"
                   >
                     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                     </svg>
+                    {featureDot && <NewFeatureDot corner />}
                   </button>
                   {showUserMenu && (
                     <div className="absolute right-0 mt-1 w-44 bg-surface-elevated border border-border rounded-lg shadow-lg z-50">
-                      <button
-                        onClick={() => {
-                          setShowUserMenu(false);
-                          setShowAccountModal(true);
-                        }}
-                        className="block w-full text-left px-4 py-2 text-sm text-fg-secondary hover:bg-surface-tertiary"
+                      <Link
+                        href={settingsHref}
+                        onClick={() => setShowUserMenu(false)}
+                        className="flex items-center justify-between w-full text-left px-4 py-2 text-sm text-fg-secondary hover:bg-surface-tertiary"
                       >
                         Settings
-                      </button>
+                        {featureDot && <NewFeatureDot />}
+                      </Link>
                       <button
                         onClick={handleLogout}
                         className="block w-full text-left px-4 py-2 text-sm text-fg-secondary hover:bg-surface-tertiary rounded-lg"
@@ -484,7 +469,7 @@ export function BookNavbar() {
                 onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
                 aria-label={mobileMenuOpen ? "Close menu" : "Open menu"}
                 aria-expanded={mobileMenuOpen}
-                className="p-2 text-fg-secondary hover:text-fg rounded-md hover:bg-surface-tertiary transition-colors"
+                className="p-2 relative text-fg-secondary hover:text-fg rounded-md hover:bg-surface-tertiary transition-colors"
               >
                 {mobileMenuOpen ? (
                   <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -495,6 +480,7 @@ export function BookNavbar() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
                   </svg>
                 )}
+                {featureDot && !mobileMenuOpen && <NewFeatureDot corner />}
               </button>
             </div>
             </div>
@@ -536,15 +522,14 @@ export function BookNavbar() {
               ))}
             </div>
             <div className="border-t border-border py-2">
-              <button
-                onClick={() => {
-                  setMobileMenuOpen(false);
-                  setShowAccountModal(true);
-                }}
-                className="block w-full text-left px-6 py-3 text-sm font-medium text-fg-secondary hover:bg-surface-tertiary"
+              <Link
+                href={settingsHref}
+                onClick={() => setMobileMenuOpen(false)}
+                className="flex items-center justify-between w-full text-left px-6 py-3 text-sm font-medium text-fg-secondary hover:bg-surface-tertiary"
               >
                 Settings
-              </button>
+                {featureDot && <NewFeatureDot />}
+              </Link>
               <button
                 onClick={() => {
                   setMobileMenuOpen(false);
@@ -560,73 +545,6 @@ export function BookNavbar() {
           </div>
         </div>
       )}
-
-      <Modal isOpen={showAccountModal} onClose={() => setShowAccountModal(false)} title="Settings" size="sm">
-        <div className="space-y-6">
-          <section>
-            <Select
-              id="theme-setting"
-              label="Theme"
-              value={theme}
-              onChange={(event) => setTheme(event.target.value as "light" | "dark" | "system")}
-              options={[
-                { value: "light", label: "Light" },
-                { value: "dark", label: "Dark" },
-                { value: "system", label: "System" },
-              ]}
-            />
-          </section>
-
-          {showAccountModal && <SaveChordSettings />}
-
-          {isOwner && (
-            <section className="pt-4 border-t border-border">
-              <Input
-                id="upcoming-days"
-                label="Upcoming recurring days"
-                type="number"
-                min={1}
-                max={365}
-                value={upcomingDays}
-                onChange={(e) => {
-                  const val = parseInt(e.target.value, 10);
-                  if (!isNaN(val) && val >= 1 && val <= 365) {
-                    setUpcomingDays(val);
-                  }
-                }}
-                onBlur={() => {
-                  if (!currentBook) return;
-                  apiPut(`/api/books/${bookId}`, {
-                    name: currentBook.name,
-                    upcomingDays,
-                  }).catch(() => {});
-                }}
-              />
-              <p className="mt-1 text-xs text-fg-tertiary">
-                Number of days into the future to show recurring transactions (1–365).
-              </p>
-            </section>
-          )}
-
-          {showAccountModal && currentBook && canWrite && <TypeSafeSettings key={bookId} bookId={bookId} bookName={currentBook.name} />}
-
-          {showAccountModal && currentBook && canWrite && <WeeklyReviewSettings key={`wr-${bookId}`} bookId={bookId} bookName={currentBook.name} />}
-
-          {showAccountModal && <BookMembersSettings bookId={bookId} />}
-
-          <section className="pt-4 border-t border-border">
-            <h3 className="text-sm font-semibold text-fg">Security</h3>
-            <p className="mt-1 text-sm text-fg-tertiary">Manage your password from the account page.</p>
-            <Link
-              href="/account"
-              className="inline-flex mt-3 text-sm font-medium text-fg-accent hover:text-fg-accent"
-              onClick={() => setShowAccountModal(false)}
-            >
-              Open account page
-            </Link>
-          </section>
-        </div>
-      </Modal>
 
       <ReportIssueModal
         isOpen={showReportModal}

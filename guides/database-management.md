@@ -59,8 +59,9 @@ change is a new numbered file after it. Each binary embeds the files:
 
 ## Making schema changes
 
-1. Add a new file to `rust-api/db/migrations/`, with the next number, for
-   example `0002_account_notes.sql`.
+1. Add a new file to `rust-api/db/migrations/`, with the next number: one
+   more than the last file in the directory. For example, the file after
+   `0007_x.sql` is `0008_account_notes.sql`.
 2. Update the Rust SQL that reads or writes the changed columns.
 3. Update the entry in [schema.md](schema.md) when the change adds a rule
    that is easy to get wrong.

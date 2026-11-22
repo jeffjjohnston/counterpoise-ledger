@@ -44,11 +44,13 @@ vi.mock("@/components/transactions/TransactionList", () => ({
 vi.mock("@/components/transactions/TransactionForm", () => ({
   TransactionForm: ({
     editingTransaction,
+    accounts,
     onSubmit,
     onDelete,
     onCancel,
   }: {
     editingTransaction?: TransactionWithSplits | null;
+    accounts?: unknown[];
     onSubmit: (data: unknown) => void;
     onDelete?: () => void;
     onCancel?: () => void;
@@ -60,6 +62,7 @@ vi.mock("@/components/transactions/TransactionForm", () => ({
       </button>
       <button type="button" onClick={() => onDelete?.()}>Delete transaction</button>
       <button type="button" onClick={() => onCancel?.()}>Cancel edit</button>
+      <span data-testid="form-account-count">{accounts?.length ?? 0}</span>
     </div>
   ),
 }));
@@ -727,6 +730,80 @@ describe("PayeeDetailPage", () => {
 
       await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("2"));
       expect(transactionCalls(fetchMock)).toBe(before + 1);
+    });
+
+    it("keeps the accounts when a background reload cannot read them", async () => {
+      let accountsFail = false;
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/b/1/payees/1") return { ok: true, status: 200, json: async () => blueBottle(1) } as Response;
+        if (url.startsWith("/api/b/1/transactions?")) {
+          return { ok: true, status: 200, json: async () => ({ transactions: [buildTransaction(101)], totalCount: 1 }) } as Response;
+        }
+        if (url === "/api/b/1/accounts?includeInactive=true") {
+          if (accountsFail) return { ok: false, status: 500, json: async () => ({ error: "failed" }) } as Response;
+          return { ok: true, status: 200, json: async () => [{ id: 5, name: "Checking", type: "asset", children: [] }] } as Response;
+        }
+        throw new Error(`Unexpected fetch url: ${url}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("1"));
+      const before = transactionCalls(fetchMock);
+
+      accountsFail = true;
+      hint(["transactions"]);
+      await waitFor(() => expect(transactionCalls(fetchMock)).toBe(before + 1));
+      await act(async () => {});
+
+      fireEvent.click(screen.getByText("Open transaction editor"));
+      expect(screen.getByTestId("form-account-count")).toHaveTextContent("1");
+    });
+
+    it("loads as many rows as the list shows after a save", async () => {
+      let observerCallback: IntersectionObserverCallback | null = null;
+      vi.stubGlobal("IntersectionObserver", vi.fn(function (
+        this: { observe: () => void; unobserve: () => void },
+        callback: IntersectionObserverCallback
+      ) {
+        observerCallback = callback;
+        this.observe = () => {};
+        this.unobserve = () => {};
+      }) as unknown as typeof IntersectionObserver);
+      const rows = Array.from({ length: 75 }, (_, index) => buildTransaction(index + 1));
+      const urls: string[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if ((init?.method ?? "GET").toUpperCase() === "PUT") {
+          return { ok: true, status: 200, json: async () => rows[0] } as Response;
+        }
+        if (url === "/api/b/1/payees/1") return { ok: true, status: 200, json: async () => blueBottle(75) } as Response;
+        if (url.startsWith("/api/b/1/transactions?")) {
+          urls.push(url);
+          const params = new URL(url, "http://localhost").searchParams;
+          const offset = Number(params.get("offset"));
+          const page = rows.slice(offset, offset + Number(params.get("limit")));
+          return { ok: true, status: 200, json: async () => ({ transactions: page, totalCount: rows.length }) } as Response;
+        }
+        return { ok: true, status: 200, json: async () => [] } as Response;
+      }));
+
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("50"));
+      const intersect = observerCallback as IntersectionObserverCallback | null;
+      await act(async () => {
+        intersect?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      });
+      await waitFor(() => expect(screen.getByTestId("transaction-count")).toHaveTextContent("75"));
+
+      fireEvent.click(screen.getByText("Open transaction editor"));
+      fireEvent.click(screen.getByText("Save transaction"));
+      await waitFor(() => expect(screen.queryByTestId("modal")).not.toBeInTheDocument());
+
+      // The rows from load more stay, so the scroll position stays.
+      await waitFor(() => expect(urls.at(-1)).toBe("/api/b/1/transactions?payeeId=1&limit=75&offset=0&includeMeta=true"));
+      expect(screen.getByTestId("transaction-count")).toHaveTextContent("75");
     });
 
     it("shows the not-found state when another client deletes the payee", async () => {

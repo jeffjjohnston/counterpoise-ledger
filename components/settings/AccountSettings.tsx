@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Link } from "@/lib/navigation";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { ApiKeyManager } from "@/components/account/ApiKeyManager";
@@ -14,7 +13,8 @@ type User = {
   username: string;
 };
 
-export default function AccountPage() {
+/** The Account group of the settings page. It applies to all the user's books. */
+export function AccountSettings() {
   const [user, setUser] = useState<User | null>(null);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -76,21 +76,22 @@ export default function AccountPage() {
   };
 
   return (
-    <div className="min-h-screen bg-surface-secondary">
-      <div className="max-w-xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
-        <div className="mb-6">
-          <Link href="/" className="text-sm text-fg-accent hover:text-fg-accent font-medium">
-            Back to books
-          </Link>
-        </div>
+    <>
+      <section id="account" className="scroll-mt-24 space-y-3">
+        <h3 className="text-base font-semibold text-fg">Profile</h3>
+        <p className="text-sm text-fg-tertiary">
+          {isLoadingUser ? "Loading..." : `Signed in as ${user?.username ?? "Unknown user"}`}
+        </p>
+        <p className="text-sm text-fg-tertiary">
+          Change the name that you sign in with. You stay signed in, and your API keys and
+          connected apps continue to work.
+        </p>
+        <ChangeUsernameForm currentUsername={user?.username ?? null} onChanged={setUser} />
+      </section>
 
-        <div className="bg-surface rounded-lg border border-border shadow-soft p-6 sm:p-8">
-          <h1 className="text-2xl font-bold text-fg">Account</h1>
-          <p className="text-sm text-fg-tertiary mt-1">
-            {isLoadingUser ? "Loading..." : `Signed in as ${user?.username ?? "Unknown user"}`}
-          </p>
-
-          <form onSubmit={handleSubmit} className="space-y-4 mt-6">
+      <section id="security" className="scroll-mt-24 pt-6 border-t border-border">
+        <h3 className="text-base font-semibold text-fg">Password</h3>
+        <form onSubmit={handleSubmit} className="space-y-4 mt-4">
             {error && (
               <div className="bg-danger-subtle border border-border text-fg-danger px-4 py-3 rounded-lg text-sm">
                 {error}
@@ -134,44 +135,32 @@ export default function AccountPage() {
               required
             />
 
-            <Button type="submit" disabled={isSaving} className="w-full">
+            <Button type="submit" disabled={isSaving} className="w-full sm:w-auto">
               {isSaving ? "Updating..." : "Change password"}
             </Button>
           </form>
-        </div>
+      </section>
 
-        <div className="bg-surface rounded-lg border border-border shadow-soft p-6 sm:p-8 mt-6">
-          <h2 className="text-xl font-bold text-fg">Username</h2>
-          <p className="text-sm text-fg-tertiary mt-1">
-            Change the name that you sign in with. You stay signed in, and your API keys and
-            connected apps continue to work.
-          </p>
-          <div className="mt-4">
-            <ChangeUsernameForm currentUsername={user?.username ?? null} onChanged={setUser} />
-          </div>
+      <section id="api-keys" className="scroll-mt-24 pt-6 border-t border-border">
+        <h3 className="text-base font-semibold text-fg">API keys</h3>
+        <p className="text-sm text-fg-tertiary mt-1">
+          Create API keys to allow MCP clients (like Claude Desktop) to read and write data in your books.
+        </p>
+        <div className="mt-4">
+          <ApiKeyManager />
         </div>
+      </section>
 
-        <div className="bg-surface rounded-lg border border-border shadow-soft p-6 sm:p-8 mt-6">
-          <h2 className="text-xl font-bold text-fg">API Keys</h2>
-          <p className="text-sm text-fg-tertiary mt-1">
-            Create API keys to allow MCP clients (like Claude Desktop) to read and write data in your books.
-          </p>
-          <div className="mt-4">
-            <ApiKeyManager />
-          </div>
+      <section id="connected-apps" className="scroll-mt-24 pt-6 border-t border-border">
+        <h3 className="text-base font-semibold text-fg">Connected apps</h3>
+        <p className="text-sm text-fg-tertiary mt-1">
+          Apps that you connected with a sign-in, such as a Claude custom connector. Disconnect an
+          app to stop its access at once.
+        </p>
+        <div className="mt-4">
+          <ConnectedApps />
         </div>
-
-        <div className="bg-surface rounded-lg border border-border shadow-soft p-6 sm:p-8 mt-6">
-          <h2 className="text-xl font-bold text-fg">Connected Apps</h2>
-          <p className="text-sm text-fg-tertiary mt-1">
-            Apps that you connected with a sign-in, such as a Claude custom connector. Disconnect an
-            app to stop its access at once.
-          </p>
-          <div className="mt-4">
-            <ConnectedApps />
-          </div>
-        </div>
-      </div>
-    </div>
+      </section>
+    </>
   );
 }

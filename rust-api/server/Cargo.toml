@@ -83,7 +83,7 @@ tower = { version = "0.5", features = ["util"] }
 # Serves the client build (static_pages.rs) and compresses responses
 # (compression.rs) with gzip or br. Each browser sends gzip, and br on HTTPS.
 tower-http = { version = "0.7", features = ["compression-gzip", "compression-br"] }
-jsonschema = { version = "0.60.2", default-features = false }
+jsonschema = { version = "0.61.1", default-features = false }
 # The OpenAPI document model. The two features keep the component and path
 # order that the source gives, so the committed file does not reorder.
 utoipa = { version = "6.0.0", features = ["preserve_order", "preserve_path_order"] }

@@ -48,6 +48,13 @@ problem that squash-merging a long-running branch produces:
 
 **Key details:**
 
+- **Branch rulesets can enforce the two branch rules.** A ruleset on `main`
+  requires a pull request, allows only a merge commit, and requires the CI
+  checks. A squash of a release PR is thus refused by GitHub, not only by
+  this guide. A ruleset on `dev` requires a pull request (merge commit or
+  squash) and the same checks. A pull request that renames or removes a CI
+  job cannot pass its own required check, so change the ruleset first, in
+  the repository settings.
 - **Version semantics**: `patch` (bug fixes), `minor` (new features), `major` (breaking changes)
 - **`release.sh` runs in a release checkout, never on `dev` or `main`.** It reads
   the current branch and refuses on either of those by name, naming the

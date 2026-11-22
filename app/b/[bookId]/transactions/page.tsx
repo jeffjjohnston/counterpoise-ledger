@@ -37,6 +37,7 @@ import {
   isTransactionConflict,
   TRANSACTION_CONFLICT_MESSAGE,
 } from "@/lib/transaction-requests";
+import { useEditConflict } from "@/hooks/useEditConflict";
 import { useToast } from "@/components/ui/ToastProvider";
 import type { PositionSummary } from "@/lib/investments";
 import type {
@@ -127,6 +128,7 @@ function TransactionsPageInner() {
   }, [router]);
 
   const bookId = useBookId();
+  const editConflict = useEditConflict(bookId, editingTransaction, setEditingTransaction);
   const toast = useToast();
 
   // Sidebar resize handlers
@@ -135,20 +137,29 @@ function TransactionsPageInner() {
     setIsResizing(true);
   }, []);
 
+  // The width of the drag in progress. It goes to storage one time, when
+  // the drag ends: a storage write is synchronous, and a drag has a move
+  // event for each pixel.
+  const draggedWidthRef = useRef<number | null>(null);
+
   const handleMouseUp = useCallback(() => {
     setIsResizing(false);
+    const width = draggedWidthRef.current;
+    draggedWidthRef.current = null;
+    if (width === null) return;
+    try {
+      localStorage.setItem("transactionsSidebarWidth", width.toString());
+    } catch {
+      // Ignore localStorage errors
+    }
   }, []);
 
   const handleMouseMove = useCallback(
     (e: MouseEvent) => {
       if (!isResizing) return;
       const newWidth = Math.max(200, Math.min(600, e.clientX));
+      draggedWidthRef.current = newWidth;
       setSidebarWidth(newWidth);
-      try {
-        localStorage.setItem("transactionsSidebarWidth", newWidth.toString());
-      } catch {
-        // Ignore localStorage errors
-      }
     },
     [isResizing]
   );
@@ -507,8 +518,9 @@ function TransactionsPageInner() {
       return true;
     } catch (e) {
       if (isTransactionConflict(e)) {
-        toast.error(TRANSACTION_CONFLICT_MESSAGE);
-        setEditingTransaction(null);
+        // Keep the editor open with the user's edits. The list shows the
+        // latest rows.
+        editConflict.flagConflict();
         void refreshData(false);
         return false;
       }
@@ -528,8 +540,9 @@ function TransactionsPageInner() {
       void refreshData(false);
     } catch (e) {
       if (isTransactionConflict(e)) {
-        toast.error(TRANSACTION_CONFLICT_MESSAGE);
-        setEditingTransaction(null);
+        // Keep the editor open with the user's edits. The list shows the
+        // latest rows.
+        editConflict.flagConflict();
         void refreshData(false);
         return;
       }
@@ -738,17 +751,45 @@ function TransactionsPageInner() {
       const params = new URLSearchParams();
       params.set("accountId", accountId.toString());
       params.set("highlight", transactionId.toString());
-      router.push(`/b/${bookId}/transactions?${params.toString()}`);
+      routerRef.current.push(`/b/${bookId}/transactions?${params.toString()}`);
     },
-    [bookId, router, scrollTransactionsToTop]
+    [bookId, scrollTransactionsToTop]
   );
 
   const handleNavigateToPayee = useCallback(
     (payeeId: number) => {
-      router.push(`/b/${bookId}/payees/${payeeId}`);
+      routerRef.current.push(`/b/${bookId}/payees/${payeeId}`);
     },
-    [bookId, router]
+    [bookId]
   );
+
+  // The props of TransactionList below. The list is memoized, so each of
+  // them keeps its identity while its inputs do not change. An inline array
+  // or closure here makes the list sort and draw every row on each render
+  // of this page.
+  const handleProjectedClick = useCallback(
+    (ruleId: number) => {
+      routerRef.current.push(`/b/${bookId}/recurring/${ruleId}`);
+    },
+    [bookId]
+  );
+
+  const handlePlaidPendingClick = useCallback(() => {
+    routerRef.current.push(`/b/${bookId}/sync`);
+  }, [bookId]);
+
+  const handleNewTransactionAnimated = useCallback(() => {
+    setNewTransactionId(null);
+  }, []);
+
+  const handleHighlightAnimated = useCallback(() => {
+    setHighlightTransactionId(null);
+    // Clean up URL param
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("highlight");
+    const qs = params.toString();
+    routerRef.current.replace(`/b/${bookId}/transactions${qs ? `?${qs}` : ""}`, { scroll: false });
+  }, [bookId, searchParams]);
 
   // Pending Plaid rows are fetched unfiltered; respect the page filters here.
   // They have no local payee, so any payee filter hides them entirely.
@@ -759,6 +800,15 @@ function TransactionsPageInner() {
         (!startDate || tx.date >= startDate) && (!endDate || tx.date <= endDate)
     );
   }, [plaidPendingTransactions, selectedPayeeId, startDate, endDate]);
+
+  const displayedTransactions = useMemo(
+    () =>
+      mergeTransactionsForDisplay(projectedTransactions, [
+        ...visiblePlaidPending,
+        ...transactions,
+      ]),
+    [projectedTransactions, visiblePlaidPending, transactions]
+  );
 
   // Build navigable account list matching sidebar visual order
   const navigableAccounts = useMemo(() => {
@@ -1132,34 +1182,22 @@ function TransactionsPageInner() {
           )}
           <TransactionList
             isLoading={transactionsLoading}
-            transactions={mergeTransactionsForDisplay(
-              projectedTransactions,
-              [...visiblePlaidPending, ...transactions]
-            )}
+            transactions={displayedTransactions}
             accounts={accounts}
             selectedAccountId={selectedAccountId}
             balanceAccountId={investmentCashAccount?.id ?? null}
             startingBalance={startingBalance}
             onEdit={setEditingTransaction}
-            onProjectedClick={(ruleId) =>
-              router.push(`/b/${bookId}/recurring/${ruleId}`)
-            }
-            onPlaidPendingClick={() => router.push(`/b/${bookId}/sync`)}
+            onProjectedClick={handleProjectedClick}
+            onPlaidPendingClick={handlePlaidPendingClick}
             onToggleReconciled={handleToggleReconciled}
             onMoveToNextBusinessDay={handleMoveToNextBusinessDay}
             newTransactionId={newTransactionId}
-            onNewTransactionAnimated={() => setNewTransactionId(null)}
+            onNewTransactionAnimated={handleNewTransactionAnimated}
             highlightTransactionId={highlightTransactionId}
             onNavigateToAccount={handleNavigateToAccount}
             onNavigateToPayee={handleNavigateToPayee}
-            onHighlightAnimated={() => {
-              setHighlightTransactionId(null);
-              // Clean up URL param
-              const params = new URLSearchParams(searchParams.toString());
-              params.delete("highlight");
-              const qs = params.toString();
-              router.replace(`/b/${bookId}/transactions${qs ? `?${qs}` : ""}`, { scroll: false });
-            }}
+            onHighlightAnimated={handleHighlightAnimated}
           />
           {transactions.length > 0 && transactions.length < totalCount && (
             <div
@@ -1263,6 +1301,9 @@ function TransactionsPageInner() {
             onSubmit={handleUpdateTransaction}
             onCancel={() => setEditingTransaction(null)}
             onDelete={handleDeleteTransaction}
+            conflict={editConflict.conflict}
+            onReloadLatest={editConflict.reloadLatest}
+            reloadingLatest={editConflict.reloading}
             onMakeRecurring={handleMakeRecurring}
             onAccountsUpdate={() => refreshData(false)}
             readOnly={!canWrite}

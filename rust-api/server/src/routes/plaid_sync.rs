@@ -27,6 +27,7 @@ use axum::{
 };
 use chrono::{Days, NaiveDate, NaiveDateTime};
 use ledger_db::Database;
+use ledger_db::lots::{collect_affected_pairs, rebuild_lots_for_pairs};
 use ledger_db::sql;
 use ledger_db::store::{self, Sql, Value as Bind, params};
 use serde::Serialize;
@@ -941,16 +942,20 @@ fn auto_match(
         // already reconciled is not a candidate: the match would stamp its
         // date again. The exception is a transaction that a bank row links,
         // which is a transfer that the other link matched (`already` keeps
-        // out the transactions of this link).
+        // out the transactions of this link). The amount is the total of the
+        // transaction on the account, as `linked_amount()` gives it: a link
+        // joins equal totals, so one split of several must not match.
         let candidates: Vec<(i32, String)> = database.query(
             &format!(
                 "SELECT t.id, {} AS date
                  FROM transaction_splits s JOIN transactions t ON s.transaction_id = t.id
-                 WHERE s.account_id = ?1 AND s.amount = ?2 AND t.book_id = ?3
+                 WHERE s.account_id = ?1 AND t.book_id = ?3
                    AND t.payee_id {in4}
                    AND (t.is_reconciled = false
                         OR EXISTS (SELECT 1 FROM plaid_transaction_reconciliation l
                                    WHERE l.matched_transaction_id = t.id AND l.book_id = ?3))
+                 GROUP BY t.id
+                 HAVING SUM(s.amount) = ?2
                  ORDER BY 2, t.id",
                 sql::EFFECTIVE_DATE,
                 in4 = sql::in_integers("?4")
@@ -996,10 +1001,10 @@ fn auto_match(
             let claimed: Option<i32> = tx.query_optional(
                 "UPDATE plaid_transaction_reconciliation
                  SET resolution_status = 'matched', matched_transaction_id = ?2,
-                     resolved_at = ?3, updated_at = ?3
+                     linked_account_id = ?4, resolved_at = ?3, updated_at = ?3
                  WHERE id = ?1 AND resolution_status = 'pending' AND review_reason IS NULL
                  RETURNING id",
-                &params![reconciliation_id, transaction_id, now],
+                &params![reconciliation_id, transaction_id, now, account_id],
             )?;
             if claimed.is_some() {
                 tx.execute(
@@ -1008,6 +1013,10 @@ fn auto_match(
                      WHERE id = ?1",
                     &params![transaction_id, matched_date, now],
                 )?;
+                // Lots are derived from the effective date, which this write
+                // can change: rebuild every pair of the transaction.
+                let pairs = collect_affected_pairs(tx, book_id, transaction_id)?;
+                rebuild_lots_for_pairs(tx, book_id, &pairs)?;
             }
             Ok::<_, store::Error>(claimed.is_some())
         })?;

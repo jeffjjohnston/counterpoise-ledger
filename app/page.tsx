@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useRouter } from "@/lib/navigation";
 import { Modal } from "@/components/ui/Modal";
-import { Input } from "@/components/ui/Input";
 import { JobStatusTable } from "@/components/system/JobStatusTable";
 import { apiGet, apiPost, apiPut, apiDelete, toMessage } from "@/lib/api-client";
 import type { BookRole } from "@/lib/book-roles";
@@ -46,11 +45,6 @@ export default function BookSelectorPage() {
   const [creatingDemo, setCreatingDemo] = useState<string | null>(null);
   // null while the list loads; [] when it failed, which shows the fallback.
   const [datasets, setDatasets] = useState<DemoDataset[] | null>(null);
-  const [editingBook, setEditingBook] = useState<Book | null>(null);
-  const [editingBookName, setEditingBookName] = useState("");
-  const [savingBook, setSavingBook] = useState(false);
-  const [deletingBook, setDeletingBook] = useState(false);
-  const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
   const [error, setError] = useState("");
   const [signingOut, setSigningOut] = useState(false);
   const [issues, setIssues] = useState<IssueReport[]>([]);
@@ -167,70 +161,6 @@ export default function BookSelectorPage() {
     }
   };
 
-  const openEditModal = (book: Book) => {
-    setEditingBook(book);
-    setEditingBookName(book.name);
-    setShowDeleteConfirmation(false);
-    setError("");
-  };
-
-  const closeEditModal = (force = false) => {
-    if (!force && (savingBook || deletingBook)) return;
-    setEditingBook(null);
-    setEditingBookName("");
-    setShowDeleteConfirmation(false);
-  };
-
-  const handleRenameBook = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingBook) return;
-
-    const name = editingBookName.trim();
-    if (!name) return;
-
-    setSavingBook(true);
-    setError("");
-
-    try {
-      const updated = await apiPut<Book>(`/api/books/${editingBook.id}`, { name });
-      setBooks((prev) =>
-        prev.map((book) => (book.id === editingBook.id ? { ...book, ...updated } : book))
-      );
-      closeEditModal(true);
-    } catch (err) {
-      setError(toMessage(err, "Failed to update book"));
-    } finally {
-      setSavingBook(false);
-    }
-  };
-
-  const handleDeleteBook = async () => {
-    if (!editingBook) return;
-
-    if (!showDeleteConfirmation) {
-      setShowDeleteConfirmation(true);
-      return;
-    }
-
-    const confirmed = window.confirm(
-      `Delete "${editingBook.name}" permanently? This removes all data in this book and cannot be undone.`
-    );
-    if (!confirmed) return;
-
-    setDeletingBook(true);
-    setError("");
-
-    try {
-      await apiDelete(`/api/books/${editingBook.id}`);
-      setBooks((prev) => prev.filter((book) => book.id !== editingBook.id));
-      closeEditModal(true);
-    } catch (err) {
-      setError(toMessage(err, "Failed to delete book"));
-    } finally {
-      setDeletingBook(false);
-    }
-  };
-
   const openEditIssueModal = (issue: IssueReport) => {
     setEditingIssue(issue);
     setEditingIssueDescription(issue.description);
@@ -314,13 +244,18 @@ export default function BookSelectorPage() {
     <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-2xl font-bold text-fg">Your Books</h1>
-        <button
-          onClick={handleSignOut}
-          disabled={signingOut}
-          className="text-sm text-fg-tertiary hover:text-fg-secondary font-medium disabled:opacity-50"
-        >
-          {signingOut ? "Signing out..." : "Sign out"}
-        </button>
+        <div className="flex items-center gap-4">
+          <Link href="/settings" className="text-sm text-fg-tertiary hover:text-fg-secondary font-medium">
+            Settings
+          </Link>
+          <button
+            onClick={handleSignOut}
+            disabled={signingOut}
+            className="text-sm text-fg-tertiary hover:text-fg-secondary font-medium disabled:opacity-50"
+          >
+            {signingOut ? "Signing out..." : "Sign out"}
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -359,14 +294,13 @@ export default function BookSelectorPage() {
                     </p>
                   </Link>
                   {(book.role === undefined || book.role === "owner") && (
-                    <button
-                      type="button"
-                      onClick={() => openEditModal(book)}
+                    <Link
+                      href={`/b/${book.id}/settings#general`}
                       className="shrink-0 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-fg-secondary hover:bg-surface-tertiary transition-colors"
                       aria-label={`Edit ${book.name}`}
                     >
                       Edit
-                    </button>
+                    </Link>
                   )}
                 </div>
               </div>
@@ -519,85 +453,6 @@ export default function BookSelectorPage() {
           </div>
         )}
       </div>
-
-      <Modal
-        isOpen={Boolean(editingBook)}
-        onClose={closeEditModal}
-        title="Edit Book"
-        size="sm"
-      >
-        <form onSubmit={handleRenameBook} className="space-y-4">
-          <Input
-            id="edit-book-name"
-            label="Book name"
-            type="text"
-            value={editingBookName}
-            onChange={(e) => setEditingBookName(e.target.value)}
-            disabled={savingBook || deletingBook}
-          />
-
-          <div className="rounded-lg border border-border bg-danger-subtle p-3">
-            <p className="text-sm font-semibold text-fg-danger mb-1">Danger zone</p>
-            <p className="text-xs text-fg-danger mb-3">
-              Deleting this book permanently removes its transactions, accounts, and all
-              related data. This action cannot be undone.
-            </p>
-
-            {!showDeleteConfirmation ? (
-              <button
-                type="button"
-                onClick={handleDeleteBook}
-                disabled={savingBook || deletingBook}
-                className="rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium text-fg-danger hover:bg-danger-subtle disabled:opacity-50"
-              >
-                Delete book...
-              </button>
-            ) : (
-              <div className="space-y-2">
-                <p className="text-xs font-medium text-fg-danger">
-                  Final confirmation required: this cannot be undone.
-                </p>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={handleDeleteBook}
-                    disabled={savingBook || deletingBook}
-                    className="rounded-lg bg-danger px-3 py-2 text-sm font-medium text-fg-on-accent hover:bg-danger disabled:opacity-50"
-                  >
-                    {deletingBook ? "Deleting..." : "Yes, permanently delete"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowDeleteConfirmation(false)}
-                    disabled={savingBook || deletingBook}
-                    className="rounded-lg border border-border px-3 py-2 text-sm font-medium text-fg-secondary hover:bg-surface-tertiary disabled:opacity-50"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="flex justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => closeEditModal()}
-              disabled={savingBook || deletingBook}
-              className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-fg-secondary hover:bg-surface-tertiary disabled:opacity-50"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={savingBook || deletingBook || !editingBookName.trim()}
-              className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-fg-on-accent hover:bg-accent-hover disabled:opacity-50"
-            >
-              {savingBook ? "Saving..." : "Save"}
-            </button>
-          </div>
-        </form>
-      </Modal>
 
       <Modal
         isOpen={Boolean(editingIssue)}

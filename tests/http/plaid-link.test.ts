@@ -501,7 +501,7 @@ describe("Plaid Hosted Link sessions", () => {
     const demo = await createPlaidToken({ financialInstitution: "Demo", itemId: "item-demo", accessToken: "demo-token", isDemo: true });
     await expectError("/api/b/1/sync/link-sessions", json("POST", { tokenId: demo.id }), 400, "A demo connection cannot be reconnected");
     for (const tokenId of ["1", 0, -2, 1.5, true]) {
-      await expectError("/api/b/1/sync/link-sessions", json("POST", { tokenId }), 400, "tokenId must be a positive integer or null");
+      await expectError("/api/b/1/sync/link-sessions", json("POST", { tokenId }), 400, "tokenId: must be a positive integer");
     }
     await expectError("/api/b/1/sync/link-sessions", json("POST", []), 400, "The request body must be a JSON object");
     expect(paths("/link/token/create")).toHaveLength(0);
@@ -636,8 +636,9 @@ describe("Plaid Hosted Link sessions", () => {
   });
 
   it("refuses a restart that is not a boolean", async () => {
-    for (const restart of [null, "true", 1, {}]) {
-      await expectError("/api/b/1/sync/link-sessions", json("POST", { restart }), 400, "restart must be a boolean");
+    for (const [restart, received] of [[null, "null"], ["true", 'string "true"'], [1, "number"], [{}, "map"]] as const) {
+      await expectError("/api/b/1/sync/link-sessions", json("POST", { restart }), 400,
+        `restart: invalid type: ${received}, expected a boolean`);
     }
     expect(paths("/link/token/create")).toHaveLength(0);
     expect(await count("plaid_link_sessions")).toBe(0);

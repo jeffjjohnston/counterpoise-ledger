@@ -218,6 +218,29 @@ describe("weekly review routes", () => {
     expect(torn).toEqual([]);
   });
 
+  // The system clock can step back (a time sync does this). The review that
+  // starts next then has an earlier started_at than the review before it.
+  // The start order is the id order, and the reads must follow it. With the
+  // order by started_at, each read after the step showed the old review, and
+  // the test above saw a started review as "neither" for 9 rounds in a row.
+  it("shows the review that started last when the clock stepped back", async () => {
+    await enable(client);
+    await client.request(`${REVIEW}/run`, json("POST"));
+    const first = (await settle(client)).latest;
+    // The same effect as a clock that steps back one day after the first review.
+    await exec("UPDATE weekly_reviews SET started_at = datetime(started_at, '+1 day') || substr(started_at, 20) WHERE id = ?", [first.id]);
+
+    mock.reply(answer({ summary: "The second review.", items: [] }));
+    const started = await client.request(`${REVIEW}/run`, json("POST"));
+    const { id } = await started.json();
+    expect((await settle(client)).latest).toMatchObject({ id, summary: "The second review." });
+
+    // A failure that started last also shows, although its started_at is earlier.
+    mock.reply({ status: 500, body: { type: "error" } });
+    const failed = await (await client.request(`${REVIEW}/run`, json("POST"))).json();
+    expect((await settle(client)).lastFailure).toMatchObject({ id: failed.id });
+  });
+
   it("removes IDs of another book, and drops a check item with no valid ID", async () => {
     await createUser({ username: "other" });
     await createBook({ name: "Other", userId: 2 });
@@ -370,7 +393,12 @@ describe("weekly review routes", () => {
       await client.request(`${REVIEW}/run`, json("POST"));
       await settle(client);
     }
-    expect(await scalar("SELECT COUNT(*) FROM weekly_reviews WHERE book_id = 1")).toBe(12);
+    // The prune runs after the save commits, so that a failed prune does not
+    // fail the review. settle() returns when the save commits: the count can
+    // be 13 for a moment.
+    await expect.poll(() => scalar("SELECT COUNT(*) FROM weekly_reviews WHERE book_id = 1")).toBe(12);
+    // The 12 that stay are the 12 that started last.
+    expect(await scalar("SELECT MIN(id) FROM weekly_reviews WHERE book_id = 1")).toBe(2);
   });
 
   it("the cron job reviews each book that opted in", async () => {

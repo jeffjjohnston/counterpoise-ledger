@@ -25,13 +25,13 @@ chrono = "0.4"
 libsqlite3-sys = { version = "0.39", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-chrono-tz = "0.10"
 iana-time-zone = "0.1"
 # The native backend of `ledger_db::store` (`engine/native.rs`). 0.41 links
 # libsqlite3-sys 0.39 (SQLite 3.54.1).
 rusqlite = { version = "0.41", optional = true }
 # The checksum of a migration file: SHA-384, as sqlx recorded it.
 sha2 = "0.11"
+jiff = { version = "1", default-features = false, features = ["std", "tzdb-bundle-always"] }
 
 # The clock reads `Date.now()` on wasm32.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

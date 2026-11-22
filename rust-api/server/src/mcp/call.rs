@@ -275,10 +275,8 @@ impl Caller {
             None => request.body(Body::empty()),
         }
         .map_err(|cause| thrown(&cause.to_string()))?;
-        let response = TOOL_CALL
-            .scope(self.oauth, router.oneshot(request))
-            .await
-            .map_err(|cause| thrown(&cause.to_string()))?;
+        // The router's error type is Infallible, so this pattern always matches.
+        let Ok(response) = TOOL_CALL.scope(self.oauth, router.oneshot(request)).await;
         let status = response.status();
         let bytes = to_bytes(response.into_body(), RESPONSE_LIMIT)
             .await

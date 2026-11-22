@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BookRoleProvider, useBookRole } from "@/components/BookRoleProvider";
 import { ToastProvider } from "@/components/ui/ToastProvider";
 
@@ -141,6 +141,20 @@ describe("BookRoleProvider", () => {
     expect(await screen.findByText(/Could not load the members of this book/)).toBeInTheDocument();
     // The role came from the books list, so it is still known.
     expect(screen.getByText("owner|true|true|0")).toBeInTheDocument();
+  });
+
+  it("shows no members error when the book is gone, as after a delete", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/books") return { ok: true, json: async () => [] } as Response;
+      if (url === "/api/books/1/members") return failure();
+      if (url === "/api/auth/me") return { ok: true, json: async () => ({ id: 1, username: "a" }) } as Response;
+      throw new Error(`Unexpected fetch url: ${url}`);
+    }));
+    renderProvider();
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(3));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(screen.queryByText(/Could not load the members of this book/)).not.toBeInTheDocument();
   });
 
   it("gives owner access outside the provider", () => {

@@ -423,7 +423,11 @@ describe("security price HTTP parity", () => {
       "NULLFIRST", "LENGTHZERO", "BROKE", 5, 1.5, 1e21, 1e-7, -0, ["A", ["B", null]], null, true, { x: 1 },
       "BRK B", "X?y=1", "../x",
     ];
-    const body = await ok(client, "/api/b/1/security-prices/tiingo", json("POST", { symbols, bookId: 99 }));
+    // The symbols that are not strings break the request contract on
+    // purpose, and the server gives them back as they came.
+    const response = await client.request("/api/b/1/security-prices/tiingo", json("POST", { symbols, bookId: 99 }), { contract: false });
+    expect(response.status).toBe(200);
+    const body = await response.json();
     // A TypeError names the variable, and the Next build minifies it.
     const notUpperCase = expect.stringMatching(/^\w+\.toUpperCase is not a function$/);
     expect(body).toEqual({
@@ -506,7 +510,7 @@ describe("security price HTTP parity", () => {
   it("writes an infinite Tiingo price and an infinite symbol as null", async () => {
     const response = await client.request("/api/b/1/security-prices/tiingo", {
       method: "POST", headers: { "content-type": "application/json" }, body: '{"symbols":["OVER",1e400]}',
-    });
+    }, { contract: false }); // 1e400 is not a string: the request breaks the contract on purpose.
     expect(await response.json()).toEqual({
       prices: [{ symbol: "OVER", price: null, date: "2026-07-02" }],
       errors: [{ symbol: null, error: "Failed to fetch price for Infinity: Not Found" }],

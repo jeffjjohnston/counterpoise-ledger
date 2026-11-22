@@ -20,6 +20,7 @@ import {
   parseStrictCurrency,
 } from "@/lib/wasm-client";
 import { validateSplits } from "@/lib/wasm-client";
+import { TRANSACTION_EDIT_CONFLICT_MESSAGE } from "@/lib/transaction-requests";
 import { prepareSaveChord } from "@/lib/save-chord";
 import type {
   AccountWithBalance,
@@ -66,6 +67,15 @@ interface TransactionFormProps {
   fullLayout?: boolean;
   /** Show the transaction without edit controls. For a viewer. */
   readOnly?: boolean;
+  /**
+   * Another user changed the transaction after the editor loaded it. The form
+   * keeps the user's edits, but Save, Delete and Make recurring are blocked.
+   */
+  conflict?: boolean;
+  /** Replaces the edits with the latest version. Shown with `conflict`. */
+  onReloadLatest?: () => void;
+  /** The latest version is loading. */
+  reloadingLatest?: boolean;
 }
 
 /** The wait after the last keystroke in the payee field before the payee search. */
@@ -89,6 +99,9 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
   isInvestmentAccountSelected = false,
   fullLayout = false,
   readOnly = false,
+  conflict = false,
+  onReloadLatest,
+  reloadingLatest = false,
 }, ref) {
   const bookId = useBookId();
   const toast = useToast();
@@ -881,6 +894,8 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
     e.preventDefault();
     // A viewer's Enter key must not submit the form.
     if (readOnly) return;
+    // The edits started from an old version. The server refuses them again.
+    if (conflict) return;
     // The button, Enter and Ctrl/Cmd+Enter all come here. A submit during a
     // save is dropped, so one entry cannot be sent twice.
     void submitGuard.run(save);
@@ -1371,7 +1386,9 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           bookId={bookId}
           transactionId={editingTransaction.id}
           onUnlinked={onPlaidUnlinked}
-          readOnly={readOnly}
+          // An unlink makes the page load the transaction again. That ends a
+          // conflict and replaces the edits that the form kept.
+          readOnly={readOnly || conflict}
         />
       )}
       <form ref={formRef} onSubmit={handleSubmit} className="space-y-4">
@@ -1621,6 +1638,27 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
         <TransactionAuthorship createdBy={editingTransaction.createdBy} updatedBy={editingTransaction.updatedBy} />
       )}
 
+      {conflict && (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-md bg-warning-subtle px-3 py-2 text-sm text-fg-warning"
+        >
+          <span>{TRANSACTION_EDIT_CONFLICT_MESSAGE}</span>
+          {onReloadLatest && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              className="shrink-0"
+              onClick={onReloadLatest}
+              disabled={reloadingLatest}
+            >
+              Reload latest
+            </Button>
+          )}
+        </div>
+      )}
+
       <div className="flex justify-between pt-4 border-t">
         {readOnly ? (
           <div className="flex w-full justify-end">
@@ -1634,7 +1672,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
           <>
             <div className="flex gap-3">
               {editingTransaction && onDelete && (
-                <Button type="button" variant="danger" onClick={onDelete} disabled={saving}>
+                <Button type="button" variant="danger" onClick={onDelete} disabled={saving || conflict}>
                   Delete
                 </Button>
               )}
@@ -1644,7 +1682,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
               {editingTransaction &&
                 (editingTransaction.investmentSplits?.length ?? 0) === 0 &&
                 onMakeRecurring && (
-                <Button type="button" variant="secondary" onClick={() => onMakeRecurring(editingTransaction.id)} disabled={saving}>
+                <Button type="button" variant="secondary" onClick={() => onMakeRecurring(editingTransaction.id)} disabled={saving || conflict}>
                   Make recurring...
                 </Button>
               )}
@@ -1655,7 +1693,7 @@ export const TransactionForm = forwardRef<TransactionFormHandle, TransactionForm
                   Cancel
                 </Button>
               )}
-              <Button type="submit" disabled={saving}>
+              <Button type="submit" disabled={saving || conflict}>
                 {editingTransaction ? "Save Changes" : "Add Transaction"}
                 {!editingTransaction && (
                   <span className="ml-1.5 text-xs opacity-60" aria-hidden="true">

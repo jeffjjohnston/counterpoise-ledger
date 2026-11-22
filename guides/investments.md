@@ -181,7 +181,11 @@ and does not follow it. Left open, the lot looks older than it actually is
 relative to fixed-date trades. The drift is latent until an installation
 actually holds a floating investment transaction, and a ledger with none is
 unaffected. The pair self-heals on any write that triggers the rebuild for
-it — there is nothing to migrate ahead of time.
+it — there is nothing to migrate ahead of time. A bank match that settles a
+floating trade is such a write: `mark_matched` in
+`rust-api/server/src/routes/reconcile.rs` and the automatic match in
+`rust-api/server/src/routes/plaid_sync.rs` rebuild the pairs of the
+transaction in the same database transaction as the date change.
 
 The Moneydance importer writes investment splits only; lots and allocations come
 from the rebuild alone.

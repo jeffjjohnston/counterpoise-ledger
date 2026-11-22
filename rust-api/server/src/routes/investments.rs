@@ -202,9 +202,9 @@ pub(super) fn positions(
     }
     basis.push(" AND remaining_shares_micros > 0 GROUP BY security_id");
     let basis: HashMap<i64, i64> = basis
-        .query::<(i32, i32)>(sql)?
+        .query::<(i32, i64)>(sql)?
         .into_iter()
-        .map(|(security_id, cents)| (i64::from(security_id), i64::from(cents)))
+        .map(|(security_id, cents)| (i64::from(security_id), cents))
         .collect();
     let missing = positions
         .iter()

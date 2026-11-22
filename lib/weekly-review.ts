@@ -28,13 +28,6 @@ export function formatPeriod(start: string, end: string): string {
   return startMonth === endMonth ? `${from} – ${endDay}` : `${from} – ${MONTHS[endMonth - 1]} ${endDay}`;
 }
 
-/** BookNavbar opens the book settings modal on this window event. */
-export const OPEN_BOOK_SETTINGS_EVENT = "counterpoise:open-book-settings";
-
-export function openBookSettings(): void {
-  window.dispatchEvent(new Event(OPEN_BOOK_SETTINGS_EVENT));
-}
-
 /** The settings section sends this window event after a successful save. */
 export const WEEKLY_REVIEW_SETTINGS_EVENT = "counterpoise:weekly-review-settings";
 

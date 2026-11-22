@@ -176,6 +176,35 @@ describe("ReportsPage", () => {
       expect(screen.getByTestId("report-table")).toBeInTheDocument();
     });
 
+    it("shows an error, not the old report, when a new query fails", async () => {
+      renderLive();
+      await waitFor(() => expect(screen.getByTestId("report-table")).toHaveTextContent("1000"));
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const serve = vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation(async (input) =>
+        String(input).includes("/reports/data") ? new Response("{}", { status: 500 }) : serve(input)
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit start date" }));
+      fireEvent.click(screen.getByRole("button", { name: "Generate Report" }));
+
+      // The old report does not belong to the new config.
+      expect(await screen.findByRole("alert")).toHaveTextContent("Could not load the report.");
+      expect(screen.queryByTestId("report-table")).not.toBeInTheDocument();
+
+      // A background reload of the new query also fails. The message stays.
+      hint(["transaction_splits"]);
+      await waitFor(() => expect(reportUrls.length + error.mock.calls.length).toBeGreaterThan(2));
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+
+      // The next Generate that succeeds shows the report again.
+      vi.mocked(fetch).mockImplementation(serve);
+      fireEvent.click(screen.getByRole("button", { name: "Generate Report" }));
+      await waitFor(() => expect(screen.getByTestId("report-table")).toHaveTextContent("1000"));
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      error.mockRestore();
+    });
+
     it("keeps the report when a background reload fails", async () => {
       renderLive();
       await waitFor(() => expect(screen.getByTestId("report-table")).toHaveTextContent("1000"));

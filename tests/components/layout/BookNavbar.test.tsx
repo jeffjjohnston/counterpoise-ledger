@@ -85,34 +85,33 @@ describe("BookNavbar", () => {
     }
   });
 
-  it("opens the Settings modal from the user dropdown", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url === "/api/books") {
-        return {
-          ok: true,
-          json: async () => [{ id: 1, name: "Primary Book" }],
-        } as Response;
-      }
-      throw new Error(`Unexpected fetch url: ${url}`);
-    });
-
-    vi.stubGlobal("fetch", fetchMock);
-
+  it("the Settings item links to the settings page", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/books") return { ok: true, json: async () => [{ id: 1, name: "Primary Book", role: "owner" }] } as Response;
+      // Both features are on, so no dot shows.
+      if (url.includes("/settings/")) return { ok: true, json: async () => ({ enabled: true, configured: true }) } as Response;
+      return { ok: false, status: 404, json: async () => ({}) } as Response;
+    }));
     renderNavbar();
-
-    await waitFor(() => {
-      expect(screen.getByText("Primary Book")).toBeInTheDocument();
-    });
-
+    await waitFor(() => expect(screen.getByText("Primary Book")).toBeInTheDocument());
     fireEvent.click(screen.getByLabelText("Open user menu"));
+    expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/b/1/settings");
+    expect(screen.queryByTestId("new-feature-dot")).not.toBeInTheDocument();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-
-    expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { level: 3, name: "Settings" })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Theme")).toHaveValue("system");
-    expect(screen.getByRole("link", { name: "Open account page" })).toHaveAttribute("href", "/account");
+  it("the Settings item links to the features section when a new feature can be turned on", async () => {
+    localStorage.clear();
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/books") return { ok: true, json: async () => [{ id: 1, name: "Primary Book", role: "owner" }] } as Response;
+      if (url.includes("/settings/")) return { ok: true, json: async () => ({ enabled: false, configured: true }) } as Response;
+      return { ok: false, status: 404, json: async () => ({}) } as Response;
+    }));
+    renderNavbar();
+    await waitFor(() => expect(screen.getAllByTestId("new-feature-dot").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByLabelText("Open user menu"));
+    expect(screen.getByRole("link", { name: /Settings/ })).toHaveAttribute("href", "/b/1/settings#features");
   });
 
   it("shows Sign out in the user dropdown", async () => {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, Suspense, useCallback } from "react";
+import { useEffect, useState, Suspense, useCallback } from "react";
 import { Link, useRouter, useSearchParams } from "@/lib/navigation";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -23,8 +23,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useBookId } from "@/hooks/useBookId";
 import { useBookRole } from "@/components/BookRoleProvider";
-import { useLiveReload } from "@/components/BookChangesProvider";
-import { useLatestRequest } from "@/hooks/useLatestRequest";
+import { useBookResource } from "@/hooks/useBookResource";
 import { apiGet, apiPost, apiPut, toMessage } from "@/lib/api-client";
 import { useToast } from "@/components/ui/ToastProvider";
 import type {
@@ -68,6 +67,14 @@ const MAX_OCCURRENCE_ITERATIONS = 366;
 const RECURRING_TABLES = [
   "recurring_rules", "recurring_template_splits", "accounts", "payees", "transactions", "books",
 ];
+
+/** What the page loads: one answer, shown together. */
+type RecurringData = {
+  rules: RecurringRuleWithSplits[];
+  accounts: AccountWithBalance[];
+  completedTxns: RecurringTransaction[];
+};
+const NO_DATA: RecurringData = { rules: [], accounts: [], completedTxns: [] };
 
 function parseDateString(dateString: string): Date {
   return new Date(`${dateString}T00:00:00`);
@@ -119,6 +126,9 @@ function getRuleOccurrencesInRange(
   }
 
   while (currentDate <= rangeEndDate && iterations < MAX_OCCURRENCE_ITERATIONS) {
+    // The server stops at the end date on the scheduled date, not on the
+    // observed date. An occurrence on the end date is included.
+    if (rule.endDate && currentDate > rule.endDate) break;
     const occurrenceDate = observe(currentDate);
     if (occurrenceDate > today && occurrenceDate <= rangeEndDate) {
       occurrences.push(occurrenceDate);
@@ -137,27 +147,13 @@ function RecurringPageInner() {
   const bookId = useBookId();
   const { canWrite } = useBookRole();
   const toast = useToast();
-  const [rules, setRules] = useState<RecurringRuleWithSplits[]>([]);
-  const [accounts, setAccounts] = useState<AccountWithBalance[]>([]);
-  const [completedTxns, setCompletedTxns] = useState<RecurringTransaction[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [prefillData, setPrefillData] = useState<PrefillData | undefined>(undefined);
   const searchParams = useSearchParams();
   const router = useRouter();
 
-  // A live update can start a reload while another is in flight, and the
-  // answers can arrive in either order. Only the latest request may publish.
-  const latestRequest = useLatestRequest();
-  // Whether this book's rules have rendered. A live reload can overtake the
-  // first load, so the first answer, not the first request, decides between
-  // the full-page error and a toast.
-  const shown = useRef(false);
-
-  const fetchData = useCallback(async () => {
-    const isLatest = latestRequest();
+  const loadData = useCallback(async (): Promise<RecurringData> => {
     // Compute calendar date range for the recurring transactions query
     const now = new Date();
     const todayStr = toDateString(now);
@@ -166,62 +162,43 @@ function RecurringPageInner() {
     const calEnd = new Date(calStart);
     calEnd.setDate(calStart.getDate() + CALENDAR_WEEKS * DAYS_PER_WEEK - 1);
 
-    try {
-      const [rulesData, accountsData, txnsData] = await Promise.all([
-        apiGet<RecurringRuleWithSplits[]>(`/api/b/${bookId}/recurring`),
-        apiGet<AccountWithBalance[]>(`/api/b/${bookId}/accounts?includeInactive=true`),
-        apiGet<RecurringTransaction[]>(
-          `/api/b/${bookId}/recurring/transactions?startDate=${toDateString(calStart)}&endDate=${toDateString(calEnd)}`
-        ),
-      ]);
+    const [rulesData, accountsData, txnsData] = await Promise.all([
+      apiGet<RecurringRuleWithSplits[]>(`/api/b/${bookId}/recurring`),
+      apiGet<AccountWithBalance[]>(`/api/b/${bookId}/accounts?includeInactive=true`),
+      apiGet<RecurringTransaction[]>(
+        `/api/b/${bookId}/recurring/transactions?startDate=${toDateString(calStart)}&endDate=${toDateString(calEnd)}`
+      ),
+    ]);
 
-      // rulesData drives `rules.filter(...)` below on every render; an
-      // unexpected (non-array) shape must fail loudly here rather than
-      // throwing later, outside this try/catch, when the page renders.
-      if (!Array.isArray(rulesData)) {
-        throw new Error("Unexpected response shape for recurring rules");
-      }
-
-      // Flatten accounts
-      const flatAccounts = flattenAccounts(accountsData);
-
-      if (!isLatest()) return;
-      setRules(rulesData);
-      setAccounts(flatAccounts);
-      setCompletedTxns(Array.isArray(txnsData) ? txnsData : []);
-      setError(null);
-      shown.current = true;
-      setLoading(false);
-    } catch {
-      if (!isLatest()) return;
-      if (!shown.current) {
-        // Nothing has rendered yet — the full-page error state is correct.
-        // Clearing loading here stops a failed first request from hanging
-        // the page on its skeleton.
-        setError("Could not load recurring rules.");
-        setLoading(false);
-      } else {
-        // A background refresh (after processing/deleting/toggling a rule,
-        // or creating/editing one, or a change by another client) failed.
-        // The already-rendered rules and calendar are still correct, so keep
-        // them on screen and surface the failure without blanking the page.
-        toast.error("Could not refresh recurring rules.");
-      }
+    // `rules.filter(...)` below runs on every render; an unexpected
+    // (non-array) shape must fail here, as a failed load, rather than throw
+    // later when the page renders.
+    if (!Array.isArray(rulesData)) {
+      throw new Error("Unexpected response shape for recurring rules");
     }
-  }, [bookId, latestRequest, toast]);
+    return {
+      rules: rulesData,
+      accounts: flattenAccounts(accountsData),
+      completedTxns: Array.isArray(txnsData) ? txnsData : [],
+    };
+  }, [bookId]);
 
-  useEffect(() => {
-    shown.current = false;
-    // fetchData handles its own errors internally.
-    void fetchData();
-  }, [fetchData]);
-
-  // Another client (an MCP tool, another tab, the scheduled processing)
-  // changed the book. The open form gets its accounts from the loaded data,
-  // so the reload waits until the form closes. The search term is local
-  // state, and the reload does not change it.
-  const reload = useCallback(() => { void fetchData(); }, [fetchData]);
-  useLiveReload(RECURRING_TABLES, reload, { paused: showModal && canWrite });
+  // The three lists are one answer: they go on the screen together. Another
+  // client (an MCP tool, another tab, the scheduled processing) can change
+  // the book. The open form gets its accounts from the loaded data, so a
+  // live reload waits until the form closes. The search term is local state,
+  // and a reload does not change it. A reload that fails (after processing,
+  // deleting, toggling, creating or editing a rule, or a live change) keeps
+  // the rules and the calendar on the screen and shows a toast.
+  const { data, loading, error, reload: fetchData } = useBookResource<RecurringData>({
+    initial: NO_DATA,
+    load: loadData,
+    tables: RECURRING_TABLES,
+    loadError: "Could not load recurring rules.",
+    refreshError: "Could not refresh recurring rules.",
+    paused: showModal && canWrite,
+  });
+  const { rules, accounts, completedTxns } = data;
 
   useEffect(() => {
     // A viewer cannot create a rule, so the link opens the list only. The

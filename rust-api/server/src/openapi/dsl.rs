@@ -94,7 +94,6 @@ pub(super) trait Refine: Sized {
     fn format(self, format: KnownFormat) -> Self;
     fn exclusive_minimum(self, value: i64) -> Self;
     fn minimum(self, value: i64) -> Self;
-    fn maximum(self, value: i64) -> Self;
     fn min_length(self, value: usize) -> Self;
     fn min_items(self, value: usize) -> Self;
     fn constant(self, value: Value) -> Self;
@@ -136,11 +135,6 @@ impl Refine for S {
 
     fn minimum(mut self, value: i64) -> Self {
         object_mut(&mut self, "minimum").minimum = Some(number(value));
-        self
-    }
-
-    fn maximum(mut self, value: i64) -> Self {
-        object_mut(&mut self, "maximum").maximum = Some(number(value));
         self
     }
 

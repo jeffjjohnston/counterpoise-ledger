@@ -7,6 +7,7 @@
 
 mod api_key_cache;
 mod auth;
+mod body;
 mod book_auth;
 mod book_changes;
 mod book_scope;

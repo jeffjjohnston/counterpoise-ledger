@@ -94,7 +94,7 @@ describe("security layers HTTP parity", () => {
         body: "{}",
       });
       expect(login.status).toBe(400);
-      expect(await login.json()).toEqual({ error: "Username and password are required" });
+      expect(await login.json()).toEqual({ error: "missing field `username`" });
       expect(await status(anonymous("/api/cron/recurring", {
         headers: { authorization: `Bearer ${CRON_SECRET}` },
       }))).toBe(200);

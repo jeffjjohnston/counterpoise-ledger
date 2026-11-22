@@ -1,5 +1,6 @@
 use crate::{
     auth::{cookie_token, principal, run_scrypt, token_hash},
+    body::{NonBlank, NonEmpty, typed_body},
     client_ip,
     error::{ApiError, error, internal_error},
     platform,
@@ -19,8 +20,10 @@ use ledger_db::{
     Sql,
     store::{self, params},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
+use utoipa::ToSchema;
 
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
 
@@ -112,7 +115,27 @@ fn truthy(value: Option<&Value>) -> bool {
     }
 }
 
-fn credentials(body: &Value, register: bool) -> Result<(String, String), ApiError> {
+// The body of `POST /api/auth/login`, and `LoginBody` in the API contract: see
+// `crate::body`. No `Debug`: it holds a password. The two texts are not
+// trimmed.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct LoginBody {
+    #[schema(inline)]
+    username: NonEmpty,
+    #[schema(inline)]
+    password: NonEmpty,
+}
+
+// The body of `POST /api/auth/api-keys`, and `CreateApiKeyBody` in the API
+// contract.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CreateApiKeyBody {
+    #[schema(inline)]
+    name: NonBlank,
+}
+
+/// The username and the password of a registration.
+fn registration(body: &Value) -> Result<(String, String), ApiError> {
     let username = body.get("username");
     let password = body.get("password");
     if !truthy(username) || !truthy(password) {
@@ -121,44 +144,31 @@ fn credentials(body: &Value, register: bool) -> Result<(String, String), ApiErro
             "Username and password are required",
         ));
     }
-    if register {
-        let username = username.and_then(Value::as_str).ok_or_else(|| {
-            error(
-                StatusCode::BAD_REQUEST,
-                "Username must be at least 3 characters",
-            )
-        })?;
-        if username.encode_utf16().count() < 3 {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "Username must be at least 3 characters",
-            ));
-        }
-        let password = password.and_then(Value::as_str).ok_or_else(|| {
-            error(
-                StatusCode::BAD_REQUEST,
-                "Password must be at least 8 characters",
-            )
-        })?;
-        if password.encode_utf16().count() < 8 {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "Password must be at least 8 characters",
-            ));
-        }
-        Ok((username.to_owned(), password.to_owned()))
-    } else {
-        let (Some(username), Some(password)) = (
-            username.and_then(Value::as_str),
-            password.and_then(Value::as_str),
-        ) else {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "Username and password must be strings",
-            ));
-        };
-        Ok((username.to_owned(), password.to_owned()))
+    let username = username.and_then(Value::as_str).ok_or_else(|| {
+        error(
+            StatusCode::BAD_REQUEST,
+            "Username must be at least 3 characters",
+        )
+    })?;
+    if username.encode_utf16().count() < 3 {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Username must be at least 3 characters",
+        ));
     }
+    let password = password.and_then(Value::as_str).ok_or_else(|| {
+        error(
+            StatusCode::BAD_REQUEST,
+            "Password must be at least 8 characters",
+        )
+    })?;
+    if password.encode_utf16().count() < 8 {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Password must be at least 8 characters",
+        ));
+    }
+    Ok((username.to_owned(), password.to_owned()))
 }
 
 fn registration_open(sql: &impl Sql) -> Result<bool, store::Error> {
@@ -267,8 +277,8 @@ async fn login_inner(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let body = parse_json_body(&body, "Failed to log in")?;
-    let (username, password) = credentials(&body, false)?;
+    let body: LoginBody = typed_body(&parse_json_body(&body, "Failed to log in")?)?;
+    let (username, password) = (body.username.into_string(), body.password.into_string());
     let keys = Keys {
         username: Some(&username),
         ip: client_ip::from_headers(&headers),
@@ -350,7 +360,7 @@ async fn register_inner(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let body = parse_json_body(&body, "Failed to register")?;
-    let (username, password) = credentials(&body, true)?;
+    let (username, password) = registration(&body)?;
     if !registration_open(&state.database).map_err(|cause| db_error(cause, "Failed to register"))? {
         return Ok(fail(StatusCode::FORBIDDEN, "Registration is closed"));
     }
@@ -695,14 +705,6 @@ fn iso_timestamp(value: NaiveDateTime) -> String {
     value.and_utc().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn js_whitespace(character: char) -> bool {
-    matches!(character,
-        '\u{0009}'..='\u{000D}' | '\u{0020}' | '\u{00A0}' | '\u{1680}' |
-        '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' |
-        '\u{205F}' | '\u{3000}' | '\u{FEFF}'
-    )
-}
-
 pub(crate) async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some((user_id, _)) = (match cookie_session(&state, &headers).await {
         Ok(value) => value,
@@ -745,13 +747,8 @@ async fn create_key_inner(
         return Ok(fail(StatusCode::UNAUTHORIZED, "Not authenticated"));
     };
     let body = parse_json_body(&body, "Failed to create API key")?;
-    let Some(name) = body.get("name").and_then(Value::as_str) else {
-        return Ok(fail(StatusCode::BAD_REQUEST, "Name is required"));
-    };
-    let name = name.trim_matches(js_whitespace);
-    if name.is_empty() {
-        return Ok(fail(StatusCode::BAD_REQUEST, "Name is required"));
-    }
+    let name = typed_body::<CreateApiKeyBody>(&body)?.name.into_string();
+    let name = name.as_str();
     let key = format!(
         "cpk_{}",
         random_hex(24).map_err(|cause| {
@@ -842,15 +839,5 @@ mod tests {
             " localhost:3000, proxy".parse().unwrap(),
         );
         assert_eq!(client_host(&headers), "localhost:3000");
-    }
-
-    #[test]
-    fn api_key_name_uses_javascript_trim_whitespace() {
-        assert_eq!(
-            "\u{feff} Phone \u{feff}".trim_matches(js_whitespace),
-            "Phone"
-        );
-        assert_eq!("\u{feff}".trim_matches(js_whitespace), "");
-        assert_eq!("\u{0085}".trim_matches(js_whitespace), "\u{0085}");
     }
 }

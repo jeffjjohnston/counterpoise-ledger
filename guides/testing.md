@@ -184,22 +184,34 @@ measurements in one place rather than testing repeated prose for agreement.
   The Homebrew target libraries live in a separate sysroot, so the plain
   `cargo build --target wasm32-unknown-unknown` command cannot find `core`.
   CI installs the target through `rustup` and uses the plain command there.
-- `npm run build`, `npm run dev`, and the npm test commands compile
-  `ledger-core` with its `wasm` feature, run `wasm-bindgen` 0.2.130 and
-  `wasm-opt`, then generate `lib/wasm/generated/` before using it. The
-  generated files are ignored: Homebrew and rustup produce different bytes,
-  and committing either build would make the other toolchain dirty the tree.
-  Install the CLI with `cargo install wasm-bindgen-cli --version 0.2.130
-  --locked` and Binaryen with `brew install binaryen`. If the CLI is outside
-  `PATH`, set `WASM_BINDGEN` to its binary path. The build script checks the
-  active `rustc` sysroot before selecting the Homebrew `rust-wasm` config and
-  `lld@22`; rustup uses its own target and linker. Docker compiles the same
-  target in a Rust build stage (`wasm-builder` in the root `Dockerfile`) and
-  passes the optimized bindings to the `client` stage, which runs the Vite
-  build. Every CI job that imports the browser adapter builds it from the Rust
-  source first, including unit, e2e, type checking, and the vacuity pass.
-  Before running `npx vitest` or `npx tsc` directly from a clean checkout,
-  run `npm run core:wasm:build`.
+- `lib/wasm/generated/` holds the browser copy of `ledger-core`: the crate
+  compiled with its `wasm` feature, then `wasm-bindgen` 0.2.130 and
+  `wasm-opt`. `scripts/build-core-wasm.mjs` makes it. The Vitest global
+  setup (`tests/global-setup.ts`) and a Vite plugin (`buildCoreWasm` in
+  `vite.config.ts`) run the script, so each Vitest run (`npm test`,
+  `npx vitest`), `npm run dev`, `npm run build` and the E2E build get a
+  current module. The script records a hash of its inputs (the core's
+  sources and manifests, the lock file and the script) in
+  `lib/wasm/generated/inputs.sha256`. When the hash is the same and each
+  output file is there, it starts no tool. After a change of `rustc`,
+  `wasm-bindgen` or `wasm-opt`, run `node scripts/build-core-wasm.mjs
+  --force`: the hash does not include the toolchain. Before `npx tsc` in a
+  clean checkout, run `npm run core:wasm:build`: the type check reads the
+  generated files and runs neither Vitest nor Vite.
+
+  The generated files are ignored: Homebrew and rustup produce different
+  bytes, and committing either build would make the other toolchain dirty
+  the tree. Install the CLI with `cargo install wasm-bindgen-cli --version
+  0.2.130 --locked` and Binaryen with `brew install binaryen`. If the CLI is
+  outside `PATH`, set `WASM_BINDGEN` to its binary path. The build script
+  checks the active `rustc` sysroot before selecting the Homebrew `rust-wasm`
+  config and `lld@22`; rustup uses its own target and linker. Docker compiles
+  the same target in a Rust build stage (`wasm-builder` in the root
+  `Dockerfile`) and passes the optimized bindings to the `client` stage,
+  which runs the Vite build with `CORE_WASM_PREBUILT=1`. The CI jobs that
+  import the browser adapter build it from the Rust source first, with
+  `npm run core:wasm:build`, including unit, e2e, type checking, and the
+  vacuity pass.
 - `rust-api/core/fixtures/core.json` is the corpus that the Rust core test
   checks. The TypeScript helpers generated it until the TypeScript server was
   retired; it is now test data. Add an edge case to it by hand alongside a
@@ -211,6 +223,25 @@ measurements in one place rather than testing repeated prose for agreement.
   goes in a unit test of the Rust module. `tests/fixtures.rs` fails when the
   corpus has fewer cases than its floor: increase the floor when you add
   cases.
+- `rust-api/core/tests/properties.rs` checks the accounting invariants on
+  random inputs from a fixed seed: a lot replay conserves shares and basis,
+  takes lots first in, first out, and does not depend on the input order;
+  the buy, sell and dividend builders give splits that sum to zero. A random
+  test in `rust-api/db/src/lots.rs` checks that a stepped rebuild equals a
+  whole rebuild. The generator is in the test files, so they add no
+  dependency. A failure prints its seed. When you change the replay or a
+  builder, add the new rule there, and plant a defect to see the test fail.
+- `node scripts/rust-coverage.mjs` reports which lines of the Rust workspace
+  the tests run: `cargo test --workspace`, then the HTTP suite and the MCP
+  suite against an instrumented server (`--unit-only` leaves the two suites
+  out). It needs `llvm-profdata` and `llvm-cov` (the rustup component
+  `llvm-tools`, or `brew install llvm`), builds into
+  `rust-api/target/coverage` (about 3 GB; delete it afterwards), and took
+  about 2 minutes on a development machine. Like the TypeScript report, it locates code
+  that no test runs; it sets no percentage. The test helpers take the path
+  of a Rust binary from `rustBinary()` in `tests/helpers/rust-binaries.ts`,
+  which reads `COUNTERPOISE_RUST_BIN_DIR`: do not write
+  `rust-api/target/debug` in a test.
 - `npm run test:coverage` reports coverage; use it to locate gaps, not as a
   correctness quota.
 
@@ -237,11 +268,19 @@ change what it checks, writes the whole mock inline
 
 For a route, add cases under `tests/http/` using `startHttpTestServer()` and
 `sessionHttpClient()` from `tests/helpers/http-parity.ts`. Seed rows through
-the database helpers, send real requests through the client, and check each
-successful response with `contract("<ComponentName>")` from
-`tests/helpers/contract.ts`. That helper validates the body against the
-component schema in `openapi/openapi.json`, and refuses any key the schema
-does not declare. `COUNTERPOISE_HTTP_SERVER=rust` (set by `npm run test:http`)
+the database helpers, and send real requests through the client. The client
+checks the contract itself: when a request is an operation of
+`openapi/openapi.json` and the response is a success, the body must match the
+schema of that operation, with no key that the schema does not declare
+(`assertResponseContract` in `tests/helpers/contract.ts`). A test thus checks
+the contract of each route it calls, also when it looks at one field only. A
+request that breaks the contract on purpose (a number where the contract has
+a string) passes `{ contract: false }` as the third argument of
+`client.request`, with a comment that says why. `contract("<ComponentName>")`
+from the same file validates one value against a component schema, for a
+body that did not come through the client. A route that is not in the
+document is not checked: add it to the contract first (see
+[api-contract.md](api-contract.md)). `COUNTERPOISE_HTTP_SERVER=rust` (set by `npm run test:http`)
 adds the suite to the database project. The HTTP suite uses the same generated
 per-worker database, migrations, and reset as other Vitest database
 suites. Start the server after `setupTestDatabase()` so it receives that

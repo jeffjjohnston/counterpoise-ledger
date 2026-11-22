@@ -66,8 +66,14 @@ describe("payee write HTTP parity", () => {
   });
 
   it("rejects payee-create input with the Node status and message", async () => {
-    for (const body of [null, [], {}, { name: 5 }, { name: "  ﻿ " }]) {
-      await expectError("/api/b/1/payees", json("POST", body), 400, "Name is required");
+    for (const [body, error] of [
+      [null, "The request body must be a JSON object"],
+      [[], "The request body must be a JSON object"],
+      [{}, "missing field `name`"],
+      [{ name: 5 }, "name: invalid type: number, expected a string"],
+      [{ name: "  ﻿ " }, "name: must not be blank"],
+    ] as const) {
+      await expectError("/api/b/1/payees", json("POST", body), 400, error);
     }
     await expectError("/api/b/1/payees", { method: "POST", body: "{" }, 500, "Failed to create payee");
   });
